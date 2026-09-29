@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+logs/
+*.log
+*.xlsx
+*.xls
+*.csv
+*.tsv
