@@ -9,4 +9,4 @@ COPY prisma prisma
 COPY apps/api apps/api
 RUN npx prisma generate --schema prisma/schema.prisma && npm run build --workspace @sync/api
 EXPOSE 3000
-CMD ["sh", "-c", "npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/main.js"]
+CMD ["sh", "-c", "case \"${SYNC_MODE:-apply}\" in apply) ;; dry) export DATABASE_URL=\"${DRY_DATABASE_URL:?DRY_DATABASE_URL is required when SYNC_MODE=dry}\" ;; *) echo 'SYNC_MODE must be dry or apply' >&2; exit 1 ;; esac; npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/main.js"]

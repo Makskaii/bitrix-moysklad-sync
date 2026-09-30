@@ -1,26 +1,19 @@
 const api = process.env.API_URL ?? 'http://localhost:3000';
 
-async function verifyTrialActionPath() {
-  const message = `compose-smoke-${Date.now()}`;
-  const createdResponse = await fetch(`${api}/api/trial-actions`, {
+async function verifyAnonymousAdminRequestsAreDenied() {
+  const writeResponse = await fetch(`${api}/api/admin/trial-actions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message: 'anonymous smoke request' }),
   });
-  if (!createdResponse.ok) throw new Error(`POST failed: ${createdResponse.status}`);
-  const created = (await createdResponse.json()) as { id: string; message: string };
-  if (!created.id || created.message !== message) throw new Error('POST returned unexpected data');
-
-  const listResponse = await fetch(`${api}/api/trial-actions`);
-  if (!listResponse.ok) throw new Error(`GET failed: ${listResponse.status}`);
-  const actions = (await listResponse.json()) as Array<{ id: string; message: string }>;
-  if (!actions.some((action) => action.id === created.id && action.message === message)) {
-    throw new Error('Created action was not returned by the list endpoint');
+  const readResponse = await fetch(`${api}/api/admin/trial-actions`);
+  if (writeResponse.status !== 403 || readResponse.status !== 403) {
+    throw new Error(`Expected anonymous admin requests to return 403; got POST ${writeResponse.status}, GET ${readResponse.status}`);
   }
-  process.stdout.write(`Trial action persisted and retrievable: ${created.id}\n`);
+  process.stdout.write('Anonymous admin reads and writes are denied.\n');
 }
 
-void verifyTrialActionPath().catch((error: unknown) => {
+void verifyAnonymousAdminRequestsAreDenied().catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
 });

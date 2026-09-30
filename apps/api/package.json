@@ -2,7 +2,9 @@
   "name": "@sync/api",
   "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "test:admin": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-access.integration.js",
+    "test:events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/events-intake.integration.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

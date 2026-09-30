@@ -1,14 +1,7 @@
 import { expect, test } from '@playwright/test';
 
-test('a trial action is saved and remains visible after reload', async ({ page }) => {
-  const message = `browser-path-${Date.now()}`;
-
+test('outside Bitrix24 the admin workspace remains closed', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByText('Сервис и база доступны')).toBeVisible();
-  await page.getByLabel('Сообщение').fill(message);
-  await page.getByRole('button', { name: /Сохранить в базу/ }).click();
-  await expect(page.locator('.record-copy strong').filter({ hasText: message })).toBeVisible();
-
-  await page.reload();
-  await expect(page.locator('.record-copy strong').filter({ hasText: message })).toBeVisible();
+  await expect(page.getByText('Откройте приложение внутри Bitrix24')).toBeVisible();
+  await expect(page.getByLabel('Сообщение')).toHaveCount(0);
 });

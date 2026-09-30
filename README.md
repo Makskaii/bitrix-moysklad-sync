@@ -6,20 +6,43 @@
 docker compose up --build
 ```
 
-Откройте http://localhost:5173. API доступен на http://localhost:3000, а `GET /health` проверяет и API, и соединение с PostgreSQL. Prisma применяет миграцию при запуске API. Локальная БД использует только демонстрационные реквизиты и не подключается к Bitrix24 или МойСклад.
+Интерфейс доступен по адресу http://localhost:5173 для проверки отображения, но административный экран открывается только внутри установленного приложения Bitrix24. API доступен на http://localhost:3000, а `GET /health` проверяет и API, и соединение с PostgreSQL. Prisma применяет миграцию при запуске API. Локальная БД использует только демонстрационные реквизиты и не подключается к Bitrix24 или МойСклад.
 
-Проверка сохранения через API и повторного чтения созданной записи:
+Проверка, что анонимные API-запросы не могут читать или менять административные данные:
 
 ```sh
 docker compose --profile test run --build --rm smoke
 ```
 
-Тест создаёт одну запись с уникальным сообщением и проверяет, что API возвращает её в списке.
+Тест проверяет, что анонимные GET и POST административных данных получают отказ.
 
-Проверка через браузер (форма → API → PostgreSQL → отображение после перезагрузки):
+Проверка через браузер, что административный экран закрыт вне iframe Bitrix24:
 
 ```sh
 docker compose --profile test run --build --rm browser-smoke
 ```
 
 Интерфейс использует относительные `/api` и `/health` адреса. Nginx проксирует их на API внутри Compose, поэтому браузеру нужен только origin интерфейса.
+
+## Приём событий
+
+При запуске intake задаются `SYNC_MODE=apply|dry` и `SYNC_STATE=on|pause|off`. Для обычного Compose-запуска приём выключен (`off`); для включения события настраиваются отдельные секреты `BITRIX24_EVENT_APPLICATION_TOKEN` и `MOYSKLAD_WEBHOOK_SECRET`. Bitrix24 отправляет событие на `POST /webhooks/bitrix24`; токен проверяется по `auth.application_token`. URL вебхука МойСклад имеет вид `https://<host>/webhooks/moysklad/<secret>`. Его документированное тело содержит `events[]` с `action` и ссылкой `meta.href`; МойСклад добавляет `requestId` в query и сохраняет его при повторах ([официальная документация](https://github.com/moysklad/workbook-api-doc/blob/master/pages/workbook/articles/webhooks.md)).
+
+Событие сначала фиксируется в PostgreSQL, после чего endpoint отвечает `200`. Если `requestId` присутствует, повторная доставка возвращает тот же ID. Без идентификатора доставки endpoint всё равно принимает уведомление и сохраняет каждое поступление отдельно, чтобы не объединить два одинаковых по телу изменения; у такого входа отсутствует источник-специфичный ключ для дедупликации повтора. Во время `pause` события сохраняются до возобновления обработки; `off` отвечает `410` и ничего не сохраняет. В режиме `dry` API и Prisma миграции используют `DRY_DATABASE_URL`, отдельный от `DATABASE_URL` для apply.
+
+PostgreSQL-backed smoke-проверка использует изолированную схему `events_test` и два временных локальных токена. Пример запуска в PowerShell:
+
+```powershell
+$oldBitrixToken = $env:BITRIX24_EVENT_APPLICATION_TOKEN
+$oldMoyskladSecret = $env:MOYSKLAD_WEBHOOK_SECRET
+$env:BITRIX24_EVENT_APPLICATION_TOKEN = [guid]::NewGuid().ToString('N')
+$env:MOYSKLAD_WEBHOOK_SECRET = [guid]::NewGuid().ToString('N')
+try {
+  docker compose -p t07-events --profile events-test run --build --rm events-smoke
+} finally {
+  if ($null -eq $oldBitrixToken) { Remove-Item Env:BITRIX24_EVENT_APPLICATION_TOKEN } else { $env:BITRIX24_EVENT_APPLICATION_TOKEN = $oldBitrixToken }
+  if ($null -eq $oldMoyskladSecret) { Remove-Item Env:MOYSKLAD_WEBHOOK_SECRET } else { $env:MOYSKLAD_WEBHOOK_SECRET = $oldMoyskladSecret }
+}
+```
+
+Профиль проверяет, что записи обеих систем доступны в PostgreSQL до ACK и повторные доставки не создают вторую запись. Контейнерный проект `t07-events` использует отдельный volume базы; тест оставляет его для повторного осмотра.

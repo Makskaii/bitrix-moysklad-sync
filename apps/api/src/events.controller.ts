@@ -1,0 +1,176 @@
+import {
+  Body,
+  BadRequestException,
+  Controller,
+  GoneException,
+  HttpCode,
+  Injectable,
+  Param,
+  Post,
+  Query,
+  UnauthorizedException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { Prisma } from '@prisma/client';
+import { DatabaseService } from './database.service';
+
+type EventPayload = Record<string, unknown>;
+type InboundSource = 'BITRIX24' | 'MOYSKLAD';
+
+@Injectable()
+export class EventIntakeService {
+  constructor(private readonly database: DatabaseService) {}
+
+  async receiveBitrix24(payload: EventPayload) {
+    const expectedToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
+    if (!expectedToken) {
+      throw new ServiceUnavailableException('Bitrix24 event authentication is not configured');
+    }
+
+    const auth = isRecord(payload.auth) ? payload.auth : {};
+    const providedToken = typeof auth.application_token === 'string' ? auth.application_token : '';
+    if (!constantTimeEqual(providedToken, expectedToken)) {
+      throw new UnauthorizedException();
+    }
+
+    this.ensureIntakeEnabled();
+    const safePayload = { ...payload };
+    delete safePayload.auth;
+    const data = isRecord(safePayload.data) ? safePayload.data : {};
+    const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
+
+    return this.save('BITRIX24', sha256(canonicalJson(safePayload)), {
+      eventType: typeof safePayload.event === 'string' ? safePayload.event : null,
+      externalEntityId: readString(fields.ID) ?? readString(data.ID),
+      payload: safePayload,
+    });
+  }
+
+  async receiveMoySklad(
+    pathSecret: string,
+    requestId: unknown,
+    payload: EventPayload | undefined,
+    query: Record<string, unknown>,
+  ) {
+    const expectedSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+    if (!expectedSecret) {
+      throw new ServiceUnavailableException('MoySklad webhook authentication is not configured');
+    }
+
+    if (!constantTimeEqual(pathSecret, expectedSecret)) {
+      throw new UnauthorizedException();
+    }
+
+    this.ensureIntakeEnabled();
+    if (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 200)) {
+      throw new BadRequestException('MoySklad requestId must be a non-empty string when provided');
+    }
+
+    const safePayload = payload ?? {};
+    const nativeEvent = readMoySkladEvent(safePayload);
+    const deliveryKey = typeof requestId === 'string' ? `request:${requestId}` : `unkeyed:${randomUUID()}`;
+    return this.save('MOYSKLAD', deliveryKey, {
+      eventType: nativeEvent.eventType ?? readString(safePayload.event) ?? readString(safePayload.action) ?? readString(query.type),
+      externalEntityId: nativeEvent.externalEntityId ?? readString(safePayload.id) ?? readString(query.id),
+      payload: safePayload,
+    });
+  }
+
+  private ensureIntakeEnabled() {
+    const state = process.env.SYNC_STATE ?? 'off';
+    if (state === 'off') throw new GoneException('Event intake is disabled');
+    if (state !== 'on' && state !== 'pause') {
+      throw new ServiceUnavailableException('SYNC_STATE must be on, pause, or off');
+    }
+    const mode = process.env.SYNC_MODE;
+    if (mode !== 'dry' && mode !== 'apply') {
+      throw new ServiceUnavailableException('SYNC_MODE must be dry or apply');
+    }
+  }
+
+  private async save(
+    source: InboundSource,
+    deliveryKey: string,
+    event: { eventType: string | null; externalEntityId: string | null; payload: EventPayload },
+  ) {
+    const row = await this.database.inboundEvent.upsert({
+      where: { source_deliveryKey: { source, deliveryKey } },
+      create: {
+        source,
+        deliveryKey,
+        eventType: event.eventType,
+        externalEntityId: event.externalEntityId,
+        payload: event.payload as Prisma.InputJsonValue,
+      },
+      update: {},
+      select: { id: true },
+    });
+
+    return { accepted: true, eventId: row.id };
+  }
+}
+
+@Controller('webhooks')
+export class EventsController {
+  constructor(private readonly intake: EventIntakeService) {}
+
+  @Post('bitrix24')
+  @HttpCode(200)
+  receiveBitrix24(@Body() payload: EventPayload | null) {
+    if (!isRecord(payload)) throw new UnauthorizedException();
+    return this.intake.receiveBitrix24(payload);
+  }
+
+  @Post('moysklad/:secret')
+  @HttpCode(200)
+  receiveMoySklad(
+    @Param('secret') secret: string,
+    @Query('requestId') requestId: unknown,
+    @Query() query: Record<string, unknown>,
+    @Body() payload: EventPayload | undefined,
+  ) {
+    if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
+    return this.intake.receiveMoySklad(secret, requestId, payload, query);
+  }
+}
+
+function isRecord(value: unknown): value is EventPayload {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : null;
+}
+
+function constantTimeEqual(provided: string, expected: string): boolean {
+  const left = Buffer.from(provided, 'utf8');
+  const right = Buffer.from(expected, 'utf8');
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function readMoySkladEvent(payload: EventPayload): { eventType: string | null; externalEntityId: string | null } {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const firstEvent = events.find(isRecord);
+  if (!firstEvent) return { eventType: null, externalEntityId: null };
+
+  const meta = isRecord(firstEvent.meta) ? firstEvent.meta : {};
+  const href = readString(meta.href);
+  const externalEntityId = href?.split('/').filter(Boolean).at(-1) ?? null;
+  return { eventType: readString(firstEvent.action), externalEntityId };
+}

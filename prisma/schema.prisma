@@ -12,3 +12,17 @@ model TrialAction {
   message   String
   createdAt DateTime @default(now())
 }
+
+model InboundEvent {
+  id               String   @id @default(cuid())
+  source           String
+  deliveryKey      String
+  eventType        String?
+  externalEntityId String?
+  payload          Json
+  status           String   @default("RECEIVED")
+  receivedAt       DateTime @default(now())
+
+  @@unique([source, deliveryKey])
+  @@index([status, receivedAt])
+}

@@ -1,14 +1,10 @@
 import 'reflect-metadata';
-import { BadRequestException, Body, Controller, Get, Injectable, Module, Post } from '@nestjs/common';
+import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { PrismaClient, TrialAction } from '@prisma/client';
-
-@Injectable()
-class DatabaseService extends PrismaClient {
-  async onModuleDestroy() {
-    await this.$disconnect();
-  }
-}
+import { AdminController } from './admin/admin.controller';
+import { AdminAccessGuard } from './admin/admin-access.guard';
+import { DatabaseService } from './database.service';
+import { EventsController, EventIntakeService } from './events.controller';
 
 @Controller()
 class AppController {
@@ -20,22 +16,12 @@ class AppController {
     return { status: 'ok', database: 'ok' };
   }
 
-  @Get('api/trial-actions')
-  list(): Promise<TrialAction[]> {
-    return this.database.trialAction.findMany({ orderBy: { createdAt: 'desc' } });
-  }
-
-  @Post('api/trial-actions')
-  create(@Body() body: { message?: unknown } | null): Promise<TrialAction> {
-    const message = typeof body?.message === 'string' ? body.message.trim() : '';
-    if (!message || message.length > 200) {
-      throw new BadRequestException('message must contain between 1 and 200 characters');
-    }
-    return this.database.trialAction.create({ data: { message } });
-  }
 }
 
-@Module({ controllers: [AppController], providers: [DatabaseService] })
+@Module({
+  controllers: [AppController, AdminController, EventsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService],
+})
 class AppModule {}
 
 async function bootstrap() {
