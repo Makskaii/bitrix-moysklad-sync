@@ -1,0 +1,9 @@
+.git
+.docker-config-check
+.env
+.env.*
+node_modules
+dist
+research
+docs
+*.log
