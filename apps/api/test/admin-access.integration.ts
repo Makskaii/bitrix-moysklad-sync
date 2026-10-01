@@ -5,6 +5,7 @@ import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AdminController } from '../src/admin/admin.controller';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
+import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
 
 const actions = {
@@ -53,12 +54,54 @@ async function adminRequest(token: string, method: 'GET' | 'POST' = 'GET') {
   return nativeFetch(`${apiUrl}/api/admin/trial-actions`, {
     method,
     headers: {
-      authorization: `Bearer ${token}`,
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
     },
     ...(method === 'POST' ? { body: JSON.stringify({ message: 'integration check' }) } : {}),
   });
 }
+
+test('ordinary API never bypasses Bitrix admin checks from preview environment variables', async () => {
+  const originalPreview = process.env.ADMIN_PREVIEW;
+  const originalBindHost = process.env.ADMIN_PREVIEW_BIND_HOST;
+  process.env.ADMIN_PREVIEW = '1';
+  process.env.ADMIN_PREVIEW_BIND_HOST = '127.0.0.1';
+  try {
+    assert.equal((await adminRequest('')).status, 403);
+    assert.equal((await adminRequest('', 'POST')).status, 403);
+  } finally {
+    if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
+    else process.env.ADMIN_PREVIEW = originalPreview;
+    if (originalBindHost === undefined) delete process.env.ADMIN_PREVIEW_BIND_HOST;
+    else process.env.ADMIN_PREVIEW_BIND_HOST = originalBindHost;
+  }
+});
+
+test('dedicated local preview API exposes status and permits trial actions without Bitrix auth', async () => {
+  const originalPreview = process.env.ADMIN_PREVIEW;
+  process.env.ADMIN_PREVIEW = '1';
+  const previewApp = await NestFactory.create(LocalAdminPreviewModule.register({
+    provide: DatabaseService,
+    useValue: { trialAction: actions },
+  }), { logger: false });
+  try {
+    await previewApp.listen(0, '127.0.0.1');
+    const previewUrl = await previewApp.getUrl();
+    const mode = await nativeFetch(`${previewUrl}/api/admin/preview-mode`);
+    assert.deepEqual(await mode.json(), { enabled: true });
+    const previewRead = await nativeFetch(`${previewUrl}/api/admin/trial-actions`);
+    assert.equal(previewRead.status, 200, await previewRead.text());
+    assert.equal((await nativeFetch(`${previewUrl}/api/admin/trial-actions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'preview check' }),
+    })).status, 201);
+  } finally {
+    await previewApp.close();
+    if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
+    else process.env.ADMIN_PREVIEW = originalPreview;
+  }
+});
 
 test('known administrator can read and perform an administrative action with their user token', async () => {
   let checks = 0;

@@ -24,6 +24,28 @@ docker compose --profile test run --build --rm browser-smoke
 
 Интерфейс использует относительные `/api` и `/health` адреса. Nginx проксирует их на API внутри Compose, поэтому браузеру нужен только origin интерфейса.
 
+## Локальный просмотр административного экрана
+
+Для просмотра пробного административного экрана вне Bitrix24 используйте отдельный Compose-проект:
+
+```sh
+docker compose -p local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml up --build
+```
+
+Откройте http://localhost:5174. В этом режиме сервер не проверяет права Bitrix24 для пробных административных действий; интерфейс показывает заметный баннер. Только веб-интерфейс опубликован на `127.0.0.1`; API доступен только веб-контейнеру во внутренней сети Compose. Сервисы используют отдельную базу проекта `local-admin-preview`. Обычный `docker compose up` по-прежнему требует администратора Bitrix24. Остановить просмотр можно командой `docker compose -p local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml down`; база останется на месте.
+
+Браузерная проверка локального режима с отдельной тестовой базой:
+
+```sh
+docker compose -p local-admin-preview-test -f docker-compose.yml -f docker-compose.preview.yml run --build --rm browser-smoke
+```
+
+Проверка нового интерфейса с preview-переменными, случайно переданными обычному API, использует отдельные локальные порты и базу:
+
+```sh
+docker compose -p local-admin-preview-off-test -f docker-compose.yml -f docker-compose.preview-off-test.yml --profile test run --build --rm browser-smoke
+```
+
 ## Приём событий
 
 При запуске intake задаются `SYNC_MODE=apply|dry` и `SYNC_STATE=on|pause|off`. Для обычного Compose-запуска приём выключен (`off`); для включения события настраиваются отдельные секреты `BITRIX24_EVENT_APPLICATION_TOKEN` и `MOYSKLAD_WEBHOOK_SECRET`. Bitrix24 отправляет событие на `POST /webhooks/bitrix24`; токен проверяется по `auth.application_token`. URL вебхука МойСклад имеет вид `https://<host>/webhooks/moysklad/<secret>`. Его документированное тело содержит `events[]` с `action` и ссылкой `meta.href`; МойСклад добавляет `requestId` в query и сохраняет его при повторах ([официальная документация](https://github.com/moysklad/workbook-api-doc/blob/master/pages/workbook/articles/webhooks.md)).

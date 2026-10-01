@@ -1,0 +1,15 @@
+services:
+  api:
+    environment:
+      ADMIN_PREVIEW: "1"
+      ADMIN_PREVIEW_BIND_HOST: 127.0.0.1
+    ports: !override
+      - "127.0.0.1:3002:3000"
+
+  web:
+    ports: !override
+      - "127.0.0.1:5175:80"
+
+  browser-smoke:
+    environment:
+      ADMIN_PREVIEW_EXPECTED: "0"

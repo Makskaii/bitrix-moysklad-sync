@@ -1,9 +1,10 @@
-import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
+import { CanActivate, ExecutionContext, ForbiddenException, Inject, Injectable, Optional } from '@nestjs/common';
 
 const bitrixAdminMethod = 'https://aerosystems.bitrix24.ru/rest/user.admin.json';
 const checkTimeoutMs = 5_000;
 
 type BitrixAdminResponse = { result: boolean };
+export const LOCAL_ADMIN_PREVIEW_ACCESS = Symbol('LOCAL_ADMIN_PREVIEW_ACCESS');
 
 export async function isBitrixAdministrator(
   accessToken: string,
@@ -36,7 +37,15 @@ function isAdminResponse(value: unknown): value is BitrixAdminResponse {
 
 @Injectable()
 export class AdminAccessGuard implements CanActivate {
+  constructor(
+    @Optional() @Inject(LOCAL_ADMIN_PREVIEW_ACCESS) private readonly localPreviewAccess = false,
+  ) {}
+
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (this.localPreviewAccess) {
+      if (process.env.ADMIN_PREVIEW === '1') return true;
+      throw new ForbiddenException('Local admin preview is disabled');
+    }
     const request = context.switchToHttp().getRequest<{ header(name: string): string | undefined }>();
     const authorization = request.header('authorization');
     const accessToken = authorization?.match(/^Bearer ([^\s]+)$/i)?.[1];
