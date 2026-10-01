@@ -4,6 +4,7 @@ import { after, before, test } from 'node:test';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AdminController } from '../src/admin/admin.controller';
+import { AdminPreviewController } from '../src/admin/admin-preview.controller';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
 import { DatabaseService } from '../src/database.service';
 
@@ -15,7 +16,7 @@ const actions = {
 };
 
 @Module({
-  controllers: [AdminController],
+  controllers: [AdminController, AdminPreviewController],
   providers: [
     AdminAccessGuard,
     { provide: DatabaseService, useValue: { trialAction: actions } },
@@ -53,12 +54,47 @@ async function adminRequest(token: string, method: 'GET' | 'POST' = 'GET') {
   return nativeFetch(`${apiUrl}/api/admin/trial-actions`, {
     method,
     headers: {
-      authorization: `Bearer ${token}`,
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
     },
     ...(method === 'POST' ? { body: JSON.stringify({ message: 'integration check' }) } : {}),
   });
 }
+
+test('explicit local preview mode exposes its status and permits trial actions without Bitrix auth', async () => {
+  const originalPreview = process.env.ADMIN_PREVIEW;
+  const originalBindHost = process.env.ADMIN_PREVIEW_BIND_HOST;
+  process.env.ADMIN_PREVIEW = '1';
+  process.env.ADMIN_PREVIEW_BIND_HOST = '127.0.0.1';
+  try {
+    const mode = await nativeFetch(`${apiUrl}/api/admin/preview-mode`);
+    assert.deepEqual(await mode.json(), { enabled: true });
+    assert.equal((await adminRequest('')).status, 200);
+    assert.equal((await adminRequest('', 'POST')).status, 201);
+  } finally {
+    if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
+    else process.env.ADMIN_PREVIEW = originalPreview;
+    if (originalBindHost === undefined) delete process.env.ADMIN_PREVIEW_BIND_HOST;
+    else process.env.ADMIN_PREVIEW_BIND_HOST = originalBindHost;
+  }
+});
+
+test('preview mode stays disabled unless the server is configured for loopback publishing', async () => {
+  const originalPreview = process.env.ADMIN_PREVIEW;
+  const originalBindHost = process.env.ADMIN_PREVIEW_BIND_HOST;
+  process.env.ADMIN_PREVIEW = '1';
+  process.env.ADMIN_PREVIEW_BIND_HOST = '0.0.0.0';
+  try {
+    const mode = await nativeFetch(`${apiUrl}/api/admin/preview-mode`);
+    assert.deepEqual(await mode.json(), { enabled: false });
+    assert.equal((await adminRequest('')).status, 403);
+  } finally {
+    if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
+    else process.env.ADMIN_PREVIEW = originalPreview;
+    if (originalBindHost === undefined) delete process.env.ADMIN_PREVIEW_BIND_HOST;
+    else process.env.ADMIN_PREVIEW_BIND_HOST = originalBindHost;
+  }
+});
 
 test('known administrator can read and perform an administrative action with their user token', async () => {
   let checks = 0;
