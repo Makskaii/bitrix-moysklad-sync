@@ -37,7 +37,7 @@
 | B24 deal ↔ MS customerorder | All 16 observed HTMLStudio custom mappings plus already-agreed standard fields are in first-version scope | Per-field directions, transforms, and writability require technical confirmation; read-only/computed properties are not presumed bidirectional; no inferred state IDs/triggers or mandatory set |
 | B24 smart invoice 31 ↔ MS invoiceout | Schema-relevant header/relationship candidates; invoice position schema; three UI status pairs in T03 | Legacy invoice type 5 inclusion, unmapped fields, links/directions/mandatory set TBD |
 | B24 catalog product/service ↔ MS product/service/variant | Full 54 B24 catalog fields enumerated below; complete MS standard product/service fields and custom attribute schema inventory referenced from T02; product-row fields fully enumerated above | No product-card directions/allowlist or global `property108` rule; exact MS product attribute pairings TBD |
-| Deal service reference ↔ customerorder custom attribute | Exact B24 UF/list ↔ MS attribute/dictionary pair separated from product positions | Reverse direction and separate text-copy decision TBD |
+| Deal service reference ↔ customerorder custom attribute | Exact B24 UF/list ↔ MS attribute/dictionary pair separated from product positions | Reverse direction and reference-value transformation require technical confirmation; Q26.10 fixes the text-copy decision: no separate copy |
 | Reference values (employees, stores, organizations, currency, states, customentity values) | Candidate object field codes/types and all available observed links in T03/T04 | No universal value map, missing-item policy, or entity-specific functional requiredness is asserted |
 
 ## Сводка сущностей и доказательств направлений
