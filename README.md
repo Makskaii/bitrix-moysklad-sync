@@ -32,15 +32,15 @@ docker compose --profile test run --build --rm browser-smoke
 docker compose -p local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml up --build
 ```
 
-Откройте http://localhost:5174. В этом режиме сервер не проверяет права Bitrix24 для пробных административных действий; интерфейс показывает заметный баннер. Веб-интерфейс и API опубликованы только на `127.0.0.1` и используют отдельную базу проекта `local-admin-preview`. Обычный `docker compose up` по-прежнему требует администратора Bitrix24. Остановить просмотр можно командой `docker compose -p local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml down`; база останется на месте.
+Откройте http://localhost:5174. В этом режиме сервер не проверяет права Bitrix24 для пробных административных действий; интерфейс показывает заметный баннер. Только веб-интерфейс опубликован на `127.0.0.1`; API доступен только веб-контейнеру во внутренней сети Compose. Сервисы используют отдельную базу проекта `local-admin-preview`. Обычный `docker compose up` по-прежнему требует администратора Bitrix24. Остановить просмотр можно командой `docker compose -p local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml down`; база останется на месте.
 
 Браузерная проверка локального режима с отдельной тестовой базой:
 
 ```sh
-docker compose -p local-admin-preview-test -f docker-compose.yml -f docker-compose.preview.yml --profile test run --build --rm browser-smoke
+docker compose -p local-admin-preview-test -f docker-compose.yml -f docker-compose.preview.yml run --build --rm browser-smoke
 ```
 
-Проверка нового интерфейса с выключенным режимом просмотра использует отдельные локальные порты и базу:
+Проверка нового интерфейса с preview-переменными, случайно переданными обычному API, использует отдельные локальные порты и базу:
 
 ```sh
 docker compose -p local-admin-preview-off-test -f docker-compose.yml -f docker-compose.preview-off-test.yml --profile test run --build --rm browser-smoke

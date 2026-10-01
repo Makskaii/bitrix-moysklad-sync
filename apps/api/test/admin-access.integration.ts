@@ -4,8 +4,8 @@ import { after, before, test } from 'node:test';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AdminController } from '../src/admin/admin.controller';
-import { AdminPreviewController } from '../src/admin/admin-preview.controller';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
+import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
 
 const actions = {
@@ -16,7 +16,7 @@ const actions = {
 };
 
 @Module({
-  controllers: [AdminController, AdminPreviewController],
+  controllers: [AdminController],
   providers: [
     AdminAccessGuard,
     { provide: DatabaseService, useValue: { trialAction: actions } },
@@ -61,16 +61,14 @@ async function adminRequest(token: string, method: 'GET' | 'POST' = 'GET') {
   });
 }
 
-test('explicit local preview mode exposes its status and permits trial actions without Bitrix auth', async () => {
+test('ordinary API never bypasses Bitrix admin checks from preview environment variables', async () => {
   const originalPreview = process.env.ADMIN_PREVIEW;
   const originalBindHost = process.env.ADMIN_PREVIEW_BIND_HOST;
   process.env.ADMIN_PREVIEW = '1';
   process.env.ADMIN_PREVIEW_BIND_HOST = '127.0.0.1';
   try {
-    const mode = await nativeFetch(`${apiUrl}/api/admin/preview-mode`);
-    assert.deepEqual(await mode.json(), { enabled: true });
-    assert.equal((await adminRequest('')).status, 200);
-    assert.equal((await adminRequest('', 'POST')).status, 201);
+    assert.equal((await adminRequest('')).status, 403);
+    assert.equal((await adminRequest('', 'POST')).status, 403);
   } finally {
     if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
     else process.env.ADMIN_PREVIEW = originalPreview;
@@ -79,20 +77,29 @@ test('explicit local preview mode exposes its status and permits trial actions w
   }
 });
 
-test('preview mode stays disabled unless the server is configured for loopback publishing', async () => {
+test('dedicated local preview API exposes status and permits trial actions without Bitrix auth', async () => {
   const originalPreview = process.env.ADMIN_PREVIEW;
-  const originalBindHost = process.env.ADMIN_PREVIEW_BIND_HOST;
   process.env.ADMIN_PREVIEW = '1';
-  process.env.ADMIN_PREVIEW_BIND_HOST = '0.0.0.0';
+  const previewApp = await NestFactory.create(LocalAdminPreviewModule.register({
+    provide: DatabaseService,
+    useValue: { trialAction: actions },
+  }), { logger: false });
   try {
-    const mode = await nativeFetch(`${apiUrl}/api/admin/preview-mode`);
-    assert.deepEqual(await mode.json(), { enabled: false });
-    assert.equal((await adminRequest('')).status, 403);
+    await previewApp.listen(0, '127.0.0.1');
+    const previewUrl = await previewApp.getUrl();
+    const mode = await nativeFetch(`${previewUrl}/api/admin/preview-mode`);
+    assert.deepEqual(await mode.json(), { enabled: true });
+    const previewRead = await nativeFetch(`${previewUrl}/api/admin/trial-actions`);
+    assert.equal(previewRead.status, 200, await previewRead.text());
+    assert.equal((await nativeFetch(`${previewUrl}/api/admin/trial-actions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'preview check' }),
+    })).status, 201);
   } finally {
+    await previewApp.close();
     if (originalPreview === undefined) delete process.env.ADMIN_PREVIEW;
     else process.env.ADMIN_PREVIEW = originalPreview;
-    if (originalBindHost === undefined) delete process.env.ADMIN_PREVIEW_BIND_HOST;
-    else process.env.ADMIN_PREVIEW_BIND_HOST = originalBindHost;
   }
 });
 

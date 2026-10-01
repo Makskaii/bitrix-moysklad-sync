@@ -2,7 +2,6 @@ import 'reflect-metadata';
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AdminController } from './admin/admin.controller';
-import { AdminPreviewController } from './admin/admin-preview.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
 import { DatabaseService } from './database.service';
 import { EventsController, EventIntakeService } from './events.controller';
@@ -20,7 +19,7 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, AdminPreviewController, EventsController],
+  controllers: [AppController, AdminController, EventsController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService],
 })
 class AppModule {}

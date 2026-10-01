@@ -1,12 +1,40 @@
 services:
   api:
+    profiles: ["normal"]
+    ports: !override []
+
+  local-admin-preview-api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command:
+      - sh
+      - -c
+      - npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/admin/local-preview-main.js
     environment:
       ADMIN_PREVIEW: "1"
-      ADMIN_PREVIEW_BIND_HOST: 127.0.0.1
-    ports: !override
-      - "127.0.0.1:3001:3000"
+      DATABASE_URL: postgresql://sync:local-only@db:5432/sync?schema=public
+      PORT: 3000
+      SYNC_MODE: apply
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      default:
+        aliases:
+          - api
 
   web:
+    depends_on: !override
+      local-admin-preview-api:
+        condition: service_healthy
     ports: !override
       - "127.0.0.1:5174:80"
 
