@@ -19,6 +19,7 @@ model InboundEvent {
   deliveryKey      String
   eventType        String?
   externalEntityId String?
+  externalEntityType String?
   payload          Json
   status           String   @default("RECEIVED")
   receivedAt       DateTime @default(now())

@@ -33,11 +33,17 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
       const pending = await this.database.inboundEvent.findMany({
         where: {
-          OR: [
-            { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
-            { status: 'PROCESSING', OR: [
-              { processingStartedAt: null },
-              { processingStartedAt: { lt: staleBefore } },
+          AND: [
+            { OR: [
+              { source: 'BITRIX24', eventType: { startsWith: 'ONCRMCONTACT' } },
+              { source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'counterparty' },
+            ] },
+            { OR: [
+              { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+              { status: 'PROCESSING', OR: [
+                { processingStartedAt: null },
+                { processingStartedAt: { lt: staleBefore } },
+              ] },
             ] },
           ],
         },
@@ -54,7 +60,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     this.active.add(eventId);
     try {
       const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
-      if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType)) return;
+      if (!candidate) return;
+      if (!isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
       const now = new Date();
       const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
       const claim = await this.database.inboundEvent.updateMany({
@@ -285,9 +292,9 @@ export class ContactSyncStatusReader {
   }
 }
 
-function isContactEmailEvent(source: string, eventType: string | null): boolean {
+function isContactEmailEvent(source: string, eventType: string | null, externalEntityType: string | null): boolean {
   return (source === 'BITRIX24' && eventType?.startsWith('ONCRMCONTACT') === true) ||
-    (source === 'MOYSKLAD' && eventType === 'UPDATE');
+    (source === 'MOYSKLAD' && eventType === 'UPDATE' && externalEntityType === 'counterparty');
 }
 
 function readSingleBitrixEmail(value: unknown): { email: string; id: string; valueType: string } | null {

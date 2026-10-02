@@ -12,6 +12,7 @@ type StoredEvent = {
   deliveryKey: string;
   eventType: string | null;
   externalEntityId: string | null;
+  externalEntityType: string | null;
   payload: unknown;
 };
 const rows = new Map<string, StoredEvent>();
@@ -25,6 +26,7 @@ const inboundEvent = {
       deliveryKey: string;
       eventType: string | null;
       externalEntityId: string | null;
+      externalEntityType: string | null;
       payload: unknown;
     };
   }) => {
@@ -152,6 +154,7 @@ test('native MoySklad event envelope is accepted without query parameters and ke
   assert.ok(stored);
   assert.equal(stored.eventType, 'UPDATE');
   assert.equal(stored.externalEntityId, 'native-id');
+  assert.equal(stored.externalEntityType, 'product');
 
   const repeated = await post();
   assert.equal(repeated.status, 200);

@@ -18,6 +18,7 @@ type StoredEvent = {
   deliveryKey: string;
   eventType: string | null;
   externalEntityId: string | null;
+  externalEntityType: string | null;
   payload: unknown;
   status: string;
   attempts: number;
@@ -83,14 +84,17 @@ const database = {
       }
       return { id: event.id };
     },
-    findMany: async () => [...events.values()],
+    findMany: async () => [...events.values()].filter((event) =>
+      (event.source === 'BITRIX24' && event.eventType?.startsWith('ONCRMCONTACT')) ||
+      (event.source === 'MOYSKLAD' && event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty')),
     updateMany: async (args: {
-      where: { id: string; OR: Array<Record<string, unknown>> };
-      data: { status: string; processingStartedAt: Date; attempts: { increment: number }; lastErrorCategory: null };
+      where: { id: string; OR?: Array<Record<string, unknown>>; status?: { in: string[] } };
+      data: { status: string; processingStartedAt?: Date | null; attempts?: { increment: number }; lastErrorCategory: null };
     }) => {
       const event = events.get(args.where.id);
       if (!event) return { count: 0 };
-      const claimable = args.where.OR.some((clause) => {
+      const matchesStatuses = args.where.status?.in.includes(event.status) ?? false;
+      const claimable = matchesStatuses || (args.where.OR?.some((clause) => {
         if (typeof clause.status === 'object' && clause.status !== null && 'in' in clause.status) {
           return ((clause.status as { in: string[] }).in).includes(event.status);
         }
@@ -98,11 +102,11 @@ const database = {
         if (clause.processingStartedAt === null) return event.processingStartedAt === null;
         const cutoff = (clause.processingStartedAt as { lt: Date }).lt;
         return event.processingStartedAt !== null && event.processingStartedAt < cutoff;
-      });
+      }) ?? false);
       if (!claimable) return { count: 0 };
       event.status = args.data.status;
-      event.processingStartedAt = args.data.processingStartedAt;
-      event.attempts += args.data.attempts.increment;
+      if (args.data.processingStartedAt !== undefined) event.processingStartedAt = args.data.processingStartedAt;
+      if (args.data.attempts) event.attempts += args.data.attempts.increment;
       event.lastErrorCategory = null;
       return { count: 1 };
     },
@@ -358,6 +362,47 @@ test('pause accepts the webhook but does not write to either external system', a
   assert.equal(status.status, 'RECEIVED');
   assert.deepEqual(externalWrites, []);
   assert.equal(moyskladState.email, 'before@example.test');
+});
+
+test('unrelated accepted Bitrix events remain durable but stay out of contact recovery scans', async () => {
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMLEADUPDATE',
+      data: { FIELDS: { ID: 'lead-42' } },
+      auth: { application_token: 'synthetic-b24-event-token' },
+    }),
+  });
+  assert.equal(response.status, 200);
+  const ack = await response.json() as { eventId: string };
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  const statusResponse = await fetch(`${apiUrl}/api/admin/contact-sync/events/${ack.eventId}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  const status = await statusResponse.json() as { status: string; attempts: number };
+  assert.equal(status.status, 'RECEIVED');
+  assert.equal(status.attempts, 0);
+  assert.deepEqual(externalWrites, []);
+
+  const moyskladResponse = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-webhook-secret`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'product', href: 'https://online.moysklad.ru/api/remap/1.2/entity/product/product-42' },
+      action: 'UPDATE',
+    }] }),
+  });
+  assert.equal(moyskladResponse.status, 200);
+  const moyskladAck = await moyskladResponse.json() as { eventId: string };
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  const moyskladStatusResponse = await fetch(`${apiUrl}/api/admin/contact-sync/events/${moyskladAck.eventId}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  const moyskladStatus = await moyskladStatusResponse.json() as { status: string; attempts: number };
+  assert.equal(moyskladStatus.status, 'RECEIVED');
+  assert.equal(moyskladStatus.attempts, 0);
+  assert.deepEqual(externalWrites, []);
 });
 
 test('dry mode preserves intake without performing an external write', async () => {
