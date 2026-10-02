@@ -6,14 +6,17 @@ import {
   HttpCode,
   Injectable,
   Param,
+  Optional,
   Post,
   Query,
+  Res,
   UnauthorizedException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { ContactSyncProcessor } from './contact-sync.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -43,6 +46,7 @@ export class EventIntakeService {
     return this.save('BITRIX24', sha256(canonicalJson(safePayload)), {
       eventType: typeof safePayload.event === 'string' ? safePayload.event : null,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
+      externalEntityType: null,
       payload: safePayload,
     });
   }
@@ -73,6 +77,7 @@ export class EventIntakeService {
     return this.save('MOYSKLAD', deliveryKey, {
       eventType: nativeEvent.eventType ?? readString(safePayload.event) ?? readString(safePayload.action) ?? readString(query.type),
       externalEntityId: nativeEvent.externalEntityId ?? readString(safePayload.id) ?? readString(query.id),
+      externalEntityType: nativeEvent.externalEntityType,
       payload: safePayload,
     });
   }
@@ -92,7 +97,7 @@ export class EventIntakeService {
   private async save(
     source: InboundSource,
     deliveryKey: string,
-    event: { eventType: string | null; externalEntityId: string | null; payload: EventPayload },
+    event: { eventType: string | null; externalEntityId: string | null; externalEntityType: string | null; payload: EventPayload },
   ) {
     const row = await this.database.inboundEvent.upsert({
       where: { source_deliveryKey: { source, deliveryKey } },
@@ -101,6 +106,7 @@ export class EventIntakeService {
         deliveryKey,
         eventType: event.eventType,
         externalEntityId: event.externalEntityId,
+        externalEntityType: event.externalEntityType,
         payload: event.payload as Prisma.InputJsonValue,
       },
       update: {},
@@ -113,13 +119,21 @@ export class EventIntakeService {
 
 @Controller('webhooks')
 export class EventsController {
-  constructor(private readonly intake: EventIntakeService) {}
+  constructor(
+    private readonly intake: EventIntakeService,
+    @Optional() private readonly contactSync?: ContactSyncProcessor,
+  ) {}
 
   @Post('bitrix24')
   @HttpCode(200)
-  receiveBitrix24(@Body() payload: EventPayload | null) {
+  async receiveBitrix24(
+    @Body() payload: EventPayload | null,
+    @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
+  ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
-    return this.intake.receiveBitrix24(payload);
+    const acknowledgement = await this.intake.receiveBitrix24(payload);
+    response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    return acknowledgement;
   }
 
   @Post('moysklad/:secret')
@@ -129,9 +143,13 @@ export class EventsController {
     @Query('requestId') requestId: unknown,
     @Query() query: Record<string, unknown>,
     @Body() payload: EventPayload | undefined,
+    @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
   ) {
     if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
-    return this.intake.receiveMoySklad(secret, requestId, payload, query);
+    return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
+      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+      return acknowledgement;
+    });
   }
 }
 
@@ -164,13 +182,19 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function readMoySkladEvent(payload: EventPayload): { eventType: string | null; externalEntityId: string | null } {
+function readMoySkladEvent(payload: EventPayload): {
+  eventType: string | null;
+  externalEntityId: string | null;
+  externalEntityType: string | null;
+} {
   const events = Array.isArray(payload.events) ? payload.events : [];
   const firstEvent = events.find(isRecord);
-  if (!firstEvent) return { eventType: null, externalEntityId: null };
+  if (!firstEvent) return { eventType: null, externalEntityId: null, externalEntityType: null };
 
   const meta = isRecord(firstEvent.meta) ? firstEvent.meta : {};
   const href = readString(meta.href);
-  const externalEntityId = href?.split('/').filter(Boolean).at(-1) ?? null;
-  return { eventType: readString(firstEvent.action), externalEntityId };
+  const hrefParts = href?.split('/').filter(Boolean) ?? [];
+  const externalEntityId = hrefParts.at(-1) ?? null;
+  const externalEntityType = readString(meta.type)?.toLowerCase() ?? hrefParts.at(-2)?.toLowerCase() ?? null;
+  return { eventType: readString(firstEvent.action), externalEntityId, externalEntityType };
 }

@@ -3,7 +3,9 @@ import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AdminController } from './admin/admin.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
+import { ContactSyncStatusController } from './admin/contact-sync-status.controller';
 import { DatabaseService } from './database.service';
+import { ContactSyncProcessor, ContactSyncStatusReader } from './contact-sync.service';
 import { EventsController, EventIntakeService } from './events.controller';
 
 @Controller()
@@ -19,8 +21,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, EventsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService],
+  controllers: [AppController, AdminController, ContactSyncStatusController, EventsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader],
 })
 class AppModule {}
 
