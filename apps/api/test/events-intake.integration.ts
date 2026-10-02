@@ -5,6 +5,7 @@ import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
+import { SyncModeService } from '../src/sync-mode.service';
 
 type StoredEvent = {
   id: string;
@@ -17,7 +18,7 @@ type StoredEvent = {
 };
 const rows = new Map<string, StoredEvent>();
 let upsertCalls = 0;
-
+let intakeMode: 'on' | 'pause' | 'off' = 'on';
 const inboundEvent = {
   upsert: async (args: {
     where: { source_deliveryKey: { source: string; deliveryKey: string } };
@@ -43,9 +44,19 @@ const inboundEvent = {
   },
 };
 
+const fakeDatabase = {
+  inboundEvent,
+  syncSetting: { upsert: async () => ({ serviceMode: intakeMode }) },
+  syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+};
+
 @Module({
   controllers: [EventsController],
-  providers: [EventIntakeService, { provide: DatabaseService, useValue: { inboundEvent } }],
+  providers: [
+    EventIntakeService,
+    { provide: DatabaseService, useValue: fakeDatabase },
+    SyncModeService,
+  ],
 })
 class EventsIntakeTestModule {}
 
@@ -165,7 +176,7 @@ test('native MoySklad event envelope is accepted without query parameters and ke
 
 test('pause stores verified events and off declines intake without storing', async () => {
   rows.clear();
-  process.env.SYNC_STATE = 'pause';
+  intakeMode = 'pause';
   const body = JSON.stringify({ event: 'ONCRMDEALADD', auth: { application_token: 'bitrix-test-application-token' } });
   const paused = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
@@ -173,11 +184,11 @@ test('pause stores verified events and off declines intake without storing', asy
   assert.equal(paused.status, 200);
   assert.equal(rows.size, 1);
 
-  process.env.SYNC_STATE = 'off';
+  intakeMode = 'off';
   const off = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
   assert.equal(off.status, 410);
   assert.equal(rows.size, 1);
-  process.env.SYNC_STATE = 'on';
+  intakeMode = 'on';
 });

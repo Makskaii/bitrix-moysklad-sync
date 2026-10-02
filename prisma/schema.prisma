@@ -13,6 +13,28 @@ model TrialAction {
   createdAt DateTime @default(now())
 }
 
+model SyncSetting {
+  id        String   @id @default("global")
+  serviceMode String @default("off")
+  offSince  DateTime?
+  resumeStatus String @default("idle")
+  resumeFrom DateTime?
+  resumeThrough DateTime?
+  resumeProvider String @default("BITRIX24")
+  resumeBitrixStart Int @default(0)
+  resumeMoyskladOffset Int @default(0)
+  resumeError String?
+  updatedAt DateTime @updatedAt
+}
+
+model SyncDirectionSetting {
+  id                    String   @id @default(cuid())
+  entityKey             String   @unique
+  bitrix24ToMoysklad    Boolean  @default(true)
+  moyskladToBitrix24    Boolean  @default(true)
+  updatedAt             DateTime @updatedAt
+}
+
 model InboundEvent {
   id               String   @id @default(cuid())
   source           String

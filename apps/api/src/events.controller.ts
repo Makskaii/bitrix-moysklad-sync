@@ -16,6 +16,7 @@ import {
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { SyncModeService } from './sync-mode.service';
 import { ContactSyncProcessor } from './contact-sync.service';
 
 type EventPayload = Record<string, unknown>;
@@ -23,7 +24,10 @@ type InboundSource = 'BITRIX24' | 'MOYSKLAD';
 
 @Injectable()
 export class EventIntakeService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly syncMode: SyncModeService,
+  ) {}
 
   async receiveBitrix24(payload: EventPayload) {
     const expectedToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
@@ -37,18 +41,21 @@ export class EventIntakeService {
       throw new UnauthorizedException();
     }
 
-    this.ensureIntakeEnabled();
+    await this.ensureIntakeEnabled();
     const safePayload = { ...payload };
     delete safePayload.auth;
     const data = isRecord(safePayload.data) ? safePayload.data : {};
     const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
+    const eventType = typeof safePayload.event === 'string' ? safePayload.event : null;
+    const directionDisabled = eventType?.startsWith('ONCRMCONTACT') === true &&
+      !await this.syncMode.isDirectionEnabled('contacts-companies', 'bitrix24ToMoysklad');
 
     return this.save('BITRIX24', sha256(canonicalJson(safePayload)), {
-      eventType: typeof safePayload.event === 'string' ? safePayload.event : null,
+      eventType,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
       externalEntityType: null,
       payload: safePayload,
-    });
+    }, directionDisabled);
   }
 
   async receiveMoySklad(
@@ -66,7 +73,7 @@ export class EventIntakeService {
       throw new UnauthorizedException();
     }
 
-    this.ensureIntakeEnabled();
+    await this.ensureIntakeEnabled();
     if (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 200)) {
       throw new BadRequestException('MoySklad requestId must be a non-empty string when provided');
     }
@@ -74,23 +81,24 @@ export class EventIntakeService {
     const safePayload = payload ?? {};
     const nativeEvent = readMoySkladEvent(safePayload);
     const deliveryKey = typeof requestId === 'string' ? `request:${requestId}` : `unkeyed:${randomUUID()}`;
+    const eventType = nativeEvent.eventType ?? readString(safePayload.event) ?? readString(safePayload.action) ?? readString(query.type);
+    const directionDisabled = eventType === 'UPDATE' && nativeEvent.externalEntityType === 'counterparty' &&
+      !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
     return this.save('MOYSKLAD', deliveryKey, {
-      eventType: nativeEvent.eventType ?? readString(safePayload.event) ?? readString(safePayload.action) ?? readString(query.type),
+      eventType,
       externalEntityId: nativeEvent.externalEntityId ?? readString(safePayload.id) ?? readString(query.id),
       externalEntityType: nativeEvent.externalEntityType,
       payload: safePayload,
-    });
+    }, directionDisabled);
   }
 
-  private ensureIntakeEnabled() {
-    const state = process.env.SYNC_STATE ?? 'off';
-    if (state === 'off') throw new GoneException('Event intake is disabled');
-    if (state !== 'on' && state !== 'pause') {
-      throw new ServiceUnavailableException('SYNC_STATE must be on, pause, or off');
-    }
+  private async ensureIntakeEnabled() {
     const mode = process.env.SYNC_MODE;
     if (mode !== 'dry' && mode !== 'apply') {
       throw new ServiceUnavailableException('SYNC_MODE must be dry or apply');
+    }
+    if ((await this.syncMode.read()).mode === 'off') {
+      throw new GoneException('Event intake is disabled');
     }
   }
 
@@ -98,6 +106,7 @@ export class EventIntakeService {
     source: InboundSource,
     deliveryKey: string,
     event: { eventType: string | null; externalEntityId: string | null; externalEntityType: string | null; payload: EventPayload },
+    directionDisabled = false,
   ) {
     const row = await this.database.inboundEvent.upsert({
       where: { source_deliveryKey: { source, deliveryKey } },
@@ -108,6 +117,8 @@ export class EventIntakeService {
         externalEntityId: event.externalEntityId,
         externalEntityType: event.externalEntityType,
         payload: event.payload as Prisma.InputJsonValue,
+        status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
+        lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
       },
       update: {},
       select: { id: true },
