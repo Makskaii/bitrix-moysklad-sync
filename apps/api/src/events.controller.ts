@@ -6,14 +6,17 @@ import {
   HttpCode,
   Injectable,
   Param,
+  Optional,
   Post,
   Query,
+  Res,
   UnauthorizedException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { ContactSyncProcessor } from './contact-sync.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -113,13 +116,21 @@ export class EventIntakeService {
 
 @Controller('webhooks')
 export class EventsController {
-  constructor(private readonly intake: EventIntakeService) {}
+  constructor(
+    private readonly intake: EventIntakeService,
+    @Optional() private readonly contactSync?: ContactSyncProcessor,
+  ) {}
 
   @Post('bitrix24')
   @HttpCode(200)
-  receiveBitrix24(@Body() payload: EventPayload | null) {
+  async receiveBitrix24(
+    @Body() payload: EventPayload | null,
+    @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
+  ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
-    return this.intake.receiveBitrix24(payload);
+    const acknowledgement = await this.intake.receiveBitrix24(payload);
+    response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    return acknowledgement;
   }
 
   @Post('moysklad/:secret')
@@ -129,9 +140,13 @@ export class EventsController {
     @Query('requestId') requestId: unknown,
     @Query() query: Record<string, unknown>,
     @Body() payload: EventPayload | undefined,
+    @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
   ) {
     if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
-    return this.intake.receiveMoySklad(secret, requestId, payload, query);
+    return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
+      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+      return acknowledgement;
+    });
   }
 }
 

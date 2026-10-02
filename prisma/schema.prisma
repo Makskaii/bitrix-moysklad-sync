@@ -22,7 +22,32 @@ model InboundEvent {
   payload          Json
   status           String   @default("RECEIVED")
   receivedAt       DateTime @default(now())
+  attempts         Int      @default(0)
+  direction        String?
+  snapshotRevision Int      @default(0)
+  lastSuccessfulAt DateTime?
+  lastErrorCategory String?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+}
+
+model ContactPair {
+  id                      String           @id @default(cuid())
+  bitrix24ContactId       String           @unique
+  moyskladCounterpartyId  String           @unique
+  moyskladType            String           @default("COUNTERPARTY")
+  active                  Boolean          @default(true)
+  snapshot                ContactSnapshot?
+}
+
+model ContactSnapshot {
+  pairId              String      @id
+  bitrix24Email       String
+  moyskladEmail       String
+  bitrix24UpdatedAt   DateTime
+  moyskladUpdatedAt   DateTime
+  revision            Int         @default(1)
+  lastSuccessfulAt    DateTime?
+  pair                ContactPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }
