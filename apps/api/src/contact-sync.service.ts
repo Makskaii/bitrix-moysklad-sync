@@ -2,6 +2,8 @@ import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/com
 import { DatabaseService } from './database.service';
 
 type JsonRecord = Record<string, unknown>;
+const PROCESSING_LEASE_MS = 60_000;
+const EXTERNAL_REQUEST_TIMEOUT_MS = 15_000;
 
 @Injectable()
 export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDestroy {
@@ -28,8 +30,17 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async resumeReceivedContactEvents() {
     if (!isApplyEnabled()) return;
     try {
+      const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
       const pending = await this.database.inboundEvent.findMany({
-        where: { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+        where: {
+          OR: [
+            { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+            { status: 'PROCESSING', OR: [
+              { processingStartedAt: null },
+              { processingStartedAt: { lt: staleBefore } },
+            ] },
+          ],
+        },
         select: { id: true },
       });
       for (const event of pending) this.enqueue(event.id);
@@ -42,14 +53,30 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (this.active.has(eventId)) return;
     this.active.add(eventId);
     try {
-      const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
-      if (!event || !isContactEmailEvent(event.source, event.eventType)) return;
-      if (event.status !== 'RECEIVED' && event.status !== 'RETRYABLE_FAILURE') return;
-      const attempt = event.attempts + 1;
-      await this.database.inboundEvent.update({
-        where: { id: eventId },
-        data: { status: 'PROCESSING', attempts: attempt, lastErrorCategory: null },
+      const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
+      if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType)) return;
+      const now = new Date();
+      const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
+      const claim = await this.database.inboundEvent.updateMany({
+        where: {
+          id: eventId,
+          OR: [
+            { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+            { status: 'PROCESSING', processingStartedAt: null },
+            { status: 'PROCESSING', processingStartedAt: { lt: staleBefore } },
+          ],
+        },
+        data: {
+          status: 'PROCESSING',
+          processingStartedAt: now,
+          attempts: { increment: 1 },
+          lastErrorCategory: null,
+        },
       });
+      if (claim.count !== 1) return;
+      const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
+      if (!event) return;
+      const attempt = event.attempts;
 
       try {
         await this.syncContactEmail(event, attempt);
@@ -106,6 +133,34 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       await this.database.inboundEvent.update({
         where: { id: event.id },
         data: { status: 'UNCHANGED', attempts: attempt, direction: null, snapshotRevision: snapshot.revision },
+      });
+      return;
+    }
+
+    if (bitrixEmail === moyskladEmail) {
+      const now = new Date();
+      const newRevision = snapshot.revision + 1;
+      await this.database.contactSnapshot.update({
+        where: { pairId: pair.id },
+        data: {
+          bitrix24Email: bitrixEmail,
+          moyskladEmail,
+          bitrix24UpdatedAt: readTimestamp(bitrixContact.DATE_MODIFY),
+          moyskladUpdatedAt: readTimestamp(moyskladCounterparty.updated),
+          revision: newRevision,
+          lastSuccessfulAt: now,
+        },
+      });
+      await this.database.inboundEvent.update({
+        where: { id: event.id },
+        data: {
+          status: 'SUCCEEDED',
+          attempts: attempt,
+          direction: null,
+          snapshotRevision: newRevision,
+          lastSuccessfulAt: now,
+          lastErrorCategory: null,
+        },
       });
       return;
     }
@@ -173,6 +228,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(fields),
+      signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
     const payload: unknown = await response.json();
@@ -201,6 +257,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       method,
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
     return response.json();

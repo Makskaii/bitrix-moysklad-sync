@@ -21,6 +21,7 @@ type StoredEvent = {
   payload: unknown;
   status: string;
   attempts: number;
+  processingStartedAt: Date | null;
   direction: string | null;
   snapshotRevision: number;
   lastSuccessfulAt: Date | null;
@@ -62,7 +63,7 @@ let bitrixHasMultipleEmails = false;
 
 const database = {
   inboundEvent: {
-    upsert: async (args: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Omit<StoredEvent, 'id' | 'status' | 'attempts' | 'direction' | 'snapshotRevision' | 'lastSuccessfulAt' | 'lastErrorCategory'> }) => {
+    upsert: async (args: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Omit<StoredEvent, 'id' | 'status' | 'attempts' | 'processingStartedAt' | 'direction' | 'snapshotRevision' | 'lastSuccessfulAt' | 'lastErrorCategory'> }) => {
       const { source, deliveryKey } = args.where.source_deliveryKey;
       const key = `${source}:${deliveryKey}`;
       let event = [...events.values()].find((row) => `${row.source}:${row.deliveryKey}` === key);
@@ -72,6 +73,7 @@ const database = {
           id: `event-${++nextEventId}`,
           status: 'RECEIVED',
           attempts: 0,
+          processingStartedAt: null,
           direction: null,
           snapshotRevision: 1,
           lastSuccessfulAt: null,
@@ -82,6 +84,28 @@ const database = {
       return { id: event.id };
     },
     findMany: async () => [...events.values()],
+    updateMany: async (args: {
+      where: { id: string; OR: Array<Record<string, unknown>> };
+      data: { status: string; processingStartedAt: Date; attempts: { increment: number }; lastErrorCategory: null };
+    }) => {
+      const event = events.get(args.where.id);
+      if (!event) return { count: 0 };
+      const claimable = args.where.OR.some((clause) => {
+        if (typeof clause.status === 'object' && clause.status !== null && 'in' in clause.status) {
+          return ((clause.status as { in: string[] }).in).includes(event.status);
+        }
+        if (clause.status !== 'PROCESSING' || event.status !== 'PROCESSING') return false;
+        if (clause.processingStartedAt === null) return event.processingStartedAt === null;
+        const cutoff = (clause.processingStartedAt as { lt: Date }).lt;
+        return event.processingStartedAt !== null && event.processingStartedAt < cutoff;
+      });
+      if (!claimable) return { count: 0 };
+      event.status = args.data.status;
+      event.processingStartedAt = args.data.processingStartedAt;
+      event.attempts += args.data.attempts.increment;
+      event.lastErrorCategory = null;
+      return { count: 1 };
+    },
     findUnique: async (args: { where: { id: string }; select?: Record<string, boolean> }) => {
       const event = events.get(args.where.id);
       if (!event || !args.select) return event ?? null;

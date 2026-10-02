@@ -23,6 +23,7 @@ model InboundEvent {
   status           String   @default("RECEIVED")
   receivedAt       DateTime @default(now())
   attempts         Int      @default(0)
+  processingStartedAt DateTime?
   direction        String?
   snapshotRevision Int      @default(0)
   lastSuccessfulAt DateTime?

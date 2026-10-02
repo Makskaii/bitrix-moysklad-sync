@@ -25,6 +25,11 @@ let mockServer: Server;
 let originalFetch: typeof fetch;
 let destinationEmail = 'before@example.test';
 let writeCount = 0;
+let writeDelayMs = 0;
+let barrierMoyskladReads = false;
+let moyskladReadArrivals = 0;
+let releaseMoyskladReads = () => {};
+let moyskladReadBarrier = Promise.resolve();
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to the isolated ephemeral PostgreSQL database');
@@ -123,6 +128,106 @@ test('real PostgreSQL persists the public intake and processing status across AP
   assert.equal(writeCount, 1);
 });
 
+test('two API instances claim one duplicate public delivery only once', async () => {
+  destinationEmail = 'before@example.test';
+  writeCount = 0;
+  writeDelayMs = 200;
+  barrierMoyskladReads = true;
+  moyskladReadArrivals = 0;
+  moyskladReadBarrier = new Promise<void>((resolve) => { releaseMoyskladReads = resolve; });
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const contactId = `t08-race-contact-${suffix}`;
+  const pair = await database.contactPair.create({
+    data: { bitrix24ContactId: contactId, moyskladCounterpartyId: `t08-race-counterparty-${suffix}` },
+  });
+  await database.contactSnapshot.create({
+    data: {
+      pairId: pair.id,
+      bitrix24Email: 'before@example.test',
+      moyskladEmail: 'before@example.test',
+      bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      revision: 1,
+    },
+  });
+  const secondApp = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
+  await secondApp.listen(0, '127.0.0.1');
+  const secondApiUrl = await secondApp.getUrl();
+  const body = JSON.stringify({
+    event: 'ONCRMCONTACTUPDATE',
+    data: { FIELDS: { ID: contactId } },
+    auth: { application_token: 'synthetic-b24-event-token' },
+  });
+  try {
+    process.env.SYNC_STATE = 'pause';
+    const initialResponse = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    });
+    assert.equal(initialResponse.status, 200);
+    const initialAck = await initialResponse.json() as { eventId: string };
+    process.env.SYNC_STATE = 'on';
+    const responses = await Promise.all([apiUrl, secondApiUrl].map((url) => fetch(`${url}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    })));
+    assert.deepEqual(responses.map((response) => response.status), [200, 200]);
+    const acknowledgements = await Promise.all(responses.map((response) => response.json() as Promise<{ eventId: string }>));
+    assert.equal(acknowledgements[0].eventId, initialAck.eventId);
+    assert.equal(acknowledgements[1].eventId, initialAck.eventId);
+    assert.equal(acknowledgements[0].eventId, acknowledgements[1].eventId);
+    const status = await waitForStatus(apiUrl, acknowledgements[0].eventId, 'SUCCEEDED');
+    assert.equal(status.attempts, 1);
+    assert.equal(status.snapshotRevision, 2);
+    assert.equal(destinationEmail, 'after@example.test');
+    assert.equal(writeCount, 1);
+  } finally {
+    (secondApp.getHttpServer() as Server).closeAllConnections();
+    await secondApp.close();
+    writeDelayMs = 0;
+    barrierMoyskladReads = false;
+  }
+});
+
+test('a stale PROCESSING event is recovered after restart without repeating a converged remote write', async () => {
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const contactId = `t08-stale-contact-${suffix}`;
+  const pair = await database.contactPair.create({
+    data: { bitrix24ContactId: contactId, moyskladCounterpartyId: `t08-stale-counterparty-${suffix}` },
+  });
+  await database.contactSnapshot.create({
+    data: {
+      pairId: pair.id,
+      bitrix24Email: 'before@example.test',
+      moyskladEmail: 'before@example.test',
+      bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      revision: 1,
+    },
+  });
+  const event = await database.inboundEvent.create({
+    data: {
+      source: 'BITRIX24',
+      deliveryKey: `t08-stale-${suffix}`,
+      eventType: 'ONCRMCONTACTUPDATE',
+      externalEntityId: contactId,
+      payload: { event: 'ONCRMCONTACTUPDATE' },
+      status: 'PROCESSING',
+      attempts: 1,
+      snapshotRevision: 1,
+    },
+  });
+
+  destinationEmail = 'after@example.test';
+  const previousWrites = writeCount;
+  await restartApp();
+  const status = await waitForStatus(apiUrl, event.id, 'SUCCEEDED');
+  assert.equal(status.attempts, 2);
+  assert.equal(status.snapshotRevision, 2);
+  assert.equal(destinationEmail, 'after@example.test');
+  assert.equal(writeCount, previousWrites);
+});
+
 async function handleExternalRequest(request: IncomingMessage, response: ServerResponse) {
   if (request.method === 'POST' && request.url === '/rest/crm.contact.get.json') {
     return readBody(request).then((body) => {
@@ -141,16 +246,33 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
     return readBody(request).then((body) => {
       destinationEmail = (JSON.parse(body) as { email: string }).email;
       writeCount++;
-      return sendJson(response, 200, { id: 'synthetic-counterparty', email: destinationEmail, updated: '2026-10-02T10:00:03.000' });
+      return new Promise<void>((resolve) => setTimeout(() => {
+        sendJson(response, 200, { id: 'synthetic-counterparty', email: destinationEmail, updated: '2026-10-02T10:00:03.000' });
+        resolve();
+      }, writeDelayMs));
     });
   }
   if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty/')) {
+    if (barrierMoyskladReads) {
+      moyskladReadArrivals++;
+      if (moyskladReadArrivals >= 2) releaseMoyskladReads();
+      await Promise.race([moyskladReadBarrier, new Promise((resolve) => setTimeout(resolve, 350))]);
+    }
     return sendJson(response, 200, {
       id: 'synthetic-counterparty', name: 'Synthetic Customer', companyType: 'legal',
-      phone: '+10000000000', email: 'before@example.test', updated: '2026-10-02T09:00:00.000',
+      phone: '+10000000000', email: destinationEmail,
+      updated: destinationEmail === 'before@example.test' ? '2026-10-02T09:00:00.000' : '2026-10-02T10:00:03.000',
     });
   }
   return sendJson(response, 404, {});
+}
+
+async function restartApp() {
+  (app.getHttpServer() as Server).closeAllConnections();
+  await app.close();
+  app = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
+  await app.listen(0, '127.0.0.1');
+  apiUrl = await app.getUrl();
 }
 
 async function waitForStatus(baseUrl: string, eventId: string, expected: string) {
