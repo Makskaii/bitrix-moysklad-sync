@@ -231,8 +231,8 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
     'invoices',
     'products-variations',
     'service-dictionary',
-    'reference-mappings',
   ]);
+  assert.equal(entities.length, 5);
   assert.deepEqual({
     key: entities[0].key,
     ready: entities[0].ready,

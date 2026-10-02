@@ -23,6 +23,9 @@ test('risky mode changes require UI confirmation and unavailable directions stay
   await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [
     { key: 'contacts-companies', label: 'Контакты ↔ контрагенты', ready: true, availability: 'Только EMAIL существующей пары', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
     { key: 'deals-orders', label: 'Сделки ↔ заказы покупателей', ready: false, availability: 'Обмен этой сущности пока недоступен.', bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'invoices', label: 'Счета ↔ счета покупателям', ready: false, availability: 'Обмен этой сущности пока недоступен.', bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'products-variations', label: 'Товары ↔ товары и модификации', ready: false, availability: 'Обмен этой сущности пока недоступен.', bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'service-dictionary', label: 'Справочник услуг ↔ поле справочника заказа', ready: false, availability: 'Обмен этой сущности пока недоступен.', bitrix24ToMoysklad: false, moyskladToBitrix24: false },
   ] }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
   await page.goto('/');
@@ -48,6 +51,8 @@ test('risky mode changes require UI confirmation and unavailable directions stay
   await directionDialog.getByRole('button', { name: 'Подтвердить' }).click();
   await expect.poll(() => directionWrites).toEqual([{ bitrix24ToMoysklad: false, moyskladToBitrix24: true, confirmed: true }]);
   const unavailable = page.locator('.entity-row').filter({ hasText: 'Сделки ↔ заказы покупателей' });
+  await expect(page.locator('.entity-row')).toHaveCount(5);
+  await expect(page.getByText('Соответствия сотрудников, организаций, складов, валют')).toHaveCount(0);
   await expect(unavailable.getByRole('checkbox')).toHaveCount(2);
   await expect(unavailable.getByRole('checkbox').nth(0)).toBeDisabled();
   await expect(unavailable.getByRole('checkbox').nth(1)).toBeDisabled();

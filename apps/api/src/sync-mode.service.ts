@@ -39,13 +39,6 @@ const entityControls = [
     directionScope: null,
     availability: 'Обмен этой сущности пока недоступен.',
   },
-  {
-    key: 'reference-mappings',
-    label: 'Соответствия сотрудников, организаций, складов, валют и значений справочников',
-    ready: false,
-    directionScope: null,
-    availability: 'Настройки связей; отдельный обработчик синхронизации не включается.',
-  },
 ] as const;
 
 @Injectable()
