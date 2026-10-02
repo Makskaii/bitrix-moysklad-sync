@@ -4,9 +4,12 @@ import { NestFactory } from '@nestjs/core';
 import { AdminController } from './admin/admin.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
 import { ContactSyncStatusController } from './admin/contact-sync-status.controller';
+import { SyncModeController } from './admin/sync-mode.controller';
 import { DatabaseService } from './database.service';
 import { ContactSyncProcessor, ContactSyncStatusReader } from './contact-sync.service';
 import { EventsController, EventIntakeService } from './events.controller';
+import { SyncModeService } from './sync-mode.service';
+import { SyncRecoveryService } from './sync-recovery.service';
 
 @Controller()
 class AppController {
@@ -21,8 +24,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, EventsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader],
+  controllers: [AppController, AdminController, ContactSyncStatusController, SyncModeController, EventsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService],
 })
 class AppModule {}
 

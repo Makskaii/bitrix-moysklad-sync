@@ -10,6 +10,7 @@ import { ContactSyncStatusController } from '../src/admin/contact-sync-status.co
 import { ContactSyncProcessor, ContactSyncStatusReader } from '../src/contact-sync.service';
 import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
+import { SyncModeService } from '../src/sync-mode.service';
 
 type HttpState = { email: string; updatedAt: string };
 type StoredEvent = {
@@ -61,8 +62,11 @@ let originalFetch: typeof fetch;
 let externalWrites: string[];
 let failNextMoyskladWrite = false;
 let bitrixHasMultipleEmails = false;
+let serviceMode: 'on' | 'pause' = 'on';
 
 const database = {
+  syncSetting: { upsert: async () => ({ serviceMode }) },
+  syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
   inboundEvent: {
     upsert: async (args: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Omit<StoredEvent, 'id' | 'status' | 'attempts' | 'processingStartedAt' | 'direction' | 'snapshotRevision' | 'lastSuccessfulAt' | 'lastErrorCategory'> }) => {
       const { source, deliveryKey } = args.where.source_deliveryKey;
@@ -150,6 +154,7 @@ const database = {
     ContactSyncStatusReader,
     AdminAccessGuard,
     { provide: DatabaseService, useValue: database },
+    SyncModeService,
   ],
 })
 class ContactSyncTestModule {}
@@ -157,6 +162,7 @@ class ContactSyncTestModule {}
 before(async () => {
   process.env.SYNC_MODE = 'apply';
   process.env.SYNC_STATE = 'on';
+  serviceMode = 'on';
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-b24-event-token';
   process.env.MOYSKLAD_WEBHOOK_SECRET = 'synthetic-ms-webhook-secret';
   process.env.BITRIX24_REST_BASE_URL = 'pending';
@@ -236,6 +242,7 @@ beforeEach(() => {
   nextEventId = 0;
   process.env.SYNC_MODE = 'apply';
   process.env.SYNC_STATE = 'on';
+  serviceMode = 'on';
   externalWrites = [];
   failNextMoyskladWrite = false;
   bitrixHasMultipleEmails = false;
@@ -342,7 +349,7 @@ test('MoySklad reflection of a successful email write does not start a second wr
 });
 
 test('pause accepts the webhook but does not write to either external system', async () => {
-  process.env.SYNC_STATE = 'pause';
+  serviceMode = 'pause';
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

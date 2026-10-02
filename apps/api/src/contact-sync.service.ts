@@ -1,5 +1,6 @@
 import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { SyncModeService } from './sync-mode.service';
 
 type JsonRecord = Record<string, unknown>;
 const PROCESSING_LEASE_MS = 60_000;
@@ -10,7 +11,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private readonly active = new Set<string>();
   private recoveryTimer?: NodeJS.Timeout;
 
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly syncMode: SyncModeService,
+  ) {}
 
   onApplicationBootstrap() {
     void this.resumeReceivedContactEvents();
@@ -23,12 +27,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   enqueue(eventId: string) {
-    if (!isApplyEnabled()) return;
     setImmediate(() => { void this.process(eventId); });
   }
 
   private async resumeReceivedContactEvents() {
-    if (!isApplyEnabled()) return;
+    if (!await this.isApplyEnabled()) return;
     try {
       const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
       const pending = await this.database.inboundEvent.findMany({
@@ -59,9 +62,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (this.active.has(eventId)) return;
     this.active.add(eventId);
     try {
+      if (!await this.isApplyEnabled()) return;
       const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
       if (!candidate) return;
       if (!isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
+      if (await this.skipIfDirectionDisabled(candidate)) return;
       const now = new Date();
       const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
       const claim = await this.database.inboundEvent.updateMany({
@@ -83,6 +88,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       if (claim.count !== 1) return;
       const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
       if (!event) return;
+      if (await this.skipIfDirectionDisabled(event)) return;
       const attempt = event.attempts;
 
       try {
@@ -100,6 +106,31 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     } finally {
       this.active.delete(eventId);
     }
+  }
+
+  private async isApplyEnabled(): Promise<boolean> {
+    return process.env.SYNC_MODE === 'apply' && (await this.syncMode.read()).mode === 'on';
+  }
+
+  private async deferIfModeIsNoLongerOn(eventId: string): Promise<boolean> {
+    if (await this.isApplyEnabled()) return false;
+    await this.database.inboundEvent.updateMany({
+      where: { id: eventId, status: 'PROCESSING' },
+      data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
+    });
+    return true;
+  }
+
+  private async skipIfDirectionDisabled(event: {
+    id: string; source: string; eventType: string | null; externalEntityType: string | null; status: string;
+  }): Promise<boolean> {
+    const direction = event.source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
+    if (await this.syncMode.isDirectionEnabled('contacts-companies', direction)) return false;
+    const skipped = await this.database.inboundEvent.updateMany({
+      where: { id: event.id, status: event.status },
+      data: { status: 'SKIPPED_DIRECTION_DISABLED', lastErrorCategory: 'DIRECTION_DISABLED', processingStartedAt: null },
+    });
+    return skipped.count === 1;
   }
 
   private async syncContactEmail(
@@ -173,6 +204,15 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
 
     const value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
+    const configuredDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
+    if (!await this.syncMode.isDirectionEnabled('contacts-companies', configuredDirection)) {
+      await this.database.inboundEvent.update({
+        where: { id: event.id },
+        data: { status: 'SKIPPED_DIRECTION_DISABLED', lastErrorCategory: 'DIRECTION_DISABLED', processingStartedAt: null },
+      });
+      return;
+    }
+    if (await this.deferIfModeIsNoLongerOn(event.id)) return;
     if (direction === 'BITRIX24_TO_MOYSKLAD') {
       const result = await this.writeMoyskladEmail(pair.moyskladCounterpartyId, value);
       if (readEmail(result.email) !== value) throw new Error('EXTERNAL_API_FAILURE');
@@ -337,10 +377,6 @@ function errorCategory(error: unknown): string {
   return error instanceof Error && error.message === 'REVIEW_REQUIRED'
     ? 'REVIEW_REQUIRED'
     : 'EXTERNAL_API_FAILURE';
-}
-
-function isApplyEnabled(): boolean {
-  return process.env.SYNC_STATE === 'on' && process.env.SYNC_MODE === 'apply';
 }
 
 function ensureTrailingSlash(value: string): string {

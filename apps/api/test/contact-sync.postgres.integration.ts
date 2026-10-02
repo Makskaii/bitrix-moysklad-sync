@@ -11,10 +11,11 @@ import { ContactSyncStatusController } from '../src/admin/contact-sync-status.co
 import { ContactSyncProcessor, ContactSyncStatusReader } from '../src/contact-sync.service';
 import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
+import { SyncModeService } from '../src/sync-mode.service';
 
 @Module({
   controllers: [EventsController, AdminController, ContactSyncStatusController],
-  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard],
+  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard, SyncModeService],
 })
 class RealDatabaseContactSyncModule {}
 
@@ -63,6 +64,9 @@ before(async () => {
   app = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
+  await app.get(DatabaseService).syncSetting.upsert({
+    where: { id: 'global' }, create: { serviceMode: 'on' }, update: { serviceMode: 'on', offSince: null },
+  });
 });
 
 after(async () => {

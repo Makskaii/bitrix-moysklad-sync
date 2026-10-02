@@ -82,7 +82,7 @@ test('dedicated local preview API exposes status and permits trial actions witho
   process.env.ADMIN_PREVIEW = '1';
   const previewApp = await NestFactory.create(LocalAdminPreviewModule.register({
     provide: DatabaseService,
-    useValue: { trialAction: actions },
+    useValue: { trialAction: actions, syncSetting: { upsert: async () => ({ serviceMode: 'off' }) } },
   }), { logger: false });
   try {
     await previewApp.listen(0, '127.0.0.1');
