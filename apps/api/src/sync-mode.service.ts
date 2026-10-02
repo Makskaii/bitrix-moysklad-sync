@@ -53,22 +53,12 @@ export class SyncModeService {
   constructor(private readonly database: DatabaseService) {}
 
   async read() {
-    const setting = await this.database.syncSetting.upsert({
-      where: { id: 'global' },
-      create: {},
-      update: {},
-      select: { serviceMode: true },
-    });
+    const setting = await this.ensureGlobalSetting();
     return { mode: setting.serviceMode as ServiceMode };
   }
 
   async setMode(mode: ServiceMode) {
-    const current = await this.database.syncSetting.upsert({
-      where: { id: 'global' },
-      create: {},
-      update: {},
-      select: { serviceMode: true, offSince: true, resumeStatus: true },
-    });
+    const current = await this.ensureGlobalSetting();
     const enteringOff = mode === 'off' && current.serviceMode !== 'off';
     const startingResume = mode === 'on' && current.serviceMode !== 'on' && current.offSince !== null &&
       ['idle', 'complete'].includes(current.resumeStatus);
@@ -104,12 +94,7 @@ export class SyncModeService {
 
   async readEntitySettings() {
     const ready = entityControls.find((entity) => entity.ready)!;
-    const directions = await this.database.syncDirectionSetting.upsert({
-      where: { entityKey: ready.key },
-      create: { entityKey: ready.key },
-      update: {},
-      select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
-    });
+    const directions = await this.ensureDirectionSetting(ready.key);
     return entityControls.map((entity) => ({
       ...entity,
       bitrix24ToMoysklad: entity.ready ? directions.bitrix24ToMoysklad : false,
@@ -125,13 +110,51 @@ export class SyncModeService {
     if (!entity || !entity.ready) {
       throw new ConflictException('This entity is not ready to be enabled');
     }
-    const setting = await this.database.syncDirectionSetting.upsert({
+    await this.ensureDirectionSetting(entityKey);
+    const setting = await this.database.syncDirectionSetting.update({
       where: { entityKey },
-      create: { entityKey, ...directions },
-      update: directions,
+      data: directions,
       select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
     });
     return { key: entityKey, ...setting };
+  }
+
+  private async ensureGlobalSetting() {
+    try {
+      return await this.database.syncSetting.upsert({
+        where: { id: 'global' },
+        create: {},
+        update: {},
+        select: { serviceMode: true, offSince: true, resumeStatus: true },
+      });
+    } catch (error) {
+      if (!isUniqueConstraintViolation(error)) throw error;
+      const setting = await this.database.syncSetting.findUnique({
+        where: { id: 'global' },
+        select: { serviceMode: true, offSince: true, resumeStatus: true },
+      });
+      if (!setting) throw error;
+      return setting;
+    }
+  }
+
+  private async ensureDirectionSetting(entityKey: string) {
+    try {
+      return await this.database.syncDirectionSetting.upsert({
+        where: { entityKey },
+        create: { entityKey },
+        update: {},
+        select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+      });
+    } catch (error) {
+      if (!isUniqueConstraintViolation(error)) throw error;
+      const setting = await this.database.syncDirectionSetting.findUnique({
+        where: { entityKey },
+        select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+      });
+      if (!setting) throw error;
+      return setting;
+    }
   }
 
   async isDirectionEnabled(
@@ -142,4 +165,8 @@ export class SyncModeService {
     return setting?.[direction] ?? true;
   }
 
+}
+
+function isUniqueConstraintViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002';
 }

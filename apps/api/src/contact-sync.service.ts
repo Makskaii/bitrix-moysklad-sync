@@ -112,6 +112,15 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     return process.env.SYNC_MODE === 'apply' && (await this.syncMode.read()).mode === 'on';
   }
 
+  private async deferIfModeIsNoLongerOn(eventId: string): Promise<boolean> {
+    if (await this.isApplyEnabled()) return false;
+    await this.database.inboundEvent.updateMany({
+      where: { id: eventId, status: 'PROCESSING' },
+      data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
+    });
+    return true;
+  }
+
   private async skipIfDirectionDisabled(event: {
     id: string; source: string; eventType: string | null; externalEntityType: string | null; status: string;
   }): Promise<boolean> {
@@ -203,6 +212,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       });
       return;
     }
+    if (await this.deferIfModeIsNoLongerOn(event.id)) return;
     if (direction === 'BITRIX24_TO_MOYSKLAD') {
       const result = await this.writeMoyskladEmail(pair.moyskladCounterpartyId, value);
       if (readEmail(result.email) !== value) throw new Error('EXTERNAL_API_FAILURE');

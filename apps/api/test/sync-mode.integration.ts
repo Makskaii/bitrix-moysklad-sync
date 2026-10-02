@@ -34,6 +34,14 @@ let apiUrl: string;
 let externalApiCalls = 0;
 const recoveryPageRequests: string[] = [];
 let failResumeMoyskladSecondPage = false;
+let raceContactId: string | null = null;
+let raceCounterpartyId: string | null = null;
+let raceReadCount = 0;
+let raceReadBarrier: Promise<void> = Promise.resolve();
+let releaseRaceReads: (() => void) | null = null;
+let raceReadsFinished: (() => void) | null = null;
+let raceReadCompletion = Promise.resolve();
+let raceExternalWrites = 0;
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to an isolated PostgreSQL test database');
@@ -49,6 +57,48 @@ before(async () => {
       return Response.json({ result: new URLSearchParams(String(init?.body ?? '')).get('auth') === 'admin-test-token' });
     }
     if (url.startsWith('https://b24-fake.invalid/rest/') || url.startsWith('https://ms-fake.invalid/api/')) {
+      if (raceContactId && url.includes('/rest/crm.contact.get.json')) {
+        const contactId = new URLSearchParams(String(init?.body ?? '')).get('id');
+        if (contactId === raceContactId) {
+          raceReadCount++;
+          if (raceReadCount === 2) {
+            await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
+              method: 'PATCH',
+              headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
+              body: JSON.stringify({ mode: 'pause', confirmed: true }),
+            });
+            releaseRaceReads?.();
+            raceReadsFinished?.();
+          } else {
+            await raceReadBarrier;
+          }
+          return Response.json({ result: {
+            ID: raceContactId,
+            EMAIL: [{ ID: 'email-race', VALUE: 'new@example.test', VALUE_TYPE: 'WORK' }],
+            DATE_MODIFY: '2026-10-02T00:00:00+03:00',
+          } });
+        }
+      }
+      if (raceCounterpartyId && url.endsWith(`/api/entity/counterparty/${raceCounterpartyId}`)) {
+        if (init?.method === 'PUT') {
+          raceExternalWrites++;
+          return Response.json({ id: raceCounterpartyId, email: 'new@example.test', updated: '2026-10-02 00:00:00.000' });
+        }
+        raceReadCount++;
+        if (raceReadCount === 2) {
+          await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
+            method: 'PATCH',
+            headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
+            body: JSON.stringify({ mode: 'pause', confirmed: true }),
+          });
+          releaseRaceReads?.();
+          raceReadsFinished?.();
+        } else {
+          await raceReadBarrier;
+        }
+        return Response.json({ id: raceCounterpartyId, email: 'old@example.test', updated: '2026-10-01 00:00:00.000' });
+      }
+      if (raceContactId && url.includes('/rest/crm.contact.update.json')) raceExternalWrites++;
       if (url.includes('/rest/crm.contact.list.json')) {
         const form = new URLSearchParams(String(init?.body ?? ''));
         recoveryPageRequests.push(`${url}?${form.toString()}`);
@@ -74,6 +124,8 @@ before(async () => {
   app = await NestFactory.create(SyncModeTestModule, { logger: false });
   await app.get(DatabaseService).syncSetting.deleteMany();
   await app.get(DatabaseService).syncDirectionSetting.deleteMany();
+  await app.get(DatabaseService).syncSetting.create({ data: { id: 'global' } });
+  await app.get(DatabaseService).syncDirectionSetting.create({ data: { entityKey: 'contacts-companies' } });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
 });
@@ -91,6 +143,19 @@ test('administrator reads Off as the persisted initial service mode', async () =
   assert.deepEqual(await response.json(), { mode: 'off' });
 });
 
+test('fresh global and direction settings tolerate concurrent public reads', async () => {
+  await app.get(DatabaseService).syncSetting.deleteMany();
+  await app.get(DatabaseService).syncDirectionSetting.deleteMany();
+  const token = { authorization: 'Bearer admin-test-token' };
+  const responses = await Promise.all(Array.from({ length: 24 }, (_, index) => nativeFetch(
+    `${apiUrl}/api/admin/sync-mode${index % 2 ? '/entities' : ''}`,
+    { headers: token },
+  )));
+  assert.ok(responses.every((response) => response.status === 200));
+  const mode = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, { headers: token });
+  assert.deepEqual(await mode.json(), { mode: 'off' });
+});
+
 test('administrator can persist Pause through the settings API', async () => {
   const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
     method: 'PATCH',
@@ -98,7 +163,7 @@ test('administrator can persist Pause through the settings API', async () => {
       authorization: 'Bearer admin-test-token',
       'content-type': 'application/json',
     },
-    body: JSON.stringify({ mode: 'pause' }),
+    body: JSON.stringify({ mode: 'pause', confirmed: true }),
   });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { mode: 'pause' });
@@ -133,13 +198,20 @@ test('administrator must explicitly confirm risky global mode transitions', asyn
     headers: { authorization: 'Bearer admin-test-token' },
   });
   assert.deepEqual(await unchanged.json(), { mode: 'off' });
+  const unconfirmedPause = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
+    method: 'PATCH',
+    headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'pause' }),
+  });
+  assert.equal(unconfirmedPause.status, 409);
+  assert.deepEqual(await (await nativeFetch(`${apiUrl}/api/admin/sync-mode`, { headers: { authorization: 'Bearer admin-test-token' } })).json(), { mode: 'off' });
 });
 
 test('settings list v1 exchange pairs and identifies the partial contact email capability', async () => {
   const restoreDirections = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH',
     headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
   });
   assert.equal(restoreDirections.status, 200);
   const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities`, {
@@ -176,6 +248,13 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
   });
   assert.ok(entities.slice(1).every(({ ready, bitrix24ToMoysklad, moyskladToBitrix24 }) =>
     !ready && !bitrix24ToMoysklad && !moyskladToBitrix24));
+  const unconfirmedDirection = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
+    method: 'PATCH', headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true }),
+  });
+  assert.equal(unconfirmedDirection.status, 409);
+  const unchanged = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities`, { headers: { authorization: 'Bearer admin-test-token' } });
+  assert.equal((await unchanged.json() as typeof entities)[0].bitrix24ToMoysklad, true);
 });
 
 test('administrator cannot enable an entity whose exchange is not ready', async () => {
@@ -206,7 +285,7 @@ test('a disabled direction is skipped once and does not replay after it is re-en
   const disableDirection = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH',
     headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true }),
+    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true, confirmed: true }),
   });
   assert.equal(disableDirection.status, 200);
 
@@ -229,7 +308,7 @@ test('a disabled direction is skipped once and does not replay after it is re-en
   const enableDirection = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH',
     headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
   });
   assert.equal(enableDirection.status, 200);
   await new Promise((resolve) => setTimeout(resolve, 1_100));
@@ -252,7 +331,7 @@ test('Pause stores a contact event without calling either external API', async (
   const pause = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
     method: 'PATCH',
     headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
-    body: JSON.stringify({ mode: 'pause' }),
+    body: JSON.stringify({ mode: 'pause', confirmed: true }),
   });
   assert.equal(pause.status, 200);
   const testId = randomUUID();
@@ -302,7 +381,7 @@ test('events received during Pause stay skipped if their direction is disabled b
   const { eventId } = await received.json() as { eventId: string };
   const disable = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true }),
+    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true, confirmed: true }),
   });
   assert.equal(disable.status, 200);
   const on = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
@@ -316,12 +395,74 @@ test('events received during Pause stay skipped if their direction is disabled b
   assert.equal(externalApiCalls, 0);
 });
 
+test('Pause during external reads defers a contact event before any outbound write', async () => {
+  const token = { authorization: 'Bearer admin-test-token' };
+  await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
+    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
+  });
+  await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
+    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'on', confirmed: true }),
+  });
+  const testId = randomUUID();
+  raceContactId = `pause-race-contact-${testId}`;
+  raceCounterpartyId = `pause-race-counterparty-${testId}`;
+  raceReadCount = 0;
+  raceExternalWrites = 0;
+  raceReadBarrier = new Promise<void>((resolve) => { releaseRaceReads = resolve; });
+  raceReadCompletion = new Promise<void>((resolve) => { raceReadsFinished = resolve; });
+  await app.get(DatabaseService).contactPair.create({
+    data: {
+      bitrix24ContactId: raceContactId,
+      moyskladCounterpartyId: raceCounterpartyId,
+      snapshot: { create: {
+        bitrix24Email: 'old@example.test',
+        moyskladEmail: 'old@example.test',
+        bitrix24UpdatedAt: new Date('2026-10-01T00:00:00.000Z'),
+        moyskladUpdatedAt: new Date('2026-10-01T00:00:00.000Z'),
+      } },
+    },
+  });
+  const received = await nativeFetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMCONTACTUPDATE',
+      data: { FIELDS: { ID: raceContactId } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(received.status, 200);
+  const { eventId } = await received.json() as { eventId: string };
+  let raceTimeout: NodeJS.Timeout | undefined;
+  await Promise.race([
+    raceReadCompletion,
+    new Promise<never>((_, reject) => { raceTimeout = setTimeout(() => reject(new Error('Timed out waiting for both fake external reads')), 4_000); }),
+  ]);
+  if (raceTimeout) clearTimeout(raceTimeout);
+  raceReadBarrier = Promise.resolve();
+
+  let eventState = { status: '', attempts: 0 };
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const statusResponse = await nativeFetch(`${apiUrl}/api/admin/contact-sync/events/${eventId}`, { headers: token });
+    eventState = await statusResponse.json() as typeof eventState;
+    if (eventState.attempts > 0 && eventState.status !== 'PROCESSING') break;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(await nativeFetch(`${apiUrl}/api/admin/sync-mode`, { headers: token }).then((response) => response.json()), { mode: 'pause' });
+  assert.equal(eventState.status, 'RECEIVED');
+  assert.equal(eventState.attempts, 1);
+  assert.equal(raceExternalWrites, 0);
+  raceContactId = null;
+  raceCounterpartyId = null;
+});
+
 test('On resumes Off with a bounded changed-since scan and completes every provider page', async () => {
   const token = { authorization: 'Bearer admin-test-token' };
   recoveryPageRequests.length = 0;
   await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
   });
   await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
     method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
