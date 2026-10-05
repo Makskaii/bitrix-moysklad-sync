@@ -324,20 +324,20 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
       throw error;
     }
-    const accepted = isRecord(payload) && !payload.error && 'result' in payload;
+    const accepted = acceptsBitrixResponse(method, payload);
     await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, accepted);
-    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new Error('EXTERNAL_API_FAILURE');
+    if (!accepted || !isRecord(payload) || !('result' in payload)) throw new Error('EXTERNAL_API_FAILURE');
     return payload.result;
   }
 
   private async readMoyskladCounterparty(eventId: string, counterpartyId: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(eventId, counterpartyId, 'GET', undefined, isRecord);
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'GET', undefined, isMoyskladCounterparty);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
   private async writeMoyskladEmail(eventId: string, counterpartyId: string, email: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email }, (payload) => isRecord(payload) && readEmail(payload.email) === email);
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email }, (payload) => isMoyskladCounterparty(payload) && readEmail(payload.email) === email);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
@@ -469,6 +469,24 @@ function errorCategory(error: unknown): string {
   return error instanceof ReviewRequiredError
     ? 'REVIEW_REQUIRED'
     : 'EXTERNAL_API_FAILURE';
+}
+
+function acceptsBitrixResponse(method: string, payload: unknown): boolean {
+  if (!isRecord(payload) || payload.error || !('result' in payload)) return false;
+  if (method.includes('.get.')) {
+    return isRecord(payload.result)
+      && Array.isArray(payload.result.EMAIL)
+      && isValidTimestamp(payload.result.DATE_MODIFY);
+  }
+  return payload.result === true;
+}
+
+function isMoyskladCounterparty(payload: unknown): payload is JsonRecord {
+  return isRecord(payload) && readEmail(payload.email) !== null && isValidTimestamp(payload.updated);
+}
+
+function isValidTimestamp(value: unknown): boolean {
+  return typeof value === 'string' && Number.isFinite(new Date(value).getTime());
 }
 
 class ReviewRequiredError extends Error {

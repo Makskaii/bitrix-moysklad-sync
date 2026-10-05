@@ -162,7 +162,7 @@ test('HTTP-200 Bitrix application errors are recorded as unsuccessful API attemp
     if (url.endsWith('/rest/crm.contact.get.json')) {
       return Response.json({ result: { ID: contactId, EMAIL: [{ ID: 'email-1', VALUE: 'before@example.test', VALUE_TYPE: 'WORK' }], DATE_MODIFY: '2026-10-01T09:00:00Z' } });
     }
-    if (url.endsWith('/rest/crm.contact.update.json')) return Response.json({ error: 'synthetic application error' }, { status: 200 });
+    if (url.endsWith('/rest/crm.contact.update.json')) return Response.json({ result: false }, { status: 200 });
     if (url.endsWith(`/api/entity/counterparty/${counterpartyId}`)) {
       return Response.json({ id: counterpartyId, email: 'after@example.test', updated: '2026-10-05 12:00:02.000' });
     }
