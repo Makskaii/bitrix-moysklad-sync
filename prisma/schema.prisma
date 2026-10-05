@@ -24,6 +24,8 @@ model SyncSetting {
   resumeBitrixStart Int @default(0)
   resumeMoyskladOffset Int @default(0)
   resumeError String?
+  resumeRetryAfter DateTime?
+  resumeAttempts Int @default(0)
   updatedAt DateTime @updatedAt
 }
 
@@ -51,6 +53,7 @@ model InboundEvent {
   snapshotRevision Int      @default(0)
   lastSuccessfulAt DateTime?
   lastErrorCategory String?
+  retryAfter       DateTime?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])

@@ -26,6 +26,7 @@ let mockServer: Server;
 let originalFetch: typeof fetch;
 let destinationEmail = 'before@example.test';
 let writeCount = 0;
+let failNextWrite = false;
 let writeDelayMs = 0;
 let barrierMoyskladReads = false;
 let moyskladReadArrivals = 0;
@@ -232,6 +233,99 @@ test('a stale PROCESSING event is recovered after restart without repeating a co
   assert.equal(writeCount, previousWrites);
 });
 
+test('a temporary external failure stays durable and retries the same event after backoff', async () => {
+  const suffix = randomUUID();
+  const contactId = `t20-retry-contact-${suffix}`;
+  const counterpartyId = `t20-retry-counterparty-${suffix}`;
+  const database = app.get(DatabaseService);
+  await database.contactPair.create({
+    data: {
+      bitrix24ContactId: contactId,
+      moyskladCounterpartyId: counterpartyId,
+      snapshot: { create: {
+        bitrix24Email: 'before@example.test',
+        moyskladEmail: 'before@example.test',
+        bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+        moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      } },
+    },
+  });
+  failNextWrite = true;
+  const previousWrites = writeCount;
+  const body = JSON.stringify({
+    event: 'ONCRMCONTACTUPDATE',
+    data: { FIELDS: { ID: contactId } },
+    auth: { application_token: 'synthetic-b24-event-token' },
+  });
+  const post = () => fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body,
+  });
+  const first = await post();
+  assert.equal(first.status, 200);
+  const firstAck = await first.json() as { eventId: string };
+  const failed = await waitForStatus(apiUrl, firstAck.eventId, 'RETRYABLE_FAILURE');
+  assert.equal(failed.attempts, 1);
+  assert.equal(destinationEmail, 'before@example.test');
+
+  const repeated = await post();
+  assert.equal(repeated.status, 200);
+  const repeatedAck = await repeated.json() as { eventId: string };
+  assert.equal(repeatedAck.eventId, firstAck.eventId);
+  assert.equal(await database.inboundEvent.count({ where: { externalEntityId: contactId } }), 1);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const waiting = await readStatus(apiUrl, firstAck.eventId);
+  assert.equal(waiting.status, 'RETRYABLE_FAILURE');
+  assert.equal(waiting.attempts, 1);
+  assert.equal(writeCount, previousWrites);
+
+  const succeeded = await waitForStatus(apiUrl, firstAck.eventId, 'SUCCEEDED');
+  assert.equal(succeeded.attempts, 2);
+  assert.equal(succeeded.snapshotRevision, 2);
+  assert.equal(destinationEmail, 'after@example.test');
+  assert.equal(writeCount, previousWrites + 1);
+});
+
+test('accumulated changes keep both journal entries and synchronize the latest state once', async () => {
+  const suffix = randomUUID();
+  const contactId = `t20-batch-contact-${suffix}`;
+  const counterpartyId = `t20-batch-counterparty-${suffix}`;
+  await app.get(DatabaseService).contactPair.create({
+    data: {
+      bitrix24ContactId: contactId,
+      moyskladCounterpartyId: counterpartyId,
+      snapshot: { create: {
+        bitrix24Email: 'before@example.test',
+        moyskladEmail: 'before@example.test',
+        bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+        moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      } },
+    },
+  });
+  const previousWrites = writeCount;
+  const post = (ts: string) => fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMCONTACTUPDATE',
+      ts,
+      data: { FIELDS: { ID: contactId } },
+      auth: { application_token: 'synthetic-b24-event-token' },
+    }),
+  });
+  const first = await post('delivery-1');
+  const firstAck = await first.json() as { eventId: string };
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const second = await post('delivery-2');
+  const secondAck = await second.json() as { eventId: string };
+  assert.notEqual(secondAck.eventId, firstAck.eventId);
+
+  const latestStatus = await waitForStatus(apiUrl, secondAck.eventId, 'SUCCEEDED');
+  assert.equal(latestStatus.snapshotRevision, 2);
+  const earlierStatus = await readStatus(apiUrl, firstAck.eventId);
+  assert.equal(earlierStatus.status, 'SUPERSEDED');
+  assert.equal(destinationEmail, 'after@example.test');
+  assert.equal(writeCount, previousWrites + 1);
+});
+
 async function handleExternalRequest(request: IncomingMessage, response: ServerResponse) {
   if (request.method === 'POST' && request.url === '/rest/crm.contact.get.json') {
     return readBody(request).then((body) => {
@@ -248,6 +342,10 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
   }
   if (request.method === 'PUT' && request.url?.startsWith('/api/entity/counterparty/')) {
     return readBody(request).then((body) => {
+      if (failNextWrite) {
+        failNextWrite = false;
+        return sendJson(response, 503, { error: 'synthetic temporary failure' });
+      }
       destinationEmail = (JSON.parse(body) as { email: string }).email;
       writeCount++;
       return new Promise<void>((resolve) => setTimeout(() => {

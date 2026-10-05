@@ -69,6 +69,8 @@ export class SyncModeService {
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
           resumeError: null,
+          resumeRetryAfter: null,
+          resumeAttempts: 0,
         } : {}),
         ...(startingResume ? {
           resumeStatus: 'pending',
@@ -78,6 +80,8 @@ export class SyncModeService {
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
           resumeError: null,
+          resumeRetryAfter: null,
+          resumeAttempts: 0,
         } : {}),
       },
       select: { serviceMode: true },

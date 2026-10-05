@@ -88,9 +88,21 @@ const database = {
       }
       return { id: event.id };
     },
-    findMany: async () => [...events.values()].filter((event) =>
-      (event.source === 'BITRIX24' && event.eventType?.startsWith('ONCRMCONTACT')) ||
-      (event.source === 'MOYSKLAD' && event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty')),
+    findMany: async (args?: { where?: {
+      source?: string; externalEntityId?: string;
+      eventType?: string | { startsWith?: string };
+      externalEntityType?: string;
+    } }) => [...events.values()].filter((event) => {
+      const where = args?.where;
+      if (where?.source && event.source !== where.source) return false;
+      if (where?.externalEntityId && event.externalEntityId !== where.externalEntityId) return false;
+      if (typeof where?.eventType === 'string' && event.eventType !== where.eventType) return false;
+      if (where?.eventType && typeof where.eventType === 'object' &&
+          !event.eventType?.startsWith(where.eventType.startsWith ?? '')) return false;
+      if (where?.externalEntityType && event.externalEntityType !== where.externalEntityType) return false;
+      return (event.source === 'BITRIX24' && event.eventType?.startsWith('ONCRMCONTACT')) ||
+        (event.source === 'MOYSKLAD' && event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty');
+    }),
     updateMany: async (args: {
       where: { id: string; OR?: Array<Record<string, unknown>>; status?: { in: string[] } };
       data: { status: string; processingStartedAt?: Date | null; attempts?: { increment: number }; lastErrorCategory: null };
@@ -102,6 +114,7 @@ const database = {
         if (typeof clause.status === 'object' && clause.status !== null && 'in' in clause.status) {
           return ((clause.status as { in: string[] }).in).includes(event.status);
         }
+        if (typeof clause.status === 'string' && clause.status === event.status) return true;
         if (clause.status !== 'PROCESSING' || event.status !== 'PROCESSING') return false;
         if (clause.processingStartedAt === null) return event.processingStartedAt === null;
         const cutoff = (clause.processingStartedAt as { lt: Date }).lt;
@@ -377,7 +390,7 @@ test('unrelated accepted Bitrix events remain durable but stay out of contact re
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       event: 'ONCRMLEADUPDATE',
-      data: { FIELDS: { ID: 'lead-42' } },
+      data: { FIELDS: { ID: 'contact-42' } },
       auth: { application_token: 'synthetic-b24-event-token' },
     }),
   });
@@ -391,6 +404,26 @@ test('unrelated accepted Bitrix events remain durable but stay out of contact re
   assert.equal(status.status, 'RECEIVED');
   assert.equal(status.attempts, 0);
   assert.deepEqual(externalWrites, []);
+
+  const contactResponse = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMCONTACTUPDATE',
+      data: { FIELDS: { ID: 'contact-42' } },
+      auth: { application_token: 'synthetic-b24-event-token' },
+    }),
+  });
+  assert.equal(contactResponse.status, 200);
+  const contactAck = await contactResponse.json() as { eventId: string };
+  const contactStatus = await waitForStatus(contactAck.eventId, 'SUCCEEDED');
+  assert.equal(contactStatus.status, 200);
+  assert.deepEqual(externalWrites, ['MOYSKLAD']);
+  const leadStatus = await fetch(`${apiUrl}/api/admin/contact-sync/events/${ack.eventId}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  }).then((response) => response.json()) as { status: string; attempts: number };
+  assert.equal(leadStatus.status, 'RECEIVED');
+  assert.equal(leadStatus.attempts, 0);
 
   const moyskladResponse = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-webhook-secret`, {
     method: 'POST',
@@ -409,7 +442,7 @@ test('unrelated accepted Bitrix events remain durable but stay out of contact re
   const moyskladStatus = await moyskladStatusResponse.json() as { status: string; attempts: number };
   assert.equal(moyskladStatus.status, 'RECEIVED');
   assert.equal(moyskladStatus.attempts, 0);
-  assert.deepEqual(externalWrites, []);
+  assert.deepEqual(externalWrites, ['MOYSKLAD']);
 });
 
 test('dry mode preserves intake without performing an external write', async () => {

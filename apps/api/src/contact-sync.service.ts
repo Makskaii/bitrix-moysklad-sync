@@ -5,10 +5,14 @@ import { SyncModeService } from './sync-mode.service';
 type JsonRecord = Record<string, unknown>;
 const PROCESSING_LEASE_MS = 60_000;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 15_000;
+const RETRY_BASE_DELAY_MS = 1_000;
+const RETRY_MAX_DELAY_MS = 15 * 60_000;
+const EVENT_BATCH_DELAY_MS = 50;
 
 @Injectable()
 export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly active = new Set<string>();
+  private readonly activeEntities = new Set<string>();
   private recoveryTimer?: NodeJS.Timeout;
 
   constructor(
@@ -27,12 +31,14 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   enqueue(eventId: string) {
-    setImmediate(() => { void this.process(eventId); });
+    const timer = setTimeout(() => { void this.process(eventId); }, EVENT_BATCH_DELAY_MS);
+    timer.unref();
   }
 
   private async resumeReceivedContactEvents() {
     if (!await this.isApplyEnabled()) return;
     try {
+      const now = new Date();
       const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
       const pending = await this.database.inboundEvent.findMany({
         where: {
@@ -42,7 +48,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
               { source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'counterparty' },
             ] },
             { OR: [
-              { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+              { status: 'RECEIVED' },
+              { status: 'RETRYABLE_FAILURE', OR: [
+                { retryAfter: null },
+                { retryAfter: { lte: now } },
+              ] },
               { status: 'PROCESSING', OR: [
                 { processingStartedAt: null },
                 { processingStartedAt: { lt: staleBefore } },
@@ -60,20 +70,27 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
 
   async process(eventId: string) {
     if (this.active.has(eventId)) return;
+    if (!await this.isApplyEnabled()) return;
+    const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
+    if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
+    const entityKey = candidate.externalEntityId ? `${candidate.source}:${candidate.externalEntityId}` : null;
+    if (entityKey && this.activeEntities.has(entityKey)) return;
     this.active.add(eventId);
+    if (entityKey) this.activeEntities.add(entityKey);
     try {
-      if (!await this.isApplyEnabled()) return;
-      const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
-      if (!candidate) return;
-      if (!isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
       if (await this.skipIfDirectionDisabled(candidate)) return;
+      const latestEventId = await this.coalescePendingEvents(candidate, eventId);
       const now = new Date();
       const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
       const claim = await this.database.inboundEvent.updateMany({
         where: {
-          id: eventId,
+          id: latestEventId,
           OR: [
-            { status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+            { status: 'RECEIVED' },
+            { status: 'RETRYABLE_FAILURE', OR: [
+              { retryAfter: null },
+              { retryAfter: { lte: now } },
+            ] },
             { status: 'PROCESSING', processingStartedAt: null },
             { status: 'PROCESSING', processingStartedAt: { lt: staleBefore } },
           ],
@@ -83,10 +100,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
           processingStartedAt: now,
           attempts: { increment: 1 },
           lastErrorCategory: null,
+          retryAfter: null,
         },
       });
       if (claim.count !== 1) return;
-      const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
+      const event = await this.database.inboundEvent.findUnique({ where: { id: latestEventId } });
       if (!event) return;
       if (await this.skipIfDirectionDisabled(event)) return;
       const attempt = event.attempts;
@@ -96,16 +114,50 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       } catch (error) {
         const category = errorCategory(error);
         await this.database.inboundEvent.update({
-          where: { id: eventId },
+          where: { id: latestEventId },
           data: {
             status: category === 'REVIEW_REQUIRED' ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
             lastErrorCategory: category,
+            retryAfter: category === 'REVIEW_REQUIRED' ? null : new Date(Date.now() + retryDelayMs(attempt)),
           },
         });
       }
     } finally {
       this.active.delete(eventId);
+      if (entityKey) this.activeEntities.delete(entityKey);
     }
+  }
+
+  private async coalescePendingEvents(
+    candidate: { id: string; source: string; externalEntityId: string | null },
+    fallbackId: string,
+  ): Promise<string> {
+    if (!candidate.externalEntityId) return fallbackId;
+    const now = new Date();
+    const pending = await this.database.inboundEvent.findMany({
+      where: {
+        source: candidate.source,
+        externalEntityId: candidate.externalEntityId,
+        ...(candidate.source === 'BITRIX24'
+          ? { eventType: { startsWith: 'ONCRMCONTACT' } }
+          : { eventType: 'UPDATE', externalEntityType: 'counterparty' }),
+        OR: [
+          { status: 'RECEIVED' },
+          { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
+        ],
+      },
+      orderBy: [{ receivedAt: 'desc' }, { id: 'desc' }],
+      select: { id: true },
+    });
+    const latestEventId = pending[0]?.id ?? fallbackId;
+    const supersededIds = pending.slice(1).map((event) => event.id);
+    if (supersededIds.length) {
+      await this.database.inboundEvent.updateMany({
+        where: { id: { in: supersededIds }, status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
+        data: { status: 'SUPERSEDED', processingStartedAt: null, lastErrorCategory: null, retryAfter: null },
+      });
+    }
+    return latestEventId;
   }
 
   private async isApplyEnabled(): Promise<boolean> {
@@ -381,6 +433,10 @@ function errorCategory(error: unknown): string {
 
 function ensureTrailingSlash(value: string): string {
   return value.endsWith('/') ? value : `${value}/`;
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)), RETRY_MAX_DELAY_MS);
 }
 
 function isRecord(value: unknown): value is JsonRecord {

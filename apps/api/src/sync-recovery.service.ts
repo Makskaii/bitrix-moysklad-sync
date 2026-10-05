@@ -37,6 +37,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       select: {
         resumeStatus: true, resumeFrom: true, resumeThrough: true,
         resumeProvider: true, resumeBitrixStart: true, resumeMoyskladOffset: true, resumeError: true,
+        resumeRetryAfter: true, resumeAttempts: true,
       },
     });
     return {
@@ -47,6 +48,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       bitrixStart: setting.resumeBitrixStart,
       moyskladOffset: setting.resumeMoyskladOffset,
       error: setting.resumeError,
+      retryAfter: setting.resumeRetryAfter,
+      attempts: setting.resumeAttempts,
     };
   }
 
@@ -61,9 +64,13 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (!setting || !['pending', 'running', 'failed'].includes(setting.resumeStatus) ||
           !setting.resumeFrom || !setting.resumeThrough) return;
+      if (setting.resumeStatus === 'failed' && setting.resumeRetryAfter && setting.resumeRetryAfter > new Date()) return;
       const resumeFrom = setting.resumeFrom;
       const resumeThrough = setting.resumeThrough;
-      await this.database.syncSetting.update({ where: { id: 'global' }, data: { resumeStatus: 'running', resumeError: null } });
+      setting = await this.database.syncSetting.update({
+        where: { id: 'global' },
+        data: { resumeStatus: 'running', resumeError: null, resumeRetryAfter: null, resumeAttempts: { increment: 1 } },
+      });
 
       while (setting.resumeProvider === 'BITRIX24') {
         const page = await this.readBitrixPage(resumeFrom, resumeThrough, setting.resumeBitrixStart);
@@ -85,14 +92,24 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           });
         } else {
           await this.database.syncSetting.update({
-            where: { id: 'global' }, data: { resumeStatus: 'complete', resumeProvider: 'COMPLETE', resumeMoyskladOffset: 0, resumeError: null, offSince: null },
+            where: { id: 'global' }, data: {
+              resumeStatus: 'complete', resumeProvider: 'COMPLETE', resumeMoyskladOffset: 0,
+              resumeError: null, resumeRetryAfter: null, offSince: null,
+            },
           });
           return;
         }
       }
     } catch {
+      const current = await this.database.syncSetting.findUnique({
+        where: { id: 'global' }, select: { resumeAttempts: true },
+      });
       await this.database.syncSetting.update({
-        where: { id: 'global' }, data: { resumeStatus: 'failed', resumeError: 'Provider retrieval failed; the resume cursor was not advanced past the incomplete page.' },
+        where: { id: 'global' }, data: {
+          resumeStatus: 'failed',
+          resumeError: 'Provider retrieval failed; the resume cursor was not advanced past the incomplete page.',
+          resumeRetryAfter: new Date(Date.now() + retryDelayMs(current?.resumeAttempts ?? 1)),
+        },
       }).catch(() => undefined);
     } finally {
       this.running = false;
@@ -194,4 +211,8 @@ function readId(value: unknown): string | null {
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(1_000 * (2 ** Math.max(0, attempt - 1)), 15 * 60_000);
 }
