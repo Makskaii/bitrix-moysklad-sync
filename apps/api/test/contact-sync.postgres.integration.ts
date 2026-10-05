@@ -32,6 +32,7 @@ let writeCount = 0;
 let failNextWrite = false;
 let writeDelayMs = 0;
 let barrierMoyskladReads = false;
+let holdMoyskladReads = false;
 let moyskladReadArrivals = 0;
 let releaseMoyskladReads = () => {};
 let moyskladReadBarrier = Promise.resolve();
@@ -194,6 +195,73 @@ test('two API instances claim one duplicate public delivery only once', async ()
     await secondApp.close();
     writeDelayMs = 0;
     barrierMoyskladReads = false;
+  }
+});
+
+test('two API instances serialize distinct pending events for the same contact', async () => {
+  destinationEmail = 'before@example.test';
+  writeCount = 0;
+  writeDelayMs = 200;
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const contactId = `t21-distinct-contact-${suffix}`;
+  const counterpartyId = `t21-distinct-counterparty-${suffix}`;
+  await database.contactPair.create({
+    data: {
+      bitrix24ContactId: contactId,
+      moyskladCounterpartyId: counterpartyId,
+      moyskladType: 'COUNTERPARTY',
+      snapshot: { create: {
+        bitrix24Email: 'before@example.test',
+        moyskladEmail: 'before@example.test',
+        bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+        moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      } },
+    },
+  });
+  const secondApp = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
+  await secondApp.listen(0, '127.0.0.1');
+  const secondApiUrl = await secondApp.getUrl();
+  holdMoyskladReads = true;
+  moyskladReadArrivals = 0;
+  moyskladReadBarrier = new Promise<void>((resolve) => { releaseMoyskladReads = resolve; });
+  try {
+    const body = (ts: string) => JSON.stringify({
+      event: 'ONCRMCONTACTUPDATE', ts,
+      data: { FIELDS: { ID: contactId } },
+      auth: { application_token: 'synthetic-b24-event-token' },
+    });
+    const firstResponse = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: body('distinct-1'),
+    });
+    assert.equal(firstResponse.status, 200);
+    const firstAck = await firstResponse.json() as { eventId: string };
+    await waitUntil(() => moyskladReadArrivals === 1);
+
+    const secondResponse = await fetch(`${secondApiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: body('distinct-2'),
+    });
+    assert.equal(secondResponse.status, 200);
+    const secondAck = await secondResponse.json() as { eventId: string };
+    assert.notEqual(firstAck.eventId, secondAck.eventId);
+    assert.equal(await database.inboundEvent.count({ where: { externalEntityId: contactId } }), 2);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const concurrentReads = moyskladReadArrivals;
+    releaseMoyskladReads();
+    holdMoyskladReads = false;
+    assert.equal(concurrentReads, 1, 'the second instance must wait for the first entity lease');
+    const settled = await Promise.all([firstAck, secondAck].map(({ eventId }) => waitForSettledStatus(apiUrl, eventId)));
+    assert.deepEqual(settled.map((event) => event.status).sort(), ['SUCCEEDED', 'UNCHANGED']);
+    assert.equal(settled.reduce((total, event) => total + event.snapshotRevision, 0), 4);
+    assert.equal(await database.contactPair.count({ where: { bitrix24ContactId: contactId } }), 1);
+    assert.equal(writeCount, 1);
+    assert.equal(destinationEmail, 'after@example.test');
+  } finally {
+    releaseMoyskladReads();
+    holdMoyskladReads = false;
+    writeDelayMs = 0;
+    (secondApp.getHttpServer() as Server).closeAllConnections();
+    await secondApp.close();
   }
 });
 
@@ -447,6 +515,10 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
     });
   }
   if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty/')) {
+    if (holdMoyskladReads) {
+      moyskladReadArrivals++;
+      await moyskladReadBarrier;
+    }
     if (barrierMoyskladReads) {
       moyskladReadArrivals++;
       if (moyskladReadArrivals >= 2) releaseMoyskladReads();
@@ -482,6 +554,25 @@ async function waitForStatus(baseUrl: string, eventId: string, expected: string)
   }
   assert.equal(latest.status, expected);
   return latest;
+}
+
+async function waitForSettledStatus(baseUrl: string, eventId: string) {
+  const deadline = NativeDate.now() + 8_000;
+  let latest = await readStatus(baseUrl, eventId);
+  while (['RECEIVED', 'PROCESSING'].includes(latest.status) && NativeDate.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    latest = await readStatus(baseUrl, eventId);
+  }
+  assert.ok(['SUCCEEDED', 'UNCHANGED', 'SUPERSEDED'].includes(latest.status), `Unexpected final event status: ${latest.status}`);
+  return latest;
+}
+
+async function waitUntil(condition: () => boolean) {
+  const deadline = NativeDate.now() + 5_000;
+  while (!condition() && NativeDate.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(condition(), true, 'timed out waiting for the fake provider boundary');
 }
 
 async function readStatus(baseUrl: string, eventId: string) {

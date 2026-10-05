@@ -69,6 +69,16 @@ model InboundEvent {
   @@index([status, receivedAt])
 }
 
+model InboundEntityLock {
+  entityKey String @id
+  ownerToken String
+  eventId String
+  leaseExpiresAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
+}
+
 model ContactPair {
   id                      String           @id @default(cuid())
   bitrix24ContactId       String           @unique

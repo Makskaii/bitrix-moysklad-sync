@@ -31,6 +31,7 @@ type StoredEvent = {
 };
 
 const events = new Map<string, StoredEvent>();
+const entityLocks = new Map<string, string>();
 type SnapshotFixture = {
   pairId: string;
   bitrix24Email: string;
@@ -65,8 +66,30 @@ let bitrixHasMultipleEmails = false;
 let serviceMode: 'on' | 'pause' = 'on';
 
 const database = {
+  $transaction: async (callback: (transaction: unknown) => Promise<unknown>) => callback(database),
+  $queryRaw: async (_query: TemplateStringsArray, ...values: unknown[]) => {
+    const ownerToken = entityLocks.get(String(values[0]));
+    return ownerToken ? [{ ownerToken, leaseExpiresAt: new Date(Date.now() + 60_000) }] : [];
+  },
   syncSetting: { upsert: async () => ({ serviceMode }) },
   syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+  inboundEntityLock: {
+    updateMany: async () => ({ count: 0 }),
+    findUnique: async (args: { where: { entityKey: string } }) => {
+      const ownerToken = entityLocks.get(args.where.entityKey);
+      return ownerToken ? { ownerToken, leaseExpiresAt: new Date(Date.now() + 60_000) } : null;
+    },
+    create: async (args: { data: { entityKey: string; ownerToken: string } }) => {
+      if ([...entityLocks.keys()].includes(args.data.entityKey)) throw Object.assign(new Error('lock exists'), { code: 'P2002' });
+      entityLocks.set(args.data.entityKey, args.data.ownerToken);
+      return args.data;
+    },
+    deleteMany: async (args: { where: { entityKey: string; ownerToken: string } }) => {
+      if (entityLocks.get(args.where.entityKey) !== args.where.ownerToken) return { count: 0 };
+      entityLocks.delete(args.where.entityKey);
+      return { count: 1 };
+    },
+  },
   inboundEvent: {
     upsert: async (args: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Omit<StoredEvent, 'id' | 'status' | 'attempts' | 'processingStartedAt' | 'direction' | 'snapshotRevision' | 'lastSuccessfulAt' | 'lastErrorCategory'> }) => {
       const { source, deliveryKey } = args.where.source_deliveryKey;
@@ -250,6 +273,7 @@ before(async () => {
 
 beforeEach(() => {
   events.clear();
+  entityLocks.clear();
   pairs.clear();
   snapshots.clear();
   nextEventId = 0;
