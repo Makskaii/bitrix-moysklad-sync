@@ -31,6 +31,7 @@ type StoredEvent = {
 };
 
 const events = new Map<string, StoredEvent>();
+const manualReviewCases = new Map<string, Record<string, unknown>>();
 type SnapshotFixture = {
   pairId: string;
   bitrix24Email: string;
@@ -67,6 +68,15 @@ let serviceMode: 'on' | 'pause' = 'on';
 const database = {
   syncSetting: { upsert: async () => ({ serviceMode }) },
   syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+  manualReviewCase: {
+    upsert: async ({ where, create, update }: { where: { eventId: string }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+      const existing = manualReviewCases.get(where.eventId);
+      if (existing) return Object.assign(existing, update);
+      const row = { id: `incident-${manualReviewCases.size + 1}`, status: 'OPEN', ...create };
+      manualReviewCases.set(where.eventId, row);
+      return row;
+    },
+  },
   inboundEvent: {
     upsert: async (args: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Omit<StoredEvent, 'id' | 'status' | 'attempts' | 'processingStartedAt' | 'direction' | 'snapshotRevision' | 'lastSuccessfulAt' | 'lastErrorCategory'> }) => {
       const { source, deliveryKey } = args.where.source_deliveryKey;

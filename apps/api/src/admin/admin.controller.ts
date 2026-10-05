@@ -2,6 +2,7 @@ import { BadRequestException, Body, Controller, Get, Post, UseGuards } from '@ne
 import { TrialAction } from '@prisma/client';
 import { AdminAccessGuard } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
+import { writeOperationalLog } from '../monitoring-log';
 
 @Controller('api/admin')
 @UseGuards(AdminAccessGuard)
@@ -19,6 +20,9 @@ export class AdminController {
     if (!message || message.length > 200) {
       throw new BadRequestException('message must contain between 1 and 200 characters');
     }
-    return this.database.trialAction.create({ data: { message } });
+    return this.database.trialAction.create({ data: { message } }).then((action) => {
+      void writeOperationalLog(this.database, 'ADMIN', 'Trial action added', action.id);
+      return action;
+    });
   }
 }

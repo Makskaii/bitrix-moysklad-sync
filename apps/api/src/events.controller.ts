@@ -17,6 +17,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
+import { writeOperationalLog } from './monitoring-log';
 import { ContactSyncProcessor } from './contact-sync.service';
 
 type EventPayload = Record<string, unknown>;
@@ -123,6 +124,7 @@ export class EventIntakeService {
       update: {},
       select: { id: true },
     });
+    void writeOperationalLog(this.database, 'EVENT', 'Inbound event accepted', row.id);
 
     return { accepted: true, eventId: row.id };
   }

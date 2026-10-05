@@ -10,6 +10,9 @@ import { ContactSyncProcessor, ContactSyncStatusReader } from './contact-sync.se
 import { EventsController, EventIntakeService } from './events.controller';
 import { SyncModeService } from './sync-mode.service';
 import { SyncRecoveryService } from './sync-recovery.service';
+import { MonitoringController } from './admin/monitoring.controller';
+import { RetentionService } from './retention.service';
+import { RotatingFileLogger } from './rotating-file.logger';
 
 @Controller()
 class AppController {
@@ -24,13 +27,13 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, SyncModeController, EventsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService],
+  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService],
 })
 class AppModule {}
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { logger: new RotatingFileLogger() });
   await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 }
 

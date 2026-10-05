@@ -1,6 +1,7 @@
 import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
+import { writeOperationalLog } from './monitoring-log';
 
 type JsonRecord = Record<string, unknown>;
 const PROCESSING_LEASE_MS = 60_000;
@@ -27,7 +28,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   enqueue(eventId: string) {
-    setImmediate(() => { void this.process(eventId); });
+    setImmediate(() => { void this.process(eventId).catch(() => undefined); });
   }
 
   private async resumeReceivedContactEvents() {
@@ -95,6 +96,20 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         await this.syncContactEmail(event, attempt);
       } catch (error) {
         const category = errorCategory(error);
+        if (category === 'REVIEW_REQUIRED') {
+          await this.database.manualReviewCase.upsert({
+            where: { eventId: event.id },
+            create: {
+              eventId: event.id,
+              source: event.source,
+              eventType: event.eventType,
+              externalEntityId: event.externalEntityId,
+              externalEntityType: event.externalEntityType,
+              reason: category,
+            },
+            update: { reason: category },
+          });
+        }
         await this.database.inboundEvent.update({
           where: { id: eventId },
           data: {
@@ -102,6 +117,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
             lastErrorCategory: category,
           },
         });
+        await writeOperationalLog(this.database, 'ERROR', `Sync attempt failed: ${category}`, event.id);
       }
     } finally {
       this.active.delete(eventId);
@@ -150,8 +166,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
 
     const [bitrixContact, moyskladCounterparty] = await Promise.all([
-      this.readBitrixContact(pair.bitrix24ContactId),
-      this.readMoyskladCounterparty(pair.moyskladCounterpartyId),
+      this.readBitrixContact(event.id, pair.bitrix24ContactId),
+      this.readMoyskladCounterparty(event.id, pair.moyskladCounterpartyId),
     ]);
     const bitrixEmailField = readSingleBitrixEmail(bitrixContact.EMAIL);
     const bitrixEmail = bitrixEmailField?.email ?? null;
@@ -172,6 +188,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         where: { id: event.id },
         data: { status: 'UNCHANGED', attempts: attempt, direction: null, snapshotRevision: snapshot.revision },
       });
+      await this.resolveManualReview(event.id);
       return;
     }
 
@@ -200,6 +217,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
           lastErrorCategory: null,
         },
       });
+      await this.resolveManualReview(event.id);
       return;
     }
 
@@ -214,11 +232,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
     if (await this.deferIfModeIsNoLongerOn(event.id)) return;
     if (direction === 'BITRIX24_TO_MOYSKLAD') {
-      const result = await this.writeMoyskladEmail(pair.moyskladCounterpartyId, value);
+      const result = await this.writeMoyskladEmail(event.id, pair.moyskladCounterpartyId, value);
       if (readEmail(result.email) !== value) throw new Error('EXTERNAL_API_FAILURE');
     } else {
       if (!bitrixEmailField) throw new Error('REVIEW_REQUIRED');
-      await this.writeBitrixEmail(pair.bitrix24ContactId, bitrixEmailField, value);
+      await this.writeBitrixEmail(event.id, pair.bitrix24ContactId, bitrixEmailField, value);
     }
 
     const now = new Date();
@@ -247,20 +265,22 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         lastErrorCategory: null,
       },
     });
+    await this.resolveManualReview(event.id);
   }
 
-  private async readBitrixContact(contactId: string): Promise<JsonRecord> {
-    const result = await this.bitrixRequest('crm.contact.get.json', { id: contactId });
+  private async readBitrixContact(eventId: string, contactId: string): Promise<JsonRecord> {
+    const result = await this.bitrixRequest(eventId, 'crm.contact.get.json', { id: contactId });
     if (!isRecord(result)) throw new Error('EXTERNAL_API_FAILURE');
     return result;
   }
 
   private async writeBitrixEmail(
+    eventId: string,
     contactId: string,
     currentEmail: { id: string; valueType: string },
     email: string,
   ): Promise<void> {
-    await this.bitrixRequest('crm.contact.update.json', {
+    await this.bitrixRequest(eventId, 'crm.contact.update.json', {
       id: contactId,
       'fields[EMAIL][0][ID]': currentEmail.id,
       'fields[EMAIL][0][VALUE]': email,
@@ -268,46 +288,88 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     });
   }
 
-  private async bitrixRequest(method: string, fields: Record<string, string>): Promise<unknown> {
+  private async bitrixRequest(eventId: string, method: string, fields: Record<string, string>): Promise<unknown> {
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('EXTERNAL_API_FAILURE');
-    const response = await fetch(new URL(method, ensureTrailingSlash(base)), {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams(fields),
-      signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(new URL(method, ensureTrailingSlash(base)), {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(fields),
+        signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', null, false);
+      throw error;
+    }
+    await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, response.ok);
     if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
     const payload: unknown = await response.json();
     if (!isRecord(payload) || payload.error || !('result' in payload)) throw new Error('EXTERNAL_API_FAILURE');
     return payload.result;
   }
 
-  private async readMoyskladCounterparty(counterpartyId: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(counterpartyId, 'GET');
+  private async readMoyskladCounterparty(eventId: string, counterpartyId: string): Promise<JsonRecord> {
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'GET');
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
-  private async writeMoyskladEmail(counterpartyId: string, email: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(counterpartyId, 'PUT', { email });
+  private async writeMoyskladEmail(eventId: string, counterpartyId: string, email: string): Promise<JsonRecord> {
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email });
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
-  private async moyskladRequest(counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord): Promise<unknown> {
+  private async moyskladRequest(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord): Promise<unknown> {
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('EXTERNAL_API_FAILURE');
     const url = new URL(`entity/counterparty/${encodeURIComponent(counterpartyId)}`, ensureTrailingSlash(base));
-    const response = await fetch(url, {
-      method,
-      headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, null, false);
+      throw error;
+    }
+    await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, response.ok);
     if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
     return response.json();
+  }
+
+  private async recordApiAttempt(
+    eventId: string,
+    provider: string,
+    operation: string,
+    method: string,
+    statusCode: number | null,
+    succeeded: boolean,
+  ) {
+    try {
+      await this.database.apiAttempt.create({
+        data: { eventId, provider, operation, method, statusCode, succeeded },
+      });
+    } catch {
+      // The history is supplementary and cannot change the external API result.
+    }
+  }
+
+  private async resolveManualReview(eventId: string) {
+    try {
+      await this.database.manualReviewCase.updateMany({
+        where: { eventId, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: new Date() },
+      });
+    } catch {
+      // Incident history is separate from event processing; an auxiliary update cannot undo a successful sync.
+    }
   }
 }
 
