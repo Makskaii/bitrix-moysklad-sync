@@ -265,6 +265,76 @@ test('two API instances serialize distinct pending events for the same contact',
   }
 });
 
+test('two API instances serialize Bitrix24 and MoySklad events for the same confirmed pair', async () => {
+  destinationEmail = 'before@example.test';
+  writeCount = 0;
+  writeDelayMs = 200;
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const contactId = `t21-cross-source-contact-${suffix}`;
+  const counterpartyId = `t21-cross-source-counterparty-${suffix}`;
+  await database.contactPair.create({
+    data: {
+      bitrix24ContactId: contactId,
+      moyskladCounterpartyId: counterpartyId,
+      moyskladType: 'COUNTERPARTY',
+      snapshot: { create: {
+        bitrix24Email: 'before@example.test',
+        moyskladEmail: 'before@example.test',
+        bitrix24UpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+        moyskladUpdatedAt: new Date('2026-10-02T09:00:00.000Z'),
+      } },
+    },
+  });
+  const secondApp = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
+  await secondApp.listen(0, '127.0.0.1');
+  const secondApiUrl = await secondApp.getUrl();
+  holdMoyskladReads = true;
+  moyskladReadArrivals = 0;
+  moyskladReadBarrier = new Promise<void>((resolve) => { releaseMoyskladReads = resolve; });
+  try {
+    const b24Response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        event: 'ONCRMCONTACTUPDATE', ts: `b24-${suffix}`,
+        data: { FIELDS: { ID: contactId } },
+        auth: { application_token: 'synthetic-b24-event-token' },
+      }),
+    });
+    assert.equal(b24Response.status, 200);
+    const b24Ack = await b24Response.json() as { eventId: string };
+    await waitUntil(() => moyskladReadArrivals === 1);
+
+    const msResponse = await fetch(`${secondApiUrl}/webhooks/moysklad/synthetic-ms-webhook-secret?requestId=${encodeURIComponent(`ms-${suffix}`)}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [{ action: 'UPDATE', meta: {
+        type: 'counterparty', href: `https://api.moysklad.ru/api/remap/1.2/entity/counterparty/${counterpartyId}`,
+      } }] }),
+    });
+    assert.equal(msResponse.status, 200);
+    const msAck = await msResponse.json() as { eventId: string };
+    assert.notEqual(b24Ack.eventId, msAck.eventId);
+    assert.equal(await database.inboundEvent.count({ where: { id: { in: [b24Ack.eventId, msAck.eventId] } } }), 2);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const concurrentReads = moyskladReadArrivals;
+    releaseMoyskladReads();
+    holdMoyskladReads = false;
+    assert.equal(concurrentReads, 1, 'cross-source events for a confirmed pair must share one entity lease');
+    const settled = await Promise.all([b24Ack, msAck].map(({ eventId }) => waitForSettledStatus(apiUrl, eventId)));
+    assert.deepEqual(settled.map((event) => event.status).sort(), ['SUCCEEDED', 'UNCHANGED']);
+    assert.equal(settled.reduce((total, event) => total + event.snapshotRevision, 0), 4);
+    assert.equal(await database.contactPair.count({ where: { bitrix24ContactId: contactId } }), 1);
+    assert.equal(writeCount, 1);
+    assert.equal(destinationEmail, 'after@example.test');
+  } finally {
+    releaseMoyskladReads();
+    holdMoyskladReads = false;
+    writeDelayMs = 0;
+    (secondApp.getHttpServer() as Server).closeAllConnections();
+    await secondApp.close();
+  }
+});
+
 test('a stale PROCESSING event is recovered after restart without repeating a converged remote write', async () => {
   const database = app.get(DatabaseService);
   const suffix = randomUUID();

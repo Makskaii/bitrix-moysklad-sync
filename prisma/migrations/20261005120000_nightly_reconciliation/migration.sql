@@ -9,4 +9,3 @@ ADD COLUMN "nightlyMoyskladOffset" INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN "nightlyRetryAfter" TIMESTAMP(3),
 ADD COLUMN "nightlyAttempts" INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN "nightlyError" TEXT;
-

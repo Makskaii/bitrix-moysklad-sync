@@ -12,6 +12,12 @@ class EntityLockLostError extends Error {
     super('Entity processing lease was lost');
   }
 }
+
+class EntityMappingChangedError extends Error {
+  constructor() {
+    super('Contact pair mapping changed while the event was being claimed');
+  }
+}
 const PROCESSING_LEASE_MS = 60_000;
 const ENTITY_LOCK_LEASE_MS = 60_000;
 const ENTITY_LOCK_RENEW_INTERVAL_MS = 15_000;
@@ -93,7 +99,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (!await this.isApplyEnabled()) return;
     const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
     if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
-    const entityKey = candidate.externalEntityId ? `${candidate.source}:${candidate.externalEntityId}` : null;
+    const entityKey = await this.entityLeaseKey(candidate);
     if (entityKey && this.activeEntities.has(entityKey)) return;
     this.active.add(eventId);
     if (entityKey) this.activeEntities.add(entityKey);
@@ -140,6 +146,18 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null);
       } catch (error) {
         if (error instanceof EntityLockLostError) return;
+        if (error instanceof EntityMappingChangedError) {
+          try {
+            await this.commitWithEntityLease(entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, (tx) =>
+              tx.inboundEvent.update({
+                where: { id: latestEventId },
+                data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null, retryAfter: null },
+              }));
+          } catch (commitError) {
+            if (!(commitError instanceof EntityLockLostError)) throw commitError;
+          }
+          return;
+        }
         const category = errorCategory(error);
         try {
           await this.commitWithEntityLease(entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, (tx) =>
@@ -163,6 +181,20 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       this.active.delete(eventId);
       if (entityKey) this.activeEntities.delete(entityKey);
     }
+  }
+
+  private async entityLeaseKey(candidate: { source: string; externalEntityId: string | null }): Promise<string | null> {
+    if (!candidate.externalEntityId) return null;
+    // Confirmed pairs have a shared cross-source identity; unmapped IDs cannot yet be safely correlated.
+    const pair = await this.database.contactPair.findUnique({
+      where: candidate.source === 'BITRIX24'
+        ? { bitrix24ContactId: candidate.externalEntityId }
+        : { moyskladCounterpartyId: candidate.externalEntityId },
+      select: { id: true },
+    });
+    return pair
+      ? `CONTACT_PAIR:${pair.id}`
+      : `${candidate.source}:${candidate.externalEntityId}`;
   }
 
   private async acquireEntityLock(entityKey: string, ownerToken: string, eventId: string): Promise<boolean> {
@@ -303,6 +335,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (!pair || !pair.active || pair.moyskladType !== 'COUNTERPARTY' || !pair.snapshot) {
       throw new Error('REVIEW_REQUIRED');
     }
+    // If a pair was added or rebound since key resolution, requeue before any provider reads or writes.
+    if (lease && lease.entityKey !== `CONTACT_PAIR:${pair.id}`) throw new EntityMappingChangedError();
 
     const [bitrixContact, moyskladCounterparty] = await Promise.all([
       this.readBitrixContact(pair.bitrix24ContactId),
