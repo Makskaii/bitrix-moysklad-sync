@@ -8,14 +8,16 @@ import { NestFactory } from '@nestjs/core';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
 import { AdminController } from '../src/admin/admin.controller';
 import { ContactSyncStatusController } from '../src/admin/contact-sync-status.controller';
+import { SyncModeController } from '../src/admin/sync-mode.controller';
 import { ContactSyncProcessor, ContactSyncStatusReader } from '../src/contact-sync.service';
 import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
 import { SyncModeService } from '../src/sync-mode.service';
+import { SyncRecoveryService } from '../src/sync-recovery.service';
 
 @Module({
-  controllers: [EventsController, AdminController, ContactSyncStatusController],
-  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard, SyncModeService],
+  controllers: [EventsController, AdminController, ContactSyncStatusController, SyncModeController],
+  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard, SyncModeService, SyncRecoveryService],
 })
 class RealDatabaseContactSyncModule {}
 
@@ -24,6 +26,7 @@ let apiUrl: string;
 let mockUrl: string;
 let mockServer: Server;
 let originalFetch: typeof fetch;
+const NativeDate = globalThis.Date;
 let destinationEmail = 'before@example.test';
 let writeCount = 0;
 let failNextWrite = false;
@@ -32,6 +35,7 @@ let barrierMoyskladReads = false;
 let moyskladReadArrivals = 0;
 let releaseMoyskladReads = () => {};
 let moyskladReadBarrier = Promise.resolve();
+const nightlyProviderQueries: string[] = [];
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to the isolated ephemeral PostgreSQL database');
@@ -234,6 +238,7 @@ test('a stale PROCESSING event is recovered after restart without repeating a co
 });
 
 test('a temporary external failure stays durable and retries the same event after backoff', async () => {
+  destinationEmail = 'before@example.test';
   const suffix = randomUUID();
   const contactId = `t20-retry-contact-${suffix}`;
   const counterpartyId = `t20-retry-counterparty-${suffix}`;
@@ -286,6 +291,7 @@ test('a temporary external failure stays durable and retries the same event afte
 });
 
 test('accumulated changes keep both journal entries and synchronize the latest state once', async () => {
+  destinationEmail = 'before@example.test';
   const suffix = randomUUID();
   const contactId = `t20-batch-contact-${suffix}`;
   const counterpartyId = `t20-batch-counterparty-${suffix}`;
@@ -326,7 +332,93 @@ test('accumulated changes keep both journal entries and synchronize the latest s
   assert.equal(writeCount, previousWrites + 1);
 });
 
+test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({
+    where: { id: 'global' },
+    data: {
+      serviceMode: 'on', nightlyScheduledDate: null, nightlyStatus: 'idle',
+      nightlyFrom: null, nightlyThrough: null, nightlyProvider: 'BITRIX24',
+      nightlyBitrixStart: 0, nightlyMoyskladOffset: 0, nightlyRetryAfter: null,
+      nightlyAttempts: 0, nightlyError: null,
+    },
+  });
+  nightlyProviderQueries.length = 0;
+  try {
+    freezeTime('2026-10-05T20:00:00.000Z');
+    await setAdminMode('pause');
+    freezeTime('2026-10-05T20:15:00.000Z');
+    await setAdminMode('on');
+    freezeTime('2026-10-05T22:00:00.000Z');
+    await waitForNightlyStatus('complete');
+    const status = await readRecoveryStatus();
+    assert.deepEqual(status.nightly, {
+      scheduledDate: '2026-10-06',
+      status: 'complete',
+      from: '2026-10-04T22:00:00.000Z',
+      through: '2026-10-05T22:00:00.000Z',
+      provider: 'COMPLETE',
+      bitrixStart: 0,
+      moyskladOffset: 0,
+      retryAfter: null,
+      attempts: 1,
+      error: null,
+    });
+    assert.equal(nightlyProviderQueries.some((query) => query.includes('2026-10-04T22%3A00%3A00.000Z')), true);
+    assert.equal(nightlyProviderQueries.some((query) => query.includes('2026-10-05T22%3A00%3A00.000Z')), true);
+  } finally {
+    restoreTime();
+  }
+});
+
+test('nightly schedule is skipped while paused and is not backfilled after resume', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({
+    where: { id: 'global' }, data: { serviceMode: 'on', nightlyScheduledDate: null, nightlyStatus: 'idle' },
+  });
+  nightlyProviderQueries.length = 0;
+  freezeTime('2026-10-06T21:59:00.000Z');
+  try {
+    await setAdminMode('pause');
+    freezeTime('2026-10-06T22:00:00.000Z');
+    await waitForNightlyStatus('skipped');
+    assert.equal(nightlyProviderQueries.length, 0);
+    freezeTime('2026-10-06T22:01:00.000Z');
+    await setAdminMode('on');
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    const status = await readRecoveryStatus();
+    assert.equal(status.nightly.scheduledDate, '2026-10-07');
+    assert.equal(status.nightly.status, 'skipped');
+    assert.equal(nightlyProviderQueries.length, 0);
+  } finally {
+    restoreTime();
+  }
+});
+
+test('nightly schedule is skipped while Off', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({
+    where: { id: 'global' }, data: { serviceMode: 'on', offSince: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
+  });
+  nightlyProviderQueries.length = 0;
+  freezeTime('2026-10-07T21:59:00.000Z');
+  try {
+    await setAdminMode('off');
+    freezeTime('2026-10-07T22:00:00.000Z');
+    await waitForNightlyStatus('skipped');
+    assert.equal(nightlyProviderQueries.length, 0);
+  } finally {
+    restoreTime();
+  }
+});
+
 async function handleExternalRequest(request: IncomingMessage, response: ServerResponse) {
+  if (request.method === 'POST' && request.url === '/rest/crm.contact.list.json') {
+    return readBody(request).then((body) => {
+      nightlyProviderQueries.push(body);
+      return sendJson(response, 200, { result: [] });
+    });
+  }
   if (request.method === 'POST' && request.url === '/rest/crm.contact.get.json') {
     return readBody(request).then((body) => {
       const id = new URLSearchParams(body).get('id');
@@ -366,6 +458,10 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
       updated: destinationEmail === 'before@example.test' ? '2026-10-02T09:00:00.000' : '2026-10-02T10:00:03.000',
     });
   }
+  if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty?')) {
+    nightlyProviderQueries.push(request.url);
+    return sendJson(response, 200, { rows: [], meta: { size: 0, limit: 1_000, offset: 0 } });
+  }
   return sendJson(response, 404, {});
 }
 
@@ -378,7 +474,7 @@ async function restartApp() {
 }
 
 async function waitForStatus(baseUrl: string, eventId: string, expected: string) {
-  const deadline = Date.now() + 4_000;
+  const deadline = Date.now() + 12_000;
   let latest = await readStatus(baseUrl, eventId);
   while (latest.status !== expected && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -396,6 +492,58 @@ async function readStatus(baseUrl: string, eventId: string) {
   return response.json() as Promise<{
     status: string; attempts: number; direction: string; snapshotRevision: number;
   }>;
+}
+
+async function readRecoveryStatus() {
+  const response = await fetch(`${apiUrl}/api/admin/sync-mode/recovery`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  assert.equal(response.status, 200);
+  return response.json() as Promise<{
+    nightly: {
+      scheduledDate: string | null; status: string; from: string | null; through: string | null;
+      provider: string; bitrixStart: number; moyskladOffset: number; retryAfter: string | null;
+      attempts: number; error: string | null;
+    };
+  }>;
+}
+
+async function waitForNightlyStatus(expected: string) {
+  const deadline = NativeDate.now() + 8_000;
+  let status = await readRecoveryStatus();
+  while (status.nightly.status !== expected && NativeDate.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    status = await readRecoveryStatus();
+  }
+  assert.equal(status.nightly.status, expected);
+}
+
+async function setAdminMode(mode: 'on' | 'pause' | 'off') {
+  const response = await fetch(`${apiUrl}/api/admin/sync-mode`, {
+    method: 'PATCH',
+    headers: { authorization: 'Bearer synthetic-admin-token', 'content-type': 'application/json' },
+    body: JSON.stringify({ mode, confirmed: true }),
+  });
+  assert.equal(response.status, 200);
+}
+
+function freezeTime(isoDate: string) {
+  const milliseconds = NativeDate.parse(isoDate);
+  class FrozenDate extends NativeDate {
+    constructor(value?: string | number) {
+      if (value === undefined) super(milliseconds);
+      else super(value);
+    }
+
+    static now() {
+      return milliseconds;
+    }
+  }
+  globalThis.Date = FrozenDate as DateConstructor;
+}
+
+function restoreTime() {
+  globalThis.Date = NativeDate;
 }
 
 function readBody(request: IncomingMessage): Promise<string> {

@@ -26,6 +26,16 @@ model SyncSetting {
   resumeError String?
   resumeRetryAfter DateTime?
   resumeAttempts Int @default(0)
+  nightlyScheduledDate String?
+  nightlyStatus String @default("idle")
+  nightlyFrom DateTime?
+  nightlyThrough DateTime?
+  nightlyProvider String @default("BITRIX24")
+  nightlyBitrixStart Int @default(0)
+  nightlyMoyskladOffset Int @default(0)
+  nightlyRetryAfter DateTime?
+  nightlyAttempts Int @default(0)
+  nightlyError String?
   updatedAt DateTime @updatedAt
 }
 

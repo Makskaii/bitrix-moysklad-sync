@@ -5,9 +5,9 @@ import { SyncModeService } from './sync-mode.service';
 type JsonRecord = Record<string, unknown>;
 const PROCESSING_LEASE_MS = 60_000;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 15_000;
-const RETRY_BASE_DELAY_MS = 1_000;
+const RETRY_BASE_DELAY_MS = 5_000;
 const RETRY_MAX_DELAY_MS = 15 * 60_000;
-const EVENT_BATCH_DELAY_MS = 50;
+const EVENT_BATCH_DELAY_MS = 250;
 
 @Injectable()
 export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDestroy {
