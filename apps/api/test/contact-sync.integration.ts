@@ -630,6 +630,14 @@ test('a Bitrix24 contact with multiple email values is not silently reduced to o
   assert.equal(result.attempts, 1);
   assert.equal(result.snapshotRevision, 1);
   assert.equal(result.lastErrorCategory, 'REVIEW_REQUIRED');
+  const reviewCase = manualReviewCases.get(ack.eventId);
+  assert.equal(reviewCase?.reason, 'SYNC_EMAIL_MISSING');
+  assert.deepEqual(reviewCase?.diagnostic, {
+    bitrixEmailPresent: false,
+    moyskladEmailPresent: true,
+    bitrixEmailFieldCount: 2,
+    snapshotRevision: 1,
+  });
   assert.deepEqual(externalWrites, []);
   assert.equal(moyskladState.email, 'before@example.test');
 });

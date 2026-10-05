@@ -73,8 +73,8 @@ test('a real manual-review incident survives PostgreSQL cleanup of its expired i
   const monitor = await nativeFetch(`${apiUrl}/api/admin/monitoring/incidents?status=OPEN`);
   const monitorBody = await monitor.text();
   assert.equal(monitor.status, 200, monitorBody);
-  const cases = JSON.parse(monitorBody) as { cases: Array<{ id: string; eventId: string; reason: string; status: string }> };
-  assert.ok(cases.cases.some((row) => row.id === incident?.id && row.eventId === eventId && row.reason === 'REVIEW_REQUIRED' && row.status === 'OPEN'));
+  const cases = JSON.parse(monitorBody) as { cases: Array<{ id: string; eventId: string; reason: string; diagnostic: unknown; status: string }> };
+  assert.ok(cases.cases.some((row) => row.id === incident?.id && row.eventId === eventId && row.reason === 'CONTACT_PAIR_NOT_FOUND' && row.status === 'OPEN' && row.diagnostic !== null));
 });
 
 test('external API attempts are listed through the monitoring endpoint without request bodies or credentials', async () => {
@@ -133,6 +133,55 @@ test('external API attempts are listed through the monitoring endpoint without r
       ['MOYSKLAD', 'entity/counterparty/{id}', true],
       ['MOYSKLAD', 'entity/counterparty/{id}', true],
     ].sort());
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('HTTP-200 Bitrix application errors are recorded as unsuccessful API attempts', async () => {
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const contactId = `monitoring-error-contact-${suffix}`;
+  const counterpartyId = `monitoring-error-counterparty-${suffix}`;
+  const pair = await database.contactPair.create({ data: { bitrix24ContactId: contactId, moyskladCounterpartyId: counterpartyId } });
+  await database.contactSnapshot.create({
+    data: {
+      pairId: pair.id,
+      bitrix24Email: 'before@example.test',
+      moyskladEmail: 'before@example.test',
+      bitrix24UpdatedAt: new Date('2026-10-01T09:00:00.000Z'),
+      moyskladUpdatedAt: new Date('2026-10-01T09:00:00.000Z'),
+      revision: 1,
+    },
+  });
+  process.env.BITRIX24_REST_BASE_URL = 'https://b24-application-error.invalid/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://ms-application-error.invalid/api/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-ms-api-token';
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith('/rest/crm.contact.get.json')) {
+      return Response.json({ result: { ID: contactId, EMAIL: [{ ID: 'email-1', VALUE: 'before@example.test', VALUE_TYPE: 'WORK' }], DATE_MODIFY: '2026-10-01T09:00:00Z' } });
+    }
+    if (url.endsWith('/rest/crm.contact.update.json')) return Response.json({ error: 'synthetic application error' }, { status: 200 });
+    if (url.endsWith(`/api/entity/counterparty/${counterpartyId}`)) {
+      return Response.json({ id: counterpartyId, email: 'after@example.test', updated: '2026-10-05 12:00:02.000' });
+    }
+    return nativeFetch(input);
+  }) as typeof fetch;
+
+  try {
+    const received = await nativeFetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event: 'ONCRMCONTACTUPDATE', data: { FIELDS: { ID: contactId } }, auth: { application_token: 'synthetic-monitoring-event-token' } }),
+    });
+    const acknowledgement = await received.json() as { eventId: string };
+    const event = await waitForEvent(database, acknowledgement.eventId, 'RETRYABLE_FAILURE');
+    assert.equal(event?.status, 'RETRYABLE_FAILURE');
+    const attempts = await database.apiAttempt.findMany({ where: { eventId: acknowledgement.eventId } });
+    const updateAttempt = attempts.find((attempt) => attempt.provider === 'BITRIX24' && attempt.operation === 'crm.contact.update');
+    assert.equal(updateAttempt?.statusCode, 200);
+    assert.equal(updateAttempt?.succeeded, false);
   } finally {
     globalThis.fetch = nativeFetch;
   }

@@ -97,6 +97,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       } catch (error) {
         const category = errorCategory(error);
         if (category === 'REVIEW_REQUIRED') {
+          const review = error instanceof ReviewRequiredError ? error : new ReviewRequiredError('UNSPECIFIED_REVIEW_REQUIRED');
           await this.database.manualReviewCase.upsert({
             where: { eventId: event.id },
             create: {
@@ -105,9 +106,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
               eventType: event.eventType,
               externalEntityId: event.externalEntityId,
               externalEntityType: event.externalEntityType,
-              reason: category,
+              reason: review.reason,
+              diagnostic: review.diagnostic,
             },
-            update: { reason: category },
+            update: { reason: review.reason, diagnostic: review.diagnostic },
           });
         }
         await this.database.inboundEvent.update({
@@ -154,16 +156,17 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     attempt: number,
   ) {
     const sourceEntityId = event.externalEntityId;
-    if (!sourceEntityId) throw new Error('REVIEW_REQUIRED');
+    if (!sourceEntityId) throw new ReviewRequiredError('SOURCE_ENTITY_ID_MISSING');
     const pair = await this.database.contactPair.findUnique({
       where: event.source === 'BITRIX24'
         ? { bitrix24ContactId: sourceEntityId }
         : { moyskladCounterpartyId: sourceEntityId },
       include: { snapshot: true },
     });
-    if (!pair || !pair.active || pair.moyskladType !== 'COUNTERPARTY' || !pair.snapshot) {
-      throw new Error('REVIEW_REQUIRED');
-    }
+    if (!pair) throw new ReviewRequiredError('CONTACT_PAIR_NOT_FOUND');
+    if (!pair.active) throw new ReviewRequiredError('CONTACT_PAIR_INACTIVE');
+    if (pair.moyskladType !== 'COUNTERPARTY') throw new ReviewRequiredError('UNSUPPORTED_MOYSKLAD_ENTITY_TYPE');
+    if (!pair.snapshot) throw new ReviewRequiredError('CONTACT_SNAPSHOT_MISSING', { pairId: pair.id });
 
     const [bitrixContact, moyskladCounterparty] = await Promise.all([
       this.readBitrixContact(event.id, pair.bitrix24ContactId),
@@ -172,7 +175,12 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     const bitrixEmailField = readSingleBitrixEmail(bitrixContact.EMAIL);
     const bitrixEmail = bitrixEmailField?.email ?? null;
     const moyskladEmail = readEmail(moyskladCounterparty.email);
-    if (!bitrixEmail || !moyskladEmail) throw new Error('REVIEW_REQUIRED');
+    if (!bitrixEmail || !moyskladEmail) throw new ReviewRequiredError('SYNC_EMAIL_MISSING', {
+      bitrixEmailPresent: Boolean(bitrixEmail),
+      moyskladEmailPresent: Boolean(moyskladEmail),
+      bitrixEmailFieldCount: Array.isArray(bitrixContact.EMAIL) ? bitrixContact.EMAIL.length : 0,
+      snapshotRevision: pair.snapshot.revision,
+    });
 
     const snapshot = pair.snapshot;
     const bitrixChanged = bitrixEmail !== snapshot.bitrix24Email;
@@ -235,7 +243,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       const result = await this.writeMoyskladEmail(event.id, pair.moyskladCounterpartyId, value);
       if (readEmail(result.email) !== value) throw new Error('EXTERNAL_API_FAILURE');
     } else {
-      if (!bitrixEmailField) throw new Error('REVIEW_REQUIRED');
+      if (!bitrixEmailField) throw new ReviewRequiredError('BITRIX_EMAIL_FIELD_NOT_WRITABLE', {
+        bitrixEmailPresent: Boolean(bitrixEmail),
+        moyskladEmailPresent: Boolean(moyskladEmail),
+        snapshotRevision: snapshot.revision,
+      });
       await this.writeBitrixEmail(event.id, pair.bitrix24ContactId, bitrixEmailField, value);
     }
 
@@ -303,26 +315,34 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', null, false);
       throw error;
     }
-    await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, response.ok);
-    if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
-    const payload: unknown = await response.json();
+    if (!response.ok) {
+      await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
+      throw new Error('EXTERNAL_API_FAILURE');
+    }
+    let payload: unknown;
+    try { payload = await response.json(); } catch (error) {
+      await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
+      throw error;
+    }
+    const accepted = isRecord(payload) && !payload.error && 'result' in payload;
+    await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, accepted);
     if (!isRecord(payload) || payload.error || !('result' in payload)) throw new Error('EXTERNAL_API_FAILURE');
     return payload.result;
   }
 
   private async readMoyskladCounterparty(eventId: string, counterpartyId: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(eventId, counterpartyId, 'GET');
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'GET', undefined, isRecord);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
   private async writeMoyskladEmail(eventId: string, counterpartyId: string, email: string): Promise<JsonRecord> {
-    const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email });
+    const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email }, (payload) => isRecord(payload) && readEmail(payload.email) === email);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
-  private async moyskladRequest(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord): Promise<unknown> {
+  private async moyskladRequest(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord, accepts: (payload: unknown) => boolean = isRecord): Promise<unknown> {
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('EXTERNAL_API_FAILURE');
@@ -339,9 +359,19 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, null, false);
       throw error;
     }
-    await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, response.ok);
-    if (!response.ok) throw new Error('EXTERNAL_API_FAILURE');
-    return response.json();
+    if (!response.ok) {
+      await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, false);
+      throw new Error('EXTERNAL_API_FAILURE');
+    }
+    let payload: unknown;
+    try { payload = await response.json(); } catch (error) {
+      await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, false);
+      throw error;
+    }
+    const accepted = accepts(payload);
+    await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, accepted);
+    if (!accepted) throw new Error('EXTERNAL_API_FAILURE');
+    return payload;
   }
 
   private async recordApiAttempt(
@@ -417,7 +447,7 @@ function readString(value: unknown): string | null {
 
 function readTimestamp(value: unknown): Date {
   const date = typeof value === 'string' ? new Date(value) : new Date(Number.NaN);
-  if (!Number.isFinite(date.getTime())) throw new Error('REVIEW_REQUIRED');
+  if (!Number.isFinite(date.getTime())) throw new ReviewRequiredError('SOURCE_MODIFIED_TIMESTAMP_INVALID');
   return new Date(Math.floor(date.getTime() / 1000) * 1000);
 }
 
@@ -436,9 +466,15 @@ function chooseDirection(
 }
 
 function errorCategory(error: unknown): string {
-  return error instanceof Error && error.message === 'REVIEW_REQUIRED'
+  return error instanceof ReviewRequiredError
     ? 'REVIEW_REQUIRED'
     : 'EXTERNAL_API_FAILURE';
+}
+
+class ReviewRequiredError extends Error {
+  constructor(readonly reason: string, readonly diagnostic: Record<string, string | number | boolean> = {}) {
+    super('REVIEW_REQUIRED');
+  }
 }
 
 function ensureTrailingSlash(value: string): string {

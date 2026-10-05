@@ -64,6 +64,7 @@ model ManualReviewCase {
   externalEntityId  String?
   externalEntityType String?
   reason            String
+  diagnostic        Json?
   status            String   @default("OPEN")
   openedAt          DateTime @default(now())
   resolvedAt        DateTime?

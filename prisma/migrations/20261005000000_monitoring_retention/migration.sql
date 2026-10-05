@@ -6,6 +6,7 @@ CREATE TABLE "ManualReviewCase" (
     "externalEntityId" TEXT,
     "externalEntityType" TEXT,
     "reason" TEXT NOT NULL,
+    "diagnostic" JSONB,
     "status" TEXT NOT NULL DEFAULT 'OPEN',
     "openedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "resolvedAt" TIMESTAMP(3),

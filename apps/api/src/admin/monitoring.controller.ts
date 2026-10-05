@@ -44,7 +44,7 @@ export class MonitoringController {
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       orderBy: [{ openedAt: 'desc' }, { id: 'desc' }],
       take,
-      select: { id: true, eventId: true, source: true, eventType: true, externalEntityId: true, externalEntityType: true, reason: true, status: true, openedAt: true, resolvedAt: true },
+      select: { id: true, eventId: true, source: true, eventType: true, externalEntityId: true, externalEntityType: true, reason: true, diagnostic: true, status: true, openedAt: true, resolvedAt: true },
     });
     return { cases, nextCursor: getNextCursor(cases, take) };
   }
