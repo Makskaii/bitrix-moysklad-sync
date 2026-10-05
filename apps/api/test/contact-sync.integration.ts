@@ -63,6 +63,7 @@ let originalFetch: typeof fetch;
 let externalWrites: string[];
 let failNextMoyskladWrite = false;
 let bitrixHasMultipleEmails = false;
+let moyskladMissingEmail = false;
 let serviceMode: 'on' | 'pause' = 'on';
 
 const database = {
@@ -208,7 +209,7 @@ before(async () => {
   });
   moyskladMock = await startMock((request, response) => {
     if (request.method === 'GET' && request.url === '/api/entity/counterparty/counterparty-uuid') {
-      return json(response, 200, { id: 'counterparty-uuid', email: moyskladState.email, updated: moyskladState.updatedAt });
+      return json(response, 200, { id: 'counterparty-uuid', email: moyskladMissingEmail ? null : moyskladState.email, updated: moyskladState.updatedAt });
     }
     if (request.method === 'PUT' && request.url === '/api/entity/counterparty/counterparty-uuid') {
       return readJson(request).then((body) => {
@@ -256,6 +257,7 @@ beforeEach(() => {
   externalWrites = [];
   failNextMoyskladWrite = false;
   bitrixHasMultipleEmails = false;
+  moyskladMissingEmail = false;
   pairs.set('contact-42', {
     id: 'pair-1',
     bitrix24ContactId: 'contact-42',
@@ -640,6 +642,29 @@ test('a Bitrix24 contact with multiple email values is not silently reduced to o
   });
   assert.deepEqual(externalWrites, []);
   assert.equal(moyskladState.email, 'before@example.test');
+});
+
+test('a valid counterparty with no email opens a durable manual-review incident', async () => {
+  moyskladMissingEmail = true;
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMCONTACTUPDATE',
+      data: { FIELDS: { ID: 'contact-42' } },
+      auth: { application_token: 'synthetic-b24-event-token' },
+    }),
+  });
+  const ack = await response.json() as { eventId: string };
+  await waitForStatus(ack.eventId, 'MANUAL_REVIEW');
+  const incident = manualReviewCases.get(ack.eventId);
+  assert.equal(incident?.reason, 'SYNC_EMAIL_MISSING');
+  assert.deepEqual(incident?.diagnostic, {
+    bitrixEmailPresent: true,
+    moyskladEmailPresent: false,
+    bitrixEmailFieldCount: 1,
+    snapshotRevision: 1,
+  });
 });
 
 async function waitForStatus(eventId: string, expectedStatus = 'SUCCEEDED'): Promise<Response> {

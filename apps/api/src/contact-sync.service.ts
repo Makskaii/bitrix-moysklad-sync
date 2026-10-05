@@ -475,14 +475,14 @@ function acceptsBitrixResponse(method: string, payload: unknown): boolean {
   if (!isRecord(payload) || payload.error || !('result' in payload)) return false;
   if (method.includes('.get.')) {
     return isRecord(payload.result)
-      && Array.isArray(payload.result.EMAIL)
+      && readString(payload.result.ID) !== null
       && isValidTimestamp(payload.result.DATE_MODIFY);
   }
   return payload.result === true;
 }
 
 function isMoyskladCounterparty(payload: unknown): payload is JsonRecord {
-  return isRecord(payload) && readEmail(payload.email) !== null && isValidTimestamp(payload.updated);
+  return isRecord(payload) && readString(payload.id) !== null && isValidTimestamp(payload.updated);
 }
 
 function isValidTimestamp(value: unknown): boolean {
