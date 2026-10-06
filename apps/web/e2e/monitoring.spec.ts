@@ -16,17 +16,17 @@ test('admin can browse queue, manual-review cases, separate log categories, and 
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Мониторинг обмена' })).toBeVisible();
-  await expect(page.getByText('RETRYABLE_FAILURE', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Очередь и попытки' }).click();
+  await expect(page.getByRole('heading', { name: 'Очередь и попытки', exact: true })).toBeVisible();
+  await expect(page.getByText('RETRYABLE_FAILURE', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('BITRIX24 · crm.contact.get').first()).toBeVisible();
 
   await page.getByRole('button', { name: /Ручная проверка/ }).click();
   await expect(page.getByText('REVIEW_REQUIRED', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Повторить' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'Журналы' }).click();
+  await page.getByRole('button', { name: 'Логи', exact: true }).click();
   await page.getByRole('button', { name: 'ADMIN' }).click();
   await expect(page.getByText('Задача выполнена')).toBeVisible();
-
-  await page.getByRole('button', { name: 'История API' }).click();
   await expect(page.getByText('BITRIX24 · crm.contact.get')).toBeVisible();
 });

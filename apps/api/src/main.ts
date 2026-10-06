@@ -13,6 +13,8 @@ import { SyncRecoveryService } from './sync-recovery.service';
 import { MonitoringController } from './admin/monitoring.controller';
 import { RetentionService } from './retention.service';
 import { RotatingFileLogger } from './rotating-file.logger';
+import { WebhookDiagnosticsController } from './webhook-diagnostics.controller';
+import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 
 @Controller()
 class AppController {
@@ -27,8 +29,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService],
+  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService],
 })
 class AppModule {}
 
