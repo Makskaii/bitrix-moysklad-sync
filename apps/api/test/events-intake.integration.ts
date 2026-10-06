@@ -353,10 +353,11 @@ test('dry deal and customer-order webhook matrix accepts create, update, and del
 test('dry webhook diagnostics show deal and customer-order delivery state without payload data', async () => {
   rows.clear();
   process.env.SYNC_MODE = 'dry';
+  const diagnosticReceivedAt = new Date(Date.now() + 1_000);
   rows.set('BITRIX24:diagnostic', {
     id: 'event-safe-id', source: 'BITRIX24', deliveryKey: 'diagnostic', eventType: 'ONCRMDEALUPDATE',
     externalEntityId: '42', externalEntityType: 'deal', payload: { email: 'private@example.test', auth: { application_token: 'secret' } },
-    status: 'RECEIVED', receivedAt: new Date('2026-10-06T10:00:00.000Z'), lastErrorCategory: null,
+    status: 'RECEIVED', receivedAt: diagnosticReceivedAt, lastErrorCategory: null,
   });
 
   const response = await fetch(`${apiUrl}/api/admin/dry-webhooks`);
@@ -371,7 +372,7 @@ test('dry webhook diagnostics show deal and customer-order delivery state withou
   assert.equal(report.subscriptions.find((item) => item.eventType === 'ONCRMDEALUPDATE')?.status, 'event_received');
   assert.equal(report.subscriptions.find((item) => item.eventType === 'DELETE' && item.source === 'MOYSKLAD')?.status, 'rejected_validation');
   assert.equal(report.events[0].externalEntityId, '42');
-  assert.equal(report.events[0].receivedAt, '2026-10-06T10:00:00.000Z');
+  assert.equal(report.events[0].receivedAt, diagnosticReceivedAt.toISOString());
   assert.equal(JSON.stringify(report).includes('private@example.test'), false);
   assert.equal(JSON.stringify(report).includes('moysklad-test-path-secret'), false);
   assert.equal(JSON.stringify(report).includes('bitrix-test-application-token'), false);
