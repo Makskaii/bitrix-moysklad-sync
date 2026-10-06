@@ -7,12 +7,16 @@ import { writeOperationalLog } from './monitoring-log';
 
 const MOYSKLAD_PAGE_SIZE = 1_000;
 const REQUEST_TIMEOUT_MS = 15_000;
+const NIGHTLY_TICK_MS = 5_000;
+const NIGHTLY_WINDOW_MS = 24 * 60 * 60_000;
+const NIGHTLY_TIME_ZONE = 'Europe/Moscow';
 
 type RecordValue = Record<string, unknown>;
 
 @Injectable()
 export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDestroy {
   private running = false;
+  private nightlyRunning = false;
   private rerunRequested = false;
   private timer?: NodeJS.Timeout;
 
@@ -24,7 +28,11 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
 
   onApplicationBootstrap() {
     void this.processPending();
-    this.timer = setInterval(() => { void this.processPending(); }, 5_000);
+    void this.processNightlySchedule().catch(() => undefined);
+    this.timer = setInterval(() => {
+      void this.processPending();
+      void this.processNightlySchedule().catch(() => undefined);
+    }, NIGHTLY_TICK_MS);
     this.timer.unref();
   }
 
@@ -38,6 +46,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       select: {
         resumeStatus: true, resumeFrom: true, resumeThrough: true,
         resumeProvider: true, resumeBitrixStart: true, resumeMoyskladOffset: true, resumeError: true,
+        resumeRetryAfter: true, resumeAttempts: true,
+        nightlyScheduledDate: true, nightlyStatus: true, nightlyFrom: true, nightlyThrough: true,
+        nightlyProvider: true, nightlyBitrixStart: true, nightlyMoyskladOffset: true,
+        nightlyRetryAfter: true, nightlyAttempts: true, nightlyError: true,
       },
     });
     return {
@@ -48,7 +60,151 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       bitrixStart: setting.resumeBitrixStart,
       moyskladOffset: setting.resumeMoyskladOffset,
       error: setting.resumeError,
+      retryAfter: setting.resumeRetryAfter,
+      attempts: setting.resumeAttempts,
+      nightly: {
+        scheduledDate: setting.nightlyScheduledDate,
+        status: setting.nightlyStatus,
+        from: setting.nightlyFrom,
+        through: setting.nightlyThrough,
+        provider: setting.nightlyProvider,
+        bitrixStart: setting.nightlyBitrixStart,
+        moyskladOffset: setting.nightlyMoyskladOffset,
+        retryAfter: setting.nightlyRetryAfter,
+        attempts: setting.nightlyAttempts,
+        error: setting.nightlyError,
+      },
     };
+  }
+
+  private async processNightlySchedule() {
+    if (this.nightlyRunning) return;
+    const now = new Date();
+    const local = localScheduleParts(now);
+    const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+    if (!setting) return;
+
+    if (setting.nightlyStatus === 'running') {
+      await this.runNightlyJob();
+      return;
+    }
+    if (setting.nightlyStatus === 'failed' && (!setting.nightlyRetryAfter || setting.nightlyRetryAfter <= now)) {
+      await this.runNightlyJob();
+      return;
+    }
+    if (local.hour !== 1 || local.minute !== 0 || setting.nightlyScheduledDate === local.date) return;
+
+    const mode = await this.syncMode.read();
+    const enabled = mode.mode === 'on' && process.env.SYNC_MODE === 'apply';
+    const windowFrom = enabled ? this.nightlyWindowStart(now) : null;
+    const claim = await this.database.syncSetting.updateMany({
+      where: {
+        id: 'global',
+        OR: [{ nightlyScheduledDate: null }, { nightlyScheduledDate: { not: local.date } }],
+      },
+      data: {
+        nightlyScheduledDate: local.date,
+        nightlyStatus: enabled ? 'pending' : 'skipped',
+        nightlyFrom: windowFrom,
+        nightlyThrough: enabled ? now : null,
+        nightlyProvider: 'BITRIX24',
+        nightlyBitrixStart: 0,
+        nightlyMoyskladOffset: 0,
+        nightlyRetryAfter: null,
+        nightlyAttempts: 0,
+        nightlyError: enabled ? null : 'Skipped because synchronization was not On and in apply mode at the scheduled time.',
+      },
+    });
+    if (claim.count === 1 && enabled) await this.runNightlyJob();
+  }
+
+  private nightlyWindowStart(now: Date): Date {
+    return new Date(now.getTime() - NIGHTLY_WINDOW_MS);
+  }
+
+  private async runNightlyJob() {
+    if (this.nightlyRunning) return;
+    this.nightlyRunning = true;
+    try {
+      let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+      if (!setting || !['pending', 'running', 'failed'].includes(setting.nightlyStatus) ||
+          !setting.nightlyFrom || !setting.nightlyThrough) return;
+      if ((await this.syncMode.read()).mode !== 'on' || process.env.SYNC_MODE !== 'apply') {
+        await this.database.syncSetting.update({
+          where: { id: 'global' },
+          data: { nightlyStatus: 'skipped', nightlyError: 'Stopped because synchronization left On/apply mode.' },
+        });
+        return;
+      }
+      if (setting.nightlyStatus === 'failed' && setting.nightlyRetryAfter && setting.nightlyRetryAfter > new Date()) return;
+      setting = await this.database.syncSetting.update({
+        where: { id: 'global' },
+        data: {
+          nightlyStatus: 'running', nightlyRetryAfter: null, nightlyError: null,
+          nightlyAttempts: { increment: 1 },
+        },
+      });
+
+      while (setting.nightlyProvider === 'BITRIX24') {
+        const page = await this.readBitrixPage(setting.nightlyFrom!, setting.nightlyThrough!, setting.nightlyBitrixStart);
+        if ((await this.syncMode.read()).mode !== 'on') {
+          await this.markNightlySkipped();
+          return;
+        }
+        await this.saveChangedEvents('BITRIX24', page.ids, setting.nightlyFrom!, setting.nightlyThrough!, `nightly:${setting.nightlyScheduledDate}`);
+        setting = await this.database.syncSetting.update({
+          where: { id: 'global' },
+          data: page.next === null
+            ? { nightlyProvider: 'MOYSKLAD', nightlyBitrixStart: 0 }
+            : { nightlyBitrixStart: page.next },
+        });
+      }
+
+      while (setting.nightlyProvider === 'MOYSKLAD') {
+        const page = await this.readMoyskladPage(setting.nightlyFrom!, setting.nightlyThrough!, setting.nightlyMoyskladOffset);
+        if ((await this.syncMode.read()).mode !== 'on') {
+          await this.markNightlySkipped();
+          return;
+        }
+        await this.saveChangedEvents('MOYSKLAD', page.ids, setting.nightlyFrom!, setting.nightlyThrough!, `nightly:${setting.nightlyScheduledDate}`);
+        if (page.hasNext) {
+          setting = await this.database.syncSetting.update({
+            where: { id: 'global' },
+            data: { nightlyMoyskladOffset: setting.nightlyMoyskladOffset + page.count },
+          });
+        } else {
+          await this.database.syncSetting.update({
+            where: { id: 'global' },
+            data: {
+              nightlyStatus: 'complete', nightlyProvider: 'COMPLETE', nightlyMoyskladOffset: 0,
+              nightlyRetryAfter: null, nightlyError: null,
+            },
+          });
+          return;
+        }
+      }
+    } catch {
+      const current = await this.database.syncSetting.findUnique({
+        where: { id: 'global' }, select: { nightlyAttempts: true },
+      });
+      await this.database.syncSetting.update({
+        where: { id: 'global' },
+        data: {
+          nightlyStatus: 'failed',
+          nightlyError: 'Provider retrieval failed; the incomplete nightly page will be retried while synchronization is On.',
+          nightlyRetryAfter: new Date(Date.now() + retryDelayMs(current?.nightlyAttempts ?? 1)),
+        },
+      }).catch(() => undefined);
+    } finally {
+      this.nightlyRunning = false;
+    }
+  }
+
+  private async markNightlySkipped() {
+    await this.database.syncSetting.update({
+      where: { id: 'global' },
+      data: { nightlyStatus: 'skipped', nightlyError: 'Stopped because synchronization left On mode.' },
+    });
   }
 
   async processPending() {
@@ -62,9 +218,13 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (!setting || !['pending', 'running', 'failed'].includes(setting.resumeStatus) ||
           !setting.resumeFrom || !setting.resumeThrough) return;
+      if (setting.resumeStatus === 'failed' && setting.resumeRetryAfter && setting.resumeRetryAfter > new Date()) return;
       const resumeFrom = setting.resumeFrom;
       const resumeThrough = setting.resumeThrough;
-      await this.database.syncSetting.update({ where: { id: 'global' }, data: { resumeStatus: 'running', resumeError: null } });
+      setting = await this.database.syncSetting.update({
+        where: { id: 'global' },
+        data: { resumeStatus: 'running', resumeError: null, resumeRetryAfter: null, resumeAttempts: { increment: 1 } },
+      });
       await writeOperationalLog(this.database, 'SCHEDULED', 'Off-period recovery started');
 
       while (setting.resumeProvider === 'BITRIX24') {
@@ -87,15 +247,25 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           });
         } else {
           await this.database.syncSetting.update({
-            where: { id: 'global' }, data: { resumeStatus: 'complete', resumeProvider: 'COMPLETE', resumeMoyskladOffset: 0, resumeError: null, offSince: null },
+            where: { id: 'global' }, data: {
+              resumeStatus: 'complete', resumeProvider: 'COMPLETE', resumeMoyskladOffset: 0,
+              resumeError: null, resumeRetryAfter: null, offSince: null,
+            },
           });
           await writeOperationalLog(this.database, 'SCHEDULED', 'Off-period recovery completed');
           return;
         }
       }
     } catch {
+      const current = await this.database.syncSetting.findUnique({
+        where: { id: 'global' }, select: { resumeAttempts: true },
+      });
       await this.database.syncSetting.update({
-        where: { id: 'global' }, data: { resumeStatus: 'failed', resumeError: 'Provider retrieval failed; the resume cursor was not advanced past the incomplete page.' },
+        where: { id: 'global' }, data: {
+          resumeStatus: 'failed',
+          resumeError: 'Provider retrieval failed; the resume cursor was not advanced past the incomplete page.',
+          resumeRetryAfter: new Date(Date.now() + retryDelayMs(current?.resumeAttempts ?? 1)),
+        },
       }).catch(() => undefined);
       await writeOperationalLog(this.database, 'ERROR', 'Off-period recovery failed');
     } finally {
@@ -173,7 +343,13 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     return { ids: ids as string[], count: payload.rows.length, hasNext };
   }
 
-  private async saveChangedEvents(source: 'BITRIX24' | 'MOYSKLAD', ids: string[], from: Date, through: Date) {
+  private async saveChangedEvents(
+    source: 'BITRIX24' | 'MOYSKLAD',
+    ids: string[],
+    from: Date,
+    through: Date,
+    jobKey = `off-resume:${from.toISOString()}:${through.toISOString()}`,
+  ) {
     if (!ids.length) return;
     const pairs = await this.database.contactPair.findMany({
       where: source === 'BITRIX24'
@@ -186,7 +362,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       const externalEntityId = source === 'BITRIX24' ? pair.bitrix24ContactId : pair.moyskladCounterpartyId;
       const direction = source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
       const enabled = await this.syncMode.isDirectionEnabled('contacts-companies', direction);
-      const deliveryKey = `off-resume:${from.toISOString()}:${through.toISOString()}:${externalEntityId}`;
+      const deliveryKey = `${jobKey}:${externalEntityId}`;
       const row = await this.database.inboundEvent.upsert({
         where: { source_deliveryKey: { source, deliveryKey } },
         create: {
@@ -194,7 +370,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           eventType: source === 'BITRIX24' ? 'ONCRMCONTACTUPDATE' : 'UPDATE',
           externalEntityId,
           externalEntityType: source === 'MOYSKLAD' ? 'counterparty' : null,
-          payload: { recovery: 'off-resume', from: from.toISOString(), through: through.toISOString() } as Prisma.InputJsonValue,
+          payload: { recovery: jobKey.startsWith('nightly:') ? 'nightly' : 'off-resume', from: from.toISOString(), through: through.toISOString() } as Prisma.InputJsonValue,
           status: enabled ? 'RECEIVED' : 'SKIPPED_DIRECTION_DISABLED',
           lastErrorCategory: enabled ? null : 'DIRECTION_DISABLED',
         },
@@ -220,4 +396,22 @@ function readId(value: unknown): string | null {
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(5_000 * (2 ** Math.max(0, attempt - 1)), 15 * 60_000);
+}
+
+function localScheduleParts(date: Date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: NIGHTLY_TIME_ZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+  };
 }

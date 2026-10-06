@@ -1,0 +1,11 @@
+ALTER TABLE "SyncSetting"
+ADD COLUMN "nightlyScheduledDate" TEXT,
+ADD COLUMN "nightlyStatus" TEXT NOT NULL DEFAULT 'idle',
+ADD COLUMN "nightlyFrom" TIMESTAMP(3),
+ADD COLUMN "nightlyThrough" TIMESTAMP(3),
+ADD COLUMN "nightlyProvider" TEXT NOT NULL DEFAULT 'BITRIX24',
+ADD COLUMN "nightlyBitrixStart" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN "nightlyMoyskladOffset" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN "nightlyRetryAfter" TIMESTAMP(3),
+ADD COLUMN "nightlyAttempts" INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN "nightlyError" TEXT;

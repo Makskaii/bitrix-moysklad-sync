@@ -24,6 +24,18 @@ model SyncSetting {
   resumeBitrixStart Int @default(0)
   resumeMoyskladOffset Int @default(0)
   resumeError String?
+  resumeRetryAfter DateTime?
+  resumeAttempts Int @default(0)
+  nightlyScheduledDate String?
+  nightlyStatus String @default("idle")
+  nightlyFrom DateTime?
+  nightlyThrough DateTime?
+  nightlyProvider String @default("BITRIX24")
+  nightlyBitrixStart Int @default(0)
+  nightlyMoyskladOffset Int @default(0)
+  nightlyRetryAfter DateTime?
+  nightlyAttempts Int @default(0)
+  nightlyError String?
   updatedAt DateTime @updatedAt
 }
 
@@ -51,9 +63,20 @@ model InboundEvent {
   snapshotRevision Int      @default(0)
   lastSuccessfulAt DateTime?
   lastErrorCategory String?
+  retryAfter       DateTime?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+}
+
+model InboundEntityLock {
+  entityKey String @id
+  ownerToken String
+  eventId String
+  leaseExpiresAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
 }
 
 model ManualReviewCase {

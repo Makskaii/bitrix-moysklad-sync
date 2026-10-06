@@ -52,9 +52,11 @@ export class SyncModeService {
 
   async setMode(mode: ServiceMode) {
     const current = await this.ensureGlobalSetting();
+    if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
     const enteringOff = mode === 'off' && current.serviceMode !== 'off';
     const startingResume = mode === 'on' && current.serviceMode !== 'on' && current.offSince !== null &&
       ['idle', 'complete'].includes(current.resumeStatus);
+    const now = new Date();
     const offSince = enteringOff ? new Date() : current.offSince;
     const setting = await this.database.syncSetting.update({
       where: { id: 'global' },
@@ -69,15 +71,19 @@ export class SyncModeService {
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
           resumeError: null,
+          resumeRetryAfter: null,
+          resumeAttempts: 0,
         } : {}),
         ...(startingResume ? {
           resumeStatus: 'pending',
           resumeFrom: new Date(Math.floor(current.offSince!.getTime() / 1_000) * 1_000),
-          resumeThrough: new Date(),
+          resumeThrough: now,
           resumeProvider: 'BITRIX24',
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
           resumeError: null,
+          resumeRetryAfter: null,
+          resumeAttempts: 0,
         } : {}),
       },
       select: { serviceMode: true },
