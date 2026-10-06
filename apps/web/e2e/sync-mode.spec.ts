@@ -29,6 +29,7 @@ test('risky mode changes require UI confirmation and unavailable directions stay
   ] }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
   await page.goto('/');
+  await page.getByRole('button', { name: 'Настройки', exact: true }).click();
   await page.getByRole('button', { name: 'Выбрать режим on' }).click();
   await expect(page.getByRole('alertdialog')).toContainText('Включение разрешит обработку событий');
   expect(modeWrites).toHaveLength(0);
