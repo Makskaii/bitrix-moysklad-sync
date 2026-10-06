@@ -5,8 +5,10 @@ import {
   GoneException,
   HttpCode,
   Injectable,
+  Logger,
   Param,
   Optional,
+  Inject,
   Post,
   Query,
   Res,
@@ -18,15 +20,18 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
 import { ContactSyncProcessor } from './contact-sync.service';
+import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
+const webhookLogger = new Logger('WebhookIntake');
 
 @Injectable()
 export class EventIntakeService {
   constructor(
     private readonly database: DatabaseService,
     private readonly syncMode: SyncModeService,
+    @Optional() @Inject(WebhookDiagnosticLog) private readonly diagnostics?: WebhookDiagnosticLog,
   ) {}
 
   async receiveBitrix24(payload: EventPayload) {
@@ -38,6 +43,17 @@ export class EventIntakeService {
     const auth = isRecord(payload.auth) ? payload.auth : {};
     const providedToken = typeof auth.application_token === 'string' ? auth.application_token : '';
     if (!constantTimeEqual(providedToken, expectedToken)) {
+      const eventType = readString(payload.event);
+      const diagnostic = {
+        status: 'rejected', source: 'BITRIX24', reason: 'invalid_application_token',
+        eventType: safeDealEventType(eventType), externalEntityId: safeDiagnosticId('BITRIX24', bitrixEntityId(payload)), receivedAt: new Date().toISOString(),
+      };
+      webhookLogger.warn(JSON.stringify(diagnostic));
+      if (diagnostic.eventType) this.diagnostics?.record({
+        source: 'BITRIX24', eventType: diagnostic.eventType, entityType: 'deal',
+        externalEntityId: diagnostic.externalEntityId, status: 'rejected_validation', reason: diagnostic.reason,
+        receivedAt: diagnostic.receivedAt,
+      });
       throw new UnauthorizedException();
     }
 
@@ -53,7 +69,7 @@ export class EventIntakeService {
     return this.save('BITRIX24', sha256(canonicalJson(safePayload)), {
       eventType,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
-      externalEntityType: null,
+      externalEntityType: bitrixEntityType(eventType),
       payload: safePayload,
     }, directionDisabled);
   }
@@ -70,6 +86,20 @@ export class EventIntakeService {
     }
 
     if (!constantTimeEqual(pathSecret, expectedSecret)) {
+      const rejectedEvent = readMoySkladEvents(payload ?? {}, query)[0];
+      const diagnostic = {
+        status: 'rejected', source: 'MOYSKLAD', reason: 'invalid_secret',
+        eventType: rejectedEvent.eventType, externalEntityType: rejectedEvent.externalEntityType,
+        externalEntityId: safeDiagnosticId('MOYSKLAD', rejectedEvent.externalEntityId), receivedAt: new Date().toISOString(),
+      };
+      webhookLogger.warn(JSON.stringify(diagnostic));
+      if (diagnostic.externalEntityType === 'customerorder' && diagnostic.eventType && ['CREATE', 'UPDATE', 'DELETE'].includes(diagnostic.eventType)) {
+        this.diagnostics?.record({
+          source: 'MOYSKLAD', eventType: diagnostic.eventType, entityType: diagnostic.externalEntityType,
+          externalEntityId: diagnostic.externalEntityId, status: 'rejected_validation', reason: diagnostic.reason,
+          receivedAt: diagnostic.receivedAt,
+        });
+      }
       throw new UnauthorizedException();
     }
 
@@ -79,17 +109,31 @@ export class EventIntakeService {
     }
 
     const safePayload = payload ?? {};
-    const nativeEvent = readMoySkladEvent(safePayload);
-    const deliveryKey = typeof requestId === 'string' ? `request:${requestId}` : `unkeyed:${randomUUID()}`;
-    const eventType = nativeEvent.eventType ?? readString(safePayload.event) ?? readString(safePayload.action) ?? readString(query.type);
-    const directionDisabled = eventType === 'UPDATE' && nativeEvent.externalEntityType === 'counterparty' &&
-      !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
-    return this.save('MOYSKLAD', deliveryKey, {
-      eventType,
-      externalEntityId: nativeEvent.externalEntityId ?? readString(safePayload.id) ?? readString(query.id),
-      externalEntityType: nativeEvent.externalEntityType,
-      payload: safePayload,
-    }, directionDisabled);
+    if (Array.isArray(safePayload.events) &&
+      (safePayload.events.length === 0 || safePayload.events.some((event) => !isRecord(event)))) {
+      throw new BadRequestException('MoySklad events must be a non-empty array of event objects');
+    }
+    const events = readMoySkladEvents(safePayload, query);
+    const eventIds: string[] = [];
+    const contactEventIds: string[] = [];
+    for (const [index, event] of events.entries()) {
+      const deliveryKey = typeof requestId === 'string'
+        ? `request:${JSON.stringify([requestId, index])}`
+        : `unkeyed:${randomUUID()}`;
+      const directionDisabled = event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty' &&
+        !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
+      const acknowledgement = await this.save('MOYSKLAD', deliveryKey, {
+        eventType: event.eventType,
+        externalEntityId: event.externalEntityId,
+        externalEntityType: event.externalEntityType,
+        payload: { ...safePayload, ...(Array.isArray(safePayload.events) ? { events: [event.payload] } : {}) },
+      }, directionDisabled);
+      eventIds.push(acknowledgement.eventId);
+      if (event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty') {
+        contactEventIds.push(acknowledgement.eventId);
+      }
+    }
+    return { accepted: true, eventId: eventIds[0], eventIds, contactEventIds };
   }
 
   private async ensureIntakeEnabled() {
@@ -108,7 +152,9 @@ export class EventIntakeService {
     event: { eventType: string | null; externalEntityId: string | null; externalEntityType: string | null; payload: EventPayload },
     directionDisabled = false,
   ) {
-    const row = await this.database.inboundEvent.upsert({
+    let row: { id: string };
+    try {
+      row = await this.database.inboundEvent.upsert({
       where: { source_deliveryKey: { source, deliveryKey } },
       create: {
         source,
@@ -122,7 +168,29 @@ export class EventIntakeService {
       },
       update: {},
       select: { id: true },
-    });
+      });
+    } catch {
+      const receivedAt = new Date().toISOString();
+      const supportedType = source === 'BITRIX24'
+        ? safeDealEventType(event.eventType)
+        : event.externalEntityType === 'customerorder' && event.eventType && ['CREATE', 'UPDATE', 'DELETE'].includes(event.eventType)
+          ? event.eventType
+          : null;
+      const reason = 'event_persistence_failed';
+      const diagnostic = safeDiagnosticDetails(source, event);
+      if (supportedType && diagnostic) this.diagnostics?.record({
+        source, eventType: supportedType, entityType: source === 'BITRIX24' ? 'deal' : 'customerorder',
+        externalEntityId: diagnostic.externalEntityId, status: 'processing_error', reason, receivedAt,
+      });
+      if (supportedType && diagnostic) webhookLogger.error(JSON.stringify({ status: 'processing_error', ...diagnostic, reason, receivedAt }));
+      throw new ServiceUnavailableException('Event persistence failed');
+    }
+
+    const diagnostic = safeDiagnosticDetails(source, event);
+    if (diagnostic) webhookLogger.log(JSON.stringify({
+      status: 'received', ...diagnostic, eventId: row.id, receivedAt: new Date().toISOString(),
+      ...(directionDisabled ? { reason: 'direction_disabled' } : {}),
+    }));
 
     return { accepted: true, eventId: row.id };
   }
@@ -143,7 +211,9 @@ export class EventsController {
   ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
     const acknowledgement = await this.intake.receiveBitrix24(payload);
-    response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    if (isContactBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    }
     return acknowledgement;
   }
 
@@ -158,8 +228,11 @@ export class EventsController {
   ) {
     if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
     return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
-      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
-      return acknowledgement;
+      if (acknowledgement.contactEventIds.length > 0) {
+        response.once('finish', () => acknowledgement.contactEventIds.forEach((eventId) => this.contactSync?.enqueue(eventId)));
+      }
+      const { contactEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
+      return eventIds.length > 1 ? { ...singleEventAcknowledgement, eventIds } : singleEventAcknowledgement;
     });
   }
 }
@@ -208,4 +281,72 @@ function readMoySkladEvent(payload: EventPayload): {
   const externalEntityId = hrefParts.at(-1) ?? null;
   const externalEntityType = readString(meta.type)?.toLowerCase() ?? hrefParts.at(-2)?.toLowerCase() ?? null;
   return { eventType: readString(firstEvent.action), externalEntityId, externalEntityType };
+}
+
+function readMoySkladEvents(payload: EventPayload, query: Record<string, unknown>): Array<{
+  eventType: string | null;
+  externalEntityId: string | null;
+  externalEntityType: string | null;
+  payload: EventPayload;
+}> {
+  const events = Array.isArray(payload.events) ? payload.events.filter(isRecord) : [];
+  const sourceEvents = events.length > 0 ? events : [payload];
+  return sourceEvents.map((event) => {
+    const native = readMoySkladEvent({ events: [event] });
+    return {
+      eventType: native.eventType ?? readString(event.event) ?? readString(event.action) ?? readString(query.type),
+      externalEntityId: native.externalEntityId ?? readString(event.id) ?? readString(query.id),
+      externalEntityType: native.externalEntityType ?? normalizeMoySkladType(readString(query.type)),
+      payload: event,
+    };
+  });
+}
+
+function normalizeMoySkladType(value: string | null): string | null {
+  return value?.toLowerCase() === 'customerorder' ? 'customerorder' : value?.toLowerCase() ?? null;
+}
+
+function safeDealEventType(value: string | null): string | null {
+  return value && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(value) ? value : null;
+}
+
+function bitrixEntityType(value: string | null): string | null {
+  if (value?.startsWith('ONCRMDEAL')) return 'deal';
+  if (value?.startsWith('ONCRMCONTACT')) return 'contact';
+  if (value?.startsWith('ONCRMCOMPANY')) return 'company';
+  return null;
+}
+
+function bitrixEntityId(payload: EventPayload): string | null {
+  const data = isRecord(payload.data) ? payload.data : {};
+  const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
+  return readString(fields.ID) ?? readString(data.ID);
+}
+
+function safeDiagnosticDetails(
+  source: InboundSource,
+  event: { eventType: string | null; externalEntityId: string | null; externalEntityType: string | null },
+) {
+  if (source === 'BITRIX24') {
+    const eventType = safeDealEventType(event.eventType);
+    if (!eventType) return null;
+    return { source, eventType, entityType: 'deal', externalEntityId: safeDiagnosticId(source, event.externalEntityId) };
+  }
+  if (event.externalEntityType !== 'customerorder' || !event.eventType || !['CREATE', 'UPDATE', 'DELETE'].includes(event.eventType)) return null;
+  return {
+    source,
+    eventType: event.eventType,
+    entityType: 'customerorder',
+    externalEntityId: safeDiagnosticId(source, event.externalEntityId),
+  };
+}
+
+function safeDiagnosticId(source: InboundSource, value: string | null): string | null {
+  if (!value) return null;
+  if (source === 'BITRIX24') return /^\d{1,20}$/.test(value) ? value : null;
+  return /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(value) ? value : null;
+}
+
+function isContactBitrixEvent(value: string | null): boolean {
+  return value?.startsWith('ONCRMCONTACT') === true;
 }
