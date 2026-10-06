@@ -10,6 +10,8 @@ import { ContactSyncProcessor, ContactSyncStatusReader } from './contact-sync.se
 import { EventsController, EventIntakeService } from './events.controller';
 import { SyncModeService } from './sync-mode.service';
 import { SyncRecoveryService } from './sync-recovery.service';
+import { WebhookDiagnosticsController } from './webhook-diagnostics.controller';
+import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 
 @Controller()
 class AppController {
@@ -24,8 +26,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, SyncModeController, EventsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService],
+  controllers: [AppController, AdminController, ContactSyncStatusController, SyncModeController, EventsController, WebhookDiagnosticsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService],
 })
 class AppModule {}
 
