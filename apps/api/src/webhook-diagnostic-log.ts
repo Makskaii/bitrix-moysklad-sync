@@ -22,4 +22,8 @@ export class WebhookDiagnosticLog {
   read() {
     return [...this.entries].reverse();
   }
+
+  clear() {
+    this.entries.length = 0;
+  }
 }

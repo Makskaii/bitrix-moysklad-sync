@@ -19,6 +19,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
+import { writeOperationalLog } from './monitoring-log';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 
@@ -186,6 +187,7 @@ export class EventIntakeService {
       throw new ServiceUnavailableException('Event persistence failed');
     }
 
+    void writeOperationalLog(this.database, 'EVENT', 'Inbound event accepted', row.id);
     const diagnostic = safeDiagnosticDetails(source, event);
     if (diagnostic) webhookLogger.log(JSON.stringify({
       status: 'received', ...diagnostic, eventId: row.id, receivedAt: new Date().toISOString(),
