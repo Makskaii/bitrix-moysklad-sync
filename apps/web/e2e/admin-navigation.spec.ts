@@ -1,5 +1,12 @@
 import { expect, test } from '@playwright/test';
 
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/admin/monitoring/queue**', (route) => route.fulfill({ json: { counts: {}, events: [], nextCursor: null } }));
+  await page.route('**/api/admin/monitoring/incidents**', (route) => route.fulfill({ json: { cases: [], nextCursor: null } }));
+  await page.route('**/api/admin/monitoring/logs**', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));
+  await page.route('**/api/admin/monitoring/api-attempts**', (route) => route.fulfill({ json: { attempts: [], nextCursor: null } }));
+});
+
 test('administrator can navigate the agreed shell without placeholder actions sending writes', async ({ page }) => {
   test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
 
@@ -21,6 +28,16 @@ test('administrator can navigate the agreed shell without placeholder actions se
     if (route.request().method() !== 'GET') writes.push(route.request().url());
     return route.fulfill({ json: { mode: 'off' } });
   });
+  await page.route('**/api/admin/monitoring/queue', (route) => route.fulfill({ json: {
+    counts: { RECEIVED: 1 }, events: [{ id: 'event-1', source: 'BITRIX24', eventType: 'ONCRMDEALUPDATE', externalEntityId: '42', status: 'RECEIVED', receivedAt: '2026-10-06T10:00:00.000Z', attempts: 0, direction: null, lastErrorCategory: null }], nextCursor: null,
+  } }));
+  await page.route('**/api/admin/monitoring/incidents?*', (route) => route.fulfill({ json: {
+    cases: [{ id: 'incident-1', eventId: 'event-1', source: 'BITRIX24', externalEntityId: '42', reason: 'validation_failed', diagnostic: null, status: 'OPEN', openedAt: '2026-10-06T10:00:00.000Z' }], nextCursor: null,
+  } }));
+  await page.route('**/api/admin/monitoring/logs?*', (route) => route.fulfill({ json: {
+    entries: [{ id: 'log-1', category: 'EVENT', message: 'Inbound event accepted', referenceId: 'event-1', occurredAt: '2026-10-06T10:00:00.000Z' }], nextCursor: null,
+  } }));
+  await page.route('**/api/admin/monitoring/api-attempts', (route) => route.fulfill({ json: { attempts: [], nextCursor: null } }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
 
   await page.goto('/');
@@ -35,19 +52,22 @@ test('administrator can navigate the agreed shell without placeholder actions se
     ['Настройки', 'Настройки сущностей и направлений'],
     ['Справочники', 'Справочники'],
     ['Соответствия полей', 'Соответствия полей'],
-    ['Логи', 'Логи'],
+    ['Логи', 'Логи и история API'],
   ];
   for (const [label, heading] of sections) {
     await page.getByRole('button', { name: label }).click();
     await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
   }
 
+  await page.getByRole('button', { name: 'Очередь и попытки' }).click();
+  await expect(page.getByText('ONCRMDEALUPDATE')).toBeVisible();
+  await page.getByRole('button', { name: 'Ручная проверка' }).click();
+  await expect(page.getByText('validation_failed')).toBeVisible();
+  await page.getByRole('button', { name: 'Логи', exact: true }).click();
+  await expect(page.getByText('Inbound event accepted')).toBeVisible();
+
   await page.getByRole('button', { name: 'Соответствия полей' }).click();
   await expect(page.getByText('Функция в разработке')).toBeVisible();
-  await page.getByRole('button', { name: 'Логи', exact: true }).click();
-  const disabledActions = page.getByRole('button', { name: 'Просмотреть журнал' });
-  await expect(disabledActions).toBeDisabled();
-  await disabledActions.click({ force: true });
   expect(writes).toEqual([]);
 });
 
@@ -142,4 +162,27 @@ test('settings show a failure instead of implying a successful update', async ({
   await expect(page.getByRole('alert')).toContainText('Не удалось изменить режим обмена');
   await expect(page.getByRole('alertdialog')).toBeVisible();
   await expect(page.getByRole('navigation', { name: 'Разделы админки' })).toBeVisible();
+});
+
+test('monitoring closes the admin workspace when a protected action is denied', async ({ page }) => {
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+
+  await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
+  await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
+  await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [] }));
+  await page.route('**/api/admin/sync-mode/recovery', (route) => route.fulfill({ json: { status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null } }));
+  await page.route('**/api/admin/sync-mode', (route) => route.fulfill({ json: { mode: 'off' } }));
+  await page.route('**/api/admin/monitoring/incidents?*', (route) => route.fulfill({ json: {
+    cases: [{ id: 'incident-1', eventId: 'event-1', source: 'BITRIX24', externalEntityId: '42', reason: 'validation_failed', diagnostic: null, status: 'OPEN', openedAt: '2026-10-06T10:00:00.000Z' }], nextCursor: null,
+  } }));
+  await page.route('**/api/admin/monitoring/incidents/*/retry', (route) => route.fulfill({ status: 403, json: { message: 'Administrator access required' } }));
+  await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Ручная проверка' }).click();
+  await page.getByRole('button', { name: 'Повторить' }).click();
+
+  await expect(page.getByRole('heading', { name: 'Доступ закрыт' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Разделы админки' })).toHaveCount(0);
+  await expect(page.getByRole('alert')).toContainText('Доступ только для администратора Bitrix24');
 });

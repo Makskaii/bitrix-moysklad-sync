@@ -56,6 +56,46 @@ model InboundEvent {
   @@index([status, receivedAt])
 }
 
+model ManualReviewCase {
+  id                String   @id @default(cuid())
+  eventId           String   @unique
+  source            String
+  eventType         String?
+  externalEntityId  String?
+  externalEntityType String?
+  reason            String
+  diagnostic        Json?
+  status            String   @default("OPEN")
+  openedAt          DateTime @default(now())
+  resolvedAt        DateTime?
+
+  @@index([status, openedAt])
+}
+
+model ApiAttempt {
+  id         String   @id @default(cuid())
+  eventId    String?
+  provider   String
+  operation  String
+  method     String
+  statusCode Int?
+  succeeded  Boolean
+  occurredAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([provider, occurredAt])
+}
+
+model OperationalLog {
+  id          String   @id @default(cuid())
+  category    String
+  message     String
+  referenceId String?
+  occurredAt  DateTime @default(now())
+
+  @@index([category, occurredAt])
+}
+
 model ContactPair {
   id                      String           @id @default(cuid())
   bitrix24ContactId       String           @unique

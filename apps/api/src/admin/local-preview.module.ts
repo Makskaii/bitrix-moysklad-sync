@@ -9,6 +9,8 @@ import { SyncRecoveryService } from '../sync-recovery.service';
 import { ContactSyncProcessor, ContactSyncStatusReader } from '../contact-sync.service';
 import { ContactSyncStatusController } from './contact-sync-status.controller';
 import { EventsController, EventIntakeService } from '../events.controller';
+import { MonitoringController } from './monitoring.controller';
+import { RetentionService } from '../retention.service';
 import { WebhookDiagnosticsController } from '../webhook-diagnostics.controller';
 import { WebhookDiagnosticLog } from '../webhook-diagnostic-log';
 
@@ -17,7 +19,7 @@ export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, SyncModeController, ContactSyncStatusController, EventsController, WebhookDiagnosticsController],
+      controllers: [PreviewHealthController, AdminController, AdminPreviewController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController],
       providers: [
         databaseProvider,
         SyncModeService,
@@ -25,6 +27,7 @@ export class LocalAdminPreviewModule {
         ContactSyncProcessor,
         ContactSyncStatusReader,
         EventIntakeService,
+        RetentionService,
         WebhookDiagnosticLog,
         { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
         AdminAccessGuard,

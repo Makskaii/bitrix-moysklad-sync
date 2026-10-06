@@ -2,11 +2,17 @@ import { BadRequestException, Body, ConflictException, Controller, Get, Param, P
 import { AdminAccessGuard } from './admin-access.guard';
 import { ServiceMode, SyncModeService } from '../sync-mode.service';
 import { SyncRecoveryService } from '../sync-recovery.service';
+import { DatabaseService } from '../database.service';
+import { writeOperationalLog } from '../monitoring-log';
 
 @Controller('api/admin/sync-mode')
 @UseGuards(AdminAccessGuard)
 export class SyncModeController {
-  constructor(private readonly syncMode: SyncModeService, private readonly recovery: SyncRecoveryService) {}
+  constructor(
+    private readonly syncMode: SyncModeService,
+    private readonly recovery: SyncRecoveryService,
+    private readonly database: DatabaseService,
+  ) {}
 
   @Get()
   read() {
@@ -24,6 +30,7 @@ export class SyncModeController {
       }
       return this.syncMode.setMode(body.mode as ServiceMode);
     }).then((result) => {
+      void writeOperationalLog(this.database, 'ADMIN', `Service mode set to ${result.mode}`);
       if (result.mode === 'on') void this.recovery.processPending();
       return result;
     });
@@ -52,10 +59,12 @@ export class SyncModeController {
     if (changed && body.confirmed !== true) {
       throw new ConflictException('Explicit confirmation is required for direction changes');
     }
-    return this.syncMode.setEntityDirections(entityKey, {
+    const result = await this.syncMode.setEntityDirections(entityKey, {
       bitrix24ToMoysklad: body.bitrix24ToMoysklad,
       moyskladToBitrix24: body.moyskladToBitrix24,
     });
+    if (changed) await writeOperationalLog(this.database, 'ADMIN', `Directions updated for ${entityKey}`);
+    return result;
   }
 
 }

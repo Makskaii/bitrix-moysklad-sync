@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { SyncModeService } from './sync-mode.service';
+import { writeOperationalLog } from './monitoring-log';
 
 const MOYSKLAD_PAGE_SIZE = 1_000;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -64,6 +65,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       const resumeFrom = setting.resumeFrom;
       const resumeThrough = setting.resumeThrough;
       await this.database.syncSetting.update({ where: { id: 'global' }, data: { resumeStatus: 'running', resumeError: null } });
+      await writeOperationalLog(this.database, 'SCHEDULED', 'Off-period recovery started');
 
       while (setting.resumeProvider === 'BITRIX24') {
         const page = await this.readBitrixPage(resumeFrom, resumeThrough, setting.resumeBitrixStart);
@@ -87,6 +89,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           await this.database.syncSetting.update({
             where: { id: 'global' }, data: { resumeStatus: 'complete', resumeProvider: 'COMPLETE', resumeMoyskladOffset: 0, resumeError: null, offSince: null },
           });
+          await writeOperationalLog(this.database, 'SCHEDULED', 'Off-period recovery completed');
           return;
         }
       }
@@ -94,6 +97,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       await this.database.syncSetting.update({
         where: { id: 'global' }, data: { resumeStatus: 'failed', resumeError: 'Provider retrieval failed; the resume cursor was not advanced past the incomplete page.' },
       }).catch(() => undefined);
+      await writeOperationalLog(this.database, 'ERROR', 'Off-period recovery failed');
     } finally {
       this.running = false;
       if (this.rerunRequested) {
@@ -115,10 +119,17 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       'select[]': 'ID',
       start: String(start),
     });
-    const response = await fetch(url, {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt('BITRIX24', 'crm.contact.list', 'POST', null, false);
+      throw error;
+    }
+    await this.recordApiAttempt('BITRIX24', 'crm.contact.list', 'POST', response.status, response.ok);
     if (!response.ok) throw new Error('Bitrix24 changed-record query failed');
     const payload: unknown = await response.json();
     if (!isRecord(payload) || payload.error || !Array.isArray(payload.result)) throw new Error('Bitrix24 changed-record query failed');
@@ -138,10 +149,17 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     url.searchParams.set('order', 'updated,asc');
     url.searchParams.set('limit', String(MOYSKLAD_PAGE_SIZE));
     url.searchParams.set('offset', String(offset));
-    const response = await fetch(url, {
-      method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', null, false);
+      throw error;
+    }
+    await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', response.status, response.ok);
     if (!response.ok) throw new Error('MoySklad changed-record query failed');
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) || typeof payload.meta.size !== 'number') {
@@ -184,6 +202,14 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         select: { id: true, status: true },
       });
       if (enabled && ['RECEIVED', 'RETRYABLE_FAILURE'].includes(row.status)) this.processor.enqueue(row.id);
+    }
+  }
+
+  private async recordApiAttempt(provider: string, operation: string, method: string, statusCode: number | null, succeeded: boolean) {
+    try {
+      await this.database.apiAttempt.create({ data: { provider, operation, method, statusCode, succeeded } });
+    } catch {
+      // API history is supplementary; a logging failure cannot change recovery behavior.
     }
   }
 }

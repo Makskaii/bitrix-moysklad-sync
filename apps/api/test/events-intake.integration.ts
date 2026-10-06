@@ -83,6 +83,7 @@ class EventsIntakeTestModule {}
 
 let app: INestApplication;
 let apiUrl: string;
+let webhookDiagnostics: WebhookDiagnosticLog;
 
 before(async () => {
   process.env.SYNC_MODE = 'apply';
@@ -91,6 +92,7 @@ before(async () => {
   process.env['MOYSKLAD_WEBHOOK_SECRET'] = 'moysklad-test-path-secret';
   process.env.ADMIN_PREVIEW = '1';
   app = await NestFactory.create(EventsIntakeTestModule, { logger: false });
+  webhookDiagnostics = app.get(WebhookDiagnosticLog);
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
 });
@@ -101,6 +103,7 @@ after(async () => {
 
 test('dry webhook diagnostics initially report all deal and customer-order subscriptions as unchecked', async () => {
   rows.clear();
+  webhookDiagnostics.clear();
   process.env.SYNC_MODE = 'dry';
   const response = await fetch(`${apiUrl}/api/admin/dry-webhooks`);
   assert.equal(response.status, 200);
@@ -353,10 +356,11 @@ test('dry deal and customer-order webhook matrix accepts create, update, and del
 test('dry webhook diagnostics show deal and customer-order delivery state without payload data', async () => {
   rows.clear();
   process.env.SYNC_MODE = 'dry';
+  const mostRecentEventAt = new Date(Date.now() + 60_000);
   rows.set('BITRIX24:diagnostic', {
     id: 'event-safe-id', source: 'BITRIX24', deliveryKey: 'diagnostic', eventType: 'ONCRMDEALUPDATE',
     externalEntityId: '42', externalEntityType: 'deal', payload: { email: 'private@example.test', auth: { application_token: 'secret' } },
-    status: 'RECEIVED', receivedAt: new Date('2026-10-06T10:00:00.000Z'), lastErrorCategory: null,
+    status: 'RECEIVED', receivedAt: mostRecentEventAt, lastErrorCategory: null,
   });
 
   const response = await fetch(`${apiUrl}/api/admin/dry-webhooks`);
@@ -371,7 +375,7 @@ test('dry webhook diagnostics show deal and customer-order delivery state withou
   assert.equal(report.subscriptions.find((item) => item.eventType === 'ONCRMDEALUPDATE')?.status, 'event_received');
   assert.equal(report.subscriptions.find((item) => item.eventType === 'DELETE' && item.source === 'MOYSKLAD')?.status, 'rejected_validation');
   assert.equal(report.events[0].externalEntityId, '42');
-  assert.equal(report.events[0].receivedAt, '2026-10-06T10:00:00.000Z');
+  assert.equal(report.events[0].receivedAt, mostRecentEventAt.toISOString());
   assert.equal(JSON.stringify(report).includes('private@example.test'), false);
   assert.equal(JSON.stringify(report).includes('moysklad-test-path-secret'), false);
   assert.equal(JSON.stringify(report).includes('bitrix-test-application-token'), false);
