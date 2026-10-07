@@ -26,6 +26,11 @@ export class FieldSettingsController {
     return this.service().catalogs(accessToken(request));
   }
 
+  @Get('fields')
+  fields(@Req() request: RequestWithHeaders, @Query('entity') entity?: string, @Query('pairId') pairId?: string) {
+    return this.service().fieldCatalogs(accessToken(request), { entity, pairId });
+  }
+
   @Get('versions/:version')
   version(@Param('version', ParseIntPipe) version: number) {
     return this.service().version(version);

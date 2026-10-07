@@ -431,9 +431,9 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     let value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
     const configuredTransform = this.fieldSettings?.transformField(
       pinnedConfig,
-      'contacts-companies',
+      'contacts',
       direction,
-      'email',
+      direction === 'BITRIX24_TO_MOYSKLAD' ? 'email' : 'EMAIL',
       direction === 'BITRIX24_TO_MOYSKLAD' ? { EMAIL: bitrixContact.EMAIL, email: bitrixEmail } : { email: moyskladEmail },
     );
     if (configuredTransform) {

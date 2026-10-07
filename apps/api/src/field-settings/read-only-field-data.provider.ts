@@ -1,4 +1,5 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 
 export type CatalogCandidate = { id: string; code: string; label: string };
 export type LiveFieldCatalogs = {
@@ -10,6 +11,7 @@ export type PairSnapshot = {
   sourceValues: Record<string, unknown>;
   targetCurrent: Record<string, unknown>;
 };
+export type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null };
 
 const PAGE_SIZE = 50;
 const MAX_PAGES = 20;
@@ -36,17 +38,58 @@ export class ReadOnlyFieldDataProvider {
     };
   }
 
+  async dictionaryCatalogs(bitrixAccessToken: string) {
+    return Promise.all(DEFAULT_FIELD_SETTINGS.references.dictionaries.map(async (dictionary) => {
+      const [bitrixRows, moyskladRows] = await Promise.all([
+        this.bitrixListElements(bitrixAccessToken, dictionary.bitrix24ListId),
+        this.moyskladList(`/entity/customentity/${encodeURIComponent(dictionary.moyskladDirectoryId)}`),
+      ]);
+      return {
+        key: dictionary.key,
+        bitrix24: bitrixRows.map((row) => ({ id: text(row.ID ?? row.id), title: text(row.NAME ?? row.name), code: text(row.CODE ?? row.code) })),
+        moysklad: moyskladRows.map((row) => ({ id: text(row.id), title: text(row.name), code: text(row.code) })),
+      };
+    }));
+  }
+
   async readPair(bitrixAccessToken: string, entity: string, sourceId: string, targetId: string): Promise<PairSnapshot> {
     const contract = pairContract(entity, sourceId, targetId);
     const [source, target] = await Promise.all([
       this.bitrixCall(bitrixAccessToken, contract.bitrixMethod, contract.bitrixParams),
       this.moyskladGet(contract.moyskladPath),
     ]);
+    const sourceRecord = unwrapSource(entity, source);
     return {
-      sourceLabel: sourceLabel(source),
-      sourceValues: asRecord(source),
+      sourceLabel: sourceLabel(sourceRecord),
+      sourceValues: sourceRecord,
       targetCurrent: asRecord(target),
     };
+  }
+
+  async fieldCatalogs(bitrixAccessToken: string, entity: string, sourceId: string, targetId: string) {
+    const contract = pairContract(entity, sourceId, targetId);
+    const snapshot = await this.readPair(bitrixAccessToken, entity, sourceId, targetId);
+    const fieldParams = { ...contract.bitrixFieldsParams };
+    if (entity === 'catalog') {
+      const iblockId = snapshot.sourceValues.iblockId;
+      if (typeof iblockId !== 'number' && typeof iblockId !== 'string') {
+        throw new ServiceUnavailableException('Bitrix24 product did not include an information-block ID for field metadata');
+      }
+      fieldParams['filter[iblockId]'] = String(iblockId);
+    }
+    const bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, fieldParams);
+    const bitrix24 = describeBitrixFields(bitrixResult);
+    const resourcePath = contract.moyskladPath.split('/').slice(0, -1).join('/');
+    const metadata = await this.moyskladGet(`${resourcePath}/metadata/attributes`);
+    const attributeRows = isRecord(metadata) && Array.isArray(metadata.rows) ? metadata.rows.filter(isRecord) : [];
+    const moyskladAttributes: FieldCandidate[] = attributeRows.flatMap((row) => {
+      if (typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.type !== 'string') return [];
+      return [{ code: `attributes.${row.id}`, title: row.name, type: row.type, writable: null }];
+    });
+    const moyskladStandard: FieldCandidate[] = Object.entries(snapshot.targetCurrent)
+      .filter(([code]) => !['meta', 'attributes', 'positions', 'files', 'owner', 'group', 'updated', 'created'].includes(code))
+      .map(([code, value]) => ({ code, title: code, type: valueType(value), writable: null }));
+    return { entity, bitrix24, moysklad: deduplicateFields([...moyskladStandard, ...moyskladAttributes]) };
   }
 
   private async bitrixList(accessToken: string, method: string): Promise<Array<Record<string, unknown>>> {
@@ -63,6 +106,21 @@ export class ReadOnlyFieldDataProvider {
       start += PAGE_SIZE;
     }
     throw new ServiceUnavailableException(`Bitrix24 ${method} catalog exceeds the supported ${MAX_PAGES * PAGE_SIZE} records; use a narrower catalog filter`);
+  }
+
+  private async bitrixListElements(accessToken: string, listId: string): Promise<Array<Record<string, unknown>>> {
+    const rows: Array<Record<string, unknown>> = [];
+    for (let page = 0, start = 0; page < MAX_PAGES; page += 1, start += PAGE_SIZE) {
+      const result = await this.bitrixCall(accessToken, 'lists.element.get', {
+        IBLOCK_TYPE_ID: 'lists', IBLOCK_ID: listId, start,
+        'SELECT[0]': 'ID', 'SELECT[1]': 'CODE', 'SELECT[2]': 'NAME',
+      });
+      if (!Array.isArray(result)) throw new ServiceUnavailableException(`Bitrix24 returned an invalid list ${listId}`);
+      const pageRows = result.filter(isRecord);
+      rows.push(...pageRows);
+      if (pageRows.length < PAGE_SIZE) return rows;
+    }
+    throw new ServiceUnavailableException(`Bitrix24 list ${listId} exceeds the supported ${MAX_PAGES * PAGE_SIZE} records`);
   }
 
   private async bitrixCall(accessToken: string, method: string, params: Record<string, string | number>): Promise<unknown> {
@@ -111,17 +169,56 @@ export class ReadOnlyFieldDataProvider {
   }
 }
 
-function pairContract(entity: string, sourceId: string, targetId: string): { bitrixMethod: string; bitrixParams: Record<string, string | number>; moyskladPath: string } {
+function pairContract(entity: string, sourceId: string, targetId: string): {
+  bitrixMethod: string;
+  bitrixParams: Record<string, string | number>;
+  bitrixFieldsMethod: string;
+  bitrixFieldsParams: Record<string, string | number>;
+  moyskladPath: string;
+} {
   const msId = encodeURIComponent(targetId);
   switch (entity) {
     case 'contacts-companies':
-    case 'contacts': return { bitrixMethod: 'crm.contact.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/counterparty/${msId}` };
-    case 'companies': return { bitrixMethod: 'crm.company.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/counterparty/${msId}` };
-    case 'deals-orders': return { bitrixMethod: 'crm.deal.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/customerorder/${msId}` };
-    case 'smart-invoices': return { bitrixMethod: 'crm.item.get', bitrixParams: { entityTypeId: 31, id: sourceId }, moyskladPath: `entity/invoiceout/${msId}` };
-    case 'catalog': return { bitrixMethod: 'catalog.product.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/product/${msId}` };
+    case 'contacts': return { bitrixMethod: 'crm.contact.get', bitrixParams: { id: sourceId }, bitrixFieldsMethod: 'crm.contact.fields', bitrixFieldsParams: {}, moyskladPath: `entity/counterparty/${msId}` };
+    case 'companies': return { bitrixMethod: 'crm.company.get', bitrixParams: { id: sourceId }, bitrixFieldsMethod: 'crm.company.fields', bitrixFieldsParams: {}, moyskladPath: `entity/counterparty/${msId}` };
+    case 'deals-orders': return { bitrixMethod: 'crm.deal.get', bitrixParams: { id: sourceId }, bitrixFieldsMethod: 'crm.deal.fields', bitrixFieldsParams: {}, moyskladPath: `entity/customerorder/${msId}` };
+    case 'smart-invoices': return { bitrixMethod: 'crm.item.get', bitrixParams: { entityTypeId: 31, id: sourceId }, bitrixFieldsMethod: 'crm.item.fields', bitrixFieldsParams: { entityTypeId: 31 }, moyskladPath: `entity/invoiceout/${msId}` };
+    case 'catalog': return { bitrixMethod: 'catalog.product.get', bitrixParams: { id: sourceId }, bitrixFieldsMethod: 'catalog.product.getFieldsByFilter', bitrixFieldsParams: {}, moyskladPath: `entity/product/${msId}` };
     default: throw new ServiceUnavailableException('This entity type has no read-only pair provider');
   }
+}
+
+function unwrapSource(entity: string, value: unknown): Record<string, unknown> {
+  const root = asRecord(value);
+  if (entity === 'smart-invoices' && isRecord(root.item)) return root.item;
+  if (entity === 'catalog' && isRecord(root.product)) return root.product;
+  return root;
+}
+
+function describeBitrixFields(value: unknown): FieldCandidate[] {
+  const root = asRecord(value);
+  const candidates = isRecord(root.fields) ? root.fields : isRecord(root.product) ? root.product : root;
+  return Object.entries(candidates).flatMap(([code, definition]) => {
+    if (!isRecord(definition) || code === 'time' || code === 'item') return [];
+    const title = typeof definition.title === 'string' ? definition.title : typeof definition.name === 'string' ? definition.name : code;
+    const type = typeof definition.type === 'string' ? definition.type : typeof definition.userTypeId === 'string' ? definition.userTypeId : 'unknown';
+    return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null }];
+  });
+}
+
+function deduplicateFields(fields: FieldCandidate[]): FieldCandidate[] {
+  const seen = new Set<string>();
+  return fields.filter((field) => {
+    if (seen.has(field.code)) return false;
+    seen.add(field.code);
+    return true;
+  });
+}
+
+function valueType(value: unknown): string {
+  if (value === null || value === undefined) return 'unknown';
+  if (Array.isArray(value)) return 'array';
+  return typeof value === 'object' ? 'object' : typeof value;
 }
 
 function sourceLabel(value: unknown): string {

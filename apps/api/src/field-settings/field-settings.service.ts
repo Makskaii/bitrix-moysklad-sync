@@ -5,6 +5,7 @@ import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
+import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -12,7 +13,11 @@ type VersionRow = { version: number; config: FieldSettingsConfigDto; createdAt: 
 
 @Injectable()
 export class FieldSettingsService {
-  constructor(private readonly database: DatabaseService, private readonly readOnlyData: ReadOnlyFieldDataProvider) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly readOnlyData: ReadOnlyFieldDataProvider,
+    private readonly entityPairs: EntityPairService,
+  ) {}
 
   async active() {
     await this.ensureInitialized();
@@ -42,6 +47,22 @@ export class FieldSettingsService {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
+    const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
+    for (const mapping of config.references.dictionaries) {
+      const live = dictionaryCatalogs.find((candidate) => candidate.key === mapping.key);
+      if (!live) throw new BadRequestException(`Dictionary ${mapping.key} is not supported`);
+      const sourceIds = new Set(live.bitrix24.map((candidate) => Number(candidate.id)));
+      const targetIds = new Set(live.moysklad.map((candidate) => candidate.id));
+      const seenSources = new Set<number>();
+      const seenTargets = new Set<string>();
+      for (const pair of mapping.pairs) {
+        if (!sourceIds.has(pair.bitrix24Id)) throw new BadRequestException(`Bitrix24 dictionary value ${pair.bitrix24Id} does not exist in ${mapping.key}`);
+        if (!targetIds.has(pair.moyskladId)) throw new BadRequestException(`MySklad dictionary value ${pair.moyskladId} does not exist in ${mapping.key}`);
+        if (seenSources.has(pair.bitrix24Id) || seenTargets.has(pair.moyskladId)) throw new BadRequestException(`Dictionary ${mapping.key} pairs must be one-to-one`);
+        seenSources.add(pair.bitrix24Id);
+        seenTargets.add(pair.moyskladId);
+      }
+    }
     if (catalogs.units.bitrix24.some((unit) => !configuredUnitSources.has(unit.id))) throw new BadRequestException('Every current Bitrix24 measure must remain visible in the mapping table');
     if (catalogs.priceTypes.bitrix24.some((priceType) => !configuredPriceSources.has(priceType.id))) throw new BadRequestException('Every current Bitrix24 price type must remain visible in the mapping table');
     const liveUnitIds = new Set(catalogs.units.moysklad.map((unit) => unit.id));
@@ -70,11 +91,15 @@ export class FieldSettingsService {
   }
 
   async catalogs(bitrixAccessToken: string) {
-    const live = await this.readOnlyData.catalogs(bitrixAccessToken);
+    const [live, dictionaryCatalogs] = await Promise.all([
+      this.readOnlyData.catalogs(bitrixAccessToken),
+      this.readOnlyData.dictionaryCatalogs(bitrixAccessToken),
+    ]);
     return {
       ...live,
       dictionaries: DEFAULT_FIELD_SETTINGS.references.dictionaries.map(({ key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId }) => ({
         key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId,
+        values: dictionaryCatalogs.find((candidate) => candidate.key === key),
       })),
     };
   }
@@ -87,23 +112,40 @@ export class FieldSettingsService {
     return { items: items.slice(cursor, cursor + pageSize), nextCursor: cursor + pageSize < items.length ? String(cursor + pageSize) : null };
   }
 
+  async fieldCatalogs(bitrixAccessToken: string, value: { entity: unknown; pairId: unknown }) {
+    if (!isString(value.entity) || !isString(value.pairId)) {
+      throw new BadRequestException('entity and pairId are required to load field metadata for an active saved pair');
+    }
+    const entityType = entityTypeForFieldEntity(value.entity);
+    const pair = (await this.entityPairs.listActive(entityType)).find((candidate) => candidate.id === value.pairId);
+    if (!pair) throw new BadRequestException('pairId must reference an active saved pair for this entity');
+    return this.readOnlyData.fieldCatalogs(bitrixAccessToken, value.entity, pair.bitrix24Id, pair.moyskladId);
+  }
+
   async preview(value: unknown, bitrixAccessToken: string) {
     if (!isRecord(value)) throw new BadRequestException('preview body must be an object');
     const entity = isString(value.entity) ? value.entity : '';
     const direction = value.direction;
-    const pairs = Array.isArray(value.pairs) ? value.pairs : [];
+    const pairIds = Array.isArray(value.pairIds) ? value.pairIds : [];
     if (!['BITRIX24_TO_MOYSKLAD', 'MOYSKLAD_TO_BITRIX24'].includes(String(direction))) throw new BadRequestException('direction is invalid');
-    if (pairs.length < 1 || pairs.length > 10 || pairs.some((pair) => !isRecord(pair) || !isString(pair.sourceId) || !isString(pair.targetId))) throw new BadRequestException('pairs must contain between 1 and 10 existing source/target IDs');
+    if (!entity) throw new BadRequestException('entity is required');
+    if (pairIds.length < 1 || pairIds.length > 10 || pairIds.some((id) => !isString(id))) throw new BadRequestException('pairIds must contain between 1 and 10 active saved pair IDs');
+    if (new Set(pairIds).size !== pairIds.length) throw new BadRequestException('pairIds must be unique');
+    const entityType = entityTypeForFieldEntity(entity);
+    const activePairs = await this.entityPairs.listActive(entityType);
+    const activeById = new Map(activePairs.map((pair) => [pair.id, pair]));
+    const selectedPairs = pairIds.map((pairId) => activeById.get(String(pairId)));
+    if (selectedPairs.some((pair) => !pair)) throw new BadRequestException('Every pairId must reference an active saved pair for this entity');
     const active = await this.active();
     const config = isRecord(value.config) ? value.config : active.config;
-    const snapshots = await Promise.all(pairs.map((pair) => this.readOnlyData.readPair(bitrixAccessToken, entity, String(pair.sourceId), String(pair.targetId))));
-    const results = snapshots.map((snapshot) => {
+    const snapshots = await Promise.all(selectedPairs.map((pair) => this.readOnlyData.readPair(bitrixAccessToken, entity, pair!.bitrix24Id, pair!.moyskladId)));
+    const results = snapshots.map((snapshot, index) => {
       const sourceIsBitrix = direction === 'BITRIX24_TO_MOYSKLAD';
       const fields = sourceIsBitrix ? snapshot.sourceValues : snapshot.targetCurrent;
       const target = sourceIsBitrix ? snapshot.targetCurrent : snapshot.sourceValues;
-      const transformed = applyFieldSettings(config, fields, String(direction));
+      const transformed = applyFieldSettings(config, entity, fields, String(direction));
       const errors = Object.entries(transformed).filter(([, result]) => result.error).map(([field, result]) => `${field}: ${result.error}`);
-      return { sourceLabel: snapshot.sourceLabel, sourceValues: fields, transformed, targetCurrent: target, errors, version: active.version, writes: 0 };
+      return { pairId: selectedPairs[index]!.id, sourceLabel: snapshot.sourceLabel, sourceValues: fields, transformed, targetCurrent: target, errors, version: active.version, writes: 0 };
     });
     return { results, writes: 0 };
   }
@@ -181,12 +223,15 @@ export class FieldSettingsService {
     if (!isRecord(config)) return null;
     const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     const rules = Array.isArray(config.rules) ? config.rules : [];
-    const rule = rules.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.targetField === targetField);
+    const sourceFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'sourceField' : 'targetField';
+    const targetFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'targetField' : 'sourceField';
+    const rule = rules.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate[targetFieldKey] === targetField);
     if (isRecord(rule)) {
       const mapping = rule[ruleDirection];
       if (isRecord(mapping) && mapping.enabled === true && isRecord(mapping.transform)) {
         const kind = mapping.transform.kind;
-        const value = isString(rule.sourceField) ? source[rule.sourceField] : undefined;
+        const sourceField = rule[sourceFieldKey];
+        const value = isString(sourceField) ? source[sourceField] : undefined;
         if (kind === 'copy' && value !== undefined && value !== null) return { value, error: null, transform: 'copy' };
         return { value: null, error: kind === 'tbd' ? 'transform is not configured' : 'source value is missing', transform: String(kind) };
       }
@@ -281,10 +326,32 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const references = value.references;
   const units = validateUnits(references.units);
   const priceTypes = validatePriceTypes(references.priceTypes);
-  if (!Array.isArray(references.dictionaries)) throw new BadRequestException('references.dictionaries must be an array');
+  const dictionaries = validateDictionaries(references.dictionaries);
   for (const rule of value.rules) validateRule(rule);
   for (const group of value.groups) validateGroup(group);
-  return { ...value, references: { ...references, units, priceTypes } } as FieldSettingsConfig;
+  return { ...value, references: { ...references, units, priceTypes, dictionaries } } as FieldSettingsConfig;
+}
+
+function validateDictionaries(value: unknown) {
+  if (!Array.isArray(value)) throw new BadRequestException('references.dictionaries must be an array');
+  const allowed = new Set(DEFAULT_FIELD_SETTINGS.references.dictionaries.map((dictionary) => dictionary.key));
+  const seenKeys = new Set<string>();
+  const dictionaries = value.map((candidate) => {
+    if (!isRecord(candidate) || !isString(candidate.key) || !allowed.has(candidate.key) || !Array.isArray(candidate.pairs)) {
+      throw new BadRequestException('Each dictionary must use a supported key and a pairs array');
+    }
+    if (seenKeys.has(candidate.key)) throw new BadRequestException(`Dictionary ${candidate.key} is duplicated`);
+    seenKeys.add(candidate.key);
+    const pairs = candidate.pairs.map((pair) => {
+      if (!isRecord(pair) || !Number.isInteger(pair.bitrix24Id) || (pair.bitrix24Id as number) < 1 || !isString(pair.moyskladId) || !isUuid(pair.moyskladId)) {
+        throw new BadRequestException(`Dictionary ${candidate.key} contains an invalid value pair`);
+      }
+      return { bitrix24Id: pair.bitrix24Id as number, moyskladId: pair.moyskladId };
+    });
+    return { ...candidate, pairs };
+  });
+  if (seenKeys.size !== allowed.size) throw new BadRequestException('All supported dictionaries must remain in the configuration');
+  return dictionaries;
 }
 
 function validateUnits(value: unknown) {
@@ -391,22 +458,24 @@ function previewGroup(group: unknown, sample: JsonRecord, sampleIndex: number) {
   }];
 }
 
-function applyFieldSettings(config: unknown, source: JsonRecord, direction: string): Record<string, { value: unknown; error?: string; transform: string }> {
+function applyFieldSettings(config: unknown, entity: string, source: JsonRecord, direction: string): Record<string, { value: unknown; error?: string; transform: string }> {
   const result: Record<string, { value: unknown; error?: string; transform: string }> = {};
   if (!isRecord(config)) return result;
   const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
   for (const rule of Array.isArray(config.rules) ? config.rules : []) {
-    if (!isRecord(rule) || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
+    if (!isRecord(rule) || rule.entity !== entity || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
     const mapping = rule[ruleDirection];
     if (!isRecord(mapping) || mapping.enabled !== true || !isRecord(mapping.transform)) continue;
     const kind = String(mapping.transform.kind);
-    const value = source[rule.sourceField];
-    result[rule.targetField] = kind === 'copy' && value !== undefined
+    const sourceField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
+    const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
+    const value = source[sourceField];
+    result[targetField] = kind === 'copy' && value !== undefined
       ? { value, transform: kind }
       : { value: null, error: kind === 'tbd' ? 'transform is not configured' : 'source value is missing', transform: kind };
   }
   for (const group of Array.isArray(config.groups) ? config.groups : []) {
-    if (!isRecord(group) || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
+    if (!isRecord(group) || group.entity !== entity || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
     const fields = group.sourceFields.filter(isString);
     if (group.transform.kind !== 'join-non-empty' || typeof group.transform.separator !== 'string') {
       result[group.targetField] = { value: null, error: 'transform is not supported', transform: String(group.transform.kind) };
@@ -446,5 +515,16 @@ function isString(value: unknown): value is string {
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function entityTypeForFieldEntity(entity: string): EntityType {
+  switch (entity) {
+    case 'contacts':
+    case 'contacts-companies': return 'CONTACT';
+    case 'companies': return 'COMPANY';
+    case 'deals-orders': return 'DEAL';
+    case 'catalog': return 'PRODUCT';
+    default: throw new BadRequestException('This entity type has no active field-settings pair catalog');
+  }
 }
 

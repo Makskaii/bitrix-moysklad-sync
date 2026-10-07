@@ -16,6 +16,7 @@ import { WebhookDiagnosticLog } from '../webhook-diagnostic-log';
 import { FieldSettingsController } from './field-settings.controller';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
+import { EntityPairService } from '../pairs/entity-pair.service';
 
 @Module({})
 export class LocalAdminPreviewModule {
@@ -31,7 +32,7 @@ export class LocalAdminPreviewModule {
         ContactSyncStatusReader,
         EventIntakeService,
         RetentionService,
-        ...(databaseProvider === DatabaseService ? [FieldSettingsService, ReadOnlyFieldDataProvider] : []),
+        ...(databaseProvider === DatabaseService ? [FieldSettingsService, ReadOnlyFieldDataProvider, EntityPairService] : []),
         WebhookDiagnosticLog,
         { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
         AdminAccessGuard,

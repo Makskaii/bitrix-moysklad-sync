@@ -28,23 +28,39 @@ type DictionaryMap = {
   moyskladDirectoryId: string;
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
+type DictionaryOption = { id: string; title: string; code: string };
+type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null };
+type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
+type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
 type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   priceTypes: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
-  dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string }>;
+  dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string; values?: { bitrix24: DictionaryOption[]; moysklad: DictionaryOption[] } }>;
 };
-type PreviewResult = { sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
+type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 
 const endpoint = '/api/admin/field-settings';
 const entityOptions = [
   ['contacts', 'Контакты'],
   ['companies', 'Компании'],
   ['deals-orders', 'Сделки и заказы покупателей'],
-  ['smart-invoices', 'Смарт-счета и счета покупателям'],
+  ['smart-invoices', 'Смарт-счета (отложено)'],
   ['catalog', 'Товары и услуги каталога'],
 ] as const;
+
+const deferredEntities = new Set(['smart-invoices']);
+
+function entityTypeForUI(entity: string): ActiveEntityPair['entityType'] | null {
+  switch (entity) {
+    case 'contacts': return 'CONTACT';
+    case 'companies': return 'COMPANY';
+    case 'deals-orders': return 'DEAL';
+    case 'catalog': return 'PRODUCT';
+    default: return null;
+  }
+}
 
 export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   accessToken: string;
@@ -54,16 +70,21 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [document, setDocument] = useState<SettingsDocument | null>(null);
   const [draft, setDraft] = useState<SettingsConfig | null>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
+  const [activePairs, setActivePairs] = useState<ActiveEntityPair[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showSaveWarning, setShowSaveWarning] = useState(false);
-  const [previewPairs, setPreviewPairs] = useState('');
+  const [previewPairIds, setPreviewPairIds] = useState<string[]>([]);
   const [previewEntity, setPreviewEntity] = useState('contacts');
   const [previewDirection, setPreviewDirection] = useState<'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24'>('BITRIX24_TO_MOYSKLAD');
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [previewError, setPreviewError] = useState('');
+  const [metadataPairId, setMetadataPairId] = useState('');
+  const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
+  const [metadataLoading, setMetadataLoading] = useState(false);
+  const [metadataError, setMetadataError] = useState('');
   const [ruleForm, setRuleForm] = useState({ entity: 'deals-orders', sourceField: '', targetField: '', bitrix24ToMoysklad: false, moyskladToBitrix24: false, forwardTransform: 'tbd', reverseTransform: 'tbd' });
-  const [groupForm, setGroupForm] = useState({ entity: 'contacts-companies', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
+  const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
 
   const headers: Record<string, string> = {
     ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
@@ -80,14 +101,22 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           throw new Error('Доступ только для администратора Bitrix24');
         }
         if (!settingsResponse.ok) throw new Error('Не удалось загрузить настройки полей');
-        const [nextDocument, nextCatalogs] = await Promise.all([
+        const pairsResponse = await fetch('/api/admin/pairs', { headers });
+        if (pairsResponse.status === 403) {
+          onForbidden();
+          throw new Error('Доступ только для администратора Bitrix24');
+        }
+        if (!pairsResponse.ok) throw new Error('Не удалось загрузить сохранённые пары записей');
+        const [nextDocument, nextCatalogs, nextPairs] = await Promise.all([
           settingsResponse.json() as Promise<SettingsDocument>,
           loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }),
+          pairsResponse.json() as Promise<ActiveEntityPair[]>,
         ]);
         if (cancelled) return;
         setDocument(nextDocument);
         setDraft(includeCurrentCatalogSources(nextDocument.config, nextCatalogs));
         setCatalogs(nextCatalogs);
+        setActivePairs(nextPairs.filter((pair) => pair.active));
       } catch (cause) {
         if (!cancelled) onError(cause instanceof Error ? cause.message : String(cause));
       } finally {
@@ -128,6 +157,48 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     }));
   }
 
+  function changeDictionaryPair(key: string, bitrix24Id: number, moyskladId: string) {
+    changeDraft((current) => ({
+      ...current,
+      references: {
+        ...current.references,
+        dictionaries: current.references.dictionaries.map((dictionary) => dictionary.key !== key ? dictionary : {
+          ...dictionary,
+          pairs: [
+            ...dictionary.pairs.filter((pair) => pair.bitrix24Id !== bitrix24Id),
+            ...(moyskladId ? [{ bitrix24Id, moyskladId }] : []),
+          ],
+        }),
+      },
+    }));
+  }
+
+  async function loadFieldMetadata() {
+    const selectedPair = activePairs.find((pair) => pair.id === metadataPairId && pair.entityType === entityTypeForUI(ruleForm.entity));
+    if (!selectedPair) {
+      setMetadataError('Выберите активную сохранённую пару для этой сущности.');
+      return;
+    }
+    setMetadataLoading(true);
+    setMetadataError('');
+    try {
+      const query = new URLSearchParams({ entity: ruleForm.entity, pairId: selectedPair.id });
+      const response = await fetch(`${endpoint}/fields?${query}`, { headers });
+      if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
+      const body = await response.text();
+      if (!response.ok) throw new Error(body || 'Не удалось загрузить метаданные полей');
+      const catalog = JSON.parse(body) as FieldMetadata;
+      setFieldMetadata(catalog);
+      setRuleForm((current) => ({ ...current, sourceField: '', targetField: '' }));
+      setGroupForm((current) => ({ ...current, sourceFields: '', targetField: '' }));
+    } catch (cause) {
+      setFieldMetadata(null);
+      setMetadataError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setMetadataLoading(false);
+    }
+  }
+
   function addRule(event: React.FormEvent) {
     event.preventDefault();
     if (!draft || !ruleForm.sourceField.trim() || !ruleForm.targetField.trim() || (!ruleForm.bitrix24ToMoysklad && !ruleForm.moyskladToBitrix24)) return;
@@ -156,15 +227,11 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     if (!draft) return;
     setPreviewError('');
     try {
-      const pairs = previewPairs.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
-        const [sourceId, targetId, ...rest] = line.split(',').map((value) => value.trim());
-        if (!sourceId || !targetId || rest.length) throw new Error('В каждой строке укажите ID пары: ID Bitrix24, ID МойСклад');
-        return { sourceId, targetId };
-      });
-      if (pairs.length === 0 || pairs.length > 10) throw new Error('Добавьте от 1 до 10 реальных пар записей');
+      const pairs = previewPairIds.filter((pairId) => activePairs.some((pair) => pair.id === pairId && pair.entityType === entityTypeForUI(previewEntity)));
+      if (pairs.length === 0 || pairs.length > 10) throw new Error('Выберите от 1 до 10 активных сохранённых пар записей');
       const response = await fetch(`${endpoint}/preview`, {
         method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
-        body: JSON.stringify({ entity: previewEntity, direction: previewDirection, pairs, config: draft }),
+        body: JSON.stringify({ entity: previewEntity, direction: previewDirection, pairIds: pairs, config: draft }),
       });
       if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
       const body = await response.text();
@@ -211,10 +278,18 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
       <section className="field-editor-section" aria-label="Правила полей">
         <div className="panel-heading"><div><p className="eyebrow">ПОЛЯ И НАПРАВЛЕНИЯ</p><h3>Правила переноса</h3></div></div>
+        <p className="panel-description">Загрузите коды, названия и типы из выбранной пары. Каталог метаданных не возвращает значения записей.</p>
+        <div className="field-rule-form">
+          <label>Активная сохранённая пара<select aria-label="Пара записей для метаданных" value={metadataPairId} onChange={(event) => { setMetadataPairId(event.target.value); setFieldMetadata(null); }}>
+            <option value="">Выберите пару</option>{activePairs.filter((pair) => pair.entityType === entityTypeForUI(ruleForm.entity)).map((pair) => <option key={pair.id} value={pair.id}>Bitrix24 {pair.bitrix24Id} ↔ МойСклад {pair.moyskladId}</option>)}
+          </select></label>
+          <button type="button" className="button-secondary" disabled={metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загружаем…' : 'Загрузить поля пары'}</button>
+        </div>
+        {metadataError && <p role="alert" className="inline-error">{metadataError}</p>}
         <form className="field-rule-form" onSubmit={addRule}>
-          <label>Пара сущностей<select aria-label="Пара сущностей поля" value={ruleForm.entity} onChange={(event) => setRuleForm({ ...ruleForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-          <label>Поле Bitrix24<input aria-label="Поле Bitrix24" value={ruleForm.sourceField} onChange={(event) => setRuleForm({ ...ruleForm, sourceField: event.target.value })} /></label>
-          <label>Поле МойСклад<input aria-label="Поле МойСклад" value={ruleForm.targetField} onChange={(event) => setRuleForm({ ...ruleForm, targetField: event.target.value })} /></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей поля" value={ruleForm.entity} onChange={(event) => { setRuleForm({ ...ruleForm, entity: event.target.value }); setMetadataPairId(''); setFieldMetadata(null); }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
+          <label>Поле Bitrix24<select aria-label="Поле Bitrix24" value={ruleForm.sourceField} onChange={(event) => setRuleForm({ ...ruleForm, sourceField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== ruleForm.entity}><option value="">Выберите поле</option>{fieldMetadata?.bitrix24.map((field) => <option key={field.code} value={field.code}>{field.title} · {field.code} · {field.type}</option>)}</select></label>
+          <label>Поле МойСклад<select aria-label="Поле МойСклад" value={ruleForm.targetField} onChange={(event) => setRuleForm({ ...ruleForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== ruleForm.entity}><option value="">Выберите поле</option>{fieldMetadata?.moysklad.map((field) => <option key={field.code} value={field.code}>{field.title} · {field.code} · {field.type}</option>)}</select></label>
           <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={ruleForm.bitrix24ToMoysklad} onChange={(event) => setRuleForm({ ...ruleForm, bitrix24ToMoysklad: event.target.checked })} /> Включено</label><select aria-label="Преобразование Bitrix24 в МойСклад" value={ruleForm.forwardTransform} onChange={(event) => setRuleForm({ ...ruleForm, forwardTransform: event.target.value })}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></fieldset>
           <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={ruleForm.moyskladToBitrix24} onChange={(event) => setRuleForm({ ...ruleForm, moyskladToBitrix24: event.target.checked })} /> Включено</label><select aria-label="Преобразование МойСклад в Bitrix24" value={ruleForm.reverseTransform} onChange={(event) => setRuleForm({ ...ruleForm, reverseTransform: event.target.value })}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></fieldset>
           <button type="submit" className="button-secondary">Добавить правило</button>
@@ -226,10 +301,10 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
-          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD">Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
-          <label>Поля-источники через запятую<input aria-label="Поля источники группы" value={groupForm.sourceFields} onChange={(event) => setGroupForm({ ...groupForm, sourceFields: event.target.value })} placeholder="LAST_NAME, NAME, SECOND_NAME" /></label>
-          <label>Поле-результат<input aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} /></label>
+          <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => setGroupForm({ ...groupForm, sourceFields: [...event.currentTarget.selectedOptions].map((option) => option.value).join(',') })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title} · {field.code} · {field.type}</option>)}</select></label>
+          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title} · {field.code} · {field.type}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           <button type="submit" className="button-secondary">Добавить составное правило</button>
         </form>
@@ -240,10 +315,16 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="panel-heading"><div><p className="eyebrow">БЕЗ ЗАПИСИ В СИСТЕМЫ</p><h3>Предпросмотр преобразования</h3></div></div>
         <p className="panel-description">Для каждой выбранной пары сервер читает свежие данные обеих систем и показывает результат и ошибки. Выполняются только GET-чтения; записи и вебхуки не вызываются. Максимум 10 пар за запрос.</p>
         <div className="field-rule-form">
-          <label>Пара сущностей<select aria-label="Пара сущностей предпросмотра" value={previewEntity} onChange={(event) => setPreviewEntity(event.target.value)}>{entityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей предпросмотра" value={previewEntity} onChange={(event) => { setPreviewEntity(event.target.value); setPreviewPairIds([]); setPreviewResults([]); }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление предпросмотра" value={previewDirection} onChange={(event) => setPreviewDirection(event.target.value as typeof previewDirection)}><option value="BITRIX24_TO_MOYSKLAD">Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
         </div>
-        <label className="field-preview-input">Пары записей, одна пара на строку<textarea aria-label="Пары записей" rows={3} value={previewPairs} onChange={(event) => setPreviewPairs(event.target.value)} placeholder="ID Bitrix24, ID МойСклад" /></label>
+        <label className="field-preview-input">Активные пары записей<select aria-label="Активные пары предпросмотра" multiple size={Math.min(6, Math.max(2, activePairs.filter((pair) => pair.entityType === entityTypeForUI(previewEntity)).length))} value={previewPairIds} onChange={(event) => {
+          const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
+          if (selected.length > 10) { setPreviewError('За один запрос можно выбрать не более 10 пар.'); return; }
+          setPreviewError(''); setPreviewPairIds(selected);
+        }}>
+          {activePairs.filter((pair) => pair.entityType === entityTypeForUI(previewEntity)).map((pair) => <option key={pair.id} value={pair.id}>Bitrix24 {pair.bitrix24Id} ↔ МойСклад {pair.moyskladId}</option>)}
+        </select></label>
         <button type="button" className="button-secondary" onClick={() => void preview()}>Прочитать пары и выполнить предпросмотр</button>
         {previewError && <p role="alert" className="inline-error">{previewError}</p>}
         {previewResults.length > 0 && <div className="field-preview-results" aria-label="Результат предпросмотра">{previewResults.map((result, index) => <article key={`${result.sourceLabel}-${index}`}><strong>{result.sourceLabel}</strong><small>Источник: {JSON.stringify(result.sourceValues)}</small><small>Сейчас в другой системе: {JSON.stringify(result.targetCurrent)}</small><small>Преобразовано: {JSON.stringify(result.transformed)}</small><small>{result.errors.length ? `Ошибки: ${result.errors.join('; ')}` : 'Ошибок преобразования нет'} · версия {result.version} · записей: {result.writes}</small></article>)}</div>}
@@ -274,11 +355,18 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
       <section className="field-editor-section" aria-label="Справочники услуг и способов оплаты">
         <div className="panel-heading"><div><p className="eyebrow">ССЫЛОЧНЫЕ ПОЛЯ ЗАКАЗА</p><h3>Услуги и способы оплаты</h3></div></div>
-        {draft.references.dictionaries.map((dictionary) => <article key={dictionary.key} className="dictionary-map-card">
+        {draft.references.dictionaries.map((dictionary) => {
+          const liveValues = catalogs.dictionaries.find((candidate) => candidate.key === dictionary.key)?.values;
+          return <article key={dictionary.key} className="dictionary-map-card">
           <div><strong>{dictionary.key === 'service' ? 'Услуга' : 'Способ оплаты'}</strong><small>Bitrix24 {dictionary.bitrix24Field} · список {dictionary.bitrix24ListId}</small><small>МойСклад атрибут {dictionary.moyskladAttributeId} · справочник {dictionary.moyskladDirectoryId}</small></div>
-          <p>{dictionary.pairs.length} сохранённых пар значений · редактируются отдельно от единиц и типов цен</p>
-          <div className="dictionary-pairs">{dictionary.pairs.slice(0, 5).map((pair) => <small key={pair.bitrix24Id}>B24 {pair.bitrix24Id} ↔ MS {pair.moyskladId}</small>)}{dictionary.pairs.length > 5 && <small>и ещё {dictionary.pairs.length - 5} пар</small>}</div>
-        </article>)}
+          <p>{dictionary.pairs.length} сопоставленных значений. Пустое значение не передаётся как новая пара.</p>
+          {!liveValues ? <p role="alert">Живой каталог значений недоступен.</p> : <div className="reference-map-list">{liveValues.bitrix24.map((source) => {
+            const currentTarget = dictionary.pairs.find((pair) => pair.bitrix24Id === Number(source.id))?.moyskladId ?? '';
+            const assignedElsewhere = new Set(dictionary.pairs.filter((pair) => pair.bitrix24Id !== Number(source.id)).map((pair) => pair.moyskladId));
+            return <article key={source.id} className="reference-map-row"><div><strong>{source.title || source.code || `Bitrix24 ${source.id}`}</strong><small>Bitrix24 ID {source.id}{source.code ? ` · код ${source.code}` : ''}</small></div><label>Значение МойСклад<select aria-label={`${dictionary.key}: значение МойСклад для ${source.id}`} value={currentTarget} onChange={(event) => changeDictionaryPair(dictionary.key, Number(source.id), event.target.value)}><option value="">Не сопоставлять</option>{liveValues.moysklad.map((candidate) => <option key={candidate.id} value={candidate.id} disabled={assignedElsewhere.has(candidate.id)}>{candidate.title || candidate.code || candidate.id} · {candidate.id}</option>)}</select></label></article>;
+          })}</div>}
+        </article>;
+        })}
       </section>
 
       <div className="field-save-bar"><p>Сохранение создаёт версию {document.version + 1} и сразу применяется к новым событиям.</p><button type="button" onClick={() => setShowSaveWarning(true)} disabled={saving}>Сохранить новую версию</button></div>

@@ -5,11 +5,14 @@ import { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
+import { APPROVED_DICTIONARY_PAIRS } from '../src/field-settings/approved-mappings';
 
 const nativeFetch = globalThis.fetch;
 const originalEnv = new Map<string, string | undefined>();
 let app: INestApplication;
 let apiUrl: string;
+const pairsByKey: Record<string, string> = {};
+const createdPairIds: string[] = [];
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -37,6 +40,16 @@ before(async () => {
         ? fakeB24UnitIds.map((id) => ({ id, code: `u${id}`, name: `Unit ${id}` }))
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
+          : method === 'crm.contact.fields.json'
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false } }
+            : method === 'catalog.product.getFieldsByFilter.json'
+              ? form.get('filter[iblockId]') === '11'
+                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false } } }
+                : { product: {} }
+            : method === 'catalog.product.get.json'
+              ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
+            : method === 'lists.element.get.json'
+              ? (form.get('IBLOCK_ID') === '42' ? APPROVED_DICTIONARY_PAIRS.service : APPROVED_DICTIONARY_PAIRS.paymentMethod).map(([ID]) => ({ ID, CODE: `code-${ID}`, NAME: `Value ${ID}` }))
           : method === 'crm.company.get.json'
             ? { ID: form.get('id'), TITLE: 'Example Company' }
           : { ID: form.get('id'), NAME: 'Ada', LAST_NAME: 'Lovelace', TITLE: 'Sample', EMAIL: [{ VALUE: 'source@example.test', VALUE_TYPE: 'WORK' }] };
@@ -45,9 +58,17 @@ before(async () => {
     if (url.origin === 'https://fake-moysklad.test') {
       const isUnitList = url.pathname.endsWith('/entity/uom');
       const isPriceList = url.pathname.endsWith('/companysettings/pricetype');
+      const serviceDirectory = url.pathname.endsWith('/entity/customentity/f0177126-8e74-11e3-b761-002590a28eca');
+      const paymentDirectory = url.pathname.endsWith('/entity/customentity/0ecffb86-d8a3-11eb-0a80-0dbc000256e5');
       const ids = isUnitList ? fakeMsUnitIds : fakeMsPriceIds;
       const rows = ids.map((id, index) => ({ id, code: `m${index + 1}`, name: `MS ${index + 1}`, externalCode: `m${index + 1}` }));
-      const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } } : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
+      const dictionaryRows = serviceDirectory
+        ? APPROVED_DICTIONARY_PAIRS.service.map(([, id]) => ({ id, name: `MS service ${id}` }))
+        : paymentDirectory ? APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([, id]) => ({ id, name: `MS payment ${id}` })) : [];
+      const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
+        : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
+        : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
+        : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     throw new Error(`Unexpected test HTTP request: ${url.origin}${url.pathname}`);
@@ -61,10 +82,22 @@ before(async () => {
     create: { serviceMode: 'pause' },
     update: { serviceMode: 'pause' },
   });
+  const pairFixtures = [
+    ['contact-42', 'CONTACT', '42', '00000000-0000-4000-8000-000000000001'],
+    ['contact-1', 'CONTACT', 'contact-1', '00000000-0000-4000-8000-000000000002'],
+    ['company-1', 'COMPANY', 'company-1', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+    ['product-1', 'PRODUCT', 'product-1', '00000000-0000-4000-8000-000000000003'],
+  ] as const;
+  for (const [key, entityType, bitrix24Id, moyskladId] of pairFixtures) {
+    const pair = await app.get(DatabaseService).entityPair.create({ data: { entityType, bitrix24Id, moyskladId, source: 'MANUAL' } });
+    pairsByKey[key] = pair.id;
+    createdPairIds.push(pair.id);
+  }
 });
 
 after(async () => {
   if (app) {
+    await app.get(DatabaseService).entityPair.deleteMany({ where: { id: { in: createdPairIds } } });
     (app.getHttpServer() as import('node:http').Server).closeAllConnections();
     await app.close();
   }
@@ -96,14 +129,18 @@ test('field settings expose only the approved unit and price pairs and mark excl
   assert.equal(settings.references.dictionaries.find((dictionary) => dictionary.key === 'payment-method')?.pairs.length, 5);
 });
 
-test('preview reads a real pair, applies the draft transform, and never writes', async () => {
+test('preview reads only an active saved pair, applies the draft transform, and never writes', async () => {
   const response = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
     body: JSON.stringify({
       entity: 'contacts-companies', direction: 'BITRIX24_TO_MOYSKLAD',
-      pairs: [{ sourceId: '42', targetId: '00000000-0000-4000-8000-000000000001' }],
-      config: { rules: [], groups: [{
+      pairIds: [pairsByKey['contact-42'], pairsByKey['contact-1']],
+      config: { rules: [{
+        id: 'deal-title', entity: 'deals-orders', sourceField: 'NAME', targetField: 'must-not-leak',
+        bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+        moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+      }], groups: [{
         id: 'person-name', entity: 'contacts-companies', direction: 'BITRIX24_TO_MOYSKLAD', targetField: 'name',
         sourceFields: ['NAME', 'LAST_NAME'], transform: { kind: 'join-non-empty', separator: ' ' },
       }] },
@@ -113,6 +150,8 @@ test('preview reads a real pair, applies the draft transform, and never writes',
   assert.equal(response.status, 201, body);
   const result = JSON.parse(body) as { writes: number; results: Array<{ transformed: Record<string, { value: string }>; sourceLabel: string; targetCurrent: Record<string, unknown>; errors: string[]; version: number }> };
   assert.equal(result.writes, 0);
+  assert.equal(result.results.length, 2);
+  assert.equal('must-not-leak' in result.results[0]!.transformed, false, 'preview ignores mappings configured for another entity');
   assert.equal(result.results[0]?.transformed.name?.value, 'Ada Lovelace');
   assert.equal(result.results[0]?.sourceLabel, 'Ada Lovelace');
   assert.equal(result.results[0]?.targetCurrent.name, 'Sample target');
@@ -122,16 +161,86 @@ test('preview reads a real pair, applies the draft transform, and never writes',
   assert.equal((await active.json() as { version: number }).version, 1);
 });
 
+test('preview rejects arbitrary IDs and applies reverse-direction rules for saved pairs', async () => {
+  const rejected = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ entity: 'contacts', direction: 'MOYSKLAD_TO_BITRIX24', pairIds: ['not-a-saved-pair'] }),
+  });
+  assert.equal(rejected.status, 400);
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({
+      entity: 'contacts', direction: 'MOYSKLAD_TO_BITRIX24',
+      pairIds: [pairsByKey['contact-1']],
+      config: { rules: [{
+        id: 'reverse-email', entity: 'contacts', sourceField: 'EMAIL', targetField: 'email',
+        bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+      }], groups: [] },
+    }),
+  });
+  const body = await response.text();
+  assert.equal(response.status, 201, body);
+  const preview = JSON.parse(body) as { writes: number; results: Array<{ transformed: Record<string, { value: unknown }>; version: number }> };
+  assert.equal(preview.writes, 0);
+  assert.equal(preview.results[0]?.transformed.EMAIL?.value, 'target@example.test');
+  assert.equal(preview.results[0]?.version, 1);
+});
+
 test('preview reads company pairs separately from contacts', async () => {
   const response = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
-    body: JSON.stringify({ entity: 'companies', direction: 'BITRIX24_TO_MOYSKLAD', pairs: [{ sourceId: 'company-1', targetId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }] }),
+    body: JSON.stringify({ entity: 'companies', direction: 'BITRIX24_TO_MOYSKLAD', pairIds: [pairsByKey['company-1']] }),
   });
   const body = await response.text();
   assert.equal(response.status, 201, body);
   const preview = JSON.parse(body) as { results: Array<{ sourceLabel: string; writes: number }> };
   assert.equal(preview.results[0].sourceLabel, 'Example Company');
   assert.equal(preview.results[0].writes, 0);
+});
+
+test('live field metadata returns codes, titles, and types without record values', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts&pairId=${pairsByKey['contact-1']}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  const body = await response.text();
+  assert.equal(response.status, 200, body);
+  const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.type === 'string'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.title === 'Preferred contact'));
+  assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
+});
+
+test('field metadata rejects a saved pair of another entity type', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=companies&pairId=${pairsByKey['contact-1']}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  assert.equal(response.status, 400);
+});
+
+test('catalog field metadata uses the product information block and API field names', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=catalog&pairId=${pairsByKey['product-1']}`, {
+    headers: { authorization: 'Bearer synthetic-admin-token' },
+  });
+  const body = await response.text();
+  assert.equal(response.status, 200, body);
+  const catalog = JSON.parse(body) as { bitrix24: Array<{ code: string; title: string; type: string }> };
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
+});
+
+test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const body = await response.text();
+  assert.equal(response.status, 200, body);
+  const catalogs = JSON.parse(body) as { dictionaries: Array<{ key: string; values: { bitrix24: Array<{ id: string; title: string }>; moysklad: Array<{ id: string; title: string }> } }> };
+  const service = catalogs.dictionaries.find((dictionary) => dictionary.key === 'service')!;
+  const payment = catalogs.dictionaries.find((dictionary) => dictionary.key === 'payment-method')!;
+  assert.equal(service.values.bitrix24.length, 46);
+  assert.equal(service.values.moysklad.length, 46);
+  assert.equal(payment.values.bitrix24.length, 5);
+  assert.equal(payment.values.moysklad.length, 5);
+  assert.equal(service.values.bitrix24[0].title, `Value ${service.values.bitrix24[0].id}`);
 });
 
 test('catalog paging exposes live candidates and allows manual reassignment to an existing unapproved ID', async () => {
