@@ -15,6 +15,9 @@ import { RetentionService } from './retention.service';
 import { RotatingFileLogger } from './rotating-file.logger';
 import { WebhookDiagnosticsController } from './webhook-diagnostics.controller';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
+import { FieldSettingsController } from './admin/field-settings.controller';
+import { FieldSettingsService } from './field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from './field-settings/read-only-field-data.provider';
 
 @Controller()
 class AppController {
@@ -29,8 +32,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService],
+  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider],
 })
 class AppModule {}
 
