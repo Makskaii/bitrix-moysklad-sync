@@ -41,7 +41,9 @@ before(async () => {
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false } }
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            : method === 'crm.deal.fields.json'
+              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false } }
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
                 ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false } } }
@@ -86,6 +88,7 @@ before(async () => {
     ['contact-42', 'CONTACT', '42', '00000000-0000-4000-8000-000000000001'],
     ['contact-1', 'CONTACT', 'contact-1', '00000000-0000-4000-8000-000000000002'],
     ['company-1', 'COMPANY', 'company-1', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+    ['deal-1', 'DEAL', 'deal-1', '00000000-0000-4000-8000-000000000004'],
     ['product-1', 'PRODUCT', 'product-1', '00000000-0000-4000-8000-000000000003'],
   ] as const;
   for (const [key, entityType, bitrix24Id, moyskladId] of pairFixtures) {
@@ -137,7 +140,7 @@ test('preview reads only an active saved pair, applies the draft transform, and 
       entity: 'contacts-companies', direction: 'BITRIX24_TO_MOYSKLAD',
       pairIds: [pairsByKey['contact-42'], pairsByKey['contact-1']],
       config: { rules: [{
-        id: 'deal-title', entity: 'deals-orders', sourceField: 'NAME', targetField: 'must-not-leak',
+        id: 'deal-title', entity: 'deals-orders', sourceField: 'NAME', targetField: 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
         bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
         moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
       }], groups: [{
@@ -151,12 +154,19 @@ test('preview reads only an active saved pair, applies the draft transform, and 
   const result = JSON.parse(body) as { writes: number; results: Array<{ transformed: Record<string, { value: string }>; sourceLabel: string; targetCurrent: Record<string, unknown>; errors: string[]; version: number }> };
   assert.equal(result.writes, 0);
   assert.equal(result.results.length, 2);
-  assert.equal('must-not-leak' in result.results[0]!.transformed, false, 'preview ignores mappings configured for another entity');
+  assert.equal('attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' in result.results[0]!.transformed, false, 'preview ignores mappings configured for another entity');
   assert.equal(result.results[0]?.transformed.name?.value, 'Ada Lovelace');
   assert.equal(result.results[0]?.sourceLabel, 'Ada Lovelace');
   assert.equal(result.results[0]?.targetCurrent.name, 'Sample target');
   assert.deepEqual(result.results[0]?.errors, []);
   assert.equal(result.results[0]?.version, 1);
+  const arbitrary = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD', pairIds: [pairsByKey['contact-1']], config: {
+      rules: [{ id: 'unsafe', entity: 'contacts', sourceField: 'UNLISTED', targetField: 'name', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: [], references: (await (await fetch(`${apiUrl}/api/admin/field-settings`)).json() as { config: { references: unknown } }).config.references,
+    } }),
+  });
+  assert.equal(arbitrary.status, 400, `preview must reject fields outside live metadata: ${await arbitrary.text()}`);
   const active = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal((await active.json() as { version: number }).version, 1);
 });
@@ -287,6 +297,32 @@ test('saving creates an immutable version and activates it for future events onl
   assert.deepEqual(previous.config.rules, []);
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal((await activeResponse.json() as { version: number }).version, saved.version);
+});
+
+test('settings reject unknown field codes and read-only Bitrix24 targets', async () => {
+  const current = await (await fetch(`${apiUrl}/api/admin/field-settings`)).json() as { config: Record<string, unknown> };
+  const references = current.config.references;
+  const invalid = { ...current.config, references, rules: [{
+    id: 'arbitrary', entity: 'contacts', sourceField: 'DOES_NOT_EXIST', targetField: 'name',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }] };
+  const response = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: invalid }) });
+  assert.equal(response.status, 400, await response.text());
+  const readOnly = { ...current.config, references, rules: [{
+    id: 'readonly-target', entity: 'contacts', sourceField: 'READ_ONLY', targetField: 'name',
+    bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }] };
+  const readOnlyResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: readOnly }) });
+  assert.equal(readOnlyResponse.status, 400, await readOnlyResponse.text());
+  const protectedTarget = { ...current.config, references, rules: [{
+    id: 'protected-target', entity: 'contacts', sourceField: 'NAME', targetField: 'id',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }] };
+  const protectedResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: protectedTarget }) });
+  assert.equal(protectedResponse.status, 400, await protectedResponse.text());
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

@@ -44,6 +44,7 @@ export class FieldSettingsService {
   async save(value: unknown, bitrixAccessToken: string) {
     const config = validateConfiguration(value);
     await this.ensureInitialized();
+    await this.validateConfiguredFields(config, bitrixAccessToken);
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
@@ -137,7 +138,12 @@ export class FieldSettingsService {
     const selectedPairs = pairIds.map((pairId) => activeById.get(String(pairId)));
     if (selectedPairs.some((pair) => !pair)) throw new BadRequestException('Every pairId must reference an active saved pair for this entity');
     const active = await this.active();
-    const config = isRecord(value.config) ? value.config : active.config;
+    const config = value.config === undefined ? active.config : validateConfiguration({
+      ...active.config,
+      ...(isRecord(value.config) ? value.config : {}),
+      references: isRecord(value.config) && value.config.references !== undefined ? value.config.references : active.config.references,
+    });
+    await this.validateConfiguredFields(config, bitrixAccessToken, selectedPairs.map((pair) => ({ entity, pair: pair! })));
     const snapshots = await Promise.all(selectedPairs.map((pair) => this.readOnlyData.readPair(bitrixAccessToken, entity, pair!.bitrix24Id, pair!.moyskladId)));
     const results = snapshots.map((snapshot, index) => {
       const sourceIsBitrix = direction === 'BITRIX24_TO_MOYSKLAD';
@@ -148,6 +154,61 @@ export class FieldSettingsService {
       return { pairId: selectedPairs[index]!.id, sourceLabel: snapshot.sourceLabel, sourceValues: fields, transformed, targetCurrent: target, errors, version: active.version, writes: 0 };
     });
     return { results, writes: 0 };
+  }
+
+  private async validateConfiguredFields(
+    config: FieldSettingsConfig,
+    bitrixAccessToken: string,
+    selected: Array<{ entity: string; pair: { id: string; entityType: EntityType; bitrix24Id: string; moyskladId: string } }> = [],
+  ) {
+    const ruleEntities = [...config.rules, ...config.groups].map((entry) => {
+      if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
+      return entry.entity;
+    });
+    const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'catalog']);
+    for (const entity of ruleEntities) if (!supported.has(entity)) throw new BadRequestException(`Entity ${entity} is not supported for field mappings`);
+    const entities = [...new Set(ruleEntities)];
+    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null }>; moysklad: Array<{ code: string; writable: boolean | null }> }>>();
+    for (const { entity, pair } of selected) {
+      const fields = await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity, pair.bitrix24Id, pair.moyskladId);
+      const current = catalogsByEntity.get(entity) ?? [];
+      current.push(fields);
+      catalogsByEntity.set(entity, current);
+    }
+    for (const entity of entities) {
+      if (catalogsByEntity.has(entity)) continue;
+      const pairs = await this.entityPairs.listActive(entityTypeForFieldEntity(entity));
+      if (pairs.length === 0) throw new BadRequestException(`An active saved pair is required before configuring ${entity} fields`);
+      const pair = pairs[0]!;
+      catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity, pair.bitrix24Id, pair.moyskladId)]);
+    }
+    const requireField = (entity: string, system: 'bitrix24' | 'moysklad', code: unknown, writable: boolean) => {
+      if (!isString(code)) throw new BadRequestException('Mapping field codes must be non-empty strings');
+      const protectedWriteFields = new Set(['id', 'meta', 'positions', 'payedsum', 'updated', 'created', 'owner', 'group']);
+      if (writable && protectedWriteFields.has(code.toLowerCase())) throw new BadRequestException(`Field ${code} is protected and cannot be configured as a write target`);
+      const catalogs = catalogsByEntity.get(entity) ?? [];
+      if (!catalogs.length || catalogs.some((catalog) => {
+        const candidate = catalog[system].find((field) => field.code === code);
+        return !candidate || (writable && candidate.writable === false) || (writable && system === 'bitrix24' && code.startsWith('UF_') && candidate.writable !== true);
+      })) throw new BadRequestException(`Field ${code} is not available as a ${writable ? 'writable ' : ''}${system} field for ${entity}`);
+    };
+    for (const candidate of config.rules) {
+      const rule = candidate as unknown as JsonRecord;
+      const entity = String(rule.entity);
+      requireField(entity, 'bitrix24', rule.sourceField, false);
+      requireField(entity, 'moysklad', rule.targetField, false);
+      const forward = rule.bitrix24ToMoysklad as JsonRecord;
+      const reverse = rule.moyskladToBitrix24 as JsonRecord;
+      if (forward.enabled === true && isRecord(forward.transform) && forward.transform.kind === 'copy') requireField(entity, 'moysklad', rule.targetField, true);
+      if (reverse.enabled === true && isRecord(reverse.transform) && reverse.transform.kind === 'copy') requireField(entity, 'bitrix24', rule.sourceField, true);
+    }
+    for (const candidate of config.groups) {
+      const group = candidate as unknown as JsonRecord;
+      const entity = String(group.entity);
+      const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+      for (const sourceField of group.sourceFields as string[]) requireField(entity, b24ToMs ? 'bitrix24' : 'moysklad', sourceField, false);
+      requireField(entity, b24ToMs ? 'moysklad' : 'bitrix24', group.targetField, true);
+    }
   }
 
   async pinEvent(eventId: string) {
