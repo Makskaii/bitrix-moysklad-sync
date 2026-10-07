@@ -18,6 +18,12 @@ The local database uses the Compose project's named volume. To stop containers a
 docker compose -p release-local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml down
 ```
 
+## Authorized server test candidate
+
+The server test unit template is [ops/bitrix-moysklad-sync.service](ops/bitrix-moysklad-sync.service). It runs the normal API (no `ADMIN_PREVIEW` bypass) on HTTP port `5015`, uses a local PostgreSQL Unix socket, and keeps `SYNC_STATE=off`, webhook credentials empty, and both local header-exchange flags at `0`. The webhook endpoint is `POST /webhooks/bitrix24`; MoySklad uses `/webhooks/moysklad/:secret`. Admin endpoints keep the normal Bitrix administrator guard; there is no public admin UI.
+
+This server candidate is for isolated intake/health testing only. HTTP does not encrypt webhook secrets or payloads, so do not send real customer data or production credentials. It does not claim full v1 exchange, new-order creation, or line-item synchronization. Do not enable a writer or configure real upstream endpoints on this candidate.
+
 ## Configuration keys
 
 The local preview explicitly sets `SYNC_STATE=off`, `LOCAL_HEADER_EXCHANGE=0`, and `LOCAL_HEADER_EXCHANGE_READY=0`, and leaves webhook/upstream credentials empty. Header exchange is disabled in the preview. The test harness may set synthetic values only for isolated fake-HTTP testing; never copy production values into this checkout:

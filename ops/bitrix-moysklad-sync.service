@@ -1,0 +1,42 @@
+[Unit]
+Description=Bitrix-MoySklad local test candidate API
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=bms_sync
+Group=bms_sync
+WorkingDirectory=/opt/bitrix-moysklad-sync
+Environment=NODE_ENV=production
+Environment=PORT=5015
+Environment=SYNC_MODE=apply
+Environment=SYNC_STATE=off
+Environment=LOCAL_HEADER_EXCHANGE=0
+Environment=LOCAL_HEADER_EXCHANGE_READY=0
+Environment=DATABASE_URL=postgresql://bms_sync@localhost/bitrix_moysklad_sync?host=/var/run/postgresql&schema=public
+Environment=LOG_DIRECTORY=/var/lib/bitrix-moysklad-sync/logs
+Environment=BITRIX24_EVENT_APPLICATION_TOKEN=
+Environment=MOYSKLAD_WEBHOOK_SECRET=
+Environment=BITRIX24_REST_BASE_URL=
+Environment=MOYSKLAD_API_BASE_URL=
+Environment=MOYSKLAD_API_TOKEN=
+ExecStartPre=/usr/bin/npx prisma migrate deploy --schema prisma/schema.prisma
+ExecStart=/usr/bin/node dist/apps/api/src/main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/bitrix-moysklad-sync /run/postgresql
+
+[Install]
+WantedBy=multi-user.target
