@@ -87,7 +87,14 @@ export class PairFirstEventProcessor {
             data: { status: 'MANUAL_REVIEW', lastErrorCategory: `BASELINE_${baseline.reason}` },
           });
         } else if (this.headerSync) {
-          await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId });
+          const headerResult = await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId });
+          const holdReason = headerHoldReason(headerResult);
+          if (holdReason) {
+            await this.database.inboundEvent.updateMany({
+              where: { id: event.id, status: 'RECEIVED' },
+              data: { status: 'MANUAL_REVIEW', lastErrorCategory: holdReason },
+            });
+          }
         }
       } catch {
         await this.database.inboundEvent.updateMany({
@@ -99,6 +106,17 @@ export class PairFirstEventProcessor {
 
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
     return result;
+  }
+}
+
+function headerHoldReason(result: string): string | null {
+  switch (result) {
+    case 'UNSUPPORTED': return 'DEAL_ORDER_HEADER_UNSUPPORTED';
+    case 'BASELINE_MISSING': return 'DEAL_ORDER_BASELINE_MISSING';
+    case 'HOLD_CONFLICT': return 'DEAL_ORDER_HEADER_CONFLICT';
+    case 'HOLD_READ_FAILED': return 'DEAL_ORDER_HEADER_READ_FAILED';
+    case 'HOLD_WRITE_FAILED': return 'DEAL_ORDER_HEADER_WRITE_FAILED';
+    default: return null;
   }
 }
 

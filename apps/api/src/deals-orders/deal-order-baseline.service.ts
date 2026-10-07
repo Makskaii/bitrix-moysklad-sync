@@ -8,7 +8,7 @@ import { PairResolutionResult } from '../pairs/pair-resolver';
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
   | { status: 'READY'; baselineId: string; created: boolean; settingsVersion: number; capturedAt: string; bitrix24UpdatedAt: string | null; moyskladUpdatedAt: string | null }
-  | { status: 'MANUAL_REVIEW'; reason: 'SOURCE_READ_FAILED' | 'BASELINE_STORE_FAILED' | 'UNSUPPORTED_ENTITY' | 'PAIR_NOT_ACTIVE' };
+  | { status: 'MANUAL_REVIEW'; reason: 'SOURCE_READ_FAILED' | 'BASELINE_STORE_FAILED' | 'UNSUPPORTED_ENTITY' | 'PAIR_NOT_ACTIVE' | 'SETTINGS_VERSION_MISMATCH' };
 
 /**
  * Captures the first bilateral, approved-field state for an already-confirmed
@@ -49,7 +49,12 @@ export class DealOrderBaselineService {
     } catch {
       return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
     }
-    if (existing) return result(existing, false);
+    if (existing) {
+      if (existing.settingsVersion !== input.eventConfig.version) {
+        return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
+      }
+      return result(existing, false);
+    }
 
     let bitrix24: Record<string, unknown>;
     let moysklad: Record<string, unknown>;
@@ -81,6 +86,9 @@ export class DealOrderBaselineService {
       });
       const saved = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
       if (!saved) return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
+      if (saved.settingsVersion !== input.eventConfig.version) {
+        return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
+      }
       return result(saved, saved.eventId === input.eventId && saved.capturedAt.getTime() === capturedAt.getTime());
     } catch {
       return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };

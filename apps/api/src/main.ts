@@ -1,6 +1,8 @@
 import 'reflect-metadata';
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { resolve } from 'node:path';
 import { AdminController } from './admin/admin.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
 import { ContactSyncStatusController } from './admin/contact-sync-status.controller';
@@ -46,7 +48,8 @@ class AppController {
 class AppModule {}
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { logger: new RotatingFileLogger() });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
+  app.useStaticAssets(resolve(__dirname, '../../../../apps/web/dist'));
   await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 }
 
