@@ -1,9 +1,11 @@
 import 'reflect-metadata';
 import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
+import { randomUUID } from 'node:crypto';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { PrismaClient } from '@prisma/client';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
 
@@ -170,6 +172,109 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
     (request.method === 'POST' && request.path === '/b24/rest/crm.deal.update.json')));
 });
 
+test('first confirmed event captures baseline with header-writer preview flags disabled', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_100_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const settingsVersion = 800_000 + Math.floor(Math.random() * 100_000);
+  const pair = await createConfirmedPairAndSettings(database, settingsVersion);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  process.env.ADMIN_PREVIEW = '0';
+  process.env.LOCAL_HEADER_EXCHANGE = '0';
+  process.env.LOCAL_HEADER_EXCHANGE_READY = '0';
+  const requestsBefore = externalRequests.length;
+
+  const response = await postB24(bitrixId, 'production first event', 'production-baseline-only');
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  await waitForBaseline(database, pair.id);
+  const baseline = await database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
+  assert.ok(baseline, 'Q26.66 baseline capture is not gated by local preview flags');
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
+  assert.equal(externalRequests.slice(requestsBefore).filter(isWrite).length, 0);
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'RECEIVED');
+
+  process.env.ADMIN_PREVIEW = '1';
+  process.env.LOCAL_HEADER_EXCHANGE = '1';
+  process.env.LOCAL_HEADER_EXCHANGE_READY = '1';
+});
+
+test('pause accepts and stores event, captures first baseline read-only, and does not run header writes', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_200_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const settingsVersion = 900_000 + Math.floor(Math.random() * 100_000);
+  const pair = await createConfirmedPairAndSettings(database, settingsVersion);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } });
+  const requestsBefore = externalRequests.length;
+  const writesBefore = externalRequests.filter(isWrite).length;
+
+  const response = await postB24(bitrixId, 'paused first event', 'paused-baseline-only');
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  await waitForBaseline(database, pair.id);
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
+  assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'pause permits baseline source reads but no sync writes');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'RECEIVED');
+
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+});
+
+test('global off rejects intake before persistence, pair resolution, or upstream reads', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+  const requestsBefore = externalRequests.length;
+  const eventsBefore = await database.inboundEvent.count();
+
+  const response = await postB24(String(7_300_000_001), 'must not be accepted', 'global-off-reject');
+  assert.equal(response.status, 410);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(await database.inboundEvent.count(), eventsBefore);
+  assert.equal(externalRequests.length, requestsBefore, 'off rejects before queuing any pair/baseline work');
+
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+});
+
+test('dry first-event baseline uses the isolated dry database and performs reads only', async () => {
+  const applyDatabaseUrl = process.env.BASELINE_TEST_DATABASE_URL ?? 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_apply_test';
+  await app.close();
+  process.env.SYNC_MODE = 'dry';
+  process.env.DRY_DATABASE_URL = process.env.BASELINE_DRY_TEST_DATABASE_URL ?? 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_test';
+  app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
+  await app.listen(0, '127.0.0.1');
+  apiUrl = await app.getUrl();
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_400_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const settingsVersion = 1_000_000 + Math.floor(Math.random() * 100_000);
+  const pair = await createConfirmedPairAndSettings(database, settingsVersion);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  const requestsBefore = externalRequests.length;
+  const writesBefore = externalRequests.filter(isWrite).length;
+
+  const response = await postB24(bitrixId, 'dry first event', 'dry-baseline-only');
+  assert.equal(response.status, 200);
+  await waitForBaseline(database, pair.id);
+  const applyDatabase = new PrismaClient({ datasources: { db: { url: applyDatabaseUrl } } });
+  assert.equal(await applyDatabase.entityPairBaseline.findUnique({ where: { pairId: pair.id } }), null);
+  await applyDatabase.$disconnect();
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
+  assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'dry mode performs no external synchronization writes');
+});
+
+async function createConfirmedPairAndSettings(database: DatabaseService, settingsVersion: number) {
+  const config = {
+    schemaVersion: 1,
+    rules: [{ id: 'deal-comments', entity: 'deals-orders', sourceField: 'COMMENTS', targetField: 'description',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+    groups: [], references: { units: [], priceTypes: [], dictionaries: [] },
+  };
+  await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
+  await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
+  return database.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, source: 'MANUAL', reason: 'first-event baseline boundary fixture' } });
+}
+
 async function reply(request: IncomingMessage, response: ServerResponse) {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -204,6 +309,14 @@ async function postB24(id: string, comments: string, marker: string) {
 async function waitUntil(condition: () => boolean) {
   for (let attempt = 0; attempt < 100 && !condition(); attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.ok(condition(), `timed out waiting for event processor; fake requests: ${JSON.stringify(externalRequests)}; fake values: ${bitrixComments}/${moyskladDescription}`);
+}
+
+async function waitForBaseline(database: DatabaseService, pairId: string) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await database.entityPairBaseline.findUnique({ where: { pairId } })) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for baseline ${pairId}; fake requests: ${JSON.stringify(externalRequests)}`);
 }
 
 function isWrite(request: { method: string; path: string }) {
