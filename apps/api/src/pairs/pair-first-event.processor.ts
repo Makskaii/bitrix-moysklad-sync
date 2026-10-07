@@ -4,6 +4,7 @@ import { PairResolutionInput, PairResolutionResult, PairResolver, PAIR_RESOLVER 
 import { lockEntityPairState } from './pair-db-lock';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
+import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
 
 const logger = new Logger('PairFirstEventProcessor');
 
@@ -20,6 +21,7 @@ export class PairFirstEventProcessor {
     @Inject(PAIR_RESOLVER) private readonly resolver: PairResolver,
     @Optional() private readonly fieldSettings?: FieldSettingsService,
     @Optional() private readonly baseline?: DealOrderBaselineService,
+    @Optional() private readonly headerSync?: DealOrderHeaderSyncProcessor,
   ) {}
 
   enqueue(eventId: string): void {
@@ -84,6 +86,8 @@ export class PairFirstEventProcessor {
             where: { id: event.id, status: 'RECEIVED' },
             data: { status: 'MANUAL_REVIEW', lastErrorCategory: `BASELINE_${baseline.reason}` },
           });
+        } else if (this.headerSync) {
+          await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId });
         }
       } catch {
         await this.database.inboundEvent.updateMany({

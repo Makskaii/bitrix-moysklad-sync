@@ -23,6 +23,7 @@ import { PAIR_RESOLVER } from '../pairs/pair-resolver';
 import { PairFirstEventProcessor } from '../pairs/pair-first-event.processor';
 import { PairResolutionController } from './pair-resolution.controller';
 import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
+import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
 
 @Module({})
 export class LocalAdminPreviewModule {
@@ -40,8 +41,8 @@ export class LocalAdminPreviewModule {
         RetentionService,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
-          FieldSettingsService, ReadOnlyFieldDataProvider, DealOrderBaselineService, EntityPairService,
-          PairResolutionProvider,
+          FieldSettingsService, ReadOnlyFieldDataProvider, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+          EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,
         ] : []),

@@ -25,6 +25,7 @@ import { PAIR_RESOLVER } from './pairs/pair-resolver';
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.service';
 import { DryRunDocumentReader } from './dry-run-document-reader';
+import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
 
 @Controller()
 class AppController {
@@ -40,7 +41,7 @@ class AppController {
 
 @Module({
   controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, EntityPairService, PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 
