@@ -70,7 +70,9 @@ before(async () => {
       const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
-        : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
+        : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
+          ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
+          : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     throw new Error(`Unexpected test HTTP request: ${url.origin}${url.pathname}`);
@@ -87,6 +89,7 @@ before(async () => {
   const pairFixtures = [
     ['contact-42', 'CONTACT', '42', '00000000-0000-4000-8000-000000000001'],
     ['contact-1', 'CONTACT', 'contact-1', '00000000-0000-4000-8000-000000000002'],
+    ['contact-no-name', 'CONTACT', 'contact-no-name', '00000000-0000-4000-8000-000000000005'],
     ['company-1', 'COMPANY', 'company-1', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
     ['deal-1', 'DEAL', 'deal-1', '00000000-0000-4000-8000-000000000004'],
     ['product-1', 'PRODUCT', 'product-1', '00000000-0000-4000-8000-000000000003'],
@@ -330,6 +333,14 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
   }] };
   const unknownWritableResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: unknownWritable }) });
   assert.equal(unknownWritableResponse.status, 400, await unknownWritableResponse.text());
+  const pairSpecific = await fetch(`${apiUrl}/api/admin/field-settings/preview`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({
+    entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD', pairIds: [pairsByKey['contact-no-name']], config: { rules: [{
+      id: 'missing-for-this-pair', entity: 'contacts', sourceField: 'NAME', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+    }], groups: [] },
+  }) });
+  assert.equal(pairSpecific.status, 400, `preview must reject a mapping absent from a selected active pair: ${await pairSpecific.text()}`);
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {
