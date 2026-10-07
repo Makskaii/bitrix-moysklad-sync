@@ -64,9 +64,34 @@ model InboundEvent {
   lastSuccessfulAt DateTime?
   lastErrorCategory String?
   retryAfter       DateTime?
+  settings          InboundEventSettings?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+}
+
+model FieldSettingsVersion {
+  version   Int                    @id
+  config    Json
+  createdAt DateTime               @default(now())
+  state     FieldSettingsState?
+  events    InboundEventSettings[]
+}
+
+model FieldSettingsState {
+  id      String               @id @default("global")
+  version Int                  @unique
+  active  FieldSettingsVersion @relation(fields: [version], references: [version], onDelete: Restrict)
+}
+
+model InboundEventSettings {
+  eventId        String              @id
+  settingsVersion Int
+  pinnedAt       DateTime            @default(now())
+  event          InboundEvent        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  settings       FieldSettingsVersion @relation(fields: [settingsVersion], references: [version], onDelete: Restrict)
+
+  @@index([settingsVersion])
 }
 
 model InboundEntityLock {

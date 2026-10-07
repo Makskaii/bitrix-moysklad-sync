@@ -38,6 +38,13 @@ test('administrator can navigate the agreed shell without placeholder actions se
     entries: [{ id: 'log-1', category: 'EVENT', message: 'Inbound event accepted', referenceId: 'event-1', occurredAt: '2026-10-06T10:00:00.000Z' }], nextCursor: null,
   } }));
   await page.route('**/api/admin/monitoring/api-attempts', (route) => route.fulfill({ json: { attempts: [], nextCursor: null } }));
+  await page.route('**/api/admin/field-settings', (route) => route.fulfill({ json: {
+    version: 1, createdAt: '2026-10-07T00:00:00.000Z', config: { rules: [], groups: [], references: { units: [], priceTypes: [], dictionaries: [] } },
+  } }));
+  await page.route('**/api/admin/field-settings/catalogs', (route) => route.fulfill({ json: {
+    units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [],
+  } }));
+  await page.route('**/api/admin/field-settings/catalogs?*', (route) => route.fulfill({ json: { items: [], nextCursor: null } }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
 
   await page.goto('/');
@@ -67,7 +74,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
   await expect(page.getByText('Inbound event accepted')).toBeVisible();
 
   await page.getByRole('button', { name: 'Соответствия полей' }).click();
-  await expect(page.getByText('Функция в разработке')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Версия 1' })).toBeVisible();
   expect(writes).toEqual([]);
 });
 

@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
+import { FieldSettingsService } from './field-settings/field-settings.service';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -37,6 +38,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   constructor(
     private readonly database: DatabaseService,
     private readonly syncMode: SyncModeService,
+    @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
   ) {}
 
   onApplicationBootstrap() {
@@ -144,7 +146,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       const attempt = event.attempts;
 
       try {
-        await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null);
+        const pinnedSettings = await this.fieldSettings?.eventConfig(event.id);
+        await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, pinnedSettings?.config);
       } catch (error) {
         if (error instanceof EntityLockLostError) return;
         if (error instanceof EntityMappingChangedError) {
@@ -345,6 +348,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     event: { id: string; source: string; externalEntityId: string | null },
     attempt: number,
     lease: EntityLeaseIdentity | null,
+    pinnedConfig?: unknown,
   ) {
     const sourceEntityId = event.externalEntityId;
     if (!sourceEntityId) throw new ReviewRequiredError('SOURCE_ENTITY_ID_MISSING');
@@ -424,7 +428,20 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       return;
     }
 
-    const value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
+    let value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
+    const configuredTransform = this.fieldSettings?.transformField(
+      pinnedConfig,
+      'contacts',
+      direction,
+      direction === 'BITRIX24_TO_MOYSKLAD' ? 'email' : 'EMAIL',
+      direction === 'BITRIX24_TO_MOYSKLAD' ? { EMAIL: bitrixContact.EMAIL, email: bitrixEmail } : { email: moyskladEmail },
+    );
+    if (configuredTransform) {
+      if (configuredTransform.error || typeof configuredTransform.value !== 'string' || !configuredTransform.value.trim()) {
+        throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, snapshotRevision: snapshot.revision });
+      }
+      value = configuredTransform.value;
+    }
     const configuredDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!await this.syncMode.isDirectionEnabled('contacts-companies', configuredDirection)) {
       await this.commitWithEntityLease(lease, (tx) => tx.inboundEvent.update({
