@@ -43,7 +43,7 @@ before(async () => {
           : method === 'crm.contact.fields.json'
             ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
             : method === 'crm.deal.fields.json'
-              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false } }
+              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
                 ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false } } }
@@ -323,6 +323,13 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
   }] };
   const protectedResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: protectedTarget }) });
   assert.equal(protectedResponse.status, 400, await protectedResponse.text());
+  const unknownWritable = { ...current.config, references, rules: [{
+    id: 'unknown-writable', entity: 'deals-orders', sourceField: 'UNKNOWN_WRITABILITY', targetField: 'name',
+    bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }] };
+  const unknownWritableResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: unknownWritable }) });
+  assert.equal(unknownWritableResponse.status, 400, await unknownWritableResponse.text());
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

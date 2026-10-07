@@ -189,7 +189,7 @@ export class FieldSettingsService {
       const catalogs = catalogsByEntity.get(entity) ?? [];
       if (!catalogs.length || catalogs.some((catalog) => {
         const candidate = catalog[system].find((field) => field.code === code);
-        return !candidate || (writable && candidate.writable === false) || (writable && system === 'bitrix24' && code.startsWith('UF_') && candidate.writable !== true);
+        return !candidate || (writable && candidate.writable === false) || (writable && system === 'bitrix24' && candidate.writable !== true);
       })) throw new BadRequestException(`Field ${code} is not available as a ${writable ? 'writable ' : ''}${system} field for ${entity}`);
     };
     for (const candidate of config.rules) {
