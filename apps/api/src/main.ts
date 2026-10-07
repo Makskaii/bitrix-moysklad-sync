@@ -15,6 +15,11 @@ import { RetentionService } from './retention.service';
 import { RotatingFileLogger } from './rotating-file.logger';
 import { WebhookDiagnosticsController } from './webhook-diagnostics.controller';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
+import { PairResolutionController } from './admin/pair-resolution.controller';
+import { EntityPairService } from './pairs/entity-pair.service';
+import { PairResolutionProvider } from './pairs/pair-resolution.provider';
+import { PAIR_RESOLVER } from './pairs/pair-resolver';
+import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 
 @Controller()
 class AppController {
@@ -29,8 +34,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService],
+  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, EntityPairService, PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 

@@ -10,6 +10,8 @@ import { WebhookDiagnosticsController } from '../src/webhook-diagnostics.control
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from '../src/admin/admin-access.guard';
 import { WebhookDiagnosticLog } from '../src/webhook-diagnostic-log';
 import { ContactSyncProcessor } from '../src/contact-sync.service';
+import { PAIR_RESOLVER, PairResolutionInput, PairResolutionResult } from '../src/pairs/pair-resolver';
+import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
 
 type StoredEvent = {
   id: string;
@@ -28,7 +30,16 @@ let upsertCalls = 0;
 let failNextWrite = false;
 const queuedContactEventIds: string[] = [];
 let intakeMode: 'on' | 'pause' | 'off' = 'on';
+const resolvedPairInputs: PairResolutionInput[] = [];
+let pairResolution: PairResolutionResult = { status: 'manual_review', reason: 'NO_APPROVED_MATCH_KEY', entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: 'fixture', reviewCaseId: 'review-test' };
 const inboundEvent = {
+  findUnique: async ({ where }: { where: { id: string } }) => [...rows.values()].find((row) => row.id === where.id) ?? null,
+  updateMany: async ({ where, data }: { where: { id: string; status: string }; data: { status: string; lastErrorCategory: string } }) => {
+    const row = [...rows.values()].find((candidate) => candidate.id === where.id && candidate.status === where.status);
+    if (!row) return { count: 0 };
+    Object.assign(row, data);
+    return { count: 1 };
+  },
   findMany: async () => [...rows.values()].map(({ id, source, eventType, externalEntityType, externalEntityId, status, receivedAt, lastErrorCategory }) => ({
     id, source, eventType, externalEntityType, externalEntityId, status, receivedAt, lastErrorCategory,
   })),
@@ -62,8 +73,18 @@ const inboundEvent = {
   },
 };
 
-const fakeDatabase = {
+const fakeDatabase: {
+  inboundEvent: typeof inboundEvent;
+  entityPair: { findFirst: () => Promise<null> };
+  $queryRaw: () => Promise<never[]>;
+  $transaction: <T>(operation: (transaction: unknown) => Promise<T>) => Promise<T>;
+  syncSetting: { upsert: () => Promise<{ serviceMode: string }> };
+  syncDirectionSetting: { findUnique: () => Promise<{ bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean }> };
+} = {
   inboundEvent,
+  entityPair: { findFirst: async () => null },
+  $queryRaw: async () => [],
+  $transaction: async <T>(operation: (transaction: unknown) => Promise<T>) => operation(fakeDatabase as unknown),
   syncSetting: { upsert: async () => ({ serviceMode: intakeMode }) },
   syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
 };
@@ -77,6 +98,13 @@ const fakeDatabase = {
     { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
     WebhookDiagnosticLog,
     { provide: ContactSyncProcessor, useValue: { enqueue: (id: string) => queuedContactEventIds.push(id) } },
+    { provide: PAIR_RESOLVER, useValue: { resolve: async (input: PairResolutionInput): Promise<PairResolutionResult> => {
+      resolvedPairInputs.push(input);
+      return pairResolution.status === 'manual_review'
+        ? { ...pairResolution, entityType: input.entityType, sourceSystem: input.sourceSystem, sourceEntityId: input.externalId }
+        : pairResolution;
+    } } },
+    PairFirstEventProcessor,
   ],
 })
 class EventsIntakeTestModule {}
@@ -320,6 +348,8 @@ test('MoySklad does not acknowledge a malformed events array as fully stored', a
 
 test('dry deal and customer-order webhook matrix accepts create, update, and delete without dispatching writers', async () => {
   rows.clear();
+  resolvedPairInputs.length = 0;
+  pairResolution = { status: 'manual_review', reason: 'NO_APPROVED_MATCH_KEY', entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: 'fixture', reviewCaseId: 'review-test' };
   queuedContactEventIds.length = 0;
   process.env.SYNC_MODE = 'dry';
   const bitrixEvents = ['ONCRMDEALADD', 'ONCRMDEALUPDATE', 'ONCRMDEALDELETE'];
@@ -347,9 +377,33 @@ test('dry deal and customer-order webhook matrix accepts create, update, and del
     assert.equal(response.status, 200);
   }
   assert.equal(rows.size, 6);
-  assert.ok([...rows.values()].every((row) => row.status === 'RECEIVED'));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok([...rows.values()].every((row) => row.status === 'MANUAL_REVIEW'));
+  assert.equal(resolvedPairInputs.length, 6);
+  assert.ok(resolvedPairInputs.every((input) => input.entityType === 'DEAL'));
+  assert.deepEqual(resolvedPairInputs.map((input) => input.sourceSystem).sort(), ['BITRIX24', 'BITRIX24', 'BITRIX24', 'MOYSKLAD', 'MOYSKLAD', 'MOYSKLAD']);
   assert.ok([...rows.values()].every((row) => !JSON.stringify(row.payload).includes('bitrix-test-application-token')));
   assert.deepEqual(queuedContactEventIds, []);
+  process.env.SYNC_MODE = 'apply';
+});
+
+test('first-event intake recognizes persisted confirmed identity without conflating baseline readiness', async () => {
+  rows.clear();
+  resolvedPairInputs.length = 0;
+  pairResolution = { status: 'confirmed', pair: { id: 'pair-fixture', entityType: 'DEAL', bitrix24Id: 'deal-confirmed', moyskladId: 'order-confirmed', status: 'MANUAL', source: 'PERSISTED' } };
+  process.env.SYNC_MODE = 'dry';
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ event: 'ONCRMDEALADD', 'auth[application_token]': 'bitrix-test-application-token', 'data[FIELDS][ID]': 'deal-confirmed' }),
+  });
+  assert.equal(response.status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const event = [...rows.values()][0];
+  assert.ok(event);
+  assert.equal(event.status, 'RECEIVED', 'confirmed identity is reported separately from downstream baseline readiness');
+  assert.equal(event.lastErrorCategory, null);
+  assert.equal(resolvedPairInputs.length, 1);
+  assert.equal(resolvedPairInputs[0].entityType, 'DEAL');
   process.env.SYNC_MODE = 'apply';
 });
 
