@@ -13,6 +13,12 @@ services:
       - npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/admin/local-preview-main.js
     environment:
       ADMIN_PREVIEW: "1"
+      SYNC_STATE: "off"
+      BITRIX24_EVENT_APPLICATION_TOKEN: ""
+      MOYSKLAD_WEBHOOK_SECRET: ""
+      BITRIX24_REST_BASE_URL: ""
+      MOYSKLAD_API_BASE_URL: ""
+      MOYSKLAD_API_TOKEN: ""
       DATABASE_URL: postgresql://sync:local-only@db:5432/sync?schema=public
       PORT: 3000
       SYNC_MODE: apply
