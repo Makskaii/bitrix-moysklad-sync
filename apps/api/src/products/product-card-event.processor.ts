@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
@@ -7,6 +7,8 @@ import { ProductCardRuntimeService } from './product-card-runtime.service';
 import { ProductCardSyncResult } from './product-card-sync.service';
 
 const logger = new Logger('ProductCardEventProcessor');
+const PROCESSING_LEASE_MS = 60_000;
+const EVENT_BATCH_DELAY_MS = 250;
 
 /**
  * Dispatches supported update events only to already-persisted PRODUCT hardpairs.
@@ -14,7 +16,11 @@ const logger = new Logger('ProductCardEventProcessor');
  * never searches, creates, or guesses a product pair.
  */
 @Injectable()
-export class ProductCardEventProcessor {
+export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
+  private recoveryTimer?: NodeJS.Timeout;
+  private recoveryScan: Promise<void> | null = null;
+  private readonly active = new Set<string>();
+
   constructor(
     private readonly database: DatabaseService,
     private readonly bitrixApi: ProductCardHttpApi,
@@ -22,16 +28,85 @@ export class ProductCardEventProcessor {
     private readonly runtime: ProductCardRuntimeService,
   ) {}
 
+  onApplicationBootstrap() {
+    this.requestRecoveryScan();
+    this.recoveryTimer = setInterval(() => this.requestRecoveryScan(), 1_000);
+    this.recoveryTimer.unref();
+  }
+
+  async onModuleDestroy() {
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    await this.recoveryScan;
+  }
+
   enqueue(eventId: string): void {
-    void this.process(eventId).catch(() => logger.error(JSON.stringify({ eventId, status: 'PRODUCT_EVENT_PROCESSOR_FAILED' })));
+    if (this.active.has(eventId)) return;
+    this.active.add(eventId);
+    const timer = setTimeout(() => {
+      void this.process(eventId)
+        .catch(() => logger.error(JSON.stringify({ eventId, status: 'PRODUCT_EVENT_PROCESSOR_FAILED' })))
+        .finally(() => this.active.delete(eventId));
+    }, EVENT_BATCH_DELAY_MS);
+    timer.unref();
+  }
+
+  private requestRecoveryScan() {
+    if (this.recoveryScan) return;
+    this.recoveryScan = this.resumeProductEvents()
+      .catch(() => undefined)
+      .finally(() => { this.recoveryScan = null; });
+  }
+
+  private async resumeProductEvents() {
+    if (process.env.SYNC_MODE !== 'apply') return;
+    try {
+      const now = new Date();
+      const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
+      const pending = await this.database.inboundEvent.findMany({
+        where: {
+          AND: [
+            { OR: [
+              { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRICE.ON.UPDATE'] } },
+              { source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'product' },
+            ] },
+            { OR: [
+              { status: 'RECEIVED' },
+              { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
+              { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
+              { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: staleBefore } }] },
+            ] },
+          ],
+        },
+        select: { id: true },
+        take: 100,
+      });
+      for (const event of pending) this.enqueue(event.id);
+    } catch {
+      // A later timer tick retries database discovery without blocking startup.
+    }
   }
 
   async process(eventId: string): Promise<ProductCardSyncResult | null> {
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true, retryAfter: true, processingStartedAt: true },
     });
-    if (!event || event.status !== 'RECEIVED') return null;
+    if (!event || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
+    if (!isProductEvent(event.source, event.eventType, event.externalEntityType)) return null;
+
+    const claimed = await this.database.inboundEvent.updateMany({
+      where: {
+        id: event.id,
+        OR: [
+          { status: 'RECEIVED' },
+          { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
+          { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
+          { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: new Date(Date.now() - PROCESSING_LEASE_MS) } }] },
+        ],
+      },
+      data: { status: 'PROCESSING', attempts: { increment: 1 }, processingStartedAt: new Date(), lastErrorCategory: null, retryAfter: null },
+    });
+    if (claimed.count !== 1) return null;
 
     // A price webhook must use a read-only catalog.price.get call to discover
     // its product. Honor global apply/off/pause/direction gates before that API read.
@@ -51,8 +126,9 @@ export class ProductCardEventProcessor {
       return null;
     }
     if (supported.status === 'retryable') {
-      await this.finish(event.id, 'RETRYABLE_FAILURE', 'PRODUCT_EVENT_ID_RESOLUTION_FAILED', new Date(Date.now() + retryDelayMs(event.attempts + 1)));
-      return { status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_EVENT_ID_RESOLUTION_FAILED', changedFields: [] };
+      const result = { status: 'RETRYABLE_FAILURE' as const, reason: 'PRODUCT_EVENT_ID_RESOLUTION_FAILED', changedFields: [] };
+      await this.applyResult(event.id, event, result);
+      return result;
     }
 
     const sideField = event.source === 'BITRIX24' ? 'bitrix24Id' : 'moyskladId';
@@ -72,12 +148,6 @@ export class ProductCardEventProcessor {
       return { status: 'MANUAL_REVIEW', reason, changedFields: [] };
     }
 
-    const claimed = await this.database.inboundEvent.updateMany({
-      where: { id: event.id, status: 'RECEIVED' },
-      data: { status: 'PROCESSING', attempts: { increment: 1 }, processingStartedAt: new Date(), lastErrorCategory: null, retryAfter: null },
-    });
-    if (claimed.count !== 1) return null;
-
     try {
       const pinned = await this.fieldSettings.eventConfig(event.id);
       const result = await this.runtime.process({
@@ -88,8 +158,9 @@ export class ProductCardEventProcessor {
       await this.applyResult(event.id, event, result);
       return result;
     } catch {
-      await this.finish(event.id, 'RETRYABLE_FAILURE', 'PRODUCT_EVENT_PROCESSING_FAILED', new Date(Date.now() + retryDelayMs(event.attempts + 1)));
-      return { status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_EVENT_PROCESSING_FAILED', changedFields: [] };
+      const result = { status: 'RETRYABLE_FAILURE' as const, reason: 'PRODUCT_EVENT_PROCESSING_FAILED', changedFields: [] };
+      await this.applyResult(event.id, event, result);
+      return result;
     }
   }
 
@@ -141,6 +212,15 @@ export class ProductCardEventProcessor {
         await this.finish(eventId, 'MANUAL_REVIEW', result.reason);
         return;
       case 'RETRYABLE_FAILURE':
+        if (event.attempts + 1 >= 8) {
+          await this.database.manualReviewCase.upsert({
+            where: { eventId },
+            create: { eventId, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId, externalEntityType: event.externalEntityType, reason: 'PRODUCT_RETRY_LIMIT_EXCEEDED' },
+            update: { reason: 'PRODUCT_RETRY_LIMIT_EXCEEDED' },
+          });
+          await this.finish(eventId, 'MANUAL_REVIEW', 'PRODUCT_RETRY_LIMIT_EXCEEDED');
+          return;
+        }
         await this.finish(eventId, 'RETRYABLE_FAILURE', result.reason, new Date(Date.now() + retryDelayMs(event.attempts + 1)));
         return;
       case 'SKIPPED_DISABLED':
@@ -157,13 +237,27 @@ export class ProductCardEventProcessor {
 
   private async finish(eventId: string, status: string, reason: string, retryAfter: Date | null = null) {
     await this.database.inboundEvent.updateMany({
-      where: { id: eventId, OR: [{ status: 'RECEIVED' }, { status: 'PROCESSING' }] },
+      where: { id: eventId, OR: [
+        { status: 'RECEIVED' }, { status: 'PROCESSING' },
+        { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' },
+      ] },
       data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter },
     });
   }
 }
 
 function retryDelayMs(attempt: number): number { return Math.min(60_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 6), 3_600_000); }
+function isProductEvent(source: string, eventType: string | null, externalEntityType: string | null): boolean {
+  return source === 'BITRIX24'
+    ? eventType === 'CATALOG.PRODUCT.ON.UPDATE' || eventType === 'CATALOG.PRICE.ON.UPDATE'
+    : source === 'MOYSKLAD' && eventType === 'UPDATE' && externalEntityType === 'product';
+}
+function isDue(status: string, retryAfter: Date | null, processingStartedAt: Date | null): boolean {
+  const now = Date.now();
+  return status === 'RECEIVED' ||
+    ((status === 'RETRYABLE_FAILURE' || status === 'DEFERRED_PAUSE') && (!retryAfter || retryAfter.getTime() <= now)) ||
+    (status === 'PROCESSING' && (!processingStartedAt || processingStartedAt.getTime() < now - PROCESSING_LEASE_MS));
+}
 function readScalar(value: unknown): string | null { return typeof value === 'string' || typeof value === 'number' ? String(value) : null; }
 function asRecord(value: unknown): Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, any> : {}; }
 function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }

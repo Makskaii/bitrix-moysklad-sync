@@ -49,6 +49,17 @@ test('product event dispatches only to an exact active PRODUCT pair and uses pin
   assert.equal(storedEvent.status, 'SUCCEEDED');
 });
 
+test('due retryable product events are claimed and reprocessed', async () => {
+  const { processor, storedEvent, runtimeCalls } = harness({
+    eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
+    payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } },
+    status: 'RETRYABLE_FAILURE', attempts: 2, retryAfter: new Date(0),
+  });
+  assert.equal((await processor.process('event-1'))?.status, 'SYNCED');
+  assert.equal(storedEvent.status, 'SUCCEEDED');
+  assert.equal(runtimeCalls.length, 1);
+});
+
 test('product event rejects unsupported B24 service and variation kinds without runtime writes', async () => {
   const { processor, storedEvent, runtimeCalls } = harness({
     eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
