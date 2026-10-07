@@ -173,10 +173,26 @@ model EntityPair {
   source      String   @default("MANUAL")
   reason      String?
   createdAt   DateTime @default(now())
+  baseline    EntityPairBaseline?
 
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
+}
+
+model EntityPairBaseline {
+  pairId              String     @id
+  eventId             String
+  settingsVersion     Int
+  bitrix24Values      Json
+  moyskladValues      Json
+  bitrix24UpdatedAt   DateTime?
+  moyskladUpdatedAt   DateTime?
+  capturedAt          DateTime   @default(now())
+  pair                EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([capturedAt])
 }
 
 model PairReviewCase {

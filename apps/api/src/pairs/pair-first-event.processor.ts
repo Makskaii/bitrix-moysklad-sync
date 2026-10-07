@@ -1,7 +1,9 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { DatabaseService } from '../database.service';
 import { PairResolutionInput, PairResolutionResult, PairResolver, PAIR_RESOLVER } from './pair-resolver';
 import { lockEntityPairState } from './pair-db-lock';
+import { FieldSettingsService } from '../field-settings/field-settings.service';
+import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
 
 const logger = new Logger('PairFirstEventProcessor');
 
@@ -16,6 +18,8 @@ export class PairFirstEventProcessor {
   constructor(
     private readonly database: DatabaseService,
     @Inject(PAIR_RESOLVER) private readonly resolver: PairResolver,
+    @Optional() private readonly fieldSettings?: FieldSettingsService,
+    @Optional() private readonly baseline?: DealOrderBaselineService,
   ) {}
 
   enqueue(eventId: string): void {
@@ -69,6 +73,24 @@ export class PairFirstEventProcessor {
         });
         return result;
       });
+    }
+
+    if (result.status === 'confirmed' && this.fieldSettings && this.baseline) {
+      try {
+        const eventConfig = await this.fieldSettings.eventConfig(event.id);
+        const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig });
+        if (baseline.status !== 'READY') {
+          await this.database.inboundEvent.updateMany({
+            where: { id: event.id, status: 'RECEIVED' },
+            data: { status: 'MANUAL_REVIEW', lastErrorCategory: `BASELINE_${baseline.reason}` },
+          });
+        }
+      } catch {
+        await this.database.inboundEvent.updateMany({
+          where: { id: event.id, status: 'RECEIVED' },
+          data: { status: 'MANUAL_REVIEW', lastErrorCategory: 'BASELINE_SETTINGS_UNAVAILABLE' },
+        });
+      }
     }
 
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
