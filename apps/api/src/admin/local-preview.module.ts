@@ -13,13 +13,16 @@ import { MonitoringController } from './monitoring.controller';
 import { RetentionService } from '../retention.service';
 import { WebhookDiagnosticsController } from '../webhook-diagnostics.controller';
 import { WebhookDiagnosticLog } from '../webhook-diagnostic-log';
+import { FieldSettingsController } from './field-settings.controller';
+import { FieldSettingsService } from '../field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
 
 @Module({})
 export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController],
+      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController],
       providers: [
         databaseProvider,
         SyncModeService,
@@ -28,6 +31,7 @@ export class LocalAdminPreviewModule {
         ContactSyncStatusReader,
         EventIntakeService,
         RetentionService,
+        ...(databaseProvider === DatabaseService ? [FieldSettingsService, ReadOnlyFieldDataProvider] : []),
         WebhookDiagnosticLog,
         { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
         AdminAccessGuard,

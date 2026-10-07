@@ -42,6 +42,7 @@ export type FieldGroupDto = {
 };
 
 export type FieldSettingsConfigDto = {
+  schemaVersion: 1;
   rules: FieldRuleDto[];
   groups: FieldGroupDto[];
   references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[] };
@@ -49,7 +50,7 @@ export type FieldSettingsConfigDto = {
 
 export type VersionedFieldSettingsDto = {
   version: number;
-  createdAt: Date;
+  createdAt: string;
   config: FieldSettingsConfigDto;
   references: FieldSettingsConfigDto['references'];
 };

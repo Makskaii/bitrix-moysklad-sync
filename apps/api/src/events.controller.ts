@@ -22,6 +22,7 @@ import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
+import { FieldSettingsService } from './field-settings/field-settings.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -33,6 +34,7 @@ export class EventIntakeService {
     private readonly database: DatabaseService,
     private readonly syncMode: SyncModeService,
     @Optional() @Inject(WebhookDiagnosticLog) private readonly diagnostics?: WebhookDiagnosticLog,
+    @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
   ) {}
 
   async receiveBitrix24(payload: EventPayload) {
@@ -155,21 +157,22 @@ export class EventIntakeService {
   ) {
     let row: { id: string };
     try {
-      row = await this.database.inboundEvent.upsert({
-      where: { source_deliveryKey: { source, deliveryKey } },
-      create: {
-        source,
-        deliveryKey,
-        eventType: event.eventType,
-        externalEntityId: event.externalEntityId,
-        externalEntityType: event.externalEntityType,
-        payload: event.payload as Prisma.InputJsonValue,
-        status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
-        lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
-      },
-      update: {},
-      select: { id: true },
-      });
+      row = this.fieldSettings
+        ? await this.fieldSettings.saveAcceptedEvent({
+          source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
+          externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue, directionDisabled,
+        })
+        : await this.database.inboundEvent.upsert({
+          where: { source_deliveryKey: { source, deliveryKey } },
+          create: {
+            source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
+            externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue,
+            status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
+            lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
+          },
+          update: {},
+          select: { id: true },
+        });
     } catch {
       const receivedAt = new Date().toISOString();
       const supportedType = source === 'BITRIX24'
