@@ -15,7 +15,8 @@
     "test:monitoring:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/monitoring.postgres.integration.js",
     "test:field-settings": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/field-settings.integration.js",
     "test:historical-inventory": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-inventory.integration.js",
-    "test:historical-inventory:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-inventory.postgres.integration.js"
+    "test:historical-inventory:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-inventory.postgres.integration.js",
+    "test:productcards": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-api.integration.js ../../dist/apps/api-test/test/product-card-event.integration.js ../../dist/apps/api-test/test/product-card-sync.integration.js ../../dist/apps/api-test/test/product-card-state.postgres.integration.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",
