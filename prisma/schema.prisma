@@ -163,3 +163,33 @@ model ContactSnapshot {
   lastSuccessfulAt    DateTime?
   pair                ContactPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }
+
+model EntityPair {
+  id          String   @id @default(cuid())
+  entityType  String
+  bitrix24Id  String
+  moyskladId  String
+  active      Boolean  @default(true)
+  source      String   @default("MANUAL")
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, active, createdAt])
+  @@index([entityType, bitrix24Id, active])
+  @@index([entityType, moyskladId, active])
+}
+
+model PairReviewCase {
+  id             String   @id @default(cuid())
+  entityType     String
+  sourceSystem   String
+  sourceEntityId String
+  eventId        String?
+  reason         String
+  status         String   @default("OPEN")
+  openedAt       DateTime @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, openedAt])
+  @@index([entityType, sourceSystem, sourceEntityId, status], map: "PairReviewCase_source_lookup_idx")
+}

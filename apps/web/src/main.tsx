@@ -341,7 +341,7 @@ function App() {
         <div className="page-content">
           {activeSection === 'overview' && <Overview mode={mode} recovery={recovery} serviceStatus={serviceStatus} actions={actions} loading={loading} message={message} setMessage={setMessage} submit={submitTrialAction} error={error} />}
           {activeSection === 'queue' && <MonitoringPage kind="queue" queue={queueSnapshot} attempts={apiAttempts} onLoadMore={loadMore} onError={setError} />}
-          {activeSection === 'pairs' && <UnavailablePage title="Связи записей" eyebrow="КАРТА СВЯЗЕЙ" description="Список связанных записей и ручное назначение пары пока недоступны. Реальные пары будут показаны после подключения их хранилища." action="Создать связь" />}
+          {activeSection === 'pairs' && <PairManager accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
           {activeSection === 'review' && <MonitoringPage kind="review" incidents={incidents} incidentNextCursor={incidentNextCursor} onLoadMore={loadMore} onResolve={resolveIncident} onRetry={retryIncident} onError={setError} />}
           {activeSection === 'settings' && <Settings mode={mode} entities={entities} recovery={recovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}
@@ -527,6 +527,157 @@ function UnavailablePage({ title, eyebrow, description, action, badge = 'Пок�
       <button type="button" disabled>{action}</button>
     </section>
   </>;
+}
+
+type PairEntityType = 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT';
+const pairEntityTypes: { id: PairEntityType; label: string }[] = [
+  { id: 'CONTACT', label: 'Контакт' },
+  { id: 'COMPANY', label: 'Компания' },
+  { id: 'DEAL', label: 'Сделка / заказ покупателя' },
+  { id: 'PRODUCT', label: 'Товар / модификация' },
+];
+const pairReviewReasonLabels: Record<string, string> = {
+  NO_APPROVED_MATCH_KEY: 'Нет утверждённого ключа для безопасного сопоставления',
+  AMBIGUOUS_CANDIDATES: 'Найдено несколько возможных пар',
+  INCOMPLETE_EVIDENCE: 'Недостаточно данных для проверки пары',
+  PAIR_ALREADY_ASSIGNED: 'Запись уже входит в другую подтверждённую пару',
+  PAIR_INACTIVE: 'Ранее сохранённая пара неактивна',
+  ENTITY_TYPE_UNSUPPORTED: 'Этот тип записи не поддерживается',
+  PAIR_STORE_UNAVAILABLE: 'Хранилище пар временно недоступно',
+};
+type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; source: string; reason: string | null; createdAt: string };
+type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; eventId: string | null; reason: string; openedAt: string };
+
+function PairManager({ accessToken, onError, onForbidden }: { accessToken: string; onError: (message: string) => void; onForbidden: () => void }) {
+  const [pairs, setPairs] = useState<PairRow[]>([]);
+  const [reviews, setReviews] = useState<PairReviewRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  async function refresh() {
+    const headers: Record<string, string> = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
+    const [pairsResponse, reviewsResponse] = await Promise.all([
+      fetch('/api/admin/pairs', { headers }),
+      fetch('/api/admin/pairs/reviews', { headers }),
+    ]);
+    if (pairsResponse.status === 403 || reviewsResponse.status === 403) {
+      onForbidden();
+      throw new Error('Доступ только для администратора Bitrix24');
+    }
+    if (!pairsResponse.ok || !reviewsResponse.ok) throw new Error('Не удалось загрузить пары записей');
+    setPairs(await pairsResponse.json() as PairRow[]);
+    setReviews(await reviewsResponse.json() as PairReviewRow[]);
+  }
+
+  useEffect(() => {
+    refresh().catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) {
+    setSaving(true);
+    try {
+      const response = await fetch('/api/admin/pairs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+        body: JSON.stringify(input),
+      });
+      if (response.status === 403) {
+        onForbidden();
+        throw new Error('Доступ только для администратора Bitrix24');
+      }
+      if (response.status === 409) throw new Error('Одна из записей уже входит в активную пару. Для переназначения включите подтверждение замены.');
+      if (!response.ok) throw new Error('Не удалось сохранить пару');
+      await refresh();
+      onError('');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <>
+    <PageHeading eyebrow="СВЯЗИ ЗАПИСЕЙ" title="Пары Bitrix24 и МойСклад" subtitle="Подтверждённая пара хранится по ID обеих записей. Непроверенное совпадение всегда остаётся на ручной проверке." />
+    <section className="panel pair-manager">
+      <div className="records-head"><div><p className="eyebrow">АКТИВНЫЕ ПАРЫ</p><h3>Сохранённые связи</h3></div><button type="button" className="refresh-monitoring" onClick={() => void refresh().catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Обновить</button></div>
+      {loading ? <p>Загрузка пар…</p> : pairs.length ? <div className="pair-list">{pairs.map((pair) => <article className="pair-card" key={pair.id}>
+        <div><span className="pair-entity">{pairEntityTypes.find((type) => type.id === pair.entityType)?.label ?? pair.entityType}</span><span className="pair-state">{pair.source === 'MANUAL' ? 'Подтверждена администратором' : 'Сохранённая подтверждённая пара'}</span></div>
+        <div className="pair-sides"><p><small>Bitrix24 · ID записи</small><code>{pair.bitrix24Id}</code></p><b aria-hidden="true">↔</b><p><small>МойСклад · ID записи</small><code>{pair.moyskladId}</code></p></div>
+        {pair.reason && <small>Основание: {pair.reason}</small>}
+      </article>)}</div> : <p className="empty-state">Сохранённых пар пока нет.</p>}
+    </section>
+    <section className="panel pair-manager">
+      <p className="eyebrow">ТРЕБУЕТСЯ РЕШЕНИЕ</p><h3>Ручная проверка пар · {reviews.length}</h3>
+      <p className="pair-safety-note">Новое сопоставление сохраняет только связь ID в базе сервиса. Оно не создаёт, не изменяет, не объединяет и не удаляет записи во внешних системах.</p>
+      {reviews.length ? <div className="pair-review-list">{reviews.map((review) => <PairReviewForm key={review.id} review={review} saving={saving} onAssign={assign} />)}</div> : <p className="empty-state">Открытых случаев ручной проверки нет.</p>}
+    </section>
+    <section className="panel pair-manager">
+      <p className="eyebrow">РУЧНОЕ НАЗНАЧЕНИЕ</p><h3>Создать или переназначить пару</h3>
+      <ManualPairForm saving={saving} onAssign={assign} />
+    </section>
+  </>;
+}
+
+function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) => Promise<void> }) {
+  const [bitrix24Id, setBitrix24Id] = useState(review.sourceSystem === 'BITRIX24' ? review.sourceEntityId : '');
+  const [moyskladId, setMoyskladId] = useState(review.sourceSystem === 'MOYSKLAD' ? review.sourceEntityId : '');
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [localError, setLocalError] = useState('');
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setLocalError('');
+    try {
+      await onAssign({ entityType: review.entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), replaceExisting });
+    } catch (cause) {
+      setLocalError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  return <article className="pair-review-card">
+    <div className="pair-review-heading"><div><span className="pair-entity">{pairEntityTypes.find((type) => type.id === review.entityType)?.label ?? review.entityType}</span><strong>{pairReviewReasonLabels[review.reason] ?? review.reason}</strong></div><time>{new Date(review.openedAt).toLocaleString()}</time></div>
+    <form onSubmit={(event) => void submit(event)}>
+      <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
+      <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
+      <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
+      <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
+      <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
+      {localError && <p className="inline-error" role="alert">{localError}</p>}
+    </form>
+  </article>;
+}
+
+function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) => Promise<void> }) {
+  const [entityType, setEntityType] = useState<PairEntityType>('DEAL');
+  const [bitrix24Id, setBitrix24Id] = useState('');
+  const [moyskladId, setMoyskladId] = useState('');
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [localError, setLocalError] = useState('');
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setLocalError('');
+    try {
+      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), replaceExisting });
+      setBitrix24Id('');
+      setMoyskladId('');
+      setReplaceExisting(false);
+      setConfirmed(false);
+    } catch (cause) {
+      setLocalError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  return <form className="manual-pair-form" onSubmit={(event) => void submit(event)}>
+    <label>Сущность<select required value={entityType} onChange={(event) => setEntityType(event.target.value as PairEntityType)}>{pairEntityTypes.map((type) => <option key={type.id} value={type.id}>{type.label}</option>)}</select></label>
+    <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
+    <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
+    <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
+    <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
+    <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
+    {localError && <p className="inline-error" role="alert">{localError}</p>}
+  </form>;
 }
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);

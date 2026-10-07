@@ -23,6 +23,7 @@ import { writeOperationalLog } from './monitoring-log';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 import { FieldSettingsService } from './field-settings/field-settings.service';
+import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -119,6 +120,7 @@ export class EventIntakeService {
     const events = readMoySkladEvents(safePayload, query);
     const eventIds: string[] = [];
     const contactEventIds: string[] = [];
+    const pairEventIds: string[] = [];
     for (const [index, event] of events.entries()) {
       const deliveryKey = typeof requestId === 'string'
         ? `request:${JSON.stringify([requestId, index])}`
@@ -135,8 +137,11 @@ export class EventIntakeService {
       if (event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty') {
         contactEventIds.push(acknowledgement.eventId);
       }
+      if (event.externalEntityType === 'customerorder' && ['CREATE', 'UPDATE', 'DELETE'].includes(event.eventType ?? '')) {
+        pairEventIds.push(acknowledgement.eventId);
+      }
     }
-    return { accepted: true, eventId: eventIds[0], eventIds, contactEventIds };
+    return { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds };
   }
 
   private async ensureIntakeEnabled() {
@@ -206,6 +211,7 @@ export class EventsController {
   constructor(
     private readonly intake: EventIntakeService,
     @Optional() private readonly contactSync?: ContactSyncProcessor,
+    @Optional() private readonly pairFirstEvent?: PairFirstEventProcessor,
   ) {}
 
   @Post('bitrix24')
@@ -218,6 +224,9 @@ export class EventsController {
     const acknowledgement = await this.intake.receiveBitrix24(payload);
     if (isContactBitrixEvent(readString(payload.event))) {
       response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    }
+    if (isDealBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.pairFirstEvent?.enqueue(acknowledgement.eventId));
     }
     return acknowledgement;
   }
@@ -236,10 +245,17 @@ export class EventsController {
       if (acknowledgement.contactEventIds.length > 0) {
         response.once('finish', () => acknowledgement.contactEventIds.forEach((eventId) => this.contactSync?.enqueue(eventId)));
       }
-      const { contactEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
+      if (acknowledgement.pairEventIds.length > 0) {
+        response.once('finish', () => acknowledgement.pairEventIds.forEach((eventId) => this.pairFirstEvent?.enqueue(eventId)));
+      }
+      const { contactEventIds, pairEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
       return eventIds.length > 1 ? { ...singleEventAcknowledgement, eventIds } : singleEventAcknowledgement;
     });
   }
+}
+
+function isDealBitrixEvent(eventType: string | null): boolean {
+  return /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '');
 }
 
 function isRecord(value: unknown): value is EventPayload {

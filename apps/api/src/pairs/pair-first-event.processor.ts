@@ -1,0 +1,82 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { DatabaseService } from '../database.service';
+import { PairResolutionInput, PairResolutionResult, PairResolver, PAIR_RESOLVER } from './pair-resolver';
+import { lockEntityPairState } from './pair-db-lock';
+
+const logger = new Logger('PairFirstEventProcessor');
+
+/**
+ * Resolves persisted deal/order webhook events before any sync work can be
+ * considered. This temporary intake gate deliberately has no writer: it
+ * resolves pair identity only, while downstream baseline readiness belongs to
+ * the baseline processor. Unresolved identities are durably held for review.
+ */
+@Injectable()
+export class PairFirstEventProcessor {
+  constructor(
+    private readonly database: DatabaseService,
+    @Inject(PAIR_RESOLVER) private readonly resolver: PairResolver,
+  ) {}
+
+  enqueue(eventId: string): void {
+    void this.process(eventId).catch(() => logger.error(JSON.stringify({ eventId, resolution: 'PAIR_STORE_UNAVAILABLE' })));
+  }
+
+  async process(eventId: string): Promise<PairResolutionResult | null> {
+    const event = await this.database.inboundEvent.findUnique({
+      where: { id: eventId },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true },
+    });
+    if (!event || event.status !== 'RECEIVED' || !event.externalEntityId || !isDealOrderEvent(event)) return null;
+
+    const input: PairResolutionInput = {
+      entityType: 'DEAL',
+      sourceSystem: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
+      externalId: event.externalEntityId,
+      eventId: event.id,
+    };
+
+    let result: PairResolutionResult;
+    try {
+      result = await this.resolver.resolve(input);
+    } catch {
+      result = { status: 'unavailable', reason: 'PAIR_STORE_UNAVAILABLE' };
+    }
+
+    if (result.status !== 'confirmed') {
+      result = await this.database.$transaction(async (transaction) => {
+        await lockEntityPairState(transaction);
+        const side = input.sourceSystem === 'BITRIX24' ? 'bitrix24Id' : 'moyskladId';
+        const currentPair = await transaction.entityPair.findFirst({
+          where: { entityType: input.entityType, [side]: input.externalId, active: true },
+        });
+        if (currentPair) {
+          return {
+            status: 'confirmed',
+            pair: {
+              id: currentPair.id,
+              entityType: input.entityType,
+              bitrix24Id: currentPair.bitrix24Id,
+              moyskladId: currentPair.moyskladId,
+              status: currentPair.source === 'MANUAL' ? 'MANUAL' : 'CONFIRMED',
+              source: 'PERSISTED',
+            },
+          };
+        }
+        await transaction.inboundEvent.updateMany({
+          where: { id: event.id, status: 'RECEIVED' },
+          data: { status: 'MANUAL_REVIEW', lastErrorCategory: result.status === 'unavailable' ? 'PAIR_RESOLUTION_UNAVAILABLE' : 'PAIR_REVIEW_REQUIRED' },
+        });
+        return result;
+      });
+    }
+
+    logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
+    return result;
+  }
+}
+
+function isDealOrderEvent(event: { source: string; eventType: string | null; externalEntityType: string | null }): boolean {
+  if (event.source === 'BITRIX24') return event.externalEntityType === 'deal' && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(event.eventType ?? '');
+  return event.source === 'MOYSKLAD' && event.externalEntityType === 'customerorder' && ['CREATE', 'UPDATE', 'DELETE'].includes(event.eventType ?? '');
+}
