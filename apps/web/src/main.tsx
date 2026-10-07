@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import { FieldSettingsPage } from './field-settings';
+import { HistoricalInventoryPage } from './historical-inventory';
 
 type TrialAction = { id: string; message: string; createdAt: string };
 type ServiceMode = 'on' | 'pause' | 'off';
@@ -14,7 +15,7 @@ type QueueSnapshot = { counts: Record<string, number>; events: QueueEvent[]; nex
 type ReviewCase = { id: string; eventId: string; source: string; externalEntityId: string | null; reason: string; diagnostic: Record<string, string | number | boolean> | null; status: string; openedAt: string };
 type OperationalLog = { id: string; category: string; message: string; referenceId: string | null; occurredAt: string };
 type ApiAttempt = { id: string; eventId: string | null; provider: string; operation: string; method: string; statusCode: number | null; succeeded: boolean; occurredAt: string };
-type AdminSection = 'overview' | 'queue' | 'pairs' | 'review' | 'settings' | 'dictionaries' | 'fields' | 'logs';
+type AdminSection = 'overview' | 'queue' | 'pairs' | 'history' | 'review' | 'settings' | 'dictionaries' | 'fields' | 'logs';
 declare global { interface Window { BX24?: BitrixSdk } }
 
 const trialActionsEndpoint = '/api/admin/trial-actions';
@@ -23,6 +24,7 @@ const sections: { id: AdminSection; label: string; icon: string }[] = [
   { id: 'overview', label: 'Обзор', icon: '⌂' },
   { id: 'queue', label: 'Очередь и попытки', icon: '≡' },
   { id: 'pairs', label: 'Связи записей', icon: '↔' },
+  { id: 'history', label: 'Исторический каталог', icon: '⌕' },
   { id: 'review', label: 'Ручная проверка', icon: '!' },
   { id: 'settings', label: 'Настройки', icon: '⚙' },
   { id: 'dictionaries', label: 'Справочники', icon: '▦' },
@@ -342,6 +344,7 @@ function App() {
           {activeSection === 'overview' && <Overview mode={mode} recovery={recovery} serviceStatus={serviceStatus} actions={actions} loading={loading} message={message} setMessage={setMessage} submit={submitTrialAction} error={error} />}
           {activeSection === 'queue' && <MonitoringPage kind="queue" queue={queueSnapshot} attempts={apiAttempts} onLoadMore={loadMore} onError={setError} />}
           {activeSection === 'pairs' && <PairManager accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
+          {activeSection === 'history' && <HistoricalInventoryPage accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
           {activeSection === 'review' && <MonitoringPage kind="review" incidents={incidents} incidentNextCursor={incidentNextCursor} onLoadMore={loadMore} onResolve={resolveIncident} onRetry={retryIncident} onError={setError} />}
           {activeSection === 'settings' && <Settings mode={mode} entities={entities} recovery={recovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}

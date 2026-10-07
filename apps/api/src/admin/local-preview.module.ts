@@ -24,13 +24,15 @@ import { PairFirstEventProcessor } from '../pairs/pair-first-event.processor';
 import { PairResolutionController } from './pair-resolution.controller';
 import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
 import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
+import { HistoricalInventoryController } from './historical-inventory.controller';
+import { HistoricalInventoryService } from '../historical-inventory.service';
 
 @Module({})
 export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController] : [])],
       providers: [
         databaseProvider,
         SyncModeService,
@@ -42,6 +44,7 @@ export class LocalAdminPreviewModule {
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
           FieldSettingsService, ReadOnlyFieldDataProvider, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+          HistoricalInventoryService,
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,
