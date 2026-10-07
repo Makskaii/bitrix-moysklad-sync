@@ -20,7 +20,7 @@ docker compose -p release-local-admin-preview -f docker-compose.yml -f docker-co
 
 ## Configuration keys
 
-The local preview explicitly sets `SYNC_STATE=off` and leaves these webhook and upstream credentials empty. For isolated fake-HTTP integration testing only, the test harness may set synthetic values for these keys; never copy production values into this checkout:
+The local preview explicitly sets `SYNC_STATE=off`, `LOCAL_HEADER_EXCHANGE=0`, and `LOCAL_HEADER_EXCHANGE_READY=0`, and leaves webhook/upstream credentials empty. Header exchange is disabled in the preview. The test harness may set synthetic values only for isolated fake-HTTP testing; never copy production values into this checkout:
 
 - `SYNC_MODE` (`apply` or `dry`)
 - `SYNC_STATE` (`on`, `pause`, or `off`)
@@ -30,13 +30,17 @@ The local preview explicitly sets `SYNC_STATE=off` and leaves these webhook and 
 - `BITRIX24_REST_BASE_URL`
 - `MOYSKLAD_API_BASE_URL`
 - `MOYSKLAD_API_TOKEN`
+- `LOCAL_HEADER_EXCHANGE`
+- `LOCAL_HEADER_EXCHANGE_READY`
 
 Never use a production database URL or connect tests to a production API. PostgreSQL tests must use a disposable isolated database and fake HTTP upstreams.
 
 ## What works and release limits
 
 - The local admin UI, persisted pair assignment/review, field-configuration preview, inbound event persistence, and existing contact/email exchange paths are available within their configured dependencies.
-- Deal/customer-order events require a persisted confirmed pair and bilateral baseline before any eligible configured header-field update. An unresolved pair, unavailable source/baseline, invalid field, unknown row identity, or missing configuration must remain held for manual review.
+- The local-only header processor is present but fail-closed: it requires preview mode, `LOCAL_HEADER_EXCHANGE=1`, a separate readiness flag `LOCAL_HEADER_EXCHANGE_READY=1`, apply mode, DB service mode on, and literal loopback fake HTTP endpoints. The checked-in preview sets both exchange flags to `0` and has blank upstream endpoints/tokens.
+- If separately enabled against loopback fakes, deal/customer-order exchange is limited to a confirmed persisted pair, immutable bilateral baseline, and the hard-coded COMMENTS↔description mapping with readback/echo guards. This is not general field-configurable exchange, and no production vendor endpoints are safe or supported by this local feature.
+- An unresolved pair, unavailable source/baseline, invalid field, unknown row identity, or missing configuration must remain held for manual review.
 - Deal/customer-order creation, full-row/position exchange, and full v1 bidirectional document exchange are not claimed. This local release does not create orders or change positions, totals, paid amounts, IDs, UUID/meta/reference objects, or `TITLE`/MoySklad `name` through generic mapping.
 - The preview's default `SYNC_STATE=off` and empty credentials prevent webhook intake and external API calls. Do not treat a webhook acknowledgement in a test fixture as proof of document exchange.
 
@@ -45,4 +49,4 @@ Never use a production database URL or connect tests to a production API. Postgr
 1. Start the preview with the command above and check the UI at `http://127.0.0.1:5174`.
 2. Check container health with `docker compose -p release-local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml ps`; the internal API health endpoint is available to the web container at `/health`.
 3. Run the API build and unit/integration suites from the repository root. Run PostgreSQL suites only when their isolation guard points to a disposable local database.
-4. The deal/customer-order fake-HTTP test must cover webhook → event → persisted pair resolution → bilateral baseline-before-write → configured scalar header update → readback/echo no-op, plus duplicate delivery and off/pause hold behavior. Assert there are no create calls and no changes to positions or totals. If baseline/readiness or writer configuration is incomplete, expect a hold rather than success.
+4. Run the isolated `test:deal-order-baseline` suite with its isolated PostgreSQL DB URL overrides (`BASELINE_TEST_DATABASE_URL` and `BASELINE_DRY_TEST_DATABASE_URL`) and fake loopback upstreams. It covers public webhook → pair resolution → bilateral baseline → COMMENTS↔description updates → readback/echo no-op and gates; assert there are no create calls or row/position/total changes. If baseline/readiness or writer configuration is incomplete, expect a hold rather than success.
