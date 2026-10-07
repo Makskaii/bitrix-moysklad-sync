@@ -181,10 +181,39 @@ h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: -.02em; }
 .log-tabs button, .button-secondary, .load-more { min-height: 32px; padding: 0 11px; border: 1px solid #dce4ef; border-radius: 8px; background: #fff; color: #52657e; font-size: 10px; cursor: pointer; }
 .log-tabs button[aria-pressed="true"] { border-color: #2768bd; background: #2d70c7; color: #fff; }
 .load-more { margin-top: 12px; }
+.field-settings-panel { padding: 22px; }
+.field-settings-panel > .panel-description, .field-editor-section > .panel-description { color: #718097; font-size: 12px; line-height: 1.6; }
+.field-editor-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid #edf0f5; }
+.field-rule-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: end; }
+.field-rule-form label, .reference-map-row label, .field-preview-input { display: grid; gap: 6px; color: #52657e; font-size: 11px; }
+.field-rule-form input, .field-rule-form select, .reference-map-row select, .field-preview-input textarea { min-width: 0; min-height: 36px; padding: 8px 10px; border: 1px solid #dce4ef; border-radius: 8px; background: #fff; color: #27384e; font: inherit; }
+.field-rule-form fieldset { min-width: 0; display: grid; gap: 8px; padding: 10px; border: 1px solid #e4e9f1; border-radius: 9px; color: #52657e; font-size: 11px; }
+.field-rule-form fieldset label { display: flex; align-items: center; gap: 7px; }
+.field-rule-form fieldset input { min-height: auto; }
+.field-rule-list, .reference-map-list, .field-preview-results, .dictionary-pairs { display: grid; gap: 8px; margin-top: 12px; }
+.field-rule-row, .reference-map-row, .dictionary-map-card, .field-preview-results article { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid #e8edf4; border-radius: 9px; background: #fcfdff; }
+.field-rule-row > div, .reference-map-row > div, .dictionary-map-card > div:first-child { min-width: 0; display: grid; gap: 5px; }
+.field-rule-row small, .reference-map-row small, .dictionary-map-card small, .field-preview-results small { color: #7c8aa0; overflow-wrap: anywhere; }
+.reference-map-row label { min-width: 210px; }
+.exact-match-note { color: #397449; font-size: 10px; }
+.muted-empty { color: #8794a7; font-size: 12px; }
+.field-preview-input { margin: 12px 0; }
+.field-preview-input textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.field-preview-results article { align-items: flex-start; flex-direction: column; }
+.dictionary-map-card { align-items: flex-start; flex-wrap: wrap; }
+.dictionary-pairs { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); width: 100%; }
+.field-save-bar { position: sticky; bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 22px; padding: 14px; border: 1px solid #cfdcf0; border-radius: 11px; background: #f4f8ff; box-shadow: 0 5px 20px #18345512; }
+.field-save-bar p { margin: 0; color: #52657e; font-size: 11px; }
+.field-save-warning { position: sticky; bottom: 90px; z-index: 2; margin-top: 12px; padding: 17px; border: 1px solid #e4be78; border-radius: 11px; background: #fff9ea; box-shadow: 0 5px 20px #18345518; }
+.field-save-warning p { color: #705d38; font-size: 12px; line-height: 1.55; }
 @media (max-width: 720px) {
   .monitor-list article { align-items: flex-start; flex-wrap: wrap; }
   .monitor-list article > div { flex-basis: 100%; }
   .incident-actions { margin-left: auto; }
+  .field-settings-panel { padding: 15px; }
+  .field-rule-form { grid-template-columns: 1fr; }
+  .field-rule-row, .reference-map-row, .field-save-bar { align-items: stretch; flex-direction: column; }
+  .reference-map-row label { min-width: 0; }
 }
 
 .pair-manager { grid-column: 1 / -1; }

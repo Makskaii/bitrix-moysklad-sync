@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
+import { FieldSettingsPage } from './field-settings';
 
 type TrialAction = { id: string; message: string; createdAt: string };
 type ServiceMode = 'on' | 'pause' | 'off';
@@ -333,7 +334,6 @@ function App() {
             aria-current={activeSection === section.id ? 'page' : undefined}
             onClick={() => { setActiveSection(section.id); setError(''); }}
           ><span className="nav-icon" aria-hidden="true">{section.icon}</span>{section.label}
-            {section.id === 'fields' && <span className="nav-soon">Скоро</span>}
           </button>)}
           <div className="nav-note"><span className="note-dot" />Доступ администратора подтверждён</div>
         </nav>
@@ -345,7 +345,7 @@ function App() {
           {activeSection === 'review' && <MonitoringPage kind="review" incidents={incidents} incidentNextCursor={incidentNextCursor} onLoadMore={loadMore} onResolve={resolveIncident} onRetry={retryIncident} onError={setError} />}
           {activeSection === 'settings' && <Settings mode={mode} entities={entities} recovery={recovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}
-          {activeSection === 'fields' && <UnavailablePage title="Соответствия полей" eyebrow="ПРАВИЛА ПЕРЕНОСА" description="Редактор соответствий полей готовится отдельно. На этой странице пока нет фиктивных правил или кнопок сохранения." action="Открыть редактор" badge="Функция в разработке" />}
+          {activeSection === 'fields' && <FieldSettingsPage accessToken={accessToken} onForbidden={denyAdminAccess} onError={setError} />}
           {activeSection === 'logs' && <MonitoringPage kind="logs" logs={logs} logCategory={logCategory} onCategory={showLogCategory} logNextCursor={logNextCursor} attempts={apiAttempts} attemptNextCursor={attemptNextCursor} onLoadMore={loadMore} onError={setError} />}
           {error && activeSection !== 'overview' && activeSection !== 'settings' && <p role="alert" className="inline-error">{error}</p>}
         </div>

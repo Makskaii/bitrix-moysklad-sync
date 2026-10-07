@@ -1,6 +1,8 @@
 import 'reflect-metadata';
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { resolve } from 'node:path';
 import { AdminController } from './admin/admin.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
 import { ContactSyncStatusController } from './admin/contact-sync-status.controller';
@@ -15,11 +17,17 @@ import { RetentionService } from './retention.service';
 import { RotatingFileLogger } from './rotating-file.logger';
 import { WebhookDiagnosticsController } from './webhook-diagnostics.controller';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
+import { FieldSettingsController } from './admin/field-settings.controller';
+import { FieldSettingsService } from './field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from './field-settings/read-only-field-data.provider';
 import { PairResolutionController } from './admin/pair-resolution.controller';
 import { EntityPairService } from './pairs/entity-pair.service';
 import { PairResolutionProvider } from './pairs/pair-resolution.provider';
 import { PAIR_RESOLVER } from './pairs/pair-resolver';
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
+import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.service';
+import { DryRunDocumentReader } from './dry-run-document-reader';
+import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
 
 @Controller()
 class AppController {
@@ -34,13 +42,14 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, EntityPairService, PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
+  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { logger: new RotatingFileLogger() });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
+  app.useStaticAssets(resolve(__dirname, '../../../../apps/web/dist'));
   await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 }
 

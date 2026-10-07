@@ -1,7 +1,10 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { DatabaseService } from '../database.service';
 import { PairResolutionInput, PairResolutionResult, PairResolver, PAIR_RESOLVER } from './pair-resolver';
 import { lockEntityPairState } from './pair-db-lock';
+import { FieldSettingsService } from '../field-settings/field-settings.service';
+import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
+import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
 
 const logger = new Logger('PairFirstEventProcessor');
 
@@ -16,6 +19,9 @@ export class PairFirstEventProcessor {
   constructor(
     private readonly database: DatabaseService,
     @Inject(PAIR_RESOLVER) private readonly resolver: PairResolver,
+    @Optional() private readonly fieldSettings?: FieldSettingsService,
+    @Optional() private readonly baseline?: DealOrderBaselineService,
+    @Optional() private readonly headerSync?: DealOrderHeaderSyncProcessor,
   ) {}
 
   enqueue(eventId: string): void {
@@ -71,8 +77,46 @@ export class PairFirstEventProcessor {
       });
     }
 
+    if (result.status === 'confirmed' && this.fieldSettings && this.baseline) {
+      try {
+        const eventConfig = await this.fieldSettings.eventConfig(event.id);
+        const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig });
+        if (baseline.status !== 'READY') {
+          await this.database.inboundEvent.updateMany({
+            where: { id: event.id, status: 'RECEIVED' },
+            data: { status: 'MANUAL_REVIEW', lastErrorCategory: `BASELINE_${baseline.reason}` },
+          });
+        } else if (this.headerSync) {
+          const headerResult = await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId });
+          const holdReason = headerHoldReason(headerResult);
+          if (holdReason) {
+            await this.database.inboundEvent.updateMany({
+              where: { id: event.id, status: 'RECEIVED' },
+              data: { status: 'MANUAL_REVIEW', lastErrorCategory: holdReason },
+            });
+          }
+        }
+      } catch {
+        await this.database.inboundEvent.updateMany({
+          where: { id: event.id, status: 'RECEIVED' },
+          data: { status: 'MANUAL_REVIEW', lastErrorCategory: 'BASELINE_SETTINGS_UNAVAILABLE' },
+        });
+      }
+    }
+
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
     return result;
+  }
+}
+
+function headerHoldReason(result: string): string | null {
+  switch (result) {
+    case 'UNSUPPORTED': return 'DEAL_ORDER_HEADER_UNSUPPORTED';
+    case 'BASELINE_MISSING': return 'DEAL_ORDER_BASELINE_MISSING';
+    case 'HOLD_CONFLICT': return 'DEAL_ORDER_HEADER_CONFLICT';
+    case 'HOLD_READ_FAILED': return 'DEAL_ORDER_HEADER_READ_FAILED';
+    case 'HOLD_WRITE_FAILED': return 'DEAL_ORDER_HEADER_WRITE_FAILED';
+    default: return null;
   }
 }
 
