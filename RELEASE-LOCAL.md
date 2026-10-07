@@ -22,6 +22,8 @@ docker compose -p release-local-admin-preview -f docker-compose.yml -f docker-co
 
 The server test unit template is [ops/bitrix-moysklad-sync.service](ops/bitrix-moysklad-sync.service). It runs the normal API (no `ADMIN_PREVIEW` bypass) on HTTP port `5015`, uses a local PostgreSQL Unix socket, and keeps `SYNC_STATE=off`, webhook credentials empty, and both local header-exchange flags at `0`. The webhook endpoint is `POST /webhooks/bitrix24`; MoySklad uses `/webhooks/moysklad/:secret`. Admin endpoints keep the normal Bitrix administrator guard; there is no public admin UI.
 
+The server serves the built React admin UI and API from the same origin at `http://80.90.191.124:5015/`. Admin API requests still require the normal Bitrix administrator bearer-token check; there is no `ADMIN_PREVIEW` bypass. Opening the UI outside a Bitrix context therefore loads the interface but does not grant access to protected data or actions. Health remains `GET /health`; webhook paths remain `POST /webhooks/bitrix24` and `/webhooks/moysklad/:secret`. Static assets are served only when present; unknown API/webhook routes continue to return API 404s rather than the UI shell.
+
 This server candidate is for isolated intake/health testing only. HTTP does not encrypt webhook secrets or payloads, so do not send real customer data or production credentials. It does not claim full v1 exchange, new-order creation, or line-item synchronization. Do not enable a writer or configure real upstream endpoints on this candidate.
 
 ## Configuration keys
