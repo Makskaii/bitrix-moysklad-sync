@@ -39,7 +39,8 @@ type PreviewResult = { sourceLabel: string; sourceValues: Record<string, unknown
 
 const endpoint = '/api/admin/field-settings';
 const entityOptions = [
-  ['contacts-companies', 'Контакты и компании'],
+  ['contacts', 'Контакты'],
+  ['companies', 'Компании'],
   ['deals-orders', 'Сделки и заказы покупателей'],
   ['smart-invoices', 'Смарт-счета и счета покупателям'],
   ['catalog', 'Товары и услуги каталога'],
@@ -57,7 +58,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [saving, setSaving] = useState(false);
   const [showSaveWarning, setShowSaveWarning] = useState(false);
   const [previewPairs, setPreviewPairs] = useState('');
-  const [previewEntity, setPreviewEntity] = useState('contacts-companies');
+  const [previewEntity, setPreviewEntity] = useState('contacts');
   const [previewDirection, setPreviewDirection] = useState<'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24'>('BITRIX24_TO_MOYSKLAD');
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [previewError, setPreviewError] = useState('');

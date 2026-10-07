@@ -114,7 +114,9 @@ export class ReadOnlyFieldDataProvider {
 function pairContract(entity: string, sourceId: string, targetId: string): { bitrixMethod: string; bitrixParams: Record<string, string | number>; moyskladPath: string } {
   const msId = encodeURIComponent(targetId);
   switch (entity) {
-    case 'contacts-companies': return { bitrixMethod: 'crm.contact.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/counterparty/${msId}` };
+    case 'contacts-companies':
+    case 'contacts': return { bitrixMethod: 'crm.contact.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/counterparty/${msId}` };
+    case 'companies': return { bitrixMethod: 'crm.company.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/counterparty/${msId}` };
     case 'deals-orders': return { bitrixMethod: 'crm.deal.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/customerorder/${msId}` };
     case 'smart-invoices': return { bitrixMethod: 'crm.item.get', bitrixParams: { entityTypeId: 31, id: sourceId }, moyskladPath: `entity/invoiceout/${msId}` };
     case 'catalog': return { bitrixMethod: 'catalog.product.get', bitrixParams: { id: sourceId }, moyskladPath: `entity/product/${msId}` };

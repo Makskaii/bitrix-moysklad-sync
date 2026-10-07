@@ -37,6 +37,8 @@ before(async () => {
         ? fakeB24UnitIds.map((id) => ({ id, code: `u${id}`, name: `Unit ${id}` }))
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
+          : method === 'crm.company.get.json'
+            ? { ID: form.get('id'), TITLE: 'Example Company' }
           : { ID: form.get('id'), NAME: 'Ada', LAST_NAME: 'Lovelace', TITLE: 'Sample', EMAIL: [{ VALUE: 'source@example.test', VALUE_TYPE: 'WORK' }] };
       return new Response(JSON.stringify({ result }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
@@ -118,6 +120,18 @@ test('preview reads a real pair, applies the draft transform, and never writes',
   assert.equal(result.results[0]?.version, 1);
   const active = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal((await active.json() as { version: number }).version, 1);
+});
+
+test('preview reads company pairs separately from contacts', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/preview`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ entity: 'companies', direction: 'BITRIX24_TO_MOYSKLAD', pairs: [{ sourceId: 'company-1', targetId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }] }),
+  });
+  const body = await response.text();
+  assert.equal(response.status, 201, body);
+  const preview = JSON.parse(body) as { results: Array<{ sourceLabel: string; writes: number }> };
+  assert.equal(preview.results[0].sourceLabel, 'Example Company');
+  assert.equal(preview.results[0].writes, 0);
 });
 
 test('catalog paging exposes live candidates and allows manual reassignment to an existing unapproved ID', async () => {
