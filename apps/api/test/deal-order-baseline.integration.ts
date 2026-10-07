@@ -18,8 +18,8 @@ const oldEnv = new Map<string, string | undefined>();
 
 before(async () => {
   for (const key of ['SYNC_MODE', 'DATABASE_URL', 'DRY_DATABASE_URL', 'ADMIN_PREVIEW', 'BITRIX24_EVENT_APPLICATION_TOKEN', 'BITRIX24_REST_BASE_URL', 'MOYSKLAD_WEBHOOK_SECRET', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN']) oldEnv.set(key, process.env[key]);
-  process.env.DATABASE_URL = 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_apply_test';
-  process.env.DRY_DATABASE_URL = 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_test';
+  process.env.DATABASE_URL = process.env.BASELINE_TEST_DATABASE_URL ?? 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_apply_test';
+  process.env.DRY_DATABASE_URL = process.env.BASELINE_DRY_TEST_DATABASE_URL ?? 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_test';
   process.env.SYNC_MODE = 'dry';
   process.env.ADMIN_PREVIEW = '1';
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-event-token';
@@ -38,7 +38,6 @@ before(async () => {
   apiUrl = await app.getUrl();
   const database = app.get(DatabaseService);
   await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
-  await database.dryRunResult.deleteMany({});
   await database.inboundEvent.deleteMany({});
   await database.entityPairBaseline.deleteMany({});
   await database.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
