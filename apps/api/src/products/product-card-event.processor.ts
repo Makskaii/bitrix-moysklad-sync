@@ -154,6 +154,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         pairId: matches[0]!.id,
         source: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
         settingsVersion: pinned.version,
+        eventId: event.id,
       });
       await this.applyResult(event.id, event, result);
       return result;

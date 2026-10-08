@@ -52,6 +52,12 @@ export class ProductCardManualReviewError extends Error {
   constructor(readonly reason: string) { super(reason); }
 }
 
+export class ProductCardLeaseError extends Error {
+  constructor(readonly reason: 'PRODUCT_PAIR_LOCK_LOST' | 'PRODUCT_PAIR_LOCK_UNAVAILABLE') {
+    super(reason);
+  }
+}
+
 /** Reconciles one already-persisted PRODUCT pair. No candidate search or card creation occurs here. */
 export class ProductCardSyncService {
   constructor(private readonly api: ProductCardApi, private readonly state: ProductCardStateStore) {}
@@ -78,6 +84,7 @@ export class ProductCardSyncService {
         this.state.read(pair.id),
       ]);
     } catch (error) {
+      if (error instanceof ProductCardLeaseError) throw error;
       return error instanceof ProductCardManualReviewError ? review(error.reason) : retry('PRODUCT_CARD_READ_FAILED');
     }
     if (!nonEmpty(bitrix24.name) || !nonEmpty(moysklad.name)) return review('PRODUCT_NAME_VALUE_MISSING');
@@ -87,7 +94,8 @@ export class ProductCardSyncService {
       try {
         await this.state.write(pair.id, settingsVersion, current);
         return { status: 'BASELINED', changedFields: [] };
-      } catch {
+      } catch (error) {
+        if (error instanceof ProductCardLeaseError) throw error;
         return retry('PRODUCT_CARD_STATE_WRITE_FAILED');
       }
     }
@@ -129,6 +137,7 @@ export class ProductCardSyncService {
         await this.state.write(pair.id, settingsVersion, next);
         changedFields.push(direction.field);
       } catch (error) {
+        if (error instanceof ProductCardLeaseError) throw error;
         const reason = error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_WRITE_OR_READBACK_FAILED';
         const optional = direction.field === 'description' || direction.field.startsWith('price:');
         (optional ? optionalReasons : criticalReasons).push(reason);

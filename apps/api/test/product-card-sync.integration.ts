@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { ProductCardApi, ProductCardPair, ProductCardPrice, ProductCardSettings, ProductCardSnapshot, ProductCardStateStore, ProductCardSyncService, ProductCardSyncState } from '../src/products/product-card-sync.service';
+import { ProductCardApi, ProductCardLeaseError, ProductCardPair, ProductCardPrice, ProductCardSettings, ProductCardSnapshot, ProductCardStateStore, ProductCardSyncService, ProductCardSyncState } from '../src/products/product-card-sync.service';
 
 const pair: ProductCardPair = {
   id: 'product-pair-1', entityType: 'PRODUCT', bitrix24Id: '101', moyskladId: 'product-uuid-1',
@@ -24,8 +24,16 @@ const settings: ProductCardSettings = {
 
 class MemoryState implements ProductCardStateStore {
   value: ProductCardSyncState | null = null;
+  failNextWrite?: Error;
   async read() { return this.value; }
-  async write(_pairId: string, _settingsVersion: number, state: ProductCardSyncState) { this.value = structuredClone(state); }
+  async write(_pairId: string, _settingsVersion: number, state: ProductCardSyncState) {
+    if (this.failNextWrite) {
+      const error = this.failNextWrite;
+      this.failNextWrite = undefined;
+      throw error;
+    }
+    this.value = structuredClone(state);
+  }
 }
 
 class FakeApi implements ProductCardApi {
@@ -180,6 +188,23 @@ test('a price write failure is field-local and does not block verified card name
   assert.deepEqual(result, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_CARD_WRITE_OR_READBACK_FAILED', changedFields: ['name'] });
   assert.equal(api.moysklad.name, 'Name despite price failure');
   assert.equal(api.moysklad.prices[0].value, 10);
+});
+
+test('a lost pair lease propagates after a vendor write without committing stale last-success state', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  await sync.sync({ pair, source: 'BITRIX24', settingsVersion: 1, settings });
+  const lastSuccessfulState = structuredClone(state.value);
+  api.bitrix24.name = 'Lease holder changed this name';
+  state.failNextWrite = new ProductCardLeaseError('PRODUCT_PAIR_LOCK_LOST');
+
+  await assert.rejects(
+    sync.sync({ pair, source: 'BITRIX24', settingsVersion: 1, settings }),
+    ProductCardLeaseError,
+  );
+  assert.equal(api.moysklad.name, 'Lease holder changed this name');
+  assert.deepEqual(state.value, lastSuccessfulState);
 });
 
 function msCurrencyRef() { return { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad', type: 'currency', mediaType: 'application/json' } }; }
