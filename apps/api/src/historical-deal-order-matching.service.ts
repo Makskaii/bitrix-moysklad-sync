@@ -80,7 +80,7 @@ export class HistoricalDealOrderMatchingService {
 
     const now = new Date();
     const claim = await this.database.$transaction(async (transaction) => {
-      await transaction.$queryRaw`SELECT pg_advisory_xact_lock(713103, 50)`;
+      await transaction.$queryRaw`WITH matching_lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(713103, 50)) SELECT 1::int AS locked FROM matching_lock`;
       let run = await transaction.historicalDealOrderMatchingRun.findFirst({ orderBy: { createdAt: 'desc' } }) as Run | null;
       if (run?.applyStatus === 'running' && run.leaseUntil && run.leaseUntil > now) {
         throw new ConflictException('MATCH_APPLY_ALREADY_RUNNING');
@@ -245,11 +245,11 @@ export class HistoricalDealOrderMatchingService {
       if (claim.count !== 1) throw new Error('MATCH_PREVIEW_LEASE_LOST');
       await transaction.$executeRaw(Prisma.sql`
         INSERT INTO "HistoricalDealOrderDuplicateKey" ("runId", "keyValue", "recordCount")
-        SELECT ${run.id}, "fields" ->> ${DEAL_MATCH_KEY}, COUNT(*)::int
-        FROM "HistoricalInventoryEntry"
-        WHERE "source" = 'BITRIX24'
-          AND ("fields" ->> ${DEAL_MATCH_KEY}) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        GROUP BY "fields" ->> ${DEAL_MATCH_KEY}
+        SELECT ${run.id}, e."fields" ->> 'UF_CRM_1719836973', COUNT(*)::int
+        FROM "HistoricalInventoryEntry" AS e
+        WHERE e."source" = 'BITRIX24'
+          AND (e."fields" ->> 'UF_CRM_1719836973') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        GROUP BY e."fields" ->> 'UF_CRM_1719836973'
         HAVING COUNT(*) > 1
       `);
       const advanced = await transaction.historicalDealOrderMatchingRun.updateMany({

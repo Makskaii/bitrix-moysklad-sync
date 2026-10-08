@@ -1,7 +1,12 @@
+import 'reflect-metadata';
 import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
+import { INestApplication, Module } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
+import { AdminAccessGuard } from '../src/admin/admin-access.guard';
+import { HistoricalDealOrderMatchingController } from '../src/admin/historical-deal-order-matching.controller';
 import { DatabaseService } from '../src/database.service';
 import { HistoricalDealOrderMatchingService } from '../src/historical-deal-order-matching.service';
 
@@ -17,6 +22,16 @@ let priorMode: string | undefined;
 let priorDryUrl: string | undefined;
 let createdInventoryJob = false;
 let fixtureInitialized = false;
+let httpApp: INestApplication | undefined;
+let httpUrl: string | undefined;
+let restoreFetch: typeof fetch | undefined;
+
+class HistoricalMatchingHttpTestModule {}
+
+Module({
+  controllers: [HistoricalDealOrderMatchingController],
+  providers: [AdminAccessGuard, DatabaseService, HistoricalDealOrderMatchingService],
+})(HistoricalMatchingHttpTestModule);
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to an isolated ephemeral PostgreSQL database');
@@ -62,8 +77,17 @@ before(async () => {
 });
 
 after(async () => {
+  if (restoreFetch) globalThis.fetch = restoreFetch;
+  if (httpApp) await httpApp.close();
   if (database && fixtureInitialized) {
     await database.historicalDealOrderMatchingRun.deleteMany();
+    await database.entityPair.deleteMany({ where: {
+      entityType: 'DEAL',
+      OR: [
+        { bitrix24Id: { in: [...dealIds, 'different-deal'] } },
+        { moyskladId: { in: [uuidA, uuidB, uuidC] } },
+      ],
+    } });
     await database.entityPair.deleteMany({ where: { id: { in: pairIds } } });
     await database.historicalInventoryEntry.deleteMany({ where: { externalId: { in: [...dealIds, uuidA, uuidB, uuidC] } } });
     if (createdInventoryJob) await database.historicalInventoryJob.deleteMany({ where: { id: 'deal-order-history' } });
@@ -89,21 +113,30 @@ test('PostgreSQL fences concurrent apply, preserves pair uniqueness, and resumes
   await service.applyPreview(runId, true);
   assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true } }), 3);
 
-  const result = await database.historicalDealOrderMatchResult.findFirst({ where: { runId, category: 'APPLIED' }, orderBy: { id: 'asc' } });
-  assert.ok(result);
-  const firstAppliedPair = await database.entityPair.create({ data: {
-    entityType: 'DEAL', bitrix24Id: result!.sourceEntityId, moyskladId: result!.linkedEntityId!,
-    active: true, source: 'HISTORICAL_MATCH', reason: `HISTORICAL_MATCH_RUN:${runId}`,
-  } });
-  pairIds.push(firstAppliedPair.id);
-  await database.entityPair.deleteMany({ where: { id: { in: saved.map((pair) => pair.id) } } });
-  await database.historicalDealOrderMatchingRun.update({ where: { id: runId }, data: { applyStatus: 'failed', applyCursor: result.id, appliedCount: 1 } });
-  await database.historicalDealOrderMatchResult.update({ where: { id: result!.id }, data: { category: 'APPLIED', applyStatus: 'applied', pairId: firstAppliedPair.id } });
+  const results = await database.historicalDealOrderMatchResult.findMany({ where: { runId, category: 'APPLIED' }, orderBy: { id: 'asc' } });
+  assert.equal(results.length, 3);
+  const firstCheckpoint = results[0];
+  const keptPair = saved.find((pair) => pair.bitrix24Id === firstCheckpoint.sourceEntityId)!;
+  const laterResults = results.slice(1);
+  const laterPairIds = saved.filter((pair) => pair.id !== keptPair.id).map((pair) => pair.id);
+  await database.entityPair.deleteMany({ where: { id: { in: laterPairIds } } });
+  await database.historicalDealOrderMatchResult.updateMany({
+    where: { runId, id: { in: laterResults.map((row) => row.id) } },
+    data: { category: 'MATCH_READY', applyStatus: 'not_applicable', pairId: null },
+  });
+  await database.historicalDealOrderMatchingRun.update({ where: { id: runId }, data: { applyStatus: 'failed', applyCursor: firstCheckpoint.id, appliedCount: 1 } });
   await service.applyPreview(runId, true);
   status = await waitFor((value) => value.run?.applyStatus === 'complete');
   assert.equal(status.run?.appliedCount, 3);
   assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true } }), 3);
-  await database.entityPair.deleteMany({ where: { id: firstAppliedPair.id } });
+  await database.entityPair.deleteMany({ where: {
+    entityType: 'DEAL',
+    OR: [
+      { bitrix24Id: { in: [...dealIds, 'different-deal'] } },
+      { moyskladId: { in: [uuidA, uuidB, uuidC] } },
+    ],
+  } });
+  assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true, moyskladId: { in: [uuidA, uuidB, uuidC] } } }), 0, 'resume fixture cleanup must remove all synthetic pairs before the conflict test');
 });
 
 test('PostgreSQL rejects stale previews and rechecks conflicting active pairs without reassignment', async () => {
@@ -119,6 +152,7 @@ test('PostgreSQL rejects stale previews and rechecks conflicting active pairs wi
   await service.startPreview();
   status = await waitFor((value) => value.run?.status === 'complete' && value.run.id !== runId);
   const conflictRunId = status.run!.id;
+  assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true, moyskladId: uuidA } }), 0, 'no test pair should occupy the conflict fixture before its manual blocker is inserted');
   const blocker = await database.entityPair.create({ data: {
     entityType: 'DEAL', bitrix24Id: 'different-deal', moyskladId: uuidA, source: 'MANUAL', reason: 'synthetic conflict',
   } });
@@ -130,13 +164,75 @@ test('PostgreSQL rejects stale previews and rechecks conflicting active pairs wi
   assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true, bitrix24Id: 'different-deal' } }), 1);
   const historicalPairs = await database.entityPair.findMany({ where: { source: 'HISTORICAL_MATCH', reason: { startsWith: `HISTORICAL_MATCH_RUN:${conflictRunId}` } }, select: { id: true } });
   pairIds.push(...historicalPairs.map((pair) => pair.id));
+  await database.entityPair.deleteMany({ where: {
+    entityType: 'DEAL',
+    OR: [
+      { bitrix24Id: { in: [...dealIds, 'different-deal'] } },
+      { moyskladId: { in: [uuidA, uuidB, uuidC] } },
+    ],
+  } });
+});
+
+test('PostgreSQL-backed preview and explicit apply are only reachable through the admin-guarded HTTP routes', async () => {
+  const upstreamFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input).startsWith('https://aerosystems.bitrix24.ru/rest/user.admin.json')) {
+      assert.equal(new URLSearchParams(String(init?.body ?? '')).get('auth'), 'synthetic-admin-token');
+      return Response.json({ result: true });
+    }
+    return upstreamFetch(input, init);
+  }) as typeof fetch;
+  restoreFetch = upstreamFetch;
+  httpApp = await NestFactory.create(HistoricalMatchingHttpTestModule, { logger: false });
+  await httpApp.listen(0, '127.0.0.1');
+  httpUrl = await httpApp.getUrl();
+
+  const unauthenticated = await upstreamFetch(`${httpUrl}/api/admin/historical-matching/preview`, { method: 'POST' });
+  assert.equal(unauthenticated.status, 403);
+  const headers = { authorization: 'Bearer synthetic-admin-token', 'content-type': 'application/json' };
+  const previewResponse = await upstreamFetch(`${httpUrl}/api/admin/historical-matching/preview`, { method: 'POST', headers });
+  assert.equal(previewResponse.status, 201);
+  let status = await fetchStatus(upstreamFetch, httpUrl, headers);
+  assert.equal(status.run?.status, 'complete');
+  assert.equal(status.previewFresh, true);
+  assert.equal((status.run?.counts as Record<string, number>).MATCH_READY, 3);
+
+  const notConfirmed = await upstreamFetch(`${httpUrl}/api/admin/historical-matching/apply`, {
+    method: 'POST', headers, body: JSON.stringify({ runId: status.run!.id, confirmed: false }),
+  });
+  assert.equal(notConfirmed.status, 409);
+  const applyResponse = await upstreamFetch(`${httpUrl}/api/admin/historical-matching/apply`, {
+    method: 'POST', headers, body: JSON.stringify({ runId: status.run!.id, confirmed: true }),
+  });
+  assert.equal(applyResponse.status, 201);
+  status = await fetchStatus(upstreamFetch, httpUrl, headers, 'applyStatus', 'complete');
+  assert.equal(status.run?.appliedCount, 3);
+  assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true, source: 'HISTORICAL_MATCH' } }), 3);
 });
 
 async function waitFor(predicate: (status: Awaited<ReturnType<HistoricalDealOrderMatchingService['readStatus']>>) => boolean) {
+  let latest: Awaited<ReturnType<HistoricalDealOrderMatchingService['readStatus']>> | undefined;
   for (let attempt = 0; attempt < 100; attempt++) {
-    const status = await service.readStatus();
-    if (predicate(status)) return status;
+    latest = await service.readStatus();
+    if (predicate(latest)) return latest;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error('Matching run did not reach the expected state.');
+  throw new Error(`Matching run did not reach the expected state: ${JSON.stringify(latest)}`);
+}
+
+async function fetchStatus(
+  fetcher: typeof fetch,
+  baseUrl: string,
+  headers: Record<string, string>,
+  field: 'status' | 'applyStatus' = 'status',
+  expected = 'complete',
+) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await fetcher(`${baseUrl}/api/admin/historical-matching/status`, { headers });
+    assert.equal(response.status, 200);
+    const status = await response.json() as Awaited<ReturnType<HistoricalDealOrderMatchingService['readStatus']>>;
+    if (status.run?.[field] === expected) return status;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('Admin-protected matching HTTP workflow did not reach the expected state.');
 }
