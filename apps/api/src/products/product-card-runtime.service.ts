@@ -9,7 +9,7 @@ import { ProductCardApi, ProductCardLeaseError, ProductCardSettings, ProductCard
 
 const PRODUCT_PAIR_LOCK_LEASE_MS = 60_000;
 const PRODUCT_PAIR_LOCK_RENEW_INTERVAL_MS = 15_000;
-const PRODUCT_PAIR_LOCK_OPERATION_TIMEOUT_MS = 20_000;
+const PRODUCT_PAIR_LOCK_OPERATION_TIMEOUT_MS = 30_000;
 
 type ProductPairLease = { entityKey: string; ownerToken: string };
 type ProductCardStateDatabase = Pick<Prisma.TransactionClient, 'entityPairSyncState'>;
