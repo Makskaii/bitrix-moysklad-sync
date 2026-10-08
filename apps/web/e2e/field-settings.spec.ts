@@ -1,10 +1,10 @@
 import { expect, test } from '@playwright/test';
 
-test('field settings preview is read-only and saving requires an explicit warning confirmation', async ({ page }) => {
+test('field settings select, save, and reload field pairs while preview stays read-only', async ({ page }) => {
   test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
   const writes: string[] = [];
   let version = 1;
-  const config = { rules: [], groups: [], references: {
+  let config = { rules: [], groups: [], references: {
     units: [{ bitrix24Id: 14, bitrix24Code: '1720010507', moyskladId: null, moyskladCode: null, status: 'unmapped' }],
     priceTypes: [], dictionaries: [
       { key: 'service', bitrix24Field: 'UF_CRM_1766085949', bitrix24ListId: '42', moyskladAttributeId: '0ad997c8-8e75-11e3-1ec9-002590a28eca', moyskladDirectoryId: 'f0177126-8e74-11e3-b761-002590a28eca', pairs: [{ bitrix24Id: 42, moyskladId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }] },
@@ -41,7 +41,8 @@ test('field settings preview is read-only and saving requires an explicit warnin
     if (method === 'PUT') {
       writes.push(method);
       version += 1;
-      await route.fulfill({ json: { version, createdAt: '2026-10-07T00:00:00.000Z', config: JSON.parse(route.request().postData() ?? '{}').config } });
+      config = JSON.parse(route.request().postData() ?? '{}').config;
+      await route.fulfill({ json: { version, createdAt: '2026-10-07T00:00:00.000Z', config } });
     } else {
       await route.fulfill({ json: { version, createdAt: '2026-10-07T00:00:00.000Z', config } });
     }
@@ -65,6 +66,11 @@ test('field settings preview is read-only and saving requires an explicit warnin
   await page.getByLabel('Поле Bitrix24').selectOption('EMAIL');
   await page.getByLabel('Поле МойСклад').selectOption('email');
   await expect(page.getByLabel('Поле Bitrix24')).toContainText('Email · EMAIL · crm_multifield');
+  await expect(page.getByLabel('Поле МойСклад')).toContainText('email · email · string');
+  await page.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
+  await page.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await expect(page.getByText('EMAIL ↔ email')).toBeVisible();
   await page.getByLabel('Активные пары предпросмотра').selectOption(['contact-pair-42', 'contact-pair-43']);
   await page.getByRole('button', { name: 'Прочитать пары и выполнить предпросмотр' }).click();
   await expect(page.getByText('Ada Lovelace', { exact: true }).first()).toBeVisible();
@@ -82,4 +88,10 @@ test('field settings preview is read-only and saving requires an explicit warnin
   await expect(page.getByRole('heading', { name: 'Версия 2' })).toBeVisible();
   expect(writes).toEqual(['PUT']);
   await expect(page.getByText('Сохранённая пара · код TEST-UOM')).toBeVisible();
+
+  await page.reload();
+  await page.getByRole('button', { name: 'Соответствия полей' }).click();
+  await expect(page.getByRole('heading', { name: 'Версия 2' })).toBeVisible();
+  await expect(page.getByText('EMAIL ↔ email')).toBeVisible();
+  expect(config.rules).toEqual([expect.objectContaining({ sourceField: 'EMAIL', targetField: 'email' })]);
 });
