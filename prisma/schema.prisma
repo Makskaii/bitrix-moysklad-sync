@@ -219,3 +219,39 @@ model PairReviewCase {
   @@index([status, openedAt])
   @@index([entityType, sourceSystem, sourceEntityId, status], map: "PairReviewCase_source_lookup_idx")
 }
+
+model HistoricalInventoryJob {
+  id                String    @id @default("deal-order-history")
+  runId             String?
+  status            String    @default("idle")
+  phase             String    @default("BITRIX24")
+  bitrixStart       Int       @default(0)
+  moyskladOffset    Int       @default(0)
+  bitrixProcessed   Int       @default(0)
+  moyskladProcessed Int       @default(0)
+  bitrixTotal       Int?
+  moyskladTotal     Int?
+  moyskladPageSize  Int       @default(500)
+  requestIntervalMs Int       @default(1000)
+  attempts          Int       @default(0)
+  error             String?
+  retryAfter        DateTime?
+  pauseRequested    Boolean   @default(false)
+  leaseOwner        String?
+  leaseUntil        DateTime?
+  checkpointAt      DateTime?
+  updatedAt         DateTime  @updatedAt
+}
+
+model HistoricalInventoryEntry {
+  id          String   @id @default(cuid())
+  source      String
+  externalId  String
+  label       String?
+  fields      Json
+  fieldTitles Json
+  observedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([source, externalId])
+}
