@@ -133,7 +133,7 @@ export function HistoricalInventoryPage({ accessToken, onError, onForbidden }: {
       <InventoryTable title="Сделки Bitrix24" entries={b24} hasMore={!!b24Cursor} loading={loadingMore.BITRIX24} onLoadMore={() => void loadMore('BITRIX24')} />
       <InventoryTable title="Заказы покупателей МойСклад" entries={moysklad} hasMore={!!moyskladCursor} loading={loadingMore.MOYSKLAD} onLoadMore={() => void loadMore('MOYSKLAD')} />
     </div>
-    <p className="inventory-footnote">Названия полей берутся из метаданных. Если API их не предоставляет, интерфейс явно показывает «unavailable in metadata». Значения отображаются только в этом административном каталоге и не попадают в журналы.</p>
+    <p className="inventory-footnote">Названия полей берутся из метаданных. Если API их не предоставляет, интерфейс явно показывает «недоступно в метаданных». Значения отображаются только в этом административном каталоге и не попадают в журналы.</p>
   </section>;
 }
 

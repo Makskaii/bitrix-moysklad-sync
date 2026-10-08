@@ -2,7 +2,7 @@
 
 The admin page at **Исторический каталог** manually starts or pauses the historical catalog. It stores only IDs and the approved candidate fields in `HistoricalInventoryEntry`; it does not create record pairs, choose candidates, create external records, capture sync snapshots, or gate normal service readiness. A process restart leaves the checkpoint in PostgreSQL; an administrator starts again in the UI with a fresh Bitrix24 session to resume.
 
-The Bitrix24 deal list has a fixed 50-record page size. The MySklad page size can be set from 1 to 1,000. The default request interval is 1,000 ms; the lowest configurable interval is 500 ms, or two requests per second. The worker runs one request at a time, backs off on 429/503 and transport errors, and retains the current page cursor until its records have been saved. Metadata titles are read from the provider response; missing titles are shown as unavailable in metadata.
+The Bitrix24 deal list has a fixed 50-record page size. The MySklad page size can be set from 1 to 1,000. The default request interval is 1,000 ms; the lowest configurable interval is 500 ms, or two requests per second. The worker runs one request at a time, backs off on 429/503 and transport errors, and retains the current page cursor until its records have been saved. Metadata titles are read from the provider response; missing titles are shown as «недоступно в метаданных».
 
 ## Local verification
 

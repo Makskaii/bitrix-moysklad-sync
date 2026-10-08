@@ -65,7 +65,7 @@ test('an administrator can build an ID and candidate-only catalog from both syst
   const order = moysklad.entries[0];
   assert.equal(order.label, '000041');
   assert.equal(order.fields.find((field: any) => field.code === 'externalCode').verification, 'UNVERIFIED');
-  assert.equal(order.fields.find((field: any) => field.code === 'externalCode').title, 'unavailable in metadata');
+  assert.equal(order.fields.find((field: any) => field.code === 'externalCode').title, 'недоступно в метаданных');
   assert.equal('description' in fixture.entries.get('MOYSKLAD:ms-uuid-1')!.fields, false);
   assert.equal(fixture.requests.some((request) => request.method === 'PUT' || request.method === 'PATCH'), false);
 });
@@ -159,6 +159,45 @@ test('a stale worker cannot advance a checkpoint after another owner takes its l
   assert.equal(fixture.job?.leaseOwner, 'lease-stolen-by-other-worker');
   assert.equal(fixture.job?.bitrixStart, 0, 'stale worker must not advance the saved page cursor');
   assert.equal(fixture.job?.bitrixProcessed, 0, 'stale worker must not commit progress for another owner');
+  assert.equal(fixture.entries.size, 0, 'stale worker must not persist page records after losing its lease');
+});
+
+test('an empty Bitrix24 page with a next cursor fails without advancing the checkpoint', async () => {
+  const fixture = createFixture(async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/crm.deal.fields.json')) return json({ result: bitrixTitles() });
+    if (url.pathname.endsWith('/crm.deal.list.json')) return json({ total: 100, next: 50, result: [] });
+    throw new Error(`Unexpected fake HTTP request ${url.pathname}`);
+  });
+  await boot(fixture);
+
+  await post('/api/admin/historical-inventory/start', { accessToken: 'session-token', requestIntervalMs: 500 });
+  const failed = await waitForStatus('failed');
+
+  assert.equal(failed.bitrixStart, 0, 'invalid empty page must retain its original cursor');
+  assert.equal(failed.bitrixProcessed, 0);
+  assert.equal(fixture.entries.size, 0);
+});
+
+test('an expired worker lease cannot advance the checkpoint even when the owner token still matches', async () => {
+  const fixture = createFixture(async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/crm.deal.fields.json')) return json({ result: bitrixTitles() });
+    if (url.pathname.endsWith('/crm.deal.list.json')) {
+      fixture.expireLease();
+      return json({ total: 0, result: [] });
+    }
+    throw new Error(`Unexpected fake HTTP request ${url.pathname}`);
+  });
+  await boot(fixture);
+
+  await post('/api/admin/historical-inventory/start', { accessToken: 'session-token', requestIntervalMs: 500 });
+  for (let attempt = 0; attempt < 200 && !fixture.leaseLossDetected; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(fixture.leaseLossDetected, true, 'the worker must reject its expired lease');
+  assert.equal(fixture.job?.bitrixStart, 0, 'expired lease must not advance the page cursor');
+  assert.equal(fixture.job?.bitrixProcessed, 0);
+  assert.equal(fixture.entries.size, 0);
 });
 
 function createFixture(fetcher: typeof fetch) {
@@ -171,6 +210,7 @@ function createFixture(fetcher: typeof fetch) {
   let job: StoredRow | null = null;
   let leaseLossDetected = false;
   const stealLease = () => { if (job) { job.leaseOwner = 'lease-stolen-by-other-worker'; job.leaseUntil = new Date(Date.now() + 60_000); } };
+  const expireLease = () => { if (job) { job.attempts = 4; job.leaseUntil = new Date(0); } };
   const database = {
     historicalInventoryJob: {
       upsert: async ({ create }: { create: StoredRow }) => job ??= ({ id: 'deal-order-history', runId: null, status: 'idle', phase: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, bitrixProcessed: 0, moyskladProcessed: 0, bitrixTotal: null, moyskladTotal: null, moyskladPageSize: 500, requestIntervalMs: 1000, attempts: 0, error: null, retryAfter: null, pauseRequested: false, leaseOwner: null, leaseUntil: null, checkpointAt: null, updatedAt: new Date(), ...create }),
@@ -179,6 +219,7 @@ function createFixture(fetcher: typeof fetch) {
       updateMany: async ({ where, data }: { where: StoredRow; data: StoredRow }) => {
         if (!job || (where.leaseOwner && where.leaseOwner !== job.leaseOwner)) { if (where.leaseOwner) leaseLossDetected = true; return { count: 0 }; }
         if (where.OR && job.leaseUntil && job.leaseUntil > new Date()) return { count: 0 };
+        if (where.leaseUntil?.gt && (!job.leaseUntil || job.leaseUntil <= where.leaseUntil.gt)) { if (where.leaseOwner) leaseLossDetected = true; return { count: 0 }; }
         job = applyData(job, data); return { count: 1 };
       },
     },
@@ -194,13 +235,14 @@ function createFixture(fetcher: typeof fetch) {
         .sort((a, b) => b.externalId.localeCompare(a.externalId)).slice(0, take),
     },
     $queryRawUnsafe: async () => [],
+    $transaction: async (operation: (transaction: any) => Promise<unknown>) => operation(database),
   };
   const instrumentedFetch: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     requests.push({ path: url.pathname, method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : String(init?.body ?? '') });
     return fetcher(input, init);
   };
-  return { database, entries, requests, runtimeState, fetcher: instrumentedFetch, stealLease, get job() { return job; }, get leaseLossDetected() { return leaseLossDetected; } };
+  return { database, entries, requests, runtimeState, fetcher: instrumentedFetch, stealLease, expireLease, get job() { return job; }, get leaseLossDetected() { return leaseLossDetected; } };
 }
 
 async function boot(fixture: Fixture) {

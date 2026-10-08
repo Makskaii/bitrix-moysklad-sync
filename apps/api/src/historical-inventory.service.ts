@@ -117,7 +117,7 @@ export class HistoricalInventoryService {
     return {
       entries: rows.map((row) => ({
         source: row.source, externalId: row.externalId, label: row.label,
-        fields: codes.map((code) => ({ code, title: row.fieldTitles[code] ?? 'unavailable in metadata', value: row.fields[code] ?? null,
+        fields: codes.map((code) => ({ code, title: row.fieldTitles[code] ?? 'недоступно в метаданных', value: row.fields[code] ?? null,
           verification: UNVERIFIED_FIELDS.has(code) ? 'UNVERIFIED' : DISPLAY_ONLY_FIELDS.has(code) ? 'DISPLAY ONLY' : null })),
         observedAt: row.observedAt,
       })),
@@ -135,6 +135,7 @@ export class HistoricalInventoryService {
         if (await this.pauseRequested(owner)) return;
         const page = await this.retryPage(() => this.readBitrixPage(accessToken, job.bitrixStart));
         const entries = page.rows.map((row) => shapeEntry('BITRIX24', row, BITRIX_FIELDS, bitrixTitles));
+        if (!entries.length && page.next !== null) throw new Error('Bitrix24 returned an empty page with a next cursor.');
         await this.savePage(entries, owner);
         job = await this.updateCheckpoint(owner, {
           bitrixStart: page.next ?? 0,
@@ -144,16 +145,16 @@ export class HistoricalInventoryService {
           phase: page.next === null ? 'MOYSKLAD' : 'BITRIX24',
           checkpointAt: new Date(), leaseUntil: new Date(Date.now() + LEASE_MS),
         });
-        if (!entries.length && page.next !== null) throw new Error('Bitrix24 returned an empty page with a next cursor.');
       }
 
       while (job.phase === 'MOYSKLAD') {
         if (await this.pauseRequested(owner)) return;
         const page = await this.retryPage(() => this.readMoyskladPage(job.moyskladOffset, job.moyskladPageSize));
         const entries = page.rows.map((row) => shapeEntry('MOYSKLAD', row, MOYSKLAD_FIELDS, moyskladTitles));
-        await this.savePage(entries, owner);
         const nextOffset = job.moyskladOffset + entries.length;
         const hasNext = nextOffset < page.total;
+        if (!entries.length && hasNext) throw new Error('MoySklad returned an empty page before the collection ended.');
+        await this.savePage(entries, owner);
         job = await this.updateCheckpoint(owner, {
           moyskladOffset: hasNext ? nextOffset : 0,
           moyskladProcessed: { increment: entries.length },
@@ -164,14 +165,13 @@ export class HistoricalInventoryService {
           checkpointAt: new Date(),
           ...(hasNext ? {} : { leaseOwner: null, leaseUntil: null }),
         });
-        if (!entries.length && hasNext) throw new Error('MoySklad returned an empty page before the collection ended.');
       }
     } catch (error) {
       const current = await this.database.historicalInventoryJob.findUnique({ where: { id: JOB_ID } }) as Job;
       const nextAttempt = current.attempts + 1;
       const retryAfterMs = Math.max(retryAfterFromError(error), Math.min(1_000 * 2 ** (nextAttempt - 1), 60_000));
       await this.database.historicalInventoryJob.updateMany({
-        where: { id: JOB_ID, leaseOwner: owner },
+        where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: new Date() } },
         data: { status: 'failed', error: 'Provider retrieval failed; the incomplete page checkpoint was retained.', retryAfter: new Date(Date.now() + retryAfterMs), attempts: { increment: 1 }, leaseOwner: null, leaseUntil: null },
       }).catch(() => undefined);
       if (nextAttempt < 5) {
@@ -190,7 +190,7 @@ export class HistoricalInventoryService {
     const job = await this.database.historicalInventoryJob.findUnique({ where: { id: JOB_ID } }) as Job | null;
     if (job?.leaseOwner !== owner) return true;
     if (!job.pauseRequested) return false;
-    await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner }, data: { status: 'paused', pauseRequested: false, leaseOwner: null, leaseUntil: null, checkpointAt: new Date() } });
+    await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: new Date() } }, data: { status: 'paused', pauseRequested: false, leaseOwner: null, leaseUntil: null, checkpointAt: new Date() } });
     return true;
   }
 
@@ -211,13 +211,23 @@ export class HistoricalInventoryService {
   }
 
   private async savePage(entries: Array<{ source: Source; externalId: string; label: string | null; fields: Record<string, unknown>; fieldTitles: FieldTitles }>, owner: string) {
-    for (const [index, entry] of entries.entries()) {
-      if (index > 0 && index % 10 === 0) await this.renewLease(owner);
-      await this.database.historicalInventoryEntry.upsert({
-        where: { source_externalId: { source: entry.source, externalId: entry.externalId } },
-        create: { ...entry, fields: entry.fields as Prisma.InputJsonObject, fieldTitles: entry.fieldTitles as Prisma.InputJsonObject },
-        update: { label: entry.label, fields: entry.fields as Prisma.InputJsonObject, fieldTitles: entry.fieldTitles as Prisma.InputJsonObject, observedAt: new Date() },
-      });
+    for (let start = 0; start < entries.length; start += 10) {
+      const batch = entries.slice(start, start + 10);
+      await this.database.$transaction(async (transaction) => {
+        const now = new Date();
+        const fenced = await transaction.historicalInventoryJob.updateMany({
+          where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: now } },
+          data: { leaseUntil: new Date(now.getTime() + LEASE_MS) },
+        });
+        if (fenced.count !== 1) throw new Error('Historical inventory lease was lost before saving a page.');
+        for (const entry of batch) {
+          await transaction.historicalInventoryEntry.upsert({
+            where: { source_externalId: { source: entry.source, externalId: entry.externalId } },
+            create: { ...entry, fields: entry.fields as Prisma.InputJsonObject, fieldTitles: entry.fieldTitles as Prisma.InputJsonObject },
+            update: { label: entry.label, fields: entry.fields as Prisma.InputJsonObject, fieldTitles: entry.fieldTitles as Prisma.InputJsonObject, observedAt: new Date() },
+          });
+        }
+      }, { maxWait: 10_000, timeout: 30_000 });
     }
   }
 
@@ -283,12 +293,13 @@ export class HistoricalInventoryService {
   }
 
   private async renewLease(owner: string) {
-    const renewed = await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner }, data: { leaseUntil: new Date(Date.now() + LEASE_MS) } });
+    const now = new Date();
+    const renewed = await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: now } }, data: { leaseUntil: new Date(now.getTime() + LEASE_MS) } });
     if (renewed.count !== 1) throw new Error('Historical inventory lease was lost.');
   }
 
   private async updateCheckpoint(owner: string, data: Prisma.HistoricalInventoryJobUpdateManyMutationInput): Promise<Job> {
-    const updated = await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner }, data });
+    const updated = await this.database.historicalInventoryJob.updateMany({ where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: new Date() } }, data });
     if (updated.count !== 1) throw new Error('Historical inventory lease was lost before checkpoint commit.');
     return await this.database.historicalInventoryJob.findUnique({ where: { id: JOB_ID } }) as Job;
   }
