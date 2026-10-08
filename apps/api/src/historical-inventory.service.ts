@@ -217,7 +217,7 @@ export class HistoricalInventoryService {
         const now = new Date();
         const fenced = await transaction.historicalInventoryJob.updateMany({
           where: { id: JOB_ID, leaseOwner: owner, leaseUntil: { gt: now } },
-          data: { leaseUntil: new Date(now.getTime() + LEASE_MS) },
+          data: { leaseUntil: new Date(now.getTime() + LEASE_MS), inventoryRevision: { increment: 1 } },
         });
         if (fenced.count !== 1) throw new Error('Historical inventory lease was lost before saving a page.');
         for (const entry of batch) {

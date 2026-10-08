@@ -10,6 +10,8 @@
     "test:contactsync": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/contact-sync.integration.js",
     "test:pairs": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/pair-resolution.integration.js",
     "test:pairs:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/pair-resolution.postgres.integration.js",
+    "test:historical-matching": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-deal-order-matching.integration.js ../../dist/apps/api-test/test/historical-deal-order-matching.service.integration.js ../../dist/apps/api-test/test/historical-deal-order-matching.admin.integration.js",
+    "test:historical-matching:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-deal-order-matching.postgres.integration.js",
     "test:contactsync:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/contact-sync.postgres.integration.js",
     "test:monitoring": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/monitoring.integration.js ../../dist/apps/api-test/test/rotating-file.logger.integration.js",
     "test:monitoring:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/monitoring.postgres.integration.js",
