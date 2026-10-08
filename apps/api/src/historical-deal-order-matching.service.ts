@@ -324,6 +324,10 @@ export class HistoricalDealOrderMatchingService {
           });
           if (claim.count !== 1) throw new Error('MATCH_APPLY_LEASE_LOST');
           await lockEntityPairState(transaction);
+          const inventoryJobLock = await transaction.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "HistoricalInventoryJob" WHERE "id" = ${INVENTORY_JOB_ID} FOR UPDATE
+          `;
+          if (inventoryJobLock.length !== 1) throw new Error('MATCH_PREVIEW_STALE');
           const job = await transaction.historicalInventoryJob.findUnique({ where: { id: INVENTORY_JOB_ID } }) as InventoryJob | null;
           if (!job || !inventoryJobMatchesRun(job, run)) throw new Error('MATCH_PREVIEW_STALE');
 

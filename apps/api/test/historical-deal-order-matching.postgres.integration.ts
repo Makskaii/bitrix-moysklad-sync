@@ -173,6 +173,43 @@ test('PostgreSQL rejects stale previews and rechecks conflicting active pairs wi
   } });
 });
 
+test('apply waits for an inventory revision writer and rejects the now-stale preview before writing pairs', async () => {
+  const priorRunId = (await service.readStatus()).run?.id;
+  await service.startPreview();
+  const status = await waitFor((value) => value.run?.id !== priorRunId && value.run?.status === 'complete');
+  const runId = status.run!.id;
+
+  let releaseWriter!: () => void;
+  let signalLocked!: () => void;
+  const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve; });
+  const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+  const inventoryWriter = database.$transaction(async (transaction) => {
+    const rows = await transaction.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "HistoricalInventoryJob" WHERE "id" = 'deal-order-history' FOR UPDATE
+    `;
+    assert.equal(rows.length, 1);
+    signalLocked();
+    await writerGate;
+    await transaction.historicalInventoryJob.update({ where: { id: 'deal-order-history' }, data: { inventoryRevision: { increment: 1 } } });
+  });
+
+  try {
+    await locked;
+    await service.applyPreview(runId, true);
+    await waitForInventoryRowLockWait(database);
+    assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true } }), 0);
+  } finally {
+    releaseWriter();
+  }
+  await inventoryWriter;
+
+  const stale = await waitFor((value) => value.run?.applyStatus === 'stale');
+  assert.equal(stale.run?.appliedCount, 0);
+  assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', active: true } }), 0);
+  assert.equal(stale.previewFresh, false);
+  await database.historicalInventoryJob.update({ where: { id: 'deal-order-history' }, data: { inventoryRevision: 3 } });
+});
+
 test('PostgreSQL-backed preview and explicit apply are only reachable through the admin-guarded HTTP routes', async () => {
   const upstreamFetch = globalThis.fetch;
   globalThis.fetch = (async (input, init) => {
@@ -235,4 +272,21 @@ async function fetchStatus(
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error('Admin-protected matching HTTP workflow did not reach the expected state.');
+}
+
+async function waitForInventoryRowLockWait(db: DatabaseService) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const rows = await db.$queryRaw<Array<{ waiters: bigint }>>`
+      SELECT COUNT(*)::bigint AS waiters
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND pid <> pg_backend_pid()
+        AND wait_event_type = 'Lock'
+        AND query ILIKE '%HistoricalInventoryJob%'
+        AND query ILIKE '%FOR UPDATE%'
+    `;
+    if (Number(rows[0]?.waiters ?? 0n) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('Apply did not wait for the held inventory job row lock.');
 }

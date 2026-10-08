@@ -157,7 +157,7 @@ function createDatabase(options: { onlyOneMatch?: boolean } = {}) {
       return duplicateKeys.length;
     },
     $transaction: async <T>(operation: (tx: unknown) => Promise<T>) => operation(database),
-    $queryRaw: async () => [],
+    $queryRaw: async () => [{ id: 'deal-order-history', locked: 1 }],
     changeInventoryRevision: () => { inventoryRevision++; },
   };
   return database;
