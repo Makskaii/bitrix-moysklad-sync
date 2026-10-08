@@ -72,7 +72,7 @@ before(async () => {
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
-          : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
+        : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test', opaqueField: 'opaque' };
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     throw new Error(`Unexpected test HTTP request: ${url.origin}${url.pathname}`);
@@ -220,7 +220,9 @@ test('live field metadata returns codes, titles, and types without record values
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
-  assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.type === 'string'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Имя контрагента'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'opaqueField' && field.title === 'opaqueField'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.title === 'Preferred contact'));
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
 });
@@ -242,6 +244,7 @@ test('catalog field metadata uses the product information block and API field na
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
 });
 
 test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {
@@ -301,7 +304,9 @@ test('saving creates an immutable version and activates it for future events onl
   const previous = await previousResponse.json() as { config: Record<string, unknown> };
   assert.deepEqual(previous.config.rules, []);
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
-  assert.equal((await activeResponse.json() as { version: number }).version, saved.version);
+  const reloaded = await activeResponse.json() as { version: number; config: Record<string, unknown> };
+  assert.equal(reloaded.version, saved.version);
+  assert.deepEqual(reloaded.config.rules, saved.config.rules);
 });
 
 test('settings reject unknown field codes and read-only Bitrix24 targets', async () => {

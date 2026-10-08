@@ -88,7 +88,7 @@ export class ReadOnlyFieldDataProvider {
     });
     const moyskladStandard: FieldCandidate[] = Object.entries(snapshot.targetCurrent)
       .filter(([code]) => !['meta', 'attributes', 'positions', 'files', 'owner', 'group', 'updated', 'created'].includes(code))
-      .map(([code, value]) => ({ code, title: '', type: valueType(value), writable: null }));
+      .map(([code, value]) => ({ code, title: moyskladStandardFieldTitle(entity, code), type: valueType(value), writable: null }));
     return { entity, bitrix24, moysklad: deduplicateFields([...moyskladStandard, ...moyskladAttributes]) };
   }
 
@@ -220,6 +220,38 @@ function valueType(value: unknown): string {
   if (value === null || value === undefined) return 'unknown';
   if (Array.isArray(value)) return 'array';
   return typeof value === 'object' ? 'object' : typeof value;
+}
+
+/** Labels for standard fields whose Russian meanings are documented for these resources.
+ * Unknown standard fields keep their exact API code as their honest display title.
+ */
+function moyskladStandardFieldTitle(entity: string, code: string): string {
+  const labels: Record<string, Record<string, string>> = {
+    contacts: {
+      name: 'Имя контрагента', companyType: 'Тип контрагента', legalTitle: 'Полное наименование',
+      inn: 'ИНН', kpp: 'КПП', legalAddress: 'Юридический адрес', actualAddress: 'Фактический адрес',
+      email: 'Электронная почта', phone: 'Телефон',
+    },
+    'contacts-companies': {
+      name: 'Имя контрагента', companyType: 'Тип контрагента', legalTitle: 'Полное наименование',
+      inn: 'ИНН', kpp: 'КПП', legalAddress: 'Юридический адрес', actualAddress: 'Фактический адрес',
+      email: 'Электронная почта', phone: 'Телефон',
+    },
+    companies: {
+      name: 'Имя контрагента', companyType: 'Тип контрагента', legalTitle: 'Полное наименование',
+      inn: 'ИНН', kpp: 'КПП', legalAddress: 'Юридический адрес', actualAddress: 'Фактический адрес',
+      email: 'Электронная почта', phone: 'Телефон',
+    },
+    'deals-orders': {
+      name: 'Наименование заказа', code: 'Код заказа', moment: 'Момент заказа',
+      deliveryPlannedMoment: 'Плановая отгрузка/доставка', state: 'Статус', sum: 'Сумма', description: 'Описание',
+    },
+    catalog: {
+      name: 'Наименование товара', code: 'Код товара', article: 'Артикул', description: 'Описание',
+      externalCode: 'Внешний код', vat: 'Ставка НДС',
+    },
+  };
+  return labels[entity]?.[code] ?? code;
 }
 
 function sourceLabel(value: unknown): string {
