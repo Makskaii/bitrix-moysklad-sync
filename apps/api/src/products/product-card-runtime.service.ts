@@ -32,13 +32,16 @@ export class ProductCardRuntimeService {
   ) {}
 
   async preflight(source: 'BITRIX24' | 'MOYSKLAD'): Promise<ProductCardRuntimeGate> {
+    // Product cards are deliberately one-way. Persisted legacy direction flags
+    // must not reopen the Bitrix24 → MySklad write path.
+    if (source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' };
     if (process.env.SYNC_MODE !== 'apply') return { status: 'SKIPPED_DISABLED', reason: 'APPLY_MODE_REQUIRED' };
     let mode: 'on' | 'pause' | 'off';
     try { mode = (await this.syncMode.read()).mode; }
     catch { return { status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_RUNTIME_MODE_READ_FAILED' }; }
     if (mode === 'off') return { status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF' };
     if (mode === 'pause') return { status: 'DEFERRED_PAUSE', reason: 'SERVICE_PAUSED' };
-    const direction = source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
+    const direction = 'moyskladToBitrix24';
     try {
       if (!await this.syncMode.isDirectionEnabled('products-variations', direction)) {
         return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' };

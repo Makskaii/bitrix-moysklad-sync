@@ -88,7 +88,7 @@ export class ReadOnlyFieldDataProvider {
     });
     const moyskladStandard: FieldCandidate[] = Object.entries(snapshot.targetCurrent)
       .filter(([code]) => !['meta', 'attributes', 'positions', 'files', 'owner', 'group', 'updated', 'created'].includes(code))
-      .map(([code, value]) => ({ code, title: code, type: valueType(value), writable: null }));
+      .map(([code, value]) => ({ code, title: '', type: valueType(value), writable: null }));
     return { entity, bitrix24, moysklad: deduplicateFields([...moyskladStandard, ...moyskladAttributes]) };
   }
 
@@ -200,7 +200,8 @@ function describeBitrixFields(value: unknown): FieldCandidate[] {
   const candidates = isRecord(root.fields) ? root.fields : isRecord(root.product) ? root.product : root;
   return Object.entries(candidates).flatMap(([code, definition]) => {
     if (!isRecord(definition) || code === 'time' || code === 'item') return [];
-    const title = typeof definition.title === 'string' ? definition.title : typeof definition.name === 'string' ? definition.name : code;
+    const title = [definition.title, definition.formLabel, definition.listLabel, definition.filterLabel, definition.listColumnLabel, definition.name]
+      .find((label): label is string => typeof label === 'string' && label.trim().length > 0)?.trim() ?? '';
     const type = typeof definition.type === 'string' ? definition.type : typeof definition.userTypeId === 'string' ? definition.userTypeId : 'unknown';
     return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null }];
   });

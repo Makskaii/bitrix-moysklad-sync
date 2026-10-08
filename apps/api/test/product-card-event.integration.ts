@@ -7,7 +7,7 @@ const productId = '12345678-1234-1234-1234-123456789abc';
 function harness(event: Record<string, unknown>, pairs: Array<Record<string, unknown>> = [{
   id: 'pair-1', entityType: 'PRODUCT', bitrix24Id: '101', moyskladId: productId,
   active: true, source: 'MANUAL', reason: null, createdAt: new Date(),
-}], gate: { status: 'READY' } | { status: 'SKIPPED_DISABLED'; reason: string } = { status: 'READY' }) {
+}], gate: { status: 'READY' } | { status: 'SKIPPED_DISABLED'; reason: string } | { status: 'SKIPPED_DIRECTION_DISABLED'; reason: string } = { status: 'READY' }) {
   const storedEvent: Record<string, unknown> = { id: 'event-1', source: 'BITRIX24', status: 'RECEIVED', attempts: 0, ...event };
   const reviewCases: Array<Record<string, unknown>> = [];
   const runtimeCalls: Array<Record<string, unknown>> = [];
@@ -47,6 +47,17 @@ test('product event dispatches only to an exact active PRODUCT pair and uses pin
   assert.deepEqual(result, { status: 'SYNCED', changedFields: ['name'] });
   assert.deepEqual(runtimeCalls, [{ pairId: 'pair-1', source: 'BITRIX24', settingsVersion: 9, eventId: 'event-1' }]);
   assert.equal(storedEvent.status, 'SUCCEEDED');
+});
+
+test('Bitrix24 product update is skipped before pair lookup or reconciliation', async () => {
+  const { processor, storedEvent, runtimeCalls } = harness({
+    eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
+    payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } },
+  }, [], { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' });
+  const result = await processor.process('event-1');
+  assert.deepEqual(result, { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [] });
+  assert.equal(storedEvent.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(runtimeCalls.length, 0);
 });
 
 test('due retryable product events are claimed and reprocessed', async () => {
