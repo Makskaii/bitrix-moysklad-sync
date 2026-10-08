@@ -1,6 +1,10 @@
 # Issue #10 dispatch brief: approved reference maps
 
-Status: implementation inputs frozen by owner approval Q26.62–65 (2026-10-07). This brief defines configuration data for #10; it does not implement the UI, persist runtime settings, or claim external API writes were verified.
+Status: pair inputs approved under Q26.62–65 (2026-10-07); direction clarified by owner on 2026-10-08. This brief defines configuration data for #10; it does not prove runtime persistence or external API writes.
+
+## Field selection display
+
+Mapping controls use a dropdown of fields for the selected entity, not a free-text code entry. Each option shows the field's human-readable title and exact code; save the original code/ID, never the display text. Resolve titles from metadata for that specific entity and field. If a title is unavailable, show the code with an explicit “title unavailable” indication; do not invent or reuse a generic label. This display rule does not normalize stored codes or business values.
 
 ## Source of truth
 
@@ -44,7 +48,7 @@ Persist only these seven explicit pairs. These are catalog-card price types, sep
 | 14 | `mdo` | `61161db9-7f0b-11ee-0a80-0b350015853e` | М. До скидки | configured seed |
 | 16 | `rrc` | `138eeb4d-82c0-11ed-0a80-0ffb0028e290` | РРЦ | configured seed |
 
-Do not exchange B24 catalog price types `10 mark`, `18 ali`, `20 MIN`, and `22 ZAKUP` until an explicit future configuration. Preserve their current values. Preserve all MySklad price types not included above: ВБ (`181fccd0-7736-11ed-0a80-080900027768`), ВБ ВентМаркет (`47e91e27-ad13-11f1-0a80-144700177791`), Ozon ВентМаркет (`7c45db73-7b9e-11f1-0a80-182500121f3e`), ЯМ (`e4a858d7-e190-11f0-0a80-1059000f9c17`), and Минимальная цена Ozon (`a88d2683-3e1f-11f1-0a80-185000073e51`). The approved seven pairs are bidirectional; MySklad wins conflicts (Q26.54). An absent optional catalog price does not block exchange (Q26.21).
+Do not exchange B24 catalog price types `10 mark`, `18 ali`, `20 MIN`, and `22 ZAKUP` until an explicit future configuration. Preserve their current values. Preserve all MySklad price types not included above: ВБ (`181fccd0-7736-11ed-0a80-080900027768`), ВБ ВентМаркет (`47e91e27-ad13-11f1-0a80-144700177791`), Ozon ВентМаркет (`7c45db73-7b9e-11f1-0a80-182500121f3e`), ЯМ (`e4a858d7-e190-11f0-0a80-1059000f9c17`), and Минимальная цена Ozon (`a88d2683-3e1f-11f1-0a80-185000073e51`). The owner clarified on 2026-10-08 that configured catalog-card prices are MySklad → Bitrix24 only. Do not create or update MySklad catalog prices from Bitrix24. Catalog-card price direction is separate from order-row quantity/price sync. An absent optional catalog price does not block exchange (Q26.21).
 
 ## Existing service and payment reference fields
 
@@ -60,7 +64,7 @@ Service is an optional order reference only (no product row or text copy, Q26.60
 ## #10 implementation boundary
 
 - Present both directories in the mapping section, show mapping state and IDs/labels, and let an admin assign or reassign pairs. Persist the configured map and record changes for diagnosis.
-- Seed only the nine UOM and seven catalog price-type pairs above. Keep the three unmapped measures and excluded/unpaired price types explicitly outside the active map while preserving their values.
+- Seed only the nine UOM and seven catalog price-type pairs above. Keep the three unmapped measures and excluded/unpaired price types explicitly outside the active map while preserving their values. Catalog price writes are MySklad → Bitrix24 only; never create/update an MS card or its price while resolving a B24 order dependency.
 - Make repeated assignment idempotent and validate each selected ID still exists. Never silently remap an existing pair because a label or order changed.
 - Keep service/payment typed value references separate from product UOM and catalog price types. An unmapped optional service/payment value follows Q26.60/.61; the catalog mapping UI remains usable with unmapped references.
 - Do not implement product/order synchronization, row matching, `row.pack` conversion, external writes, or production round-trip proof in #10. The row-ID and per-order UOM readiness evidence remains a consuming feature gate for #16, not a prerequisite for building the generic reference-mapping UI.

@@ -1,4 +1,6 @@
-# T26 live technical gate — 2026-10-06
+# T26 live technical gate — 2026-10-06 (decision update 2026-10-08)
+
+Owner clarification dated 2026-10-08: product cards and their catalog prices may be created/updated only MySklad → Bitrix24. No Bitrix24 event may create/update a MySklad product or catalog price, including while resolving an order dependency. If the required MySklad product is absent, record why exchange cannot proceed. This applies to catalog cards/prices; order-row quantity and price remain governed separately by deal/order rules. This policy does not change the GET-only observations or prove implementation.
 
 This supplement records a bounded, read-only live check for the field-mapping gate. It does not replace the product decisions recorded in the accepted Q26.58–61 review, and it does not claim a complete approved runtime map.
 
@@ -120,8 +122,9 @@ MySklad's API describes custom-entity references in metadata and supports entity
 This evidence supports a scoped static schema/identifier map for the two named dictionaries and the currently observed UOM and price-type catalogs. It does **not** satisfy a claim that every field in #26 has a verified mapping or is successfully writable. In particular:
 
 - UOM: 9 pairs are owner-approved configuration inputs (seven exact-code plus two explicitly confirmed zero-padded codes); B24 measure IDs `14`, `16`, and `20` remain intentionally unmapped. Persisting/using these pairs is not verified; document-row `pack` remains open.
-- Prices: seven catalog price-type pairs are owner-approved configuration inputs. Four B24 types are excluded until explicit future configuration; five additional MySklad types remain unpaired and preserved. No API-exposed saved settings table or runtime pair persistence was verified.
+- Prices: seven catalog price-type pairs are owner-approved configuration inputs, now with MySklad → Bitrix24-only direction per the 2026-10-08 owner update. Four B24 types are excluded until explicit future configuration; five additional MySklad types remain unpaired and preserved. No API-exposed saved settings table or runtime pair persistence was verified.
+- Product cards: the 2026-10-08 policy prohibits B24-origin creation/update in MySklad, including order-dependency resolution. It does not constrain order-row quantity/price sync. Runtime enforcement remains unverified.
 - Writes: documentation supports reference-field update shapes, but account permissions and production roundtrip remain unverified and intentionally untested.
 - Dictionary values: ID coverage is complete for the current 46/46 and 5/5 lists; archival/active state, semantic labels, and write success are not established.
 
-Therefore do not mark #26 fully complete or close it based on this check alone. A truthful completion claim is limited to the live schema/catalogue inventory, owner-approved catalog map inputs, and current ID coverage above. Preserve Q26.58–65 as product decisions, not evidence of implementation or runtime success. The approved map is an input for #10; row-ID/update proof and per-order readiness remain downstream #16 gates. No production write or roundtrip was attempted.
+Therefore do not mark #26 fully complete or close it based on this check alone. A truthful completion claim is limited to the live schema/catalogue inventory, owner-approved catalog map inputs/directions, and current ID coverage above. Preserve Q26.58–65 and the 2026-10-08 clarification as product decisions, not evidence of implementation or runtime success. The approved map is an input for #10; row-ID/update proof and per-order readiness remain downstream #16 gates. No production write or roundtrip was attempted.
