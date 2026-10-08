@@ -44,6 +44,7 @@ class FakeApi implements ProductCardApi {
   ]);
   writes: Array<{ side: string; field: string }> = [];
   failMoyskladPriceWrite = false;
+  failMoyskladNameWriteAfterApply = false;
   moyskladPricePayloads: Array<Array<{ value: number; priceType: { meta: { href: string; type: string; mediaType: string } } }>> = [];
   async readBitrix24() { return structuredClone(this.bitrix24); }
   async readMoysklad() { return structuredClone(this.moysklad); }
@@ -60,7 +61,13 @@ class FakeApi implements ProductCardApi {
   }
   async updateMoysklad(_id: string, fields: Record<string, unknown>) {
     this.writes.push({ side: 'MOYSKLAD', field: Object.keys(fields).join(',') });
-    if ('name' in fields) this.moysklad.name = String(fields.name);
+    if ('name' in fields) {
+      this.moysklad.name = String(fields.name);
+      if (this.failMoyskladNameWriteAfterApply) {
+        this.failMoyskladNameWriteAfterApply = false;
+        throw new Error('synthetic response lost after vendor applied write');
+      }
+    }
     if ('description' in fields) this.moysklad.detailText = String(fields.description);
     if ('uom' in fields) this.moysklad.unitId = 'unit-uuid-3';
     if ('salePrices' in fields) {
@@ -185,9 +192,26 @@ test('a price write failure is field-local and does not block verified card name
   api.bitrix24.prices[0].value = 12;
   api.failMoyskladPriceWrite = true;
   const result = await sync.sync({ pair, source: 'BITRIX24', settingsVersion: 1, settings });
-  assert.deepEqual(result, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_CARD_WRITE_OR_READBACK_FAILED', changedFields: ['name'] });
+  assert.deepEqual(result, { status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_CARD_WRITE_OUTCOME_PENDING', changedFields: ['name'] });
   assert.equal(api.moysklad.name, 'Name despite price failure');
   assert.equal(api.moysklad.prices[0].value, 10);
+});
+
+test('a vendor write with a lost response is accepted only after target readback verifies it', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  await sync.sync({ pair, source: 'BITRIX24', settingsVersion: 1, settings });
+  api.bitrix24.name = 'Applied despite lost response';
+  api.failMoyskladNameWriteAfterApply = true;
+
+  const result = await sync.sync({ pair, source: 'BITRIX24', settingsVersion: 1, settings });
+
+  assert.deepEqual(result, { status: 'SYNCED', changedFields: ['name'] });
+  assert.equal(api.moysklad.name, 'Applied despite lost response');
+  assert.equal(state.value?.bitrix24Values.name, 'Applied despite lost response');
+  assert.equal(state.value?.moyskladValues.name, 'Applied despite lost response');
+  assert.deepEqual(api.writes, [{ side: 'MOYSKLAD', field: 'name' }]);
 });
 
 test('a lost pair lease propagates after a vendor write without committing stale last-success state', async () => {

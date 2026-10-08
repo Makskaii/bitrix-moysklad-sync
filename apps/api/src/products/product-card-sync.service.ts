@@ -126,22 +126,46 @@ export class ProductCardSyncService {
     directions.push(...priceDirections);
 
     for (const direction of directions) {
+      let verified = false;
       try {
         await this.apply(direction, pair, bitrix24, moysklad, rules, settings);
         const actual = await this.readTarget(direction.target, pair, direction.field, direction);
         if (!same(actual, direction.value)) throw new Error('PRODUCT_CARD_READBACK_MISMATCH');
-        setState(next, direction.field, 'BITRIX24', direction.bitrix24Key,
-          direction.target === 'BITRIX24' ? direction.value : readField(bitrix24, direction.field));
-        setState(next, direction.field, 'MOYSKLAD', direction.moyskladKey,
-          direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field));
-        await this.state.write(pair.id, settingsVersion, next);
-        changedFields.push(direction.field);
+        verified = true;
       } catch (error) {
         if (error instanceof ProductCardLeaseError) throw error;
-        const reason = error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_WRITE_OR_READBACK_FAILED';
-        const optional = direction.field === 'description' || direction.field.startsWith('price:');
-        (optional ? optionalReasons : criticalReasons).push(reason);
-        if (!optional) break;
+        if (error instanceof ProductCardManualReviewError) {
+          const optional = direction.field === 'description' || direction.field.startsWith('price:');
+          (optional ? optionalReasons : criticalReasons).push(error.reason);
+          if (!optional) break;
+          continue;
+        }
+
+        // A transport error does not prove that the vendor rejected an absolute update.
+        // Read the target again before committing state; never blindly replay a write.
+        try {
+          const actual = await this.readTarget(direction.target, pair, direction.field, direction);
+          verified = same(actual, direction.value);
+        } catch (readError) {
+          if (readError instanceof ProductCardLeaseError) throw readError;
+        }
+        if (!verified) {
+          return retry('PRODUCT_CARD_WRITE_OUTCOME_PENDING', changedFields);
+        }
+      }
+
+      if (verified) {
+        try {
+          setState(next, direction.field, 'BITRIX24', direction.bitrix24Key,
+            direction.target === 'BITRIX24' ? direction.value : readField(bitrix24, direction.field));
+          setState(next, direction.field, 'MOYSKLAD', direction.moyskladKey,
+            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field));
+          await this.state.write(pair.id, settingsVersion, next);
+          changedFields.push(direction.field);
+        } catch (error) {
+          if (error instanceof ProductCardLeaseError) throw error;
+          return retry('PRODUCT_CARD_STATE_WRITE_FAILED', changedFields);
+        }
       }
     }
 
@@ -357,4 +381,6 @@ function sameCurrency(left: string, right: string): boolean {
 }
 function record(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function review(reason: string, changedFields: string[] = []): ProductCardSyncResult { return { status: 'MANUAL_REVIEW', reason, changedFields }; }
-function retry(reason: string): ProductCardSyncResult { return { status: 'RETRYABLE_FAILURE', reason, changedFields: [] }; }
+function retry(reason: string, changedFields: string[] = []): ProductCardSyncResult {
+  return { status: 'RETRYABLE_FAILURE', reason, changedFields };
+}

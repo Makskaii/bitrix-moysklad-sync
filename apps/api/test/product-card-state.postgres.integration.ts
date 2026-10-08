@@ -91,6 +91,7 @@ test('concurrent runtime instances retry by PRODUCT pair and retain both verifie
     assert.equal(await firstDatabase.inboundEntityLock.findUnique({ where: { entityKey } }), null);
 
     api.bitrix24.name = 'Renamed in Bitrix';
+    api.failNextMoyskladNameResponseAfterApply = true;
     const firstSync = firstRuntime.process({ pairId, source: 'BITRIX24', settingsVersion: 4, eventId: 'name-event' });
     await firstNameWriteStarted;
 
@@ -121,6 +122,22 @@ test('concurrent runtime instances retry by PRODUCT pair and retain both verifie
     assert.equal(state?.moyskladValues.name, 'Renamed in Bitrix');
     assert.equal(state?.bitrix24Values.description, 'Description changed in MySklad');
     assert.equal(state?.moyskladValues.description, 'Description changed in MySklad');
+
+    api.bitrix24.name = 'Next Bitrix name';
+    api.failNextMoyskladNameWriteBeforeApply = true;
+    const pending = await firstRuntime.process({ pairId, source: 'BITRIX24', settingsVersion: 4, eventId: 'pending-name-event' });
+    assert.deepEqual(pending, {
+      status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_CARD_WRITE_OUTCOME_PENDING', changedFields: [],
+    });
+    const unchangedState = await stateStore.read(pairId);
+    assert.equal(unchangedState?.bitrix24Values.name, 'Renamed in Bitrix');
+    assert.equal(unchangedState?.moyskladValues.name, 'Renamed in Bitrix');
+
+    const retriedPending = await firstRuntime.process({ pairId, source: 'BITRIX24', settingsVersion: 4, eventId: 'pending-name-event' });
+    assert.deepEqual(retriedPending, { status: 'SYNCED', changedFields: ['name'] });
+    const verifiedRetryState = await stateStore.read(pairId);
+    assert.equal(verifiedRetryState?.bitrix24Values.name, 'Next Bitrix name');
+    assert.equal(verifiedRetryState?.moyskladValues.name, 'Next Bitrix name');
   } finally {
     releaseFirstNameWrite();
     await firstDatabase.entityPair.deleteMany({ where: { id: pairId } }).catch(() => undefined);
@@ -147,6 +164,8 @@ class ConcurrentProductCardApi {
   moysklad = { name: 'Initial', detailText: 'Initial description', unitId: null, prices: [], updatedAt: null };
   writes: Array<{ side: string; field: string }> = [];
   private shouldBlockNameWrite = false;
+  failNextMoyskladNameResponseAfterApply = false;
+  failNextMoyskladNameWriteBeforeApply = false;
   private nameWriteStarted?: () => void;
   private nameWriteGate?: Promise<void>;
 
@@ -168,6 +187,11 @@ class ConcurrentProductCardApi {
   async updateBitrix24Price() { throw new Error('No price fields are configured in this test'); }
 
   async updateMoysklad(_id: string, fields: Record<string, unknown>) {
+    if ('name' in fields && this.failNextMoyskladNameWriteBeforeApply) {
+      this.failNextMoyskladNameWriteBeforeApply = false;
+      this.writes.push({ side: 'MOYSKLAD', field: 'name' });
+      throw new Error('synthetic connection failure before vendor applied write');
+    }
     this.writes.push({ side: 'MOYSKLAD', field: Object.keys(fields).join(',') });
     if ('name' in fields) {
       this.moysklad.name = String(fields.name);
@@ -175,6 +199,10 @@ class ConcurrentProductCardApi {
         this.shouldBlockNameWrite = false;
         this.nameWriteStarted?.();
         await this.nameWriteGate;
+      }
+      if (this.failNextMoyskladNameResponseAfterApply) {
+        this.failNextMoyskladNameResponseAfterApply = false;
+        throw new Error('synthetic response lost after vendor applied write');
       }
     }
     if ('description' in fields) this.moysklad.detailText = String(fields.description);
