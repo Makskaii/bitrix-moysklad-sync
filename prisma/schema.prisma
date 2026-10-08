@@ -64,9 +64,34 @@ model InboundEvent {
   lastSuccessfulAt DateTime?
   lastErrorCategory String?
   retryAfter       DateTime?
+  settings          InboundEventSettings?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+}
+
+model FieldSettingsVersion {
+  version   Int                    @id
+  config    Json
+  createdAt DateTime               @default(now())
+  state     FieldSettingsState?
+  events    InboundEventSettings[]
+}
+
+model FieldSettingsState {
+  id      String               @id @default("global")
+  version Int                  @unique
+  active  FieldSettingsVersion @relation(fields: [version], references: [version], onDelete: Restrict)
+}
+
+model InboundEventSettings {
+  eventId        String              @id
+  settingsVersion Int
+  pinnedAt       DateTime            @default(now())
+  event          InboundEvent        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  settings       FieldSettingsVersion @relation(fields: [settingsVersion], references: [version], onDelete: Restrict)
+
+  @@index([settingsVersion])
 }
 
 model InboundEntityLock {
@@ -137,4 +162,161 @@ model ContactSnapshot {
   revision            Int         @default(1)
   lastSuccessfulAt    DateTime?
   pair                ContactPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model EntityPair {
+  id          String   @id @default(cuid())
+  entityType  String
+  bitrix24Id  String
+  moyskladId  String
+  active      Boolean  @default(true)
+  source      String   @default("MANUAL")
+  reason      String?
+  createdAt   DateTime @default(now())
+  baseline    EntityPairBaseline?
+  syncState   EntityPairSyncState?
+
+  @@index([entityType, active, createdAt])
+  @@index([entityType, bitrix24Id, active])
+  @@index([entityType, moyskladId, active])
+}
+
+model EntityPairBaseline {
+  pairId              String     @id
+  eventId             String
+  settingsVersion     Int
+  bitrix24Values      Json
+  moyskladValues      Json
+  bitrix24UpdatedAt   DateTime?
+  moyskladUpdatedAt   DateTime?
+  capturedAt          DateTime   @default(now())
+  pair                EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([capturedAt])
+}
+
+model EntityPairSyncState {
+  pairId          String     @id
+  settingsVersion Int
+  bitrix24Values  Json
+  moyskladValues  Json
+  updatedAt       DateTime   @updatedAt
+  pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model PairReviewCase {
+  id             String   @id @default(cuid())
+  entityType     String
+  sourceSystem   String
+  sourceEntityId String
+  eventId        String?
+  reason         String
+  status         String   @default("OPEN")
+  openedAt       DateTime @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, openedAt])
+  @@index([entityType, sourceSystem, sourceEntityId, status], map: "PairReviewCase_source_lookup_idx")
+}
+
+model HistoricalInventoryJob {
+  id                String    @id @default("deal-order-history")
+  runId             String?
+  status            String    @default("idle")
+  phase             String    @default("BITRIX24")
+  bitrixStart       Int       @default(0)
+  moyskladOffset    Int       @default(0)
+  bitrixProcessed   Int       @default(0)
+  moyskladProcessed Int       @default(0)
+  bitrixTotal       Int?
+  moyskladTotal     Int?
+  moyskladPageSize  Int       @default(500)
+  requestIntervalMs Int       @default(1000)
+  attempts          Int       @default(0)
+  error             String?
+  retryAfter        DateTime?
+  pauseRequested    Boolean   @default(false)
+  leaseOwner        String?
+  leaseUntil        DateTime?
+  checkpointAt      DateTime?
+  inventoryRevision Int       @default(0)
+  updatedAt         DateTime  @updatedAt
+}
+
+model HistoricalInventoryEntry {
+  id          String   @id @default(cuid())
+  source      String
+  externalId  String
+  label       String?
+  fields      Json
+  fieldTitles Json
+  observedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([source, externalId])
+}
+
+model HistoricalDealOrderMatchingRun {
+  id                       String   @id @default(cuid())
+  status                   String   @default("running")
+  phase                    String   @default("KEYS")
+  bitrixCursor             String?
+  moyskladCursor           String?
+  bitrixProcessed          Int      @default(0)
+  moyskladProcessed        Int      @default(0)
+  bitrixTotal              Int
+  moyskladTotal            Int
+  inventoryCheckpointAt    DateTime
+  inventoryRevision        Int
+  bitrixInventoryMaxUpdate DateTime?
+  moyskladInventoryMaxUpdate DateTime?
+  inventoryFingerprint    String
+  counts                   Json     @default("{}")
+  applyStatus              String   @default("not_started")
+  applyCursor              String?
+  appliedCount             Int      @default(0)
+  applyError               String?
+  leaseOwner               String?
+  leaseUntil               DateTime?
+  error                    String?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+  results                  HistoricalDealOrderMatchResult[]
+  duplicateKeys            HistoricalDealOrderDuplicateKey[]
+
+  @@index([status, createdAt])
+  @@index([leaseUntil])
+}
+
+model HistoricalDealOrderDuplicateKey {
+  runId      String
+  keyValue   String
+  recordCount Int
+  run        HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, keyValue])
+}
+
+model HistoricalDealOrderMatchResult {
+  id                 String   @id @default(cuid())
+  runId              String
+  sourceSystem       String
+  sourceEntityId     String
+  linkedEntityId     String?
+  category           String
+  keyValue           String?
+  sourceLabel        String?
+  linkedLabel        String?
+  keyFieldCode       String
+  keyFieldTitle      String?
+  applyStatus        String   @default("not_applicable")
+  pairId             String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  run                HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, sourceSystem, sourceEntityId])
+  @@index([runId, category, id])
+  @@index([runId, linkedEntityId])
 }

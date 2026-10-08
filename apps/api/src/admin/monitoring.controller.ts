@@ -1,15 +1,20 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, NotFoundException, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Optional, Param, Patch, Post, Query, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { ContactSyncProcessor } from '../contact-sync.service';
+import { FieldSettingsService } from '../field-settings/field-settings.service';
 
 const LOG_CATEGORIES = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN'] as const;
 
 @Controller('api/admin/monitoring')
 @UseGuards(AdminAccessGuard)
 export class MonitoringController {
-  constructor(private readonly database: DatabaseService, private readonly processor: ContactSyncProcessor) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly processor: ContactSyncProcessor,
+    @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
+  ) {}
 
   @Get('queue')
   async queue(@Query('status') status?: string, @Query('limit') limit?: string, @Query('cursor') cursor?: string) {
@@ -28,9 +33,16 @@ export class MonitoringController {
         },
       }),
     ]);
+    const settingsByEvent = this.fieldSettings
+      ? await this.fieldSettings.eventSettings(events.map((event) => event.id))
+      : new Map<string, { version: number; transforms: string[] }>();
     return {
       counts: Object.fromEntries(counts.map((row) => [row.status, row._count._all])),
-      events,
+      events: events.map((event) => ({
+        ...event,
+        fieldSettingsVersion: settingsByEvent.get(event.id)?.version ?? null,
+        transforms: settingsByEvent.get(event.id)?.transforms ?? [],
+      })),
       nextCursor: getNextCursor(events, take),
     };
   }
@@ -76,7 +88,23 @@ export class MonitoringController {
     });
     await writeOperationalLog(this.database, 'ADMIN', 'Manual-review event retry requested', incident.id);
     this.processor.enqueue(event.id);
-    return { incidentId: incident.id, eventId: event.id, status: 'RECEIVED' };
+    const settings = this.fieldSettings ? await this.fieldSettings.eventSettings([event.id]) : new Map();
+    const eventSettings = settings.get(event.id);
+    return {
+      incidentId: incident.id, eventId: event.id, status: 'RECEIVED',
+      fieldSettingsVersion: eventSettings?.version ?? null,
+      transforms: eventSettings?.transforms ?? [],
+    };
+  }
+
+  @Post('events/:eventId/recompute')
+  async recomputeEvent(@Param('eventId') eventId: string, @Body() body: { confirmed?: unknown }) {
+    if (body?.confirmed !== true) throw new BadRequestException('confirmed must be true');
+    if (!this.fieldSettings) throw new ServiceUnavailableException('Field settings are not available');
+    const fieldSettingsVersion = await this.fieldSettings.repinEvent(eventId);
+    this.processor.enqueue(eventId);
+    await writeOperationalLog(this.database, 'ADMIN', 'One event recompute requested with newer field settings', eventId);
+    return { eventId, status: 'RECEIVED', fieldSettingsVersion };
   }
 
   @Get('logs')
