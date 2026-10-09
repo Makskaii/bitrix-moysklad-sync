@@ -83,7 +83,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [metadataError, setMetadataError] = useState('');
-  const [ruleForm, setRuleForm] = useState({ entity: 'deals-orders', sourceField: '', targetField: '', bitrix24ToMoysklad: false, moyskladToBitrix24: false, forwardTransform: 'tbd', reverseTransform: 'tbd' });
+  const [mappingEntity, setMappingEntity] = useState('deals-orders');
+  const [saveValidationError, setSaveValidationError] = useState('');
   const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
 
   const headers: Record<string, string> = {
@@ -116,7 +117,24 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         setDocument(nextDocument);
         setDraft(includeCurrentCatalogSources(nextDocument.config, nextCatalogs));
         setCatalogs(nextCatalogs);
-        setActivePairs(nextPairs.filter((pair) => pair.active));
+        const nextActivePairs = nextPairs.filter((pair) => pair.active);
+        setActivePairs(nextActivePairs);
+        const defaultPair = nextActivePairs.find((pair) => pair.entityType === entityTypeForUI(mappingEntity));
+        if (defaultPair) {
+          setMetadataPairId(defaultPair.id);
+          setMetadataLoading(true);
+          try {
+            const query = new URLSearchParams({ entity: mappingEntity, pairId: defaultPair.id });
+            const metadataResponse = await fetch(`${endpoint}/fields?${query}`, { headers });
+            const body = await metadataResponse.text();
+            if (!metadataResponse.ok) throw new Error(body || 'Не удалось загрузить метаданные полей');
+            if (!cancelled) setFieldMetadata(JSON.parse(body) as FieldMetadata);
+          } catch (cause) {
+            if (!cancelled) setMetadataError(cause instanceof Error ? cause.message : String(cause));
+          } finally {
+            if (!cancelled) setMetadataLoading(false);
+          }
+        }
       } catch (cause) {
         if (!cancelled) onError(cause instanceof Error ? cause.message : String(cause));
       } finally {
@@ -173,8 +191,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     }));
   }
 
-  async function loadFieldMetadata() {
-    const selectedPair = activePairs.find((pair) => pair.id === metadataPairId && pair.entityType === entityTypeForUI(ruleForm.entity));
+  async function loadFieldMetadata(pairId = metadataPairId, entity = mappingEntity) {
+    const selectedPair = activePairs.find((pair) => pair.id === pairId && pair.entityType === entityTypeForUI(entity));
     if (!selectedPair) {
       setMetadataError('Выберите активную сохранённую пару для этой сущности.');
       return;
@@ -182,14 +200,13 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     setMetadataLoading(true);
     setMetadataError('');
     try {
-      const query = new URLSearchParams({ entity: ruleForm.entity, pairId: selectedPair.id });
+      const query = new URLSearchParams({ entity, pairId: selectedPair.id });
       const response = await fetch(`${endpoint}/fields?${query}`, { headers });
       if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
       const body = await response.text();
       if (!response.ok) throw new Error(body || 'Не удалось загрузить метаданные полей');
       const catalog = JSON.parse(body) as FieldMetadata;
       setFieldMetadata(catalog);
-      setRuleForm((current) => ({ ...current, sourceField: '', targetField: '' }));
       setGroupForm((current) => ({ ...current, sourceFields: '', targetField: '' }));
     } catch (cause) {
       setFieldMetadata(null);
@@ -199,28 +216,38 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     }
   }
 
-  function addRule(event: React.FormEvent) {
-    event.preventDefault();
-    if (!draft || !ruleForm.sourceField.trim() || !ruleForm.targetField.trim() || (!ruleForm.bitrix24ToMoysklad && !ruleForm.moyskladToBitrix24)) return;
-    const rule: FieldRule = {
-      id: crypto.randomUUID(), entity: ruleForm.entity, sourceField: ruleForm.sourceField.trim(), targetField: ruleForm.targetField.trim(),
-      bitrix24ToMoysklad: { enabled: ruleForm.bitrix24ToMoysklad, transform: { kind: ruleForm.bitrix24ToMoysklad ? ruleForm.forwardTransform as Transform['kind'] : 'tbd' } },
-      moyskladToBitrix24: { enabled: ruleForm.moyskladToBitrix24, transform: { kind: ruleForm.moyskladToBitrix24 ? ruleForm.reverseTransform as Transform['kind'] : 'tbd' } },
-    };
-    changeDraft((current) => ({ ...current, rules: [...current.rules, rule] }));
-    setRuleForm((current) => ({ ...current, sourceField: '', targetField: '' }));
+  function addRule() {
+    if (!draft) return;
+    setSaveValidationError('');
+    changeDraft((current) => ({ ...current, rules: [...current.rules, {
+      id: newLocalId(), entity: mappingEntity, sourceField: '', targetField: '',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+    }] }));
   }
 
   function addGroup(event: React.FormEvent) {
     event.preventDefault();
     if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim()) return;
     const group: FieldGroup = {
-      id: crypto.randomUUID(), entity: groupForm.entity, direction: groupForm.direction,
+      id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
       transform: { kind: 'join-non-empty', separator: groupForm.separator },
     };
     changeDraft((current) => ({ ...current, groups: [...current.groups, group] }));
     setGroupForm((current) => ({ ...current, targetField: '', sourceFields: '' }));
+  }
+
+  function updateRule(ruleId: string, update: (rule: FieldRule) => FieldRule) {
+    changeDraft((current) => ({ ...current, rules: current.rules.map((rule) => rule.id === ruleId ? update(rule) : rule) }));
+    setSaveValidationError('');
+  }
+
+  function isRuleSaved(rule: FieldRule) {
+    const saved = document?.config.rules.find((candidate) => candidate.id === rule.id);
+    return Boolean(saved && saved.entity === rule.entity && saved.sourceField === rule.sourceField && saved.targetField === rule.targetField &&
+      saved.bitrix24ToMoysklad.enabled === rule.bitrix24ToMoysklad.enabled && saved.bitrix24ToMoysklad.transform.kind === rule.bitrix24ToMoysklad.transform.kind &&
+      saved.moyskladToBitrix24.enabled === rule.moyskladToBitrix24.enabled && saved.moyskladToBitrix24.transform.kind === rule.moyskladToBitrix24.transform.kind);
   }
 
   async function preview() {
@@ -246,6 +273,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   async function save() {
     if (!draft) return;
+    if (draft.rules.some((rule) => !rule.sourceField.trim() || !rule.targetField.trim())) {
+      setSaveValidationError('Выберите оба поля или удалите незавершённую строку.');
+      setShowSaveWarning(false);
+      return;
+    }
+    setSaveValidationError('');
     setSaving(true);
     try {
       const response = await fetch(endpoint, {
@@ -270,33 +303,72 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   if (loading) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="status">Загружаем версию настроек и справочники…</p></section>;
   if (!document || !draft || !catalogs) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="alert">Настройки полей пока недоступны.</p></section>;
 
+  const visibleRules = draft.rules.filter((rule) => rule.entity === mappingEntity);
+  const entityPair = activePairs.find((pair) => pair.id === metadataPairId && pair.entityType === entityTypeForUI(mappingEntity));
+
   return <>
-    <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2><p>Независимые направления, преобразования и справочные значения хранятся в версиях.</p></div>
+    <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2></div>
     <section className="panel field-settings-panel" aria-label="Редактор соответствий полей">
-      <div className="panel-heading"><div><p className="eyebrow">АКТИВНАЯ КОНФИГУРАЦИЯ</p><h3>Версия {document.version}</h3></div><span className="event-status status-succeeded">Новые события используют эту версию</span></div>
-      <p className="panel-description">Обычный повтор события использует закреплённую версию. Старые события не пересчитываются автоматически. Для пересчёта нужно отдельно выбрать одно событие в очереди.</p>
+      <div className="field-version-line"><strong>Версия {document.version}</strong><span>Активна для новых событий</span></div>
 
       <section className="field-editor-section" aria-label="Правила полей">
-        <div className="panel-heading"><div><p className="eyebrow">ПОЛЯ И НАПРАВЛЕНИЯ</p><h3>Правила переноса</h3></div></div>
-        <p className="panel-description">Загрузите коды, названия и типы из выбранной пары. Каталог метаданных не возвращает значения записей.</p>
-        <div className="field-rule-form">
-          <label>Активная сохранённая пара<select aria-label="Пара записей для метаданных" value={metadataPairId} onChange={(event) => { setMetadataPairId(event.target.value); setFieldMetadata(null); }}>
-            <option value="">Выберите пару</option>{activePairs.filter((pair) => pair.entityType === entityTypeForUI(ruleForm.entity)).map((pair) => <option key={pair.id} value={pair.id}>Bitrix24 {pair.bitrix24Id} ↔ МойСклад {pair.moyskladId}</option>)}
+        <div className="field-mapping-context">
+          <label>Сущность<select aria-label="Сущность соответствий" value={mappingEntity} onChange={(event) => {
+            const nextEntity = event.target.value;
+            const nextPair = activePairs.find((pair) => pair.entityType === entityTypeForUI(nextEntity));
+            setMappingEntity(nextEntity);
+            setMetadataPairId(nextPair?.id ?? '');
+            setFieldMetadata(null);
+            setMetadataError('');
+            if (nextPair) void loadFieldMetadata(nextPair.id, nextEntity);
+          }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
+          <label>Пара для полей<select aria-label="Пара записей для метаданных" value={metadataPairId} onChange={(event) => {
+            const pairId = event.target.value;
+            setMetadataPairId(pairId);
+            setFieldMetadata(null);
+            setMetadataError('');
+            if (pairId) void loadFieldMetadata(pairId, mappingEntity);
+          }}>
+            <option value="">Выберите пару</option>{activePairs.filter((pair) => pair.entityType === entityTypeForUI(mappingEntity)).map((pair) => <option key={pair.id} value={pair.id}>{pair.bitrix24Id} ↔ {pair.moyskladId}</option>)}
           </select></label>
-          <button type="button" className="button-secondary" disabled={metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загружаем…' : 'Загрузить поля пары'}</button>
+          <button type="button" className="button-secondary" disabled={!entityPair || metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загрузка…' : 'Обновить поля'}</button>
         </div>
         {metadataError && <p role="alert" className="inline-error">{metadataError}</p>}
-        <form className="field-rule-form" onSubmit={addRule}>
-          <label>Пара сущностей<select aria-label="Пара сущностей поля" value={ruleForm.entity} onChange={(event) => { setRuleForm({ ...ruleForm, entity: event.target.value }); setMetadataPairId(''); setFieldMetadata(null); }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
-          <label>Поле Bitrix24<select aria-label="Поле Bitrix24" value={ruleForm.sourceField} onChange={(event) => setRuleForm({ ...ruleForm, sourceField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== ruleForm.entity}><option value="">Выберите поле</option>{fieldMetadata?.bitrix24.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
-          <label>Поле МойСклад<select aria-label="Поле МойСклад" value={ruleForm.targetField} onChange={(event) => setRuleForm({ ...ruleForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== ruleForm.entity}><option value="">Выберите поле</option>{fieldMetadata?.moysklad.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
-          <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={ruleForm.bitrix24ToMoysklad} onChange={(event) => setRuleForm({ ...ruleForm, bitrix24ToMoysklad: event.target.checked })} /> Включено</label><select aria-label="Преобразование Bitrix24 в МойСклад" value={ruleForm.forwardTransform} onChange={(event) => setRuleForm({ ...ruleForm, forwardTransform: event.target.value })}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></fieldset>
-          <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={ruleForm.moyskladToBitrix24} onChange={(event) => setRuleForm({ ...ruleForm, moyskladToBitrix24: event.target.checked })} /> Включено</label><select aria-label="Преобразование МойСклад в Bitrix24" value={ruleForm.reverseTransform} onChange={(event) => setRuleForm({ ...ruleForm, reverseTransform: event.target.value })}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></fieldset>
-          <button type="submit" className="button-secondary">Добавить правило</button>
-        </form>
-        {draft.rules.length ? <div className="field-rule-list">{draft.rules.map((rule) => <article key={rule.id} className="field-rule-row"><div><strong>{rule.sourceField} ↔ {rule.targetField}</strong><small>{entityOptions.find(([key]) => key === rule.entity)?.[1] ?? rule.entity}</small></div><span>{rule.bitrix24ToMoysklad.enabled ? `B24 → МС: ${rule.bitrix24ToMoysklad.transform.kind}` : 'B24 → МС: выключено'}</span><span>{rule.moyskladToBitrix24.enabled ? `МС → B24: ${rule.moyskladToBitrix24.transform.kind}` : 'МС → B24: выключено'}</span><button type="button" className="button-secondary" aria-label={`Удалить правило ${rule.sourceField}`} onClick={() => changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Пары полей ещё не добавлены. Для неизвестных преобразований оставляйте «Не задано (TBD)».</p>}
+        <div className="field-mapping-table" role="table" aria-label="Соответствия полей">
+          <div className="field-mapping-header" role="row"><strong role="columnheader">Bitrix24</strong><span aria-hidden="true">→</span><strong role="columnheader">МойСклад</strong><span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true">Статус</span></div>
+          {visibleRules.map((rule) => {
+            const sourceFields = fieldMetadata?.entity === rule.entity ? fieldMetadata.bitrix24 : [];
+            const targetFields = fieldMetadata?.entity === rule.entity ? fieldMetadata.moysklad : [];
+            const saved = isRuleSaved(rule);
+            const source = sourceFields.find((field) => field.code === rule.sourceField);
+            const target = targetFields.find((field) => field.code === rule.targetField);
+            return <article className="field-mapping-row" role="row" key={rule.id}>
+              <select aria-label="Поле Bitrix24" title={source ? `${source.code} · ${source.type}` : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code}</option>)}
+              </select>
+              <span className="mapping-direction" role="cell" aria-label="Направление">→</span>
+              <select aria-label="Поле МойСклад" title={target ? `${target.code} · ${target.type}` : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code}</option>)}
+              </select>
+              <span className="mapping-equals" role="cell">=</span>
+              <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) }))}>⊖</button>
+              <span className={saved ? 'mapping-status is-saved' : 'mapping-status is-unsaved'} role="cell" aria-label={saved ? 'Сохранено' : 'Не сохранено'} title={saved ? 'Сохранено в активную версию' : 'Есть несохранённые изменения'}>{saved ? '✓ Сохранено' : '• Не сохранено'}</span>
+              <details className="mapping-row-advanced"><summary>Направления и коды</summary>
+                <div className="mapping-advanced-content">
+                  <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
+                  <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
+                  <details className="mapping-codes"><summary>Технические коды</summary><code>{rule.sourceField || '—'} → {rule.targetField || '—'}</code><small>{source?.type ?? 'тип недоступен'} → {target?.type ?? 'тип недоступен'}</small></details>
+                </div>
+              </details>
+            </article>;
+          })}
+          {!visibleRules.length && <p className="muted-empty">Пока нет соответствий для этой сущности.</p>}
+        </div>
+        <button type="button" className="mapping-add" onClick={addRule}>＋ Добавить соответствие</button>
+        {saveValidationError && <p role="alert" className="inline-error">{saveValidationError}</p>}
       </section>
 
+      <details className="field-advanced-settings"><summary>Дополнительные настройки: группы, предпросмотр и справочники</summary>
       <section className="field-editor-section" aria-label="Составные правила">
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
@@ -368,6 +440,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         </article>;
         })}
       </section>
+      </details>
 
       <div className="field-save-bar"><p>Сохранение создаёт версию {document.version + 1} и сразу применяется к новым событиям.</p><button type="button" onClick={() => setShowSaveWarning(true)} disabled={saving}>Сохранить новую версию</button></div>
       {showSaveWarning && <div className="field-save-warning" role="alertdialog" aria-label="Предупреждение о настройках">
@@ -378,6 +451,10 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       </div>}
     </section>
   </>;
+}
+
+function newLocalId() {
+  return globalThis.crypto?.randomUUID?.() ?? `field-rule-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {

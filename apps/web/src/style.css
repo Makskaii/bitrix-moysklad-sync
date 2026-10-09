@@ -183,7 +183,40 @@ h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: -.02em; }
 .load-more { margin-top: 12px; }
 .field-settings-panel { padding: 22px; }
 .field-settings-panel > .panel-description, .field-editor-section > .panel-description { color: #718097; font-size: 12px; line-height: 1.6; }
+.field-version-line { display: flex; align-items: center; gap: 10px; color: #52657e; font-size: 11px; }
+.field-version-line strong { color: #27384e; font-size: 13px; }
+.field-version-line span { padding: 4px 8px; border-radius: 20px; background: #eaf5e9; color: #397449; }
 .field-editor-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid #edf0f5; }
+.field-settings-panel > .field-editor-section[aria-label="Правила полей"] { margin-top: 14px; padding-top: 14px; }
+.field-mapping-context { display: grid; grid-template-columns: minmax(160px, .8fr) minmax(240px, 1.4fr) auto; gap: 10px; align-items: end; margin-bottom: 14px; }
+.field-mapping-context label { display: grid; gap: 5px; color: #52657e; font-size: 11px; }
+.field-mapping-context select, .field-mapping-row > select { min-width: 0; min-height: 36px; padding: 7px 10px; border: 1px solid #dce4ef; border-radius: 6px; background: #fff; color: #27384e; font: inherit; }
+.field-mapping-table { overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 7px; }
+.field-mapping-header, .field-mapping-row { display: grid; grid-template-columns: minmax(190px, 1fr) 30px minmax(190px, 1fr) 28px 38px 92px; align-items: center; gap: 10px; min-width: 760px; padding: 10px 14px; }
+.field-mapping-header { background: #f5f7fa; color: #354255; font-size: 12px; }
+.field-mapping-header > span { text-align: center; color: #66758b; }
+.field-mapping-row { border-top: 1px solid #e8edf3; background: #fff; }
+.field-mapping-row > select { width: 100%; font-size: 12px; }
+.mapping-direction, .mapping-equals { text-align: center; color: #3c4a5f; font-size: 15px; }
+.mapping-remove { width: 30px; height: 30px; justify-self: center; padding: 0; border: 0; background: transparent; color: #27384e; font-size: 25px; line-height: 1; cursor: pointer; }
+.mapping-remove:hover { color: #b44343; }
+.mapping-status { white-space: nowrap; font-size: 10px; }
+.mapping-status.is-saved { color: #168238; }
+.mapping-status.is-unsaved { color: #9a6c1d; }
+.mapping-row-advanced { grid-column: 1 / -1; margin: -2px 0 0; color: #63728a; font-size: 10px; }
+.mapping-row-advanced > summary, .field-advanced-settings > summary, .mapping-codes > summary { width: fit-content; cursor: pointer; }
+.mapping-advanced-content { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 0 2px; }
+.mapping-advanced-content fieldset { display: grid; gap: 7px; min-width: 220px; margin: 0; padding: 9px 11px; border: 1px solid #e3e8ef; border-radius: 7px; }
+.mapping-advanced-content fieldset label { display: flex; align-items: center; gap: 7px; }
+.mapping-advanced-content fieldset label:last-child { justify-content: space-between; }
+.mapping-advanced-content select { max-width: 170px; min-height: 30px; border: 1px solid #dce4ef; border-radius: 5px; background: white; }
+.mapping-codes { display: grid; gap: 5px; align-content: start; padding: 5px; }
+.mapping-codes code { color: #43536c; }
+.mapping-add { margin-top: 14px; padding: 10px 14px; border: 1px dashed #c7d4e6; border-radius: 7px; background: #fff; color: #2768bd; font-size: 13px; cursor: pointer; }
+.mapping-add:hover { background: #f6f9ff; border-color: #8baee0; }
+.field-advanced-settings { margin-top: 18px; padding: 14px 0; border-top: 1px solid #edf0f5; color: #52657e; font-size: 12px; }
+.field-advanced-settings > summary { font-weight: 600; }
+.field-advanced-settings > .field-editor-section:first-of-type { margin-top: 12px; }
 .field-rule-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: end; }
 .field-rule-form label, .reference-map-row label, .field-preview-input { display: grid; gap: 6px; color: #52657e; font-size: 11px; }
 .field-rule-form input, .field-rule-form select, .reference-map-row select, .field-preview-input textarea { min-width: 0; min-height: 36px; padding: 8px 10px; border: 1px solid #dce4ef; border-radius: 8px; background: #fff; color: #27384e; font: inherit; }
@@ -213,6 +246,7 @@ h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: -.02em; }
   .field-settings-panel { padding: 15px; }
   .field-rule-form { grid-template-columns: 1fr; }
   .field-rule-row, .reference-map-row, .field-save-bar { align-items: stretch; flex-direction: column; }
+  .field-mapping-context { grid-template-columns: 1fr; }
   .reference-map-row label { min-width: 0; }
 }
 
