@@ -38,14 +38,27 @@ before(async () => {
     if (url.origin === 'https://fake-bitrix.test') {
       const form = new URLSearchParams(String(init?.body ?? ''));
       const method = url.pathname.split('/').at(-1);
+      if (method?.endsWith('.userfield.list.json')) assert.equal(form.get('filter[LANG]'), 'ru');
       const result = method === 'catalog.measure.list.json'
         ? fakeB24UnitIds.map((id) => ({ id, code: `u${id}`, name: `Unit ${id}` }))
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'Custom contact field', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            : method === 'crm.contact.userfield.list.json'
+              ? [
+                { FIELD_NAME: 'UF_CRM_CUSTOM', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
+                { FIELD_NAME: 'UF_CRM_DUPLICATE_A', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+                { FIELD_NAME: 'UF_CRM_DUPLICATE_B', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+              ]
+              : method === 'crm.company.fields.json'
+                ? { TITLE: { type: 'string', title: 'Company', isReadOnly: false }, UF_COMPANY_SAMPLE: { type: 'string', title: 'UF_COMPANY_SAMPLE', isReadOnly: false } }
+                : method === 'crm.company.userfield.list.json'
+                  ? [{ FIELD_NAME: 'UF_COMPANY_SAMPLE', EDIT_FORM_LABEL: 'Company sample' }]
             : method === 'crm.deal.fields.json'
-              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
+              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UF_DEAL_SAMPLE: { type: 'string', title: 'UF_DEAL_SAMPLE', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
+              : method === 'crm.deal.userfield.list.json'
+                ? [{ FIELD_NAME: 'UF_DEAL_SAMPLE', EDIT_FORM_LABEL: 'Deal sample' }]
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
                 ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
@@ -226,7 +239,9 @@ test('entity field metadata loads without a saved pair or reading record values'
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.category === 'standard'));
-  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.category === 'custom'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.title === 'Preferred contact' && field.category === 'custom'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_A' && field.title === 'Shared label'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_B' && field.title === 'Shared label'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
@@ -235,14 +250,26 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.category === 'custom'));
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
+  assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.list.json'));
   assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
 });
 
 test('field metadata ignores pair IDs and loads by selected entity', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=companies`, {
-    headers: { authorization: 'Bearer synthetic-admin-token' },
-  });
-  assert.equal(response.status, 200, await response.text());
+  const cases = [
+    ['companies', 'UF_COMPANY_SAMPLE', 'Company sample', 'crm.company.userfield.list.json'],
+    ['deals-orders', 'UF_DEAL_SAMPLE', 'Deal sample', 'crm.deal.userfield.list.json'],
+  ] as const;
+  for (const [entity, code, title, method] of cases) {
+    fakeUpstreamMethods.length = 0;
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=${entity}`, {
+      headers: { authorization: 'Bearer synthetic-admin-token' },
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    const catalog = JSON.parse(body) as { bitrix24: Array<{ code: string; title: string }> };
+    assert.ok(catalog.bitrix24.some((field) => field.code === code && field.title === title));
+    assert.ok(fakeUpstreamMethods.includes(method), `${entity} uses its entity-specific userfield schema`);
+  }
 });
 
 test('catalog field metadata uses the product information block and API field names', async () => {
@@ -265,6 +292,7 @@ test('catalog field metadata uses the product information block and API field na
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
   assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
   assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
+  assert.ok(!fakeUpstreamMethods.some((method) => method.endsWith('.userfield.list.json')));
 });
 
 test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {

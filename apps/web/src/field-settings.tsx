@@ -70,6 +70,11 @@ function normalizedFieldName(value: string) {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+function isGenericFieldTitle(field: FieldCandidate) {
+  const title = normalizedFieldName(field.title);
+  return !title || field.title.trim() === field.code.trim() || /^(пользовательское поле|custom field)(?:\s*\([^)]*\))?$/.test(title);
+}
+
 function fieldCategory(field: FieldCandidate, system: 'bitrix24' | 'moysklad', entity: string): 'standard' | 'custom' {
   if (field.category) return field.category;
   if (system === 'moysklad' && field.code.startsWith('attributes.')) return 'custom';
@@ -97,6 +102,7 @@ function suggestFieldMatches(metadata: FieldMetadata, entity: string, existingRu
     const byName = (fields: FieldCandidate[]) => {
       const result = new Map<string, FieldCandidate[]>();
       for (const field of fields) {
+        if (isGenericFieldTitle(field)) continue;
         const name = normalizedFieldName(field.title);
         if (!name) continue;
         result.set(name, [...(result.get(name) ?? []), field]);
@@ -448,11 +454,11 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             const target = targetFields.find((field) => field.code === rule.targetField);
             return <article className="field-mapping-row" role="row" key={rule.id}>
               <select aria-label="Поле Bitrix24" title={source ? `${source.code} · ${source.type}` : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code}</option>)}
+                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
               </select>
               <span className="mapping-direction" role="cell" aria-label="Направление">→</span>
               <select aria-label="Поле МойСклад" title={target ? `${target.code} · ${target.type}` : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code}</option>)}
+                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
               </select>
               <span className="mapping-equals" role="cell">=</span>
               <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => { setAutoMatchSummary(null); changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) })); }}>⊖</button>

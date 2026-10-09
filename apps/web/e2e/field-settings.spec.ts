@@ -47,6 +47,7 @@ test('field settings select, save, and reload field pairs while preview stays re
         { code: 'UF_CRM_DUP_1', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
         { code: 'UF_CRM_DUP_2', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
         { code: 'UF_CRM_LOCKED', title: 'Reserved Custom', type: 'string', writable: true, category: 'custom' },
+        { code: 'UF_CRM_GENERIC', title: 'Пользовательское поле (Строка)', type: 'string', writable: true, category: 'custom' },
       ],
       moysklad: [
         { code: 'email', title: 'Email', type: 'string', writable: null, category: 'standard' },
@@ -54,6 +55,7 @@ test('field settings select, save, and reload field pairs while preview stays re
         { code: 'attributes.alias', title: 'custom alias', type: 'string', writable: null, category: 'custom' },
         { code: 'attributes.duplicate', title: 'Duplicate', type: 'string', writable: null, category: 'custom' },
         { code: 'attributes.locked', title: 'Reserved Custom', type: 'string', writable: null, category: 'custom' },
+        { code: 'attributes.generic', title: 'Пользовательское поле (Строка)', type: 'string', writable: null, category: 'custom' },
       ],
     } });
   });
@@ -93,11 +95,13 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Конфликты: 1');
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Найдено: 1');
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Конфликты: 2');
+  await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Без пары: 2');
   await expect(autoMatches.getByText('NAME', { exact: true })).toBeVisible();
   await expect(autoMatches.getByText('UF_CRM_ALIAS', { exact: true })).toBeVisible();
   await expect(autoMatches.getByText('UF_CRM_DUP_1', { exact: true })).toHaveCount(0);
   await expect(autoMatches.getByText('UF_CRM_DUP_2', { exact: true })).toHaveCount(0);
   await expect(autoMatches.getByText('UF_CRM_LOCKED', { exact: true })).toHaveCount(0);
+  await expect(autoMatches.getByText('UF_CRM_GENERIC', { exact: true })).toHaveCount(0);
   expect(writes).toEqual([]);
   await page.getByRole('button', { name: '＋ Добавить соответствие' }).click();
   const mappingRow = page.locator('.field-mapping-row').last();

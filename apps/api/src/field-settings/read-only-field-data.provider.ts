@@ -93,7 +93,10 @@ export class ReadOnlyFieldDataProvider {
     } else {
       bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, contract.bitrixFieldsParams);
     }
-    const bitrix24 = describeBitrixFields(bitrixResult, entity);
+    const bitrixUserFields = contract.bitrixUserFieldsMethod
+      ? await this.bitrixCall(bitrixAccessToken, contract.bitrixUserFieldsMethod, { 'filter[LANG]': 'ru' })
+      : undefined;
+    const bitrix24 = describeBitrixFields(bitrixResult, entity, bitrixUserFields);
     const metadata = await this.moyskladGet(`${contract.moyskladResource}/metadata/attributes`);
     const attributeRows = isRecord(metadata) && Array.isArray(metadata.rows) ? metadata.rows.filter(isRecord) : [];
     const moyskladAttributes: FieldCandidate[] = attributeRows.flatMap((row) => {
@@ -181,12 +184,12 @@ export class ReadOnlyFieldDataProvider {
   }
 }
 
-function fieldMetadataContract(entity: string): { bitrixFieldsMethod: string; bitrixFieldsParams: Record<string, string | number>; moyskladResource: string } {
+function fieldMetadataContract(entity: string): { bitrixFieldsMethod: string; bitrixFieldsParams: Record<string, string | number>; bitrixUserFieldsMethod?: string; moyskladResource: string } {
   switch (entity) {
     case 'contacts':
-    case 'contacts-companies': return { bitrixFieldsMethod: 'crm.contact.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/counterparty' };
-    case 'companies': return { bitrixFieldsMethod: 'crm.company.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/counterparty' };
-    case 'deals-orders': return { bitrixFieldsMethod: 'crm.deal.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/customerorder' };
+    case 'contacts-companies': return { bitrixFieldsMethod: 'crm.contact.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.contact.userfield.list', moyskladResource: 'entity/counterparty' };
+    case 'companies': return { bitrixFieldsMethod: 'crm.company.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.company.userfield.list', moyskladResource: 'entity/counterparty' };
+    case 'deals-orders': return { bitrixFieldsMethod: 'crm.deal.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.deal.userfield.list', moyskladResource: 'entity/customerorder' };
     case 'catalog': return { bitrixFieldsMethod: 'catalog.product.getFieldsByFilter', bitrixFieldsParams: {}, moyskladResource: 'entity/product' };
     default: throw new ServiceUnavailableException('This entity type has no read-only field metadata provider');
   }
@@ -229,17 +232,35 @@ function unwrapSource(entity: string, value: unknown): Record<string, unknown> {
   return root;
 }
 
-function describeBitrixFields(value: unknown, entity: string): FieldCandidate[] {
+function describeBitrixFields(value: unknown, entity: string, userFields?: unknown): FieldCandidate[] {
   const root = asRecord(value);
   const candidates = isRecord(root.fields) ? root.fields : isRecord(root.product) ? root.product : root;
+  const localizedLabels = new Map<string, string>();
+  const userFieldRows = Array.isArray(userFields) ? userFields : isRecord(userFields) && Array.isArray(userFields.result) ? userFields.result : [];
+  for (const row of userFieldRows) {
+    if (!isRecord(row) || typeof row.FIELD_NAME !== 'string') continue;
+    const code = row.FIELD_NAME.trim();
+    const label = [row.EDIT_FORM_LABEL, row.LIST_COLUMN_LABEL, row.LIST_FILTER_LABEL]
+      .map(localizedLabel)
+      .find((candidate) => candidate && candidate !== code);
+    if (code && label) localizedLabels.set(code, label);
+  }
   return Object.entries(candidates).flatMap(([code, definition]) => {
     if (!isRecord(definition) || code === 'time' || code === 'item') return [];
-    const title = [definition.title, definition.formLabel, definition.listLabel, definition.filterLabel, definition.listColumnLabel, definition.name]
+    const apiTitle = [definition.title, definition.formLabel, definition.listLabel, definition.filterLabel, definition.listColumnLabel, definition.name]
       .find((label): label is string => typeof label === 'string' && label.trim().length > 0)?.trim() ?? '';
+    const title = localizedLabels.get(code) ?? apiTitle;
     const type = typeof definition.type === 'string' ? definition.type : typeof definition.userTypeId === 'string' ? definition.userTypeId : 'unknown';
     const custom = /^UF_CRM/i.test(code) || (entity === 'catalog' && /^property\d+$/i.test(code));
     return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null, category: custom ? 'custom' : 'standard' }];
   });
+}
+
+function localizedLabel(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (!isRecord(value)) return '';
+  const label = value.ru ?? value['ru-RU'] ?? value.en ?? Object.values(value).find((candidate) => typeof candidate === 'string');
+  return typeof label === 'string' ? label.trim() : '';
 }
 
 function deduplicateFields(fields: FieldCandidate[]): FieldCandidate[] {
