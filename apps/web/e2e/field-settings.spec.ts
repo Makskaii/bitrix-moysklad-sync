@@ -92,9 +92,11 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Найдено: 1');
   await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Конфликты: 1');
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Найдено: 1');
-  await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Конфликты: 3');
+  await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Конфликты: 2');
   await expect(autoMatches.getByText('NAME', { exact: true })).toBeVisible();
   await expect(autoMatches.getByText('UF_CRM_ALIAS', { exact: true })).toBeVisible();
+  await expect(autoMatches.getByText('UF_CRM_DUP_1', { exact: true })).toHaveCount(0);
+  await expect(autoMatches.getByText('UF_CRM_DUP_2', { exact: true })).toHaveCount(0);
   await expect(autoMatches.getByText('UF_CRM_LOCKED', { exact: true })).toHaveCount(0);
   expect(writes).toEqual([]);
   await page.getByRole('button', { name: '＋ Добавить соответствие' }).click();
@@ -113,7 +115,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
   await mappingRow.getByText('Направления и коды').click();
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
-  await page.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
   await mappingRow.getByText('Технические коды').click();
   await expect(mappingRow.getByText('EMAIL → email')).toBeVisible();
   await mappingRow.getByText('Направления и коды').click();

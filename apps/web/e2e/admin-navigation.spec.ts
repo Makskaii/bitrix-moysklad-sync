@@ -54,7 +54,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
 
   const sections = [
     ['Очередь и попытки', 'Очередь и попытки'],
-    ['Связи записей', 'Связи записей'],
+    ['Связи записей', 'Пары Bitrix24 и МойСклад'],
     ['Ручная проверка', 'Ручная проверка'],
     ['Настройки', 'Настройки сущностей и направлений'],
     ['Справочники', 'Справочники'],
@@ -74,7 +74,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
   await expect(page.getByText('Inbound event accepted')).toBeVisible();
 
   await page.getByRole('button', { name: 'Соответствия полей' }).click();
-  await expect(page.getByRole('heading', { name: 'Версия 1' })).toBeVisible();
+  await expect(page.getByText('Версия 1', { exact: true })).toBeVisible();
   expect(writes).toEqual([]);
 });
 

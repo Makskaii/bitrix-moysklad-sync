@@ -20,7 +20,8 @@ test('local preview opens the trial admin workspace outside Bitrix24', async ({ 
   await page.route('**/api/admin/monitoring/api-attempts**', (route) => route.fulfill({ json: { attempts: [], nextCursor: null } }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
   await page.goto('/');
-  await expect(page.getByRole('status')).toContainText('Локальный режим просмотра');
+  await expect(page.getByRole('status')).toContainText('Локальный предпросмотр');
+  await expect(page.getByRole('status')).toContainText('настройки сохраняются только в локальную базу');
   await expect(page.getByLabel('Сообщение')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Сохранить в базу' })).toBeEnabled();
 });
