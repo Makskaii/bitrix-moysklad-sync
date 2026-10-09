@@ -73,6 +73,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [catalogs, setCatalogs] = useState<Catalogs>(emptyCatalogs);
   const [catalogError, setCatalogError] = useState('');
   const [activePairs, setActivePairs] = useState<ActiveEntityPair[]>([]);
+  const [pairError, setPairError] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showSaveWarning, setShowSaveWarning] = useState(false);
@@ -104,22 +105,21 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           throw new Error('Доступ только для администратора Bitrix24');
         }
         if (!settingsResponse.ok) throw new Error('Не удалось загрузить настройки полей');
-        const pairsResponse = await fetch('/api/admin/pairs', { headers });
-        if (pairsResponse.status === 403) {
-          onForbidden();
-          throw new Error('Доступ только для администратора Bitrix24');
-        }
-        if (!pairsResponse.ok) throw new Error('Не удалось загрузить сохранённые пары записей');
-        const [nextDocument, nextPairs] = await Promise.all([
-          settingsResponse.json() as Promise<SettingsDocument>,
-          pairsResponse.json() as Promise<ActiveEntityPair[]>,
-        ]);
+        const nextDocument = await settingsResponse.json() as SettingsDocument;
         if (cancelled) return;
         setDocument(nextDocument);
         setDraft(structuredClone(nextDocument.config));
         setCatalogs(emptyCatalogs);
-        const nextActivePairs = nextPairs.filter((pair) => pair.active);
-        setActivePairs(nextActivePairs);
+        setActivePairs([]);
+        void fetch('/api/admin/pairs', { headers }).then(async (pairsResponse) => {
+          if (pairsResponse.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
+          if (!pairsResponse.ok) throw new Error('Не удалось загрузить сохранённые пары записей');
+          return pairsResponse.json() as Promise<ActiveEntityPair[]>;
+        }).then((nextPairs) => {
+          if (!cancelled) { setActivePairs(nextPairs.filter((pair) => pair.active)); setPairError(''); }
+        }).catch((cause) => {
+          if (!cancelled) setPairError(cause instanceof Error ? cause.message : 'Не удалось загрузить пары записей');
+        });
         void loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }).then((nextCatalogs) => {
           if (cancelled) return;
           setCatalogs(nextCatalogs);
@@ -351,6 +351,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
       <details className="field-advanced-settings"><summary>Дополнительные настройки: группы, предпросмотр и справочники</summary>
       {catalogError && <p role="alert" className="inline-error">Справочники пока недоступны: {catalogError}. Соответствия полей можно редактировать отдельно.</p>}
+      {pairError && <p role="alert" className="inline-error">Пары записей для предпросмотра недоступны: {pairError}. Список полей от этого не зависит.</p>}
       <section className="field-editor-section" aria-label="Составные правила">
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
