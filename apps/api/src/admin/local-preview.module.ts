@@ -1,4 +1,4 @@
-import { Controller, DynamicModule, Get, Module, Provider } from '@nestjs/common';
+import { Controller, DynamicModule, Get, Module, Provider, Type } from '@nestjs/common';
 import { AdminController } from './admin.controller';
 import { AdminPreviewController } from './admin-preview.controller';
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from './admin-access.guard';
@@ -15,7 +15,6 @@ import { WebhookDiagnosticsController } from '../webhook-diagnostics.controller'
 import { WebhookDiagnosticLog } from '../webhook-diagnostic-log';
 import { FieldSettingsController } from './field-settings.controller';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
-import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { EntityPairService } from '../pairs/entity-pair.service';
 import { PairResolutionProvider } from '../pairs/pair-resolution.provider';
@@ -26,10 +25,11 @@ import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.se
 import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
+import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
 
 @Module({})
 export class LocalAdminPreviewModule {
-  static register(databaseProvider: Provider = DatabaseService): DynamicModule {
+  static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
       controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController] : [])],
@@ -43,7 +43,7 @@ export class LocalAdminPreviewModule {
         RetentionService,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
-          FieldSettingsService, ReadOnlyFieldDataProvider, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
           HistoricalInventoryService,
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },

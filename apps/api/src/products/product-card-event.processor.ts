@@ -108,9 +108,9 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     });
     if (claimed.count !== 1) return null;
 
-    // A price webhook must use a read-only catalog.price.get call to discover
-    // its product. Honor global apply/off/pause/direction gates before that API read.
-    if (event.source === 'BITRIX24' && event.eventType === 'CATALOG.PRICE.ON.UPDATE') {
+    // Ignore every Bitrix24 catalog change before resolving its product or pair.
+    // This also keeps legacy direction settings from reopening reverse writes.
+    if (event.source === 'BITRIX24') {
       const gate = await this.runtime.preflight('BITRIX24');
       if (gate.status !== 'READY') {
         const result = { ...gate, changedFields: [] as [] };

@@ -27,8 +27,8 @@ export class FieldSettingsController {
   }
 
   @Get('fields')
-  fields(@Req() request: RequestWithHeaders, @Query('entity') entity?: string, @Query('pairId') pairId?: string) {
-    return this.service().fieldCatalogs(accessToken(request), { entity, pairId });
+  fields(@Req() request: RequestWithHeaders, @Query('entity') entity?: string) {
+    return this.service().fieldCatalogs(accessToken(request), { entity });
   }
 
   @Get('versions/:version')
@@ -54,6 +54,7 @@ export class FieldSettingsController {
 
 function accessToken(request: RequestWithHeaders): string {
   const token = request.header('authorization')?.match(/^Bearer ([^\s]+)$/i)?.[1];
+  if (!token && process.env.ADMIN_PREVIEW === '1') return '';
   if (!token) throw new BadRequestException('Administrator access token is required');
   return token;
 }

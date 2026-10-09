@@ -69,6 +69,7 @@ export class ProductCardSyncService {
     settings: ProductCardSettings;
   }): Promise<ProductCardSyncResult> {
     const { pair, settings, settingsVersion } = input;
+    if (input.source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [] };
     if (pair.entityType !== 'PRODUCT' || pair.active !== true) return review('PRODUCT_PAIR_NOT_ACTIVE');
     if (!Number.isInteger(settingsVersion) || settingsVersion < 1) return review('FIELD_SETTINGS_VERSION_INVALID');
     const rules = productRules(settings);
@@ -261,7 +262,7 @@ function productRules(settings: ProductCardSettings): { name?: FieldRule; descri
     const rule: FieldRule = {
       source: candidate.sourceField,
       target: candidate.targetField,
-      bitrix24ToMoysklad: forward?.enabled === true,
+      bitrix24ToMoysklad: false,
       moyskladToBitrix24: reverse?.enabled === true,
     };
     if (candidate.sourceField === 'name' && candidate.targetField === 'name') result.name = rule;
@@ -276,11 +277,8 @@ function chooseField(field: string, b24: unknown, ms: unknown, oldB24: unknown, 
     return null;
   }
   if (same(b24, ms)) return null;
-  const b24Changed = !same(b24, oldB24);
-  const msChanged = !same(ms, oldMs);
-  if (!b24Changed && !msChanged) return null;
-  if (msChanged) return rule.moyskladToBitrix24 ? { field, target: 'BITRIX24', value: ms } : null;
-  return rule.bitrix24ToMoysklad ? { field, target: 'MOYSKLAD', value: b24 } : null;
+  if (same(b24, oldB24) && same(ms, oldMs)) return null;
+  return rule.moyskladToBitrix24 ? { field, target: 'BITRIX24', value: ms } : null;
 }
 
 function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, mappings: unknown[]): Direction | null {
@@ -288,15 +286,11 @@ function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, 
   if (b24 === undefined || ms === undefined || oldB24 === undefined || oldMs === undefined) {
     throw new ProductCardManualReviewError('PRODUCT_UNIT_VALUE_UNAVAILABLE');
   }
-  const b24Changed = !same(b24, oldB24);
-  const msChanged = !same(ms, oldMs);
-  if (!b24Changed && !msChanged) return null;
-  const target: Side = msChanged ? 'BITRIX24' : 'MOYSKLAD';
-  const row = target === 'MOYSKLAD'
-    ? mappings.filter((item) => record(item) && String(item.bitrix24Id) === String(b24) && item.status === 'configured' && typeof item.moyskladId === 'string')
-    : mappings.filter((item) => record(item) && String(item.moyskladId) === String(ms) && item.status === 'configured' && Number.isInteger(item.bitrix24Id));
+  if (same(b24, oldB24) && same(ms, oldMs)) return null;
+  const target: Side = 'BITRIX24';
+  const row = mappings.filter((item) => record(item) && String(item.moyskladId) === String(ms) && item.status === 'configured' && Number.isInteger(item.bitrix24Id));
   if (row.length !== 1 || !record(row[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
-  return { field: 'unit', target, value: target === 'MOYSKLAD' ? row[0].moyskladId : row[0].bitrix24Id };
+  return { field: 'unit', target, value: row[0].bitrix24Id };
 }
 
 function choosePrices(b24: ProductCardPrice[], ms: ProductCardPrice[], oldB24: unknown, oldMs: unknown, mappings: unknown[]): Direction[] {
@@ -317,10 +311,9 @@ function choosePrices(b24: ProductCardPrice[], ms: ProductCardPrice[], oldB24: u
       throw new ProductCardManualReviewError('PRODUCT_PRICE_CURRENCY_UNVERIFIED_OR_MISMATCHED');
     }
     if (same(b24Price.value, msPrice.value)) continue;
-    const b24Changed = !same(b24Price.value, previousB24);
-    const msChanged = !same(msPrice.value, previousMs);
-    if (msChanged) result.push({ field: `price:${msKey}`, target: 'BITRIX24', value: msPrice.value, bitrix24Key: b24Key, moyskladKey: msKey });
-    else if (b24Changed) result.push({ field: `price:${msKey}`, target: 'MOYSKLAD', value: b24Price.value, bitrix24Key: b24Key, moyskladKey: msKey });
+    if (!same(b24Price.value, previousB24) || !same(msPrice.value, previousMs)) {
+      result.push({ field: `price:${msKey}`, target: 'BITRIX24', value: msPrice.value, bitrix24Key: b24Key, moyskladKey: msKey });
+    }
   }
   return result;
 }

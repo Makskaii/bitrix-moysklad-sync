@@ -13,6 +13,9 @@ let app: INestApplication;
 let apiUrl: string;
 const pairsByKey: Record<string, string> = {};
 const createdPairIds: string[] = [];
+const fakeUpstreamMethods: string[] = [];
+const fakeB24UserFieldStarts: number[] = [];
+let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -33,21 +36,58 @@ before(async () => {
   globalThis.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return nativeFetch(input, init);
+    fakeUpstreamMethods.push(url.pathname.split('/').at(-1) ?? '');
     if (url.origin === 'https://fake-bitrix.test') {
       const form = new URLSearchParams(String(init?.body ?? ''));
       const method = url.pathname.split('/').at(-1);
+      let bitrixPagination: Record<string, number> = {};
+      if (method?.endsWith('.userfield.list.json')) assert.equal(form.get('filter[LANG]'), 'ru');
+      if (method === 'crm.contact.userfield.list.json') fakeB24UserFieldStarts.push(Number(form.get('start') ?? 0));
       const result = method === 'catalog.measure.list.json'
         ? fakeB24UnitIds.map((id) => ({ id, code: `u${id}`, name: `Unit ${id}` }))
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, UF_CRM_PAGE_51: { type: 'string', title: 'UF_CRM_PAGE_51', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            : method === 'crm.contact.userfield.list.json'
+              ? (() => {
+                const start = Number(form.get('start') ?? 0);
+                const rows = [
+                  { FIELD_NAME: 'UF_CRM_CUSTOM', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
+                  { FIELD_NAME: 'UF_CRM_DUPLICATE_A', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+                  { FIELD_NAME: 'UF_CRM_DUPLICATE_B', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+                  ...Array.from({ length: 47 }, (_, index) => ({ FIELD_NAME: `UF_FILLER_${index}`, EDIT_FORM_LABEL: `Filler ${index}` })),
+                  { FIELD_NAME: 'UF_CRM_PAGE_51', EDIT_FORM_LABEL: 'Page two label' },
+                ];
+                if (userFieldPaginationMode === 'malformed-result') {
+                  bitrixPagination = { total: 51 };
+                  return { rows };
+                }
+                if (userFieldPaginationMode === 'repeating-cursor') {
+                  bitrixPagination = { total: 51, next: 50 };
+                  return start === 0 ? rows.slice(0, 50) : rows.slice(50);
+                }
+                if (userFieldPaginationMode === 'missing-next') {
+                  bitrixPagination = { total: 51 };
+                  return rows.slice(0, 50);
+                }
+                bitrixPagination = start === 0 ? { total: 51, next: 50 } : { total: 51 };
+                return rows.slice(start, start + 50);
+              })()
+              : method === 'crm.company.fields.json'
+                ? { TITLE: { type: 'string', title: 'Company', isReadOnly: false }, UF_COMPANY_SAMPLE: { type: 'string', title: 'UF_COMPANY_SAMPLE', isReadOnly: false } }
+                : method === 'crm.company.userfield.list.json'
+                  ? [{ FIELD_NAME: 'UF_COMPANY_SAMPLE', EDIT_FORM_LABEL: 'Company sample' }]
             : method === 'crm.deal.fields.json'
-              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
+              ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UF_DEAL_SAMPLE: { type: 'string', title: 'UF_DEAL_SAMPLE', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
+              : method === 'crm.deal.userfield.list.json'
+                ? [{ FIELD_NAME: 'UF_DEAL_SAMPLE', EDIT_FORM_LABEL: 'Deal sample' }]
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
-                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false } } }
+                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
                 : { product: {} }
+            : method === 'catalog.catalog.list.json'
+              ? { catalogs: [{ id: 11, name: 'Товары' }] }
             : method === 'catalog.product.get.json'
               ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
             : method === 'lists.element.get.json'
@@ -55,7 +95,7 @@ before(async () => {
           : method === 'crm.company.get.json'
             ? { ID: form.get('id'), TITLE: 'Example Company' }
           : { ID: form.get('id'), NAME: 'Ada', LAST_NAME: 'Lovelace', TITLE: 'Sample', EMAIL: [{ VALUE: 'source@example.test', VALUE_TYPE: 'WORK' }] };
-      return new Response(JSON.stringify({ result }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ result, ...bitrixPagination }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.origin === 'https://fake-moysklad.test') {
       const isUnitList = url.pathname.endsWith('/entity/uom');
@@ -72,7 +112,7 @@ before(async () => {
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
-          : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test' };
+        : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test', opaqueField: 'opaque' };
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     throw new Error(`Unexpected test HTTP request: ${url.origin}${url.pathname}`);
@@ -212,34 +252,87 @@ test('preview reads company pairs separately from contacts', async () => {
   assert.equal(preview.results[0].writes, 0);
 });
 
-test('live field metadata returns codes, titles, and types without record values', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts&pairId=${pairsByKey['contact-1']}`, {
+test('entity field metadata loads without a saved pair or reading record values', async () => {
+  fakeUpstreamMethods.length = 0;
+  fakeB24UserFieldStarts.length = 0;
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
   const body = await response.text();
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
-  assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.type === 'string'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.category === 'standard'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.title === 'Preferred contact' && field.category === 'custom'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_A' && field.title === 'Shared label'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_B' && field.title === 'Shared label'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_PAGE_51' && field.title === 'Page two label'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
+  assert.ok(!catalog.moysklad.some((field) => field.code === 'opaqueField'), 'standard field catalog must not be inferred from a record');
   assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.title === 'Preferred contact'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.category === 'custom'));
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
+  assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
+  assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.list.json'));
+  assert.deepEqual(fakeB24UserFieldStarts, [0, 50]);
+  assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
 });
 
-test('field metadata rejects a saved pair of another entity type', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=companies&pairId=${pairsByKey['contact-1']}`, {
-    headers: { authorization: 'Bearer synthetic-admin-token' },
-  });
-  assert.equal(response.status, 400);
+test('field metadata rejects malformed, truncated, or repeating userfield pagination responses', async () => {
+  try {
+    for (const mode of ['malformed-result', 'missing-next', 'repeating-cursor'] as const) {
+      userFieldPaginationMode = mode;
+      const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, {
+        headers: { authorization: 'Bearer synthetic-admin-token' },
+      });
+      assert.equal(response.status, 503, `${mode} response must not silently return incomplete labels`);
+    }
+  } finally {
+    userFieldPaginationMode = 'two-page';
+  }
+});
+
+test('field metadata ignores pair IDs and loads by selected entity', async () => {
+  const cases = [
+    ['companies', 'UF_COMPANY_SAMPLE', 'Company sample', 'crm.company.userfield.list.json'],
+    ['deals-orders', 'UF_DEAL_SAMPLE', 'Deal sample', 'crm.deal.userfield.list.json'],
+  ] as const;
+  for (const [entity, code, title, method] of cases) {
+    fakeUpstreamMethods.length = 0;
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=${entity}`, {
+      headers: { authorization: 'Bearer synthetic-admin-token' },
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    const catalog = JSON.parse(body) as { bitrix24: Array<{ code: string; title: string }> };
+    assert.ok(catalog.bitrix24.some((field) => field.code === code && field.title === title));
+    assert.ok(fakeUpstreamMethods.includes(method), `${entity} uses its entity-specific userfield schema`);
+  }
 });
 
 test('catalog field metadata uses the product information block and API field names', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=catalog&pairId=${pairsByKey['product-1']}`, {
+  fakeUpstreamMethods.length = 0;
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=catalog`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
   const body = await response.text();
   assert.equal(response.status, 200, body);
-  const catalog = JSON.parse(body) as { bitrix24: Array<{ code: string; title: string; type: string }> };
+  const catalog = JSON.parse(body) as {
+    bitrix24: Array<{ code: string; title: string; type: string; category: string }>;
+    moysklad: Array<{ code: string; title: string; type: string; category: string }>;
+  };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.category === 'custom'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.category === 'standard'), 'unknown field codes are not assumed to be user-defined');
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
+  assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
+  assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
+  assert.ok(!fakeUpstreamMethods.some((method) => method.endsWith('.userfield.list.json')));
 });
 
 test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {
@@ -299,7 +392,9 @@ test('saving creates an immutable version and activates it for future events onl
   const previous = await previousResponse.json() as { config: Record<string, unknown> };
   assert.deepEqual(previous.config.rules, []);
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
-  assert.equal((await activeResponse.json() as { version: number }).version, saved.version);
+  const reloaded = await activeResponse.json() as { version: number; config: Record<string, unknown> };
+  assert.equal(reloaded.version, saved.version);
+  assert.deepEqual(reloaded.config.rules, saved.config.rules);
 });
 
 test('settings reject unknown field codes and read-only Bitrix24 targets', async () => {
@@ -340,7 +435,7 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
       moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
     }], groups: [] },
   }) });
-  assert.equal(pairSpecific.status, 400, `preview must reject a mapping absent from a selected active pair: ${await pairSpecific.text()}`);
+  assert.equal(pairSpecific.status, 201, `entity-wide field mappings must not depend on the selected preview pair: ${await pairSpecific.text()}`);
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

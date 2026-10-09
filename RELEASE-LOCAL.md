@@ -10,7 +10,7 @@ Run from the repository root:
 docker compose -p release-local-admin-preview -f docker-compose.yml -f docker-compose.preview.yml up -d --build
 ```
 
-Open http://127.0.0.1:5174. The web container and local preview API share the same database, so settings and active pairs shown in the UI are the ones used by that preview API. The preview API is not published on a host port; only the UI is reachable from the host. `ADMIN_PREVIEW=1` is set only for the dedicated `LocalPreviewModule`, never for the normal production API.
+Open http://127.0.0.1:5174. The web container and local preview API share the same database, so settings and active pairs shown in the UI are the ones used by that preview API. The web port is published on host loopback only. The API listens on all interfaces inside its Compose container so the web proxy can reach it, but it is not published on a host port. When running the preview API outside Compose, its bind address defaults to `127.0.0.1`; set `ADMIN_PREVIEW_BIND_HOST=0.0.0.0` only when a trusted container network needs to reach it. `ADMIN_PREVIEW=1` is set only for the dedicated `LocalPreviewModule`, never for the normal production API.
 
 The local database uses the Compose project's named volume. To stop containers and preserve that volume:
 

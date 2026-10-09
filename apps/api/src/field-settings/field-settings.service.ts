@@ -45,6 +45,9 @@ export class FieldSettingsService {
     const config = validateConfiguration(value);
     await this.ensureInitialized();
     await this.validateConfiguredFields(config, bitrixAccessToken);
+    const active = await this.active();
+    const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references);
+    if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
@@ -70,6 +73,7 @@ export class FieldSettingsService {
     const livePriceTypeIds = new Set(catalogs.priceTypes.moysklad.map((priceType) => priceType.id));
     for (const unit of config.references.units) if (unit.moyskladId && !liveUnitIds.has(unit.moyskladId)) throw new BadRequestException(`MySklad unit ${unit.moyskladId} no longer exists`);
     for (const priceType of config.references.priceTypes) if (priceType.moyskladId && !livePriceTypeIds.has(priceType.moyskladId)) throw new BadRequestException(`MySklad price type ${priceType.moyskladId} no longer exists`);
+    }
     const version = await this.database.$transaction(async (transaction) => {
       const states = await transaction.$queryRaw<Array<{ version: number }>>`
         SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR UPDATE
@@ -113,14 +117,10 @@ export class FieldSettingsService {
     return { items: items.slice(cursor, cursor + pageSize), nextCursor: cursor + pageSize < items.length ? String(cursor + pageSize) : null };
   }
 
-  async fieldCatalogs(bitrixAccessToken: string, value: { entity: unknown; pairId: unknown }) {
-    if (!isString(value.entity) || !isString(value.pairId)) {
-      throw new BadRequestException('entity and pairId are required to load field metadata for an active saved pair');
-    }
-    const entityType = entityTypeForFieldEntity(value.entity);
-    const pair = (await this.entityPairs.listActive(entityType)).find((candidate) => candidate.id === value.pairId);
-    if (!pair) throw new BadRequestException('pairId must reference an active saved pair for this entity');
-    return this.readOnlyData.fieldCatalogs(bitrixAccessToken, value.entity, pair.bitrix24Id, pair.moyskladId);
+  async fieldCatalogs(bitrixAccessToken: string, value: { entity: unknown }) {
+    if (!isString(value.entity)) throw new BadRequestException('entity is required to load field metadata');
+    entityTypeForFieldEntity(value.entity);
+    return this.readOnlyData.fieldCatalogs(bitrixAccessToken, value.entity);
   }
 
   async preview(value: unknown, bitrixAccessToken: string) {
@@ -143,7 +143,7 @@ export class FieldSettingsService {
       ...(isRecord(value.config) ? value.config : {}),
       references: isRecord(value.config) && value.config.references !== undefined ? value.config.references : active.config.references,
     });
-    await this.validateConfiguredFields(config, bitrixAccessToken, selectedPairs.map((pair) => ({ entity, pair: pair! })));
+    await this.validateConfiguredFields(config, bitrixAccessToken);
     const snapshots = await Promise.all(selectedPairs.map((pair) => this.readOnlyData.readPair(bitrixAccessToken, entity, pair!.bitrix24Id, pair!.moyskladId)));
     const results = snapshots.map((snapshot, index) => {
       const sourceIsBitrix = direction === 'BITRIX24_TO_MOYSKLAD';
@@ -156,11 +156,7 @@ export class FieldSettingsService {
     return { results, writes: 0 };
   }
 
-  private async validateConfiguredFields(
-    config: FieldSettingsConfig,
-    bitrixAccessToken: string,
-    selected: Array<{ entity: string; pair: { id: string; entityType: EntityType; bitrix24Id: string; moyskladId: string } }> = [],
-  ) {
+  private async validateConfiguredFields(config: FieldSettingsConfig, bitrixAccessToken: string) {
     const ruleEntities = [...config.rules, ...config.groups].map((entry) => {
       if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
       return entry.entity;
@@ -169,18 +165,8 @@ export class FieldSettingsService {
     for (const entity of ruleEntities) if (!supported.has(entity)) throw new BadRequestException(`Entity ${entity} is not supported for field mappings`);
     const entities = [...new Set(ruleEntities)];
     const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null }>; moysklad: Array<{ code: string; writable: boolean | null }> }>>();
-    for (const { entity, pair } of selected) {
-      const fields = await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity, pair.bitrix24Id, pair.moyskladId);
-      const current = catalogsByEntity.get(entity) ?? [];
-      current.push(fields);
-      catalogsByEntity.set(entity, current);
-    }
     for (const entity of entities) {
-      if (catalogsByEntity.has(entity)) continue;
-      const pairs = await this.entityPairs.listActive(entityTypeForFieldEntity(entity));
-      if (pairs.length === 0) throw new BadRequestException(`An active saved pair is required before configuring ${entity} fields`);
-      const pair = pairs[0]!;
-      catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity, pair.bitrix24Id, pair.moyskladId)]);
+      catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity)]);
     }
     const requireField = (entity: string, system: 'bitrix24' | 'moysklad', code: unknown, writable: boolean) => {
       if (!isString(code)) throw new BadRequestException('Mapping field codes must be non-empty strings');
@@ -585,7 +571,7 @@ function entityTypeForFieldEntity(entity: string): EntityType {
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
     case 'catalog': return 'PRODUCT';
-    default: throw new BadRequestException('This entity type has no active field-settings pair catalog');
+    default: throw new BadRequestException('This entity type has no field metadata provider');
   }
 }
 
