@@ -4,7 +4,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
   const writes: string[] = [];
   let version = 1;
-  let config = { rules: [], groups: [], references: {
+  let config = { rules: [{ id: 'locked-rule', entity: 'contacts', sourceField: 'UF_CRM_LOCKED', targetField: 'attributes.locked', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: [], references: {
     units: [{ bitrix24Id: 14, bitrix24Code: '1720010507', moyskladId: null, moyskladCode: null, status: 'unmapped' }],
     priceTypes: [], dictionaries: [
       { key: 'service', bitrix24Field: 'UF_CRM_1766085949', bitrix24ListId: '42', moyskladAttributeId: '0ad997c8-8e75-11e3-1ec9-002590a28eca', moyskladDirectoryId: 'f0177126-8e74-11e3-b761-002590a28eca', pairs: [{ bitrix24Id: 42, moyskladId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }] },
@@ -39,7 +39,23 @@ test('field settings select, save, and reload field pairs while preview stays re
     const query = new URL(route.request().url()).searchParams;
     expect(query.get('pairId')).toBeNull();
     const entity = query.get('entity') ?? 'contacts';
-    return route.fulfill({ json: { entity, bitrix24: [{ code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true }], moysklad: [{ code: 'email', title: 'Электронная почта', type: 'string', writable: null }] } });
+    return route.fulfill({ json: { entity,
+      bitrix24: [
+        { code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true, category: 'standard' },
+        { code: 'NAME', title: 'Full Name', type: 'string', writable: true, category: 'standard' },
+        { code: 'UF_CRM_ALIAS', title: 'Custom Alias', type: 'string', writable: true, category: 'custom' },
+        { code: 'UF_CRM_DUP_1', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
+        { code: 'UF_CRM_DUP_2', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
+        { code: 'UF_CRM_LOCKED', title: 'Reserved Custom', type: 'string', writable: true, category: 'custom' },
+      ],
+      moysklad: [
+        { code: 'email', title: 'Email', type: 'string', writable: null, category: 'standard' },
+        { code: 'name', title: '  full   name ', type: 'string', writable: true, category: 'standard' },
+        { code: 'attributes.alias', title: 'custom alias', type: 'string', writable: null, category: 'custom' },
+        { code: 'attributes.duplicate', title: 'Duplicate', type: 'string', writable: null, category: 'custom' },
+        { code: 'attributes.locked', title: 'Reserved Custom', type: 'string', writable: null, category: 'custom' },
+      ],
+    } });
   });
   await page.route('**/api/admin/field-settings', async (route) => {
     const method = route.request().method();
@@ -71,20 +87,30 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByLabel('Сущность соответствий').selectOption('contacts');
   await expect(page.getByLabel('Пара записей для метаданных')).toHaveCount(0);
   await expect(page.getByRole('status').filter({ hasText: 'Поля загружены' })).toBeVisible();
+  await page.getByRole('button', { name: 'Сопоставить автоматически' }).click();
+  const autoMatches = page.getByLabel('Несохранённые предложения');
+  await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Найдено: 1');
+  await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Конфликты: 1');
+  await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Найдено: 1');
+  await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Конфликты: 3');
+  await expect(autoMatches.getByText('NAME', { exact: true })).toBeVisible();
+  await expect(autoMatches.getByText('UF_CRM_ALIAS', { exact: true })).toBeVisible();
+  await expect(autoMatches.getByText('UF_CRM_LOCKED', { exact: true })).toHaveCount(0);
+  expect(writes).toEqual([]);
   await page.getByRole('button', { name: '＋ Добавить соответствие' }).click();
-  const mappingRow = page.locator('.field-mapping-row').first();
-  await expect(page.getByLabel('Поле Bitrix24')).toBeEnabled();
-  await expect(page.getByLabel('Поле МойСклад')).toBeEnabled();
-  await expect(page.getByLabel('Не сохранено')).toBeVisible();
+  const mappingRow = page.locator('.field-mapping-row').last();
+  await expect(page.getByLabel('Поле Bitrix24').last()).toBeEnabled();
+  await expect(page.getByLabel('Поле МойСклад').last()).toBeEnabled();
+  await expect(page.getByLabel('Не сохранено').last()).toBeVisible();
   await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
   await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
   await expect(page.getByRole('alert').filter({ hasText: 'Выберите оба поля или удалите незавершённую строку.' })).toBeVisible();
   expect(writes).toEqual([]);
-  await page.getByLabel('Поле Bitrix24').selectOption('EMAIL');
-  await page.getByLabel('Поле МойСклад').selectOption('email');
-  await expect(page.getByLabel('Поле Bitrix24')).toHaveValue('EMAIL');
-  await expect(page.getByLabel('Поле МойСклад')).toHaveValue('email');
-  await expect(page.getByLabel('Поле Bitrix24')).toHaveAttribute('title', 'EMAIL · crm_multifield');
+  await page.getByLabel('Поле Bitrix24').last().selectOption('EMAIL');
+  await page.getByLabel('Поле МойСклад').last().selectOption('email');
+  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveValue('EMAIL');
+  await expect(page.getByLabel('Поле МойСклад').last()).toHaveValue('email');
+  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
   await mappingRow.getByText('Направления и коды').click();
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
   await page.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
@@ -108,7 +134,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
   await expect(page.getByText('Версия 2', { exact: true })).toBeVisible();
   expect(writes).toEqual(['PUT']);
-  await expect(page.getByLabel('Сохранено')).toBeVisible();
+  await expect(page.getByLabel('Сохранено').first()).toBeVisible();
   await expect(page.getByText('Сохранённая пара · код TEST-UOM')).toBeVisible();
   await page.getByText('Дополнительные настройки:', { exact: false }).click();
   await page.screenshot({ path: 'test-results/field-settings-mapping.png' });
@@ -117,7 +143,10 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByRole('button', { name: 'Соответствия полей' }).click();
   await expect(page.getByText('Версия 2', { exact: true })).toBeVisible();
   await page.getByLabel('Сущность соответствий').selectOption('contacts');
-  await expect(page.getByLabel('Поле Bitrix24')).toHaveValue('EMAIL');
-  await expect(page.getByLabel('Поле МойСклад')).toHaveValue('email');
-  expect(config.rules).toEqual([expect.objectContaining({ sourceField: 'EMAIL', targetField: 'email' })]);
+  expect(config.rules).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: 'locked-rule', sourceField: 'UF_CRM_LOCKED', targetField: 'attributes.locked' }),
+    expect.objectContaining({ sourceField: 'NAME', targetField: 'name', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }),
+    expect.objectContaining({ sourceField: 'UF_CRM_ALIAS', targetField: 'attributes.alias', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }),
+    expect.objectContaining({ sourceField: 'EMAIL', targetField: 'email' }),
+  ]));
 });

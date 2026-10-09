@@ -45,7 +45,8 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
 }
 
 function field(code: string, title: string, type = 'string', writable: boolean | null = true): FieldCandidate {
-  return { code, title, type, writable };
+  const custom = /^UF_CRM/i.test(code) || /^property\d+$/i.test(code) || code.startsWith('attributes.');
+  return { code, title, type, writable, category: custom ? 'custom' : 'standard' };
 }
 
 function unique<T extends { id: string }>(items: T[]): T[] {

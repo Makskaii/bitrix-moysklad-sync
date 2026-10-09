@@ -29,7 +29,7 @@ type DictionaryMap = {
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
 type DictionaryOption = { id: string; title: string; code: string };
-type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null };
+type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
 type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[] } };
@@ -41,6 +41,9 @@ type Catalogs = {
 };
 const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
 type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
+type AutoMatch = { source: FieldCandidate; target: FieldCandidate; canBitrix24ToMoysklad: boolean; canMoyskladToBitrix24: boolean };
+type AutoMatchBlock = { matches: AutoMatch[]; unmatched: number; conflicts: number };
+type AutoMatchSummary = { standard: AutoMatchBlock; custom: AutoMatchBlock };
 
 const endpoint = '/api/admin/field-settings';
 const entityOptions = [
@@ -61,6 +64,82 @@ function entityTypeForUI(entity: string): ActiveEntityPair['entityType'] | null 
     case 'catalog': return 'PRODUCT';
     default: return null;
   }
+}
+
+function normalizedFieldName(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function fieldCategory(field: FieldCandidate, system: 'bitrix24' | 'moysklad', entity: string): 'standard' | 'custom' {
+  if (field.category) return field.category;
+  if (system === 'moysklad' && field.code.startsWith('attributes.')) return 'custom';
+  if (system === 'bitrix24' && (/^UF_CRM/i.test(field.code) || (entity === 'catalog' && /^property\d+$/i.test(field.code)))) return 'custom';
+  return 'standard';
+}
+
+function compatibleFieldTypes(left: string, right: string) {
+  const typeClass = (value: string) => {
+    const normalized = value.trim().toLowerCase();
+    if (['integer', 'int', 'double', 'float', 'number', 'decimal'].includes(normalized)) return 'number';
+    return normalized;
+  };
+  return typeClass(left) === typeClass(right) && typeClass(left) !== '' && typeClass(left) !== 'unknown';
+}
+
+function suggestFieldMatches(metadata: FieldMetadata, entity: string, existingRules: FieldRule[]): AutoMatchSummary {
+  const summary: AutoMatchSummary = {
+    standard: { matches: [], unmatched: 0, conflicts: 0 },
+    custom: { matches: [], unmatched: 0, conflicts: 0 },
+  };
+  for (const category of ['standard', 'custom'] as const) {
+    const sources = metadata.bitrix24.filter((field) => fieldCategory(field, 'bitrix24', entity) === category);
+    const targets = metadata.moysklad.filter((field) => fieldCategory(field, 'moysklad', entity) === category);
+    const byName = (fields: FieldCandidate[]) => {
+      const result = new Map<string, FieldCandidate[]>();
+      for (const field of fields) {
+        const name = normalizedFieldName(field.title);
+        if (!name) continue;
+        result.set(name, [...(result.get(name) ?? []), field]);
+      }
+      return result;
+    };
+    const sourceNames = byName(sources);
+    const targetNames = byName(targets);
+    const blocked = new Set<string>();
+    const matched = new Set<string>();
+    const usedFields = new Set(existingRules.filter((rule) => rule.entity === entity).flatMap((rule) => [rule.sourceField, rule.targetField]).filter(Boolean));
+    for (const name of new Set([...sourceNames.keys(), ...targetNames.keys()])) {
+      const sourceMatches = sourceNames.get(name) ?? [];
+      const targetMatches = targetNames.get(name) ?? [];
+      if (!sourceMatches.length || !targetMatches.length) continue;
+      if (sourceMatches.length !== 1 || targetMatches.length !== 1) {
+        summary[category].conflicts += 1;
+        [...sourceMatches, ...targetMatches].forEach((field) => blocked.add(`${field.code}`));
+        continue;
+      }
+      const source = sourceMatches[0]!;
+      const target = targetMatches[0]!;
+      if (usedFields.has(source.code) || usedFields.has(target.code) || !compatibleFieldTypes(source.type, target.type)) {
+        summary[category].conflicts += 1;
+        blocked.add(source.code);
+        blocked.add(target.code);
+        continue;
+      }
+      const bitrix24ToMoysklad = target.writable !== false;
+      const moyskladToBitrix24 = source.writable === true;
+      if (!bitrix24ToMoysklad && !moyskladToBitrix24) {
+        summary[category].conflicts += 1;
+        blocked.add(source.code);
+        blocked.add(target.code);
+        continue;
+      }
+      summary[category].matches.push({ source, target, canBitrix24ToMoysklad: bitrix24ToMoysklad, canMoyskladToBitrix24: moyskladToBitrix24 });
+      matched.add(source.code);
+      matched.add(target.code);
+    }
+    summary[category].unmatched = [...sources, ...targets].filter((field) => !matched.has(field.code) && !blocked.has(field.code)).length;
+  }
+  return summary;
 }
 
 export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
@@ -85,6 +164,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [metadataError, setMetadataError] = useState('');
+  const [autoMatchSummary, setAutoMatchSummary] = useState<AutoMatchSummary | null>(null);
   const [mappingEntity, setMappingEntity] = useState('deals-orders');
   const metadataRequest = useRef(0);
   const [saveValidationError, setSaveValidationError] = useState('');
@@ -211,6 +291,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   function addRule() {
     if (!draft) return;
+    setAutoMatchSummary(null);
     setSaveValidationError('');
     changeDraft((current) => ({ ...current, rules: [...current.rules, {
       id: newLocalId(), entity: mappingEntity, sourceField: '', targetField: '',
@@ -232,7 +313,27 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   }
 
   function updateRule(ruleId: string, update: (rule: FieldRule) => FieldRule) {
+    setAutoMatchSummary(null);
     changeDraft((current) => ({ ...current, rules: current.rules.map((rule) => rule.id === ruleId ? update(rule) : rule) }));
+    setSaveValidationError('');
+  }
+
+  function autoMatchFields() {
+    if (!draft || !fieldMetadata || fieldMetadata.entity !== mappingEntity) return;
+    const summary = suggestFieldMatches(fieldMetadata, mappingEntity, draft.rules);
+    const suggestions = [...summary.standard.matches, ...summary.custom.matches];
+    if (suggestions.length) {
+      changeDraft((current) => ({
+        ...current,
+        rules: [...current.rules, ...suggestions.map(({ source, target }) => ({
+          id: newLocalId(), entity: mappingEntity, sourceField: source.code, targetField: target.code,
+          // Matching proposes field identity only. Direction and transformation need explicit review.
+          bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' as const } },
+          moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' as const } },
+        }))],
+      }));
+    }
+    setAutoMatchSummary(summary);
     setSaveValidationError('');
   }
 
@@ -286,6 +387,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       setDraft(catalogs ? includeCurrentCatalogSources(nextDocument.config, catalogs) : structuredClone(nextDocument.config));
       setShowSaveWarning(false);
       setPreviewResults([]);
+      setAutoMatchSummary(null);
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -297,6 +399,20 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   if (!document || !draft) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="alert">Настройки полей пока недоступны.</p></section>;
 
   const visibleRules = draft.rules.filter((rule) => rule.entity === mappingEntity);
+  const autoMatchBlock = (category: 'standard' | 'custom', label: string) => {
+    const block = autoMatchSummary?.[category];
+    if (!block) return null;
+    return <section className="auto-match-block" aria-label={label} key={category}>
+      <strong>{label}</strong>
+      <span className="auto-match-counts">Найдено: {block.matches.length} · Без пары: {block.unmatched} · Конфликты: {block.conflicts}</span>
+      {block.matches.length > 0 && <ul>{block.matches.map((match) => <li key={`${match.source.code}:${match.target.code}`}>
+        <span>{match.source.title || match.source.code} <code>{match.source.code}</code></span><span aria-hidden="true">→</span><span>{match.target.title || match.target.code} <code>{match.target.code}</code></span><em>Черновик · {[
+          ...(match.canBitrix24ToMoysklad ? ['Bitrix24 → МойСклад'] : []),
+          ...(match.canMoyskladToBitrix24 ? ['МойСклад → Bitrix24'] : []),
+        ].join(', ')}</em>
+      </li>)}</ul>}
+    </section>;
+  };
 
   return <>
     <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2></div>
@@ -310,11 +426,18 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             setMappingEntity(nextEntity);
             setFieldMetadata(null);
             setMetadataError('');
+            setAutoMatchSummary(null);
           }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <span className="mapping-meta-status" role="status">{metadataLoading ? 'Загрузка полей…' : fieldMetadata?.entity === mappingEntity ? 'Поля загружены' : ''}</span>
           <button type="button" className="button-secondary" disabled={metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загрузка…' : 'Повторить загрузку'}</button>
         </div>
         {metadataError && <p role="alert" className="inline-error">{metadataError}</p>}
+        <button type="button" className="button-secondary auto-match-button" disabled={metadataLoading || !fieldMetadata || fieldMetadata.entity !== mappingEntity} onClick={autoMatchFields}>Сопоставить автоматически</button>
+        {autoMatchSummary && <div className="auto-match-results" aria-label="Несохранённые предложения">
+          <p>Совпадения предложены только по точному совпадению названий и совместимым типам. Направления отключены, преобразование оставлено как TBD до вашей настройки. Сохранение выполняется только кнопкой «Сохранить новую версию».</p>
+          {autoMatchBlock('standard', 'Стандартные поля')}
+          {autoMatchBlock('custom', 'Пользовательские поля')}
+        </div>}
         <div className="field-mapping-table" role="table" aria-label="Соответствия полей">
           <div className="field-mapping-header" role="row"><strong role="columnheader">Bitrix24</strong><span aria-hidden="true">→</span><strong role="columnheader">МойСклад</strong><span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true">Статус</span></div>
           {visibleRules.map((rule) => {
@@ -332,7 +455,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
                 <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code}</option>)}
               </select>
               <span className="mapping-equals" role="cell">=</span>
-              <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) }))}>⊖</button>
+              <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => { setAutoMatchSummary(null); changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) })); }}>⊖</button>
               <span className={saved ? 'mapping-status is-saved' : 'mapping-status is-unsaved'} role="cell" aria-label={saved ? 'Сохранено' : 'Не сохранено'} title={saved ? 'Сохранено в активную версию' : 'Есть несохранённые изменения'}>{saved ? '✓ Сохранено' : '• Не сохранено'}</span>
               <details className="mapping-row-advanced"><summary>Направления и коды</summary>
                 <div className="mapping-advanced-content">

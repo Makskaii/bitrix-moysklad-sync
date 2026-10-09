@@ -11,7 +11,7 @@ export type PairSnapshot = {
   sourceValues: Record<string, unknown>;
   targetCurrent: Record<string, unknown>;
 };
-export type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null };
+export type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category: 'standard' | 'custom' };
 
 const PAGE_SIZE = 50;
 const MAX_PAGES = 20;
@@ -93,12 +93,12 @@ export class ReadOnlyFieldDataProvider {
     } else {
       bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, contract.bitrixFieldsParams);
     }
-    const bitrix24 = describeBitrixFields(bitrixResult);
+    const bitrix24 = describeBitrixFields(bitrixResult, entity);
     const metadata = await this.moyskladGet(`${contract.moyskladResource}/metadata/attributes`);
     const attributeRows = isRecord(metadata) && Array.isArray(metadata.rows) ? metadata.rows.filter(isRecord) : [];
     const moyskladAttributes: FieldCandidate[] = attributeRows.flatMap((row) => {
       if (typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.type !== 'string') return [];
-      return [{ code: `attributes.${row.id}`, title: row.name, type: row.type, writable: null }];
+      return [{ code: `attributes.${row.id}`, title: row.name, type: row.type, writable: null, category: 'custom' }];
     });
     const moyskladStandard = moyskladStandardFields(entity);
     return { entity, bitrix24, moysklad: deduplicateFields([...moyskladStandard, ...moyskladAttributes]) };
@@ -200,7 +200,7 @@ function moyskladStandardFields(entity: string): FieldCandidate[] {
     'deals-orders': [['name', 'Наименование заказа', 'string', true], ['code', 'Код заказа', 'string', true], ['moment', 'Момент заказа', 'datetime', true], ['deliveryPlannedMoment', 'Плановая отгрузка/доставка', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
     catalog: [['name', 'Наименование товара', 'string', true], ['code', 'Код товара', 'string', true], ['article', 'Артикул', 'string', true], ['description', 'Описание', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['vat', 'Ставка НДС', 'number', true]],
   };
-  return (fields[entity] ?? []).map(([code, title, type, writable]) => ({ code, title, type, writable }));
+  return (fields[entity] ?? []).map(([code, title, type, writable]) => ({ code, title, type, writable, category: 'standard' }));
 }
 
 function pairContract(entity: string, sourceId: string, targetId: string): {
@@ -229,7 +229,7 @@ function unwrapSource(entity: string, value: unknown): Record<string, unknown> {
   return root;
 }
 
-function describeBitrixFields(value: unknown): FieldCandidate[] {
+function describeBitrixFields(value: unknown, entity: string): FieldCandidate[] {
   const root = asRecord(value);
   const candidates = isRecord(root.fields) ? root.fields : isRecord(root.product) ? root.product : root;
   return Object.entries(candidates).flatMap(([code, definition]) => {
@@ -237,7 +237,8 @@ function describeBitrixFields(value: unknown): FieldCandidate[] {
     const title = [definition.title, definition.formLabel, definition.listLabel, definition.filterLabel, definition.listColumnLabel, definition.name]
       .find((label): label is string => typeof label === 'string' && label.trim().length > 0)?.trim() ?? '';
     const type = typeof definition.type === 'string' ? definition.type : typeof definition.userTypeId === 'string' ? definition.userTypeId : 'unknown';
-    return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null }];
+    const custom = /^UF_CRM/i.test(code) || (entity === 'catalog' && /^property\d+$/i.test(code));
+    return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null, category: custom ? 'custom' : 'standard' }];
   });
 }
 

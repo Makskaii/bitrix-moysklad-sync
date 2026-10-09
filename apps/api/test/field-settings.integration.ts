@@ -43,7 +43,7 @@ before(async () => {
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'Custom contact field', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
             : method === 'crm.deal.fields.json'
               ? { TITLE: { type: 'string', title: 'Deal title', isReadOnly: false }, NAME: { type: 'string', title: 'Deal name', isReadOnly: false }, UNKNOWN_WRITABILITY: { type: 'string', title: 'Unknown writability' } }
             : method === 'catalog.product.getFieldsByFilter.json'
@@ -225,10 +225,14 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.category === 'standard'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.category === 'custom'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
   assert.ok(!catalog.moysklad.some((field) => field.code === 'opaqueField'), 'standard field catalog must not be inferred from a record');
   assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.title === 'Preferred contact'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.category === 'custom'));
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
   assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
@@ -249,13 +253,16 @@ test('catalog field metadata uses the product information block and API field na
   const body = await response.text();
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as {
-    bitrix24: Array<{ code: string; title: string; type: string }>;
-    moysklad: Array<{ code: string; title: string; type: string }>;
+    bitrix24: Array<{ code: string; title: string; type: string; category: string }>;
+    moysklad: Array<{ code: string; title: string; type: string; category: string }>;
   };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.category === 'custom'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.category === 'standard'), 'unknown field codes are not assumed to be user-defined');
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
   assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
   assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
 });
