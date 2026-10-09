@@ -23,7 +23,7 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
     ];
   }
 
-  override async fieldCatalogs(_bitrixAccessToken: string, entity: string, _sourceId: string, _targetId: string) {
+  override async fieldCatalogs(_bitrixAccessToken: string, entity: string) {
     const bitrix24: FieldCandidate[] = entity === 'catalog'
       ? [field('NAME', 'Демо: название товара'), field('property108', 'Демо: ключ склада'), field('PREVIEW_LABEL', 'Демо: подпись'), field('ID', 'ID', 'integer', false)]
       : [field('NAME', 'Демо: имя'), field('LAST_NAME', 'Демо: фамилия'), field('EMAIL', 'Демо: электронная почта'), field('PHONE', 'Демо: телефон'), field('TITLE', 'Демо: тема'), field('PREVIEW_LABEL', 'Демо: подпись'), field('ID', 'ID', 'integer', false)];

@@ -13,6 +13,7 @@ let app: INestApplication;
 let apiUrl: string;
 const pairsByKey: Record<string, string> = {};
 const createdPairIds: string[] = [];
+const fakeUpstreamMethods: string[] = [];
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -33,6 +34,7 @@ before(async () => {
   globalThis.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return nativeFetch(input, init);
+    fakeUpstreamMethods.push(url.pathname.split('/').at(-1) ?? '');
     if (url.origin === 'https://fake-bitrix.test') {
       const form = new URLSearchParams(String(init?.body ?? ''));
       const method = url.pathname.split('/').at(-1);
@@ -48,6 +50,8 @@ before(async () => {
               ? form.get('filter[iblockId]') === '11'
                 ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
                 : { product: {} }
+            : method === 'catalog.catalog.list.json'
+              ? { catalogs: [{ id: 11, name: 'Товары' }] }
             : method === 'catalog.product.get.json'
               ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
             : method === 'lists.element.get.json'
@@ -212,8 +216,9 @@ test('preview reads company pairs separately from contacts', async () => {
   assert.equal(preview.results[0].writes, 0);
 });
 
-test('live field metadata returns codes, titles, and types without record values', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts&pairId=${pairsByKey['contact-1']}`, {
+test('entity field metadata loads without a saved pair or reading record values', async () => {
+  fakeUpstreamMethods.length = 0;
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
   const body = await response.text();
@@ -221,21 +226,24 @@ test('live field metadata returns codes, titles, and types without record values
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
-  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Имя контрагента'));
-  assert.ok(catalog.moysklad.some((field) => field.code === 'opaqueField' && field.title === 'opaqueField'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование'));
+  assert.ok(!catalog.moysklad.some((field) => field.code === 'opaqueField'), 'standard field catalog must not be inferred from a record');
   assert.ok(catalog.moysklad.some((field) => field.code === 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && field.title === 'Preferred contact'));
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
+  assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
+  assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
 });
 
-test('field metadata rejects a saved pair of another entity type', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=companies&pairId=${pairsByKey['contact-1']}`, {
+test('field metadata ignores pair IDs and loads by selected entity', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=companies`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 200, await response.text());
 });
 
 test('catalog field metadata uses the product information block and API field names', async () => {
-  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=catalog&pairId=${pairsByKey['product-1']}`, {
+  fakeUpstreamMethods.length = 0;
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=catalog`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
   const body = await response.text();
@@ -248,6 +256,8 @@ test('catalog field metadata uses the product information block and API field na
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
+  assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
+  assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
 });
 
 test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {
@@ -350,7 +360,7 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
       moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
     }], groups: [] },
   }) });
-  assert.equal(pairSpecific.status, 400, `preview must reject a mapping absent from a selected active pair: ${await pairSpecific.text()}`);
+  assert.equal(pairSpecific.status, 201, `entity-wide field mappings must not depend on the selected preview pair: ${await pairSpecific.text()}`);
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

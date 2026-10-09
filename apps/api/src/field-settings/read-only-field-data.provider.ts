@@ -66,29 +66,41 @@ export class ReadOnlyFieldDataProvider {
     };
   }
 
-  async fieldCatalogs(bitrixAccessToken: string, entity: string, sourceId: string, targetId: string) {
-    const contract = pairContract(entity, sourceId, targetId);
-    const snapshot = await this.readPair(bitrixAccessToken, entity, sourceId, targetId);
-    const fieldParams = { ...contract.bitrixFieldsParams };
+  async fieldCatalogs(bitrixAccessToken: string, entity: string) {
+    const contract = fieldMetadataContract(entity);
+    let bitrixResult: unknown;
     if (entity === 'catalog') {
-      const iblockId = snapshot.sourceValues.iblockId;
-      if (typeof iblockId !== 'number' && typeof iblockId !== 'string') {
-        throw new ServiceUnavailableException('Bitrix24 product did not include an information-block ID for field metadata');
+      // Product field definitions are scoped to an information block. List catalog
+      // metadata (not product records), then merge each catalog's schema.
+      const catalogResult = await this.bitrixCall(bitrixAccessToken, 'catalog.catalog.list', {});
+      const root = asRecord(catalogResult);
+      const rows = Array.isArray(root.catalogs) ? root.catalogs : Array.isArray(catalogResult) ? catalogResult : [];
+      const ids = [...new Set(rows.filter(isRecord).map((row) => row.id).filter((id): id is string | number => typeof id === 'string' || typeof id === 'number').map(String))];
+      if (!ids.length) throw new ServiceUnavailableException('Bitrix24 returned no product catalog metadata');
+      const schemas: unknown[] = [];
+      for (const iblockId of ids) {
+        try {
+          schemas.push(await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, { 'filter[iblockId]': iblockId }));
+        } catch (cause) {
+          // Bitrix may include service catalogs in catalog.catalog.list; those
+          // don't expose product fields through catalog.product.getFieldsByFilter.
+          if (!(cause instanceof ServiceUnavailableException)) throw cause;
+        }
       }
-      fieldParams['filter[iblockId]'] = String(iblockId);
+      const productFields = Object.assign({}, ...schemas.map((schema) => asRecord(asRecord(schema).product)));
+      if (!Object.keys(productFields).length) throw new ServiceUnavailableException('Bitrix24 returned no product field schemas for its product catalogs');
+      bitrixResult = { product: productFields };
+    } else {
+      bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, contract.bitrixFieldsParams);
     }
-    const bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, fieldParams);
     const bitrix24 = describeBitrixFields(bitrixResult);
-    const resourcePath = contract.moyskladPath.split('/').slice(0, -1).join('/');
-    const metadata = await this.moyskladGet(`${resourcePath}/metadata/attributes`);
+    const metadata = await this.moyskladGet(`${contract.moyskladResource}/metadata/attributes`);
     const attributeRows = isRecord(metadata) && Array.isArray(metadata.rows) ? metadata.rows.filter(isRecord) : [];
     const moyskladAttributes: FieldCandidate[] = attributeRows.flatMap((row) => {
       if (typeof row.id !== 'string' || typeof row.name !== 'string' || typeof row.type !== 'string') return [];
       return [{ code: `attributes.${row.id}`, title: row.name, type: row.type, writable: null }];
     });
-    const moyskladStandard: FieldCandidate[] = Object.entries(snapshot.targetCurrent)
-      .filter(([code]) => !['meta', 'attributes', 'positions', 'files', 'owner', 'group', 'updated', 'created'].includes(code))
-      .map(([code, value]) => ({ code, title: moyskladStandardFieldTitle(entity, code), type: valueType(value), writable: null }));
+    const moyskladStandard = moyskladStandardFields(entity);
     return { entity, bitrix24, moysklad: deduplicateFields([...moyskladStandard, ...moyskladAttributes]) };
   }
 
@@ -162,11 +174,33 @@ export class ReadOnlyFieldDataProvider {
     const url = path.startsWith('http') ? new URL(path) : new URL(path.replace(/^\//, ''), ensureSlash(base));
     const allowedOrigin = new URL(base).origin;
     if (url.origin !== allowedOrigin) throw new ServiceUnavailableException('MoySklad returned an untrusted pagination URL');
-    const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .catch(() => { throw new ServiceUnavailableException('MoySklad read-only request failed'); });
     if (!response.ok) throw new ServiceUnavailableException(`MoySklad read-only request failed (${response.status})`);
     return response.json().catch(() => { throw new ServiceUnavailableException('MoySklad returned invalid JSON'); });
   }
+}
+
+function fieldMetadataContract(entity: string): { bitrixFieldsMethod: string; bitrixFieldsParams: Record<string, string | number>; moyskladResource: string } {
+  switch (entity) {
+    case 'contacts':
+    case 'contacts-companies': return { bitrixFieldsMethod: 'crm.contact.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/counterparty' };
+    case 'companies': return { bitrixFieldsMethod: 'crm.company.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/counterparty' };
+    case 'deals-orders': return { bitrixFieldsMethod: 'crm.deal.fields', bitrixFieldsParams: {}, moyskladResource: 'entity/customerorder' };
+    case 'catalog': return { bitrixFieldsMethod: 'catalog.product.getFieldsByFilter', bitrixFieldsParams: {}, moyskladResource: 'entity/product' };
+    default: throw new ServiceUnavailableException('This entity type has no read-only field metadata provider');
+  }
+}
+
+function moyskladStandardFields(entity: string): FieldCandidate[] {
+  const fields: Record<string, Array<[string, string, string, boolean | null]>> = {
+    contacts: [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
+    'contacts-companies': [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
+    companies: [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
+    'deals-orders': [['name', 'Наименование заказа', 'string', true], ['code', 'Код заказа', 'string', true], ['moment', 'Момент заказа', 'datetime', true], ['deliveryPlannedMoment', 'Плановая отгрузка/доставка', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
+    catalog: [['name', 'Наименование товара', 'string', true], ['code', 'Код товара', 'string', true], ['article', 'Артикул', 'string', true], ['description', 'Описание', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['vat', 'Ставка НДС', 'number', true]],
+  };
+  return (fields[entity] ?? []).map(([code, title, type, writable]) => ({ code, title, type, writable }));
 }
 
 function pairContract(entity: string, sourceId: string, targetId: string): {

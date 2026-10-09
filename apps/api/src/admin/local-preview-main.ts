@@ -2,14 +2,13 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { LocalAdminPreviewModule } from './local-preview.module';
 import { DatabaseService } from '../database.service';
-import { LocalPreviewFixtureFieldDataProvider } from './local-preview-fixtures';
 
 async function bootstrap() {
   if (process.env.ADMIN_PREVIEW !== '1') {
     throw new Error('ADMIN_PREVIEW=1 is required for the local preview API');
   }
 
-  const app = await NestFactory.create(LocalAdminPreviewModule.register(DatabaseService, LocalPreviewFixtureFieldDataProvider));
+  const app = await NestFactory.create(LocalAdminPreviewModule.register());
   const database = app.get(DatabaseService);
   const fixturePairs = [
     { entityType: 'CONTACT', bitrix24Id: 'preview-contact-1001', moyskladId: 'preview-counterparty-1001' },

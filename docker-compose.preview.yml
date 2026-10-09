@@ -18,9 +18,9 @@ services:
       LOCAL_HEADER_EXCHANGE_READY: "0"
       BITRIX24_EVENT_APPLICATION_TOKEN: ""
       MOYSKLAD_WEBHOOK_SECRET: ""
-      BITRIX24_REST_BASE_URL: ""
-      MOYSKLAD_API_BASE_URL: ""
-      MOYSKLAD_API_TOKEN: ""
+      BITRIX24_REST_BASE_URL: ${BITRIX_WEBHOOK_URL:-}
+      MOYSKLAD_API_BASE_URL: https://api.moysklad.ru/api/remap/1.2/
+      MOYSKLAD_API_TOKEN: ${MOYSKLAD_TOKEN:-}
       DATABASE_URL: postgresql://sync:local-only@db:5432/sync?schema=public
       PORT: 3000
       SYNC_MODE: apply

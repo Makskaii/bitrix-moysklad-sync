@@ -35,7 +35,12 @@ test('field settings select, save, and reload field pairs while preview stays re
     { key: 'service', bitrix24Field: 'UF_CRM_1766085949', bitrix24ListId: '42', moyskladAttributeId: '0ad997c8-8e75-11e3-1ec9-002590a28eca', moyskladDirectoryId: 'f0177126-8e74-11e3-b761-002590a28eca', values: { bitrix24: [{ id: '42', title: 'Delivery', code: 'DELIVERY' }], moysklad: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', title: 'Delivery MS', code: '' }, { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', title: 'Install MS', code: '' }] } },
     { key: 'payment-method', bitrix24Field: 'UF_CRM_1766072752', bitrix24ListId: '44', moyskladAttributeId: 'f214f966-dc1a-11f0-0a80-0ef700278459', moyskladDirectoryId: '0ecffb86-d8a3-11eb-0a80-0dbc000256e5', values: { bitrix24: [{ id: '44', title: 'Card', code: 'CARD' }], moysklad: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', title: 'Card MS', code: '' }] } },
   ] } }));
-  await page.route('**/api/admin/field-settings/fields?*', (route) => route.fulfill({ json: { entity: 'contacts', bitrix24: [{ code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true }], moysklad: [{ code: 'email', title: 'email', type: 'string', writable: null }] } }));
+  await page.route('**/api/admin/field-settings/fields?*', (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    expect(query.get('pairId')).toBeNull();
+    const entity = query.get('entity') ?? 'contacts';
+    return route.fulfill({ json: { entity, bitrix24: [{ code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true }], moysklad: [{ code: 'email', title: 'Электронная почта', type: 'string', writable: null }] } });
+  });
   await page.route('**/api/admin/field-settings', async (route) => {
     const method = route.request().method();
     if (method === 'PUT') {
@@ -64,8 +69,8 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByText('Дополнительные настройки:', { exact: false }).click();
   await expect(page.getByLabel('Пара сущностей группы')).toHaveValue('contacts');
   await page.getByLabel('Сущность соответствий').selectOption('contacts');
-  await page.getByLabel('Пара записей для метаданных').selectOption('contact-pair-42');
-  await page.getByRole('button', { name: 'Обновить поля' }).click();
+  await expect(page.getByLabel('Пара записей для метаданных')).toHaveCount(0);
+  await expect(page.getByRole('status').filter({ hasText: 'Поля загружены' })).toBeVisible();
   await page.getByRole('button', { name: '＋ Добавить соответствие' }).click();
   const mappingRow = page.locator('.field-mapping-row').first();
   await expect(page.getByLabel('Поле Bitrix24')).toBeEnabled();

@@ -281,7 +281,7 @@ function App() {
 
   /* Legacy combined monitor view is replaced by the section-based views below.
   return <main className="app-shell">
-    {previewMode && <aside className="preview-banner" role="status">Локальный демо-режим: синтетические поля; сохранение только в локальную базу.</aside>}
+    {previewMode && <aside className="preview-banner" role="status">Локальный предпросмотр: поля читаются из систем; настройки сохраняются только в локальную базу.</aside>}
     <header><div className="mark">↔</div><div><p className="eyebrow">BITRIX24 · АДМИН-ПАНЕЛЬ</p><h1>Контур синхронизации</h1></div><span className="status"><i />{serviceStatus}</span></header>
     <section className="intro"><div><p className="eyebrow">{previewMode ? 'ЛОКАЛЬНЫЙ ПРОСМОТР' : 'ДОСТУП ПО ПРАВАМ BITRIX24'}</p><h2>Управление контуром</h2><p>{previewMode ? 'Пробный экран доступен в локальном режиме просмотра.' : 'Сервер проверяет права текущего пользователя через Bitrix24 при каждом административном запросе.'}</p></div><div className="flow"><span>Bitrix24</span><b>→</b><span>API</span><b>→</b><span>PostgreSQL</span></div></section>
     {authorized ? <section className="workspace">
@@ -307,7 +307,7 @@ function App() {
           {(['on', 'pause', 'off'] as const).map((nextMode) => <button key={nextMode} type="button" aria-label={`Выбрать режим ${nextMode}`} aria-pressed={mode === nextMode} disabled={mode === nextMode} onClick={() => setConfirmMode(nextMode)}>{nextMode === 'on' ? 'Включить' : nextMode === 'pause' ? 'Пауза' : 'Выключить'}</button>)}
   */
   return <main className="app-shell">
-    {previewMode && <aside className="preview-banner" role="status">Локальный демо-режим: синтетические поля; сохранение только в локальную базу.</aside>}
+    {previewMode && <aside className="preview-banner" role="status">Локальный предпросмотр: поля читаются из систем; настройки сохраняются только в локальную базу.</aside>}
     <header className="app-header">
       <div className="brand-mark" aria-hidden="true">↔</div>
       <div className="brand-copy"><p className="eyebrow">BITRIX24 · АДМИН-ПАНЕЛЬ</p><h1>Контур синхронизации</h1></div>

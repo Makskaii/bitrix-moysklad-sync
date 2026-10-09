@@ -27,8 +27,8 @@ export class FieldSettingsController {
   }
 
   @Get('fields')
-  fields(@Req() request: RequestWithHeaders, @Query('entity') entity?: string, @Query('pairId') pairId?: string) {
-    return this.service().fieldCatalogs(accessToken(request), { entity, pairId });
+  fields(@Req() request: RequestWithHeaders, @Query('entity') entity?: string) {
+    return this.service().fieldCatalogs(accessToken(request), { entity });
   }
 
   @Get('versions/:version')

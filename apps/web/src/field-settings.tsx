@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 type Transform = { kind: 'tbd' | 'copy' };
 type RuleDirection = { enabled: boolean; transform: Transform };
@@ -39,6 +39,7 @@ type Catalogs = {
   priceTypes: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string; values?: { bitrix24: DictionaryOption[]; moysklad: DictionaryOption[] } }>;
 };
+const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
 type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 
 const endpoint = '/api/admin/field-settings';
@@ -69,7 +70,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 }) {
   const [document, setDocument] = useState<SettingsDocument | null>(null);
   const [draft, setDraft] = useState<SettingsConfig | null>(null);
-  const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
+  const [catalogs, setCatalogs] = useState<Catalogs>(emptyCatalogs);
+  const [catalogError, setCatalogError] = useState('');
   const [activePairs, setActivePairs] = useState<ActiveEntityPair[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -79,11 +81,11 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [previewDirection, setPreviewDirection] = useState<'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24'>('BITRIX24_TO_MOYSKLAD');
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [previewError, setPreviewError] = useState('');
-  const [metadataPairId, setMetadataPairId] = useState('');
   const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [metadataError, setMetadataError] = useState('');
   const [mappingEntity, setMappingEntity] = useState('deals-orders');
+  const metadataRequest = useRef(0);
   const [saveValidationError, setSaveValidationError] = useState('');
   const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
 
@@ -108,33 +110,24 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           throw new Error('Доступ только для администратора Bitrix24');
         }
         if (!pairsResponse.ok) throw new Error('Не удалось загрузить сохранённые пары записей');
-        const [nextDocument, nextCatalogs, nextPairs] = await Promise.all([
+        const [nextDocument, nextPairs] = await Promise.all([
           settingsResponse.json() as Promise<SettingsDocument>,
-          loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }),
           pairsResponse.json() as Promise<ActiveEntityPair[]>,
         ]);
         if (cancelled) return;
         setDocument(nextDocument);
-        setDraft(includeCurrentCatalogSources(nextDocument.config, nextCatalogs));
-        setCatalogs(nextCatalogs);
+        setDraft(structuredClone(nextDocument.config));
+        setCatalogs(emptyCatalogs);
         const nextActivePairs = nextPairs.filter((pair) => pair.active);
         setActivePairs(nextActivePairs);
-        const defaultPair = nextActivePairs.find((pair) => pair.entityType === entityTypeForUI(mappingEntity));
-        if (defaultPair) {
-          setMetadataPairId(defaultPair.id);
-          setMetadataLoading(true);
-          try {
-            const query = new URLSearchParams({ entity: mappingEntity, pairId: defaultPair.id });
-            const metadataResponse = await fetch(`${endpoint}/fields?${query}`, { headers });
-            const body = await metadataResponse.text();
-            if (!metadataResponse.ok) throw new Error(body || 'Не удалось загрузить метаданные полей');
-            if (!cancelled) setFieldMetadata(JSON.parse(body) as FieldMetadata);
-          } catch (cause) {
-            if (!cancelled) setMetadataError(cause instanceof Error ? cause.message : String(cause));
-          } finally {
-            if (!cancelled) setMetadataLoading(false);
-          }
-        }
+        void loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }).then((nextCatalogs) => {
+          if (cancelled) return;
+          setCatalogs(nextCatalogs);
+          setDraft((current) => current ? includeCurrentCatalogSources(current, nextCatalogs) : current);
+          setCatalogError('');
+        }).catch((cause) => {
+          if (!cancelled) setCatalogError(cause instanceof Error ? cause.message : 'Не удалось загрузить справочники');
+        });
       } catch (cause) {
         if (!cancelled) onError(cause instanceof Error ? cause.message : String(cause));
       } finally {
@@ -191,30 +184,30 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     }));
   }
 
-  async function loadFieldMetadata(pairId = metadataPairId, entity = mappingEntity) {
-    const selectedPair = activePairs.find((pair) => pair.id === pairId && pair.entityType === entityTypeForUI(entity));
-    if (!selectedPair) {
-      setMetadataError('Выберите активную сохранённую пару для этой сущности.');
-      return;
-    }
+  async function loadFieldMetadata(entity = mappingEntity) {
+    const requestId = ++metadataRequest.current;
     setMetadataLoading(true);
     setMetadataError('');
     try {
-      const query = new URLSearchParams({ entity, pairId: selectedPair.id });
+      const query = new URLSearchParams({ entity });
       const response = await fetch(`${endpoint}/fields?${query}`, { headers });
       if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
       const body = await response.text();
       if (!response.ok) throw new Error(body || 'Не удалось загрузить метаданные полей');
       const catalog = JSON.parse(body) as FieldMetadata;
+      if (requestId !== metadataRequest.current) return;
       setFieldMetadata(catalog);
       setGroupForm((current) => ({ ...current, sourceFields: '', targetField: '' }));
     } catch (cause) {
+      if (requestId !== metadataRequest.current) return;
       setFieldMetadata(null);
       setMetadataError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setMetadataLoading(false);
+      if (requestId === metadataRequest.current) setMetadataLoading(false);
     }
   }
+
+  useEffect(() => { void loadFieldMetadata(mappingEntity); }, [mappingEntity]);
 
   function addRule() {
     if (!draft) return;
@@ -301,10 +294,9 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   }
 
   if (loading) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="status">Загружаем версию настроек и справочники…</p></section>;
-  if (!document || !draft || !catalogs) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="alert">Настройки полей пока недоступны.</p></section>;
+  if (!document || !draft) return <section className="panel field-settings-panel" aria-label="Соответствия полей"><p role="alert">Настройки полей пока недоступны.</p></section>;
 
   const visibleRules = draft.rules.filter((rule) => rule.entity === mappingEntity);
-  const entityPair = activePairs.find((pair) => pair.id === metadataPairId && pair.entityType === entityTypeForUI(mappingEntity));
 
   return <>
     <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2></div>
@@ -315,23 +307,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="field-mapping-context">
           <label>Сущность<select aria-label="Сущность соответствий" value={mappingEntity} onChange={(event) => {
             const nextEntity = event.target.value;
-            const nextPair = activePairs.find((pair) => pair.entityType === entityTypeForUI(nextEntity));
             setMappingEntity(nextEntity);
-            setMetadataPairId(nextPair?.id ?? '');
             setFieldMetadata(null);
             setMetadataError('');
-            if (nextPair) void loadFieldMetadata(nextPair.id, nextEntity);
           }}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
-          <label>Пара для полей<select aria-label="Пара записей для метаданных" value={metadataPairId} onChange={(event) => {
-            const pairId = event.target.value;
-            setMetadataPairId(pairId);
-            setFieldMetadata(null);
-            setMetadataError('');
-            if (pairId) void loadFieldMetadata(pairId, mappingEntity);
-          }}>
-            <option value="">Выберите пару</option>{activePairs.filter((pair) => pair.entityType === entityTypeForUI(mappingEntity)).map((pair) => <option key={pair.id} value={pair.id}>{pair.bitrix24Id} ↔ {pair.moyskladId}</option>)}
-          </select></label>
-          <button type="button" className="button-secondary" disabled={!entityPair || metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загрузка…' : 'Обновить поля'}</button>
+          <span className="mapping-meta-status" role="status">{metadataLoading ? 'Загрузка полей…' : fieldMetadata?.entity === mappingEntity ? 'Поля загружены' : ''}</span>
+          <button type="button" className="button-secondary" disabled={metadataLoading} onClick={() => void loadFieldMetadata()}>{metadataLoading ? 'Загрузка…' : 'Повторить загрузку'}</button>
         </div>
         {metadataError && <p role="alert" className="inline-error">{metadataError}</p>}
         <div className="field-mapping-table" role="table" aria-label="Соответствия полей">
@@ -369,6 +350,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       </section>
 
       <details className="field-advanced-settings"><summary>Дополнительные настройки: группы, предпросмотр и справочники</summary>
+      {catalogError && <p role="alert" className="inline-error">Справочники пока недоступны: {catalogError}. Соответствия полей можно редактировать отдельно.</p>}
       <section className="field-editor-section" aria-label="Составные правила">
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
