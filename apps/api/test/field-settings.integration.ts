@@ -14,6 +14,8 @@ let apiUrl: string;
 const pairsByKey: Record<string, string> = {};
 const createdPairIds: string[] = [];
 const fakeUpstreamMethods: string[] = [];
+const fakeB24UserFieldStarts: number[] = [];
+let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -38,19 +40,40 @@ before(async () => {
     if (url.origin === 'https://fake-bitrix.test') {
       const form = new URLSearchParams(String(init?.body ?? ''));
       const method = url.pathname.split('/').at(-1);
+      let bitrixPagination: Record<string, number> = {};
       if (method?.endsWith('.userfield.list.json')) assert.equal(form.get('filter[LANG]'), 'ru');
+      if (method === 'crm.contact.userfield.list.json') fakeB24UserFieldStarts.push(Number(form.get('start') ?? 0));
       const result = method === 'catalog.measure.list.json'
         ? fakeB24UnitIds.map((id) => ({ id, code: `u${id}`, name: `Unit ${id}` }))
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, UF_CRM_PAGE_51: { type: 'string', title: 'UF_CRM_PAGE_51', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
             : method === 'crm.contact.userfield.list.json'
-              ? [
-                { FIELD_NAME: 'UF_CRM_CUSTOM', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
-                { FIELD_NAME: 'UF_CRM_DUPLICATE_A', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
-                { FIELD_NAME: 'UF_CRM_DUPLICATE_B', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
-              ]
+              ? (() => {
+                const start = Number(form.get('start') ?? 0);
+                const rows = [
+                  { FIELD_NAME: 'UF_CRM_CUSTOM', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
+                  { FIELD_NAME: 'UF_CRM_DUPLICATE_A', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+                  { FIELD_NAME: 'UF_CRM_DUPLICATE_B', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
+                  ...Array.from({ length: 47 }, (_, index) => ({ FIELD_NAME: `UF_FILLER_${index}`, EDIT_FORM_LABEL: `Filler ${index}` })),
+                  { FIELD_NAME: 'UF_CRM_PAGE_51', EDIT_FORM_LABEL: 'Page two label' },
+                ];
+                if (userFieldPaginationMode === 'malformed-result') {
+                  bitrixPagination = { total: 51 };
+                  return { rows };
+                }
+                if (userFieldPaginationMode === 'repeating-cursor') {
+                  bitrixPagination = { total: 51, next: 50 };
+                  return start === 0 ? rows.slice(0, 50) : rows.slice(50);
+                }
+                if (userFieldPaginationMode === 'missing-next') {
+                  bitrixPagination = { total: 51 };
+                  return rows.slice(0, 50);
+                }
+                bitrixPagination = start === 0 ? { total: 51, next: 50 } : { total: 51 };
+                return rows.slice(start, start + 50);
+              })()
               : method === 'crm.company.fields.json'
                 ? { TITLE: { type: 'string', title: 'Company', isReadOnly: false }, UF_COMPANY_SAMPLE: { type: 'string', title: 'UF_COMPANY_SAMPLE', isReadOnly: false } }
                 : method === 'crm.company.userfield.list.json'
@@ -72,7 +95,7 @@ before(async () => {
           : method === 'crm.company.get.json'
             ? { ID: form.get('id'), TITLE: 'Example Company' }
           : { ID: form.get('id'), NAME: 'Ada', LAST_NAME: 'Lovelace', TITLE: 'Sample', EMAIL: [{ VALUE: 'source@example.test', VALUE_TYPE: 'WORK' }] };
-      return new Response(JSON.stringify({ result }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ result, ...bitrixPagination }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.origin === 'https://fake-moysklad.test') {
       const isUnitList = url.pathname.endsWith('/entity/uom');
@@ -231,6 +254,7 @@ test('preview reads company pairs separately from contacts', async () => {
 
 test('entity field metadata loads without a saved pair or reading record values', async () => {
   fakeUpstreamMethods.length = 0;
+  fakeB24UserFieldStarts.length = 0;
   const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
@@ -242,6 +266,7 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.title === 'Preferred contact' && field.category === 'custom'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_A' && field.title === 'Shared label'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_B' && field.title === 'Shared label'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_PAGE_51' && field.title === 'Page two label'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'email' && field.title === 'Электронная почта' && field.type === 'string'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
@@ -251,7 +276,22 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.list.json'));
+  assert.deepEqual(fakeB24UserFieldStarts, [0, 50]);
   assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
+});
+
+test('field metadata rejects malformed, truncated, or repeating userfield pagination responses', async () => {
+  try {
+    for (const mode of ['malformed-result', 'missing-next', 'repeating-cursor'] as const) {
+      userFieldPaginationMode = mode;
+      const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, {
+        headers: { authorization: 'Bearer synthetic-admin-token' },
+      });
+      assert.equal(response.status, 503, `${mode} response must not silently return incomplete labels`);
+    }
+  } finally {
+    userFieldPaginationMode = 'two-page';
+  }
 });
 
 test('field metadata ignores pair IDs and loads by selected entity', async () => {

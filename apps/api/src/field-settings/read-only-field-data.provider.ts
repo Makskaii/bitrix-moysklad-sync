@@ -94,7 +94,7 @@ export class ReadOnlyFieldDataProvider {
       bitrixResult = await this.bitrixCall(bitrixAccessToken, contract.bitrixFieldsMethod, contract.bitrixFieldsParams);
     }
     const bitrixUserFields = contract.bitrixUserFieldsMethod
-      ? await this.bitrixCall(bitrixAccessToken, contract.bitrixUserFieldsMethod, { 'filter[LANG]': 'ru' })
+      ? await this.bitrixUserFieldList(bitrixAccessToken, contract.bitrixUserFieldsMethod)
       : undefined;
     const bitrix24 = describeBitrixFields(bitrixResult, entity, bitrixUserFields);
     const metadata = await this.moyskladGet(`${contract.moyskladResource}/metadata/attributes`);
@@ -123,6 +123,55 @@ export class ReadOnlyFieldDataProvider {
     throw new ServiceUnavailableException(`Bitrix24 ${method} catalog exceeds the supported ${MAX_PAGES * PAGE_SIZE} records; use a narrower catalog filter`);
   }
 
+  private async bitrixUserFieldList(accessToken: string, method: string): Promise<Array<Record<string, unknown>>> {
+    const rows: Array<Record<string, unknown>> = [];
+    const seenCursors = new Set<number>();
+    const seenCodes = new Set<string>();
+    let start = 0;
+    let expectedTotal: number | undefined;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      if (seenCursors.has(start)) throw new ServiceUnavailableException(`Bitrix24 ${method} returned a repeating pagination cursor`);
+      seenCursors.add(start);
+      const response = await this.bitrixCallEnvelope(accessToken, method, { 'filter[LANG]': 'ru', start });
+      if (!Array.isArray(response.result)) throw new ServiceUnavailableException(`Bitrix24 returned an invalid ${method} userfield list`);
+      const pageRows = response.result;
+      if (pageRows.some((row) => !isRecord(row) || typeof row.FIELD_NAME !== 'string' || !row.FIELD_NAME.trim())) {
+        throw new ServiceUnavailableException(`Bitrix24 returned a malformed ${method} userfield row`);
+      }
+      if (response.total !== undefined) {
+        if (!Number.isSafeInteger(response.total) || (response.total as number) < 0) {
+          throw new ServiceUnavailableException(`Bitrix24 returned an invalid total for ${method}`);
+        }
+        if (expectedTotal !== undefined && response.total !== expectedTotal) {
+          throw new ServiceUnavailableException(`Bitrix24 returned an inconsistent total for ${method}`);
+        }
+        expectedTotal = response.total as number;
+      }
+      for (const row of pageRows as Array<Record<string, unknown>>) {
+        const code = (row.FIELD_NAME as string).trim();
+        if (seenCodes.has(code)) throw new ServiceUnavailableException(`Bitrix24 ${method} returned a duplicate field code`);
+        seenCodes.add(code);
+      }
+      rows.push(...pageRows as Array<Record<string, unknown>>);
+      if (expectedTotal !== undefined && rows.length > expectedTotal) {
+        throw new ServiceUnavailableException(`Bitrix24 returned more rows than total for ${method}`);
+      }
+
+      if (response.next === undefined) {
+        if (expectedTotal !== undefined && rows.length !== expectedTotal) {
+          throw new ServiceUnavailableException(`Bitrix24 omitted the next cursor before all ${method} rows were returned`);
+        }
+        return rows;
+      }
+      if (!Number.isSafeInteger(response.next) || (response.next as number) <= start) {
+        throw new ServiceUnavailableException(`Bitrix24 returned an invalid or non-advancing cursor for ${method}`);
+      }
+      if (pageRows.length === 0) throw new ServiceUnavailableException(`Bitrix24 returned an empty ${method} page with a next cursor`);
+      start = response.next as number;
+    }
+    throw new ServiceUnavailableException(`Bitrix24 ${method} userfield list exceeds the supported ${MAX_PAGES} page limit`);
+  }
+
   private async bitrixListElements(accessToken: string, listId: string): Promise<Array<Record<string, unknown>>> {
     const rows: Array<Record<string, unknown>> = [];
     for (let page = 0, start = 0; page < MAX_PAGES; page += 1, start += PAGE_SIZE) {
@@ -139,6 +188,10 @@ export class ReadOnlyFieldDataProvider {
   }
 
   private async bitrixCall(accessToken: string, method: string, params: Record<string, string | number>): Promise<unknown> {
+    return (await this.bitrixCallEnvelope(accessToken, method, params)).result;
+  }
+
+  private async bitrixCallEnvelope(accessToken: string, method: string, params: Record<string, string | number>): Promise<{ result: unknown; next?: unknown; total?: unknown }> {
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new ServiceUnavailableException('Bitrix24 read-only catalog provider is not configured');
     const form = new URLSearchParams({ auth: accessToken, ...Object.fromEntries(Object.entries(params).map(([key, value]) => [key, String(value)])) });
@@ -149,7 +202,7 @@ export class ReadOnlyFieldDataProvider {
     if (!response.ok) throw new ServiceUnavailableException(`Bitrix24 read-only request failed (${response.status})`);
     const payload: unknown = await response.json().catch(() => null);
     if (!isRecord(payload) || !('result' in payload) || 'error' in payload) throw new ServiceUnavailableException('Bitrix24 rejected the read-only request');
-    return payload.result;
+    return { result: payload.result, next: payload.next, total: payload.total };
   }
 
   private async moyskladList(path: string): Promise<Array<Record<string, unknown>>> {
@@ -236,9 +289,14 @@ function describeBitrixFields(value: unknown, entity: string, userFields?: unkno
   const root = asRecord(value);
   const candidates = isRecord(root.fields) ? root.fields : isRecord(root.product) ? root.product : root;
   const localizedLabels = new Map<string, string>();
-  const userFieldRows = Array.isArray(userFields) ? userFields : isRecord(userFields) && Array.isArray(userFields.result) ? userFields.result : [];
+  if (userFields !== undefined && !Array.isArray(userFields)) {
+    throw new ServiceUnavailableException('Bitrix24 returned an invalid userfield metadata list');
+  }
+  const userFieldRows = Array.isArray(userFields) ? userFields : [];
   for (const row of userFieldRows) {
-    if (!isRecord(row) || typeof row.FIELD_NAME !== 'string') continue;
+    if (!isRecord(row) || typeof row.FIELD_NAME !== 'string' || !row.FIELD_NAME.trim()) {
+      throw new ServiceUnavailableException('Bitrix24 returned a malformed userfield metadata row');
+    }
     const code = row.FIELD_NAME.trim();
     const label = [row.EDIT_FORM_LABEL, row.LIST_COLUMN_LABEL, row.LIST_FILTER_LABEL]
       .map(localizedLabel)
