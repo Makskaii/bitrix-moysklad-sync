@@ -20,7 +20,7 @@ async function bootstrap() {
     const existing = await database.entityPair.findFirst({ where: { source: 'LOCAL_PREVIEW_FIXTURE', ...pair } });
     if (!existing) await database.entityPair.create({ data: { ...pair, source: 'LOCAL_PREVIEW_FIXTURE', reason: 'Synthetic local-only preview fixture' } });
   }
-  await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
+  await app.listen(process.env.PORT ?? 3000, process.env.ADMIN_PREVIEW_BIND_HOST ?? '127.0.0.1');
 }
 
 void bootstrap();
