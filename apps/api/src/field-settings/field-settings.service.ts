@@ -571,7 +571,7 @@ function entityTypeForFieldEntity(entity: string): EntityType {
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
     case 'catalog': return 'PRODUCT';
-    default: throw new BadRequestException('This entity type has no active field-settings pair catalog');
+    default: throw new BadRequestException('This entity type has no field metadata provider');
   }
 }
 
