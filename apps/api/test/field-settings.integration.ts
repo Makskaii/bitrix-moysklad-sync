@@ -240,7 +240,10 @@ test('catalog field metadata uses the product information block and API field na
   });
   const body = await response.text();
   assert.equal(response.status, 200, body);
-  const catalog = JSON.parse(body) as { bitrix24: Array<{ code: string; title: string; type: string }> };
+  const catalog = JSON.parse(body) as {
+    bitrix24: Array<{ code: string; title: string; type: string }>;
+    moysklad: Array<{ code: string; title: string; type: string }>;
+  };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
