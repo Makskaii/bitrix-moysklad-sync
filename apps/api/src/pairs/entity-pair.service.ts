@@ -3,6 +3,7 @@ import { DatabaseService } from '../database.service';
 import { EntityType, isEntityType } from './pair-resolver';
 import { isUniqueConstraintError } from './pair-db-errors';
 import { lockEntityPairState } from './pair-db-lock';
+import { createAdminAuditEntry } from '../admin/admin-audit.service';
 
 export type { EntityType } from './pair-resolver';
 
@@ -61,7 +62,7 @@ export class EntityPairService {
     return rows.map((row) => ({ ...row, entityType: row.entityType as EntityType, sourceSystem: row.sourceSystem as PairSourceSystem, status: 'OPEN' as const }));
   }
 
-  async assign(input: AssignEntityPairInput): Promise<EntityPairDto> {
+  async assign(input: AssignEntityPairInput, auditActorId?: string): Promise<EntityPairDto> {
     validate(input);
     try {
       return await this.database.$transaction(async (transaction) => {
@@ -122,6 +123,15 @@ export class EntityPairService {
             status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
           },
           data: { status: 'RECEIVED', lastErrorCategory: null },
+        });
+        if (auditActorId) await createAdminAuditEntry(transaction, {
+          actorId: auditActorId,
+          action: conflicts.length ? 'ENTITY_PAIR_REASSIGNED' : 'ENTITY_PAIR_ASSIGNED',
+          entityType: 'entity-pair',
+          entityId: pair.id,
+          before: conflicts.map(({ id, entityType, bitrix24Id, moyskladId, active }) => ({ id, entityType, bitrix24Id, moyskladId, active })),
+          after: { entityType: pair.entityType, bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, active: pair.active },
+          reason: pair.reason,
         });
         return { ...pair, entityType: pair.entityType as EntityType, active: true };
       });

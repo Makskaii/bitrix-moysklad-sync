@@ -32,6 +32,8 @@ import { HistoricalInventoryController } from './admin/historical-inventory.cont
 import { HistoricalInventoryService } from './historical-inventory.service';
 import { HistoricalDealOrderMatchingController } from './admin/historical-deal-order-matching.controller';
 import { HistoricalDealOrderMatchingService } from './historical-deal-order-matching.service';
+import { AdminAuditController } from './admin/admin-audit.controller';
+import { AdminAuditService } from './admin/admin-audit.service';
 
 @Controller()
 class AppController {
@@ -46,8 +48,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
+  controllers: [AppController, AdminController, AdminAuditController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController],
+  providers: [DatabaseService, AdminAccessGuard, AdminAuditService, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 

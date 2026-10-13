@@ -5,6 +5,7 @@ import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
 import { FieldSettingsService } from './field-settings/field-settings.service';
+import { manualReviewDetails } from './admin/manual-review-details';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -169,6 +170,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
             async (tx) => {
               if (category === 'REVIEW_REQUIRED') {
                 const review = error instanceof ReviewRequiredError ? error : new ReviewRequiredError('UNSPECIFIED_REVIEW_REQUIRED');
+                const details = manualReviewDetails(review.diagnostic);
                 await tx.manualReviewCase.upsert({
                   where: { eventId: event.id },
                   create: {
@@ -179,8 +181,9 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
                     externalEntityType: event.externalEntityType,
                     reason: review.reason,
                     diagnostic: review.diagnostic,
+                    ...details,
                   },
-                  update: { reason: review.reason, diagnostic: review.diagnostic },
+                  update: { reason: review.reason, diagnostic: review.diagnostic, ...details },
                 });
               }
               return tx.inboundEvent.update({
@@ -377,6 +380,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       moyskladEmailPresent: Boolean(moyskladEmail),
       bitrixEmailFieldCount: Array.isArray(bitrixContact.EMAIL) ? bitrixContact.EMAIL.length : 0,
       snapshotRevision: pair.snapshot.revision,
+      entityLabel: `Контакт ${pair.bitrix24ContactId}`,
+      fieldTitle: 'Email',
+      oldValue: event.source === 'BITRIX24' ? pair.snapshot.bitrix24Email : pair.snapshot.moyskladEmail,
+      proposedValue: bitrixEmail ?? moyskladEmail ?? null,
     });
 
     const snapshot = pair.snapshot;
@@ -604,6 +611,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     } catch {
       // The history is supplementary and cannot change the external API result.
     }
+    await writeOperationalLog(this.database, 'API', `${provider} ${method} ${operation} ${statusCode ?? 'network error'} · ${succeeded ? 'OK' : 'error'}`, eventId);
   }
 
   private async resolveManualReview(eventId: string) {
@@ -705,7 +713,7 @@ function isValidTimestamp(value: unknown): boolean {
 }
 
 class ReviewRequiredError extends Error {
-  constructor(readonly reason: string, readonly diagnostic: Record<string, string | number | boolean> = {}) {
+  constructor(readonly reason: string, readonly diagnostic: Record<string, string | number | boolean | null> = {}) {
     super('REVIEW_REQUIRED');
   }
 }

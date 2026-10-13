@@ -8,9 +8,9 @@ export class RotatingFileLogger implements LoggerService {
   private readonly directory: string;
   private readonly fileName: string;
 
-  constructor(directory = process.env.LOG_DIRECTORY ?? 'logs', private readonly maxBytes = LOG_FILE_MAX_BYTES) {
+  constructor(directory = process.env.LOG_DIRECTORY ?? 'logs', private readonly maxBytes = LOG_FILE_MAX_BYTES, fileName = 'application.log') {
     this.directory = resolve(directory);
-    this.fileName = join(this.directory, 'application.log');
+    this.fileName = join(this.directory, fileName);
     mkdirSync(this.directory, { recursive: true });
   }
 
@@ -38,8 +38,9 @@ export class RotatingFileLogger implements LoggerService {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const existing = new Set(readdirSync(this.directory));
     let suffix = 0;
-    let rotatedName = `application-${timestamp}.log`;
-    while (existing.has(rotatedName)) rotatedName = `application-${timestamp}-${++suffix}.log`;
+    const base = basename(this.fileName, '.log');
+    let rotatedName = `${base}-${timestamp}.log`;
+    while (existing.has(rotatedName)) rotatedName = `${base}-${timestamp}-${++suffix}.log`;
     renameSync(this.fileName, join(this.directory, basename(rotatedName)));
   }
 }

@@ -26,15 +26,18 @@ import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
+import { AdminAuditController } from './admin-audit.controller';
+import { AdminAuditService } from './admin-audit.service';
 
 @Module({})
 export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController] : [])],
       providers: [
         databaseProvider,
+        AdminAuditService,
         SyncModeService,
         SyncRecoveryService,
         ContactSyncProcessor,

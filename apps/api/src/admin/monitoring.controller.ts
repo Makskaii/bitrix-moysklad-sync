@@ -1,11 +1,12 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Optional, Param, Patch, Post, Query, ServiceUnavailableException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Optional, Param, Patch, Post, Query, Req, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { ContactSyncProcessor } from '../contact-sync.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
+import { AdminAuditService, createAdminAuditEntry, RequestWithHeaders, safeAuditJson } from './admin-audit.service';
 
-const LOG_CATEGORIES = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN'] as const;
+const LOG_CATEGORIES = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN', 'MANUAL', 'SYSTEM', 'API'] as const;
 
 @Controller('api/admin/monitoring')
 @UseGuards(AdminAccessGuard)
@@ -13,6 +14,7 @@ export class MonitoringController {
   constructor(
     private readonly database: DatabaseService,
     private readonly processor: ContactSyncProcessor,
+    private readonly audit: AdminAuditService,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
   ) {}
 
@@ -40,6 +42,7 @@ export class MonitoringController {
       counts: Object.fromEntries(counts.map((row) => [row.status, row._count._all])),
       events: events.map((event) => ({
         ...event,
+        entityLabel: entityLabel(event.externalEntityType),
         fieldSettingsVersion: settingsByEvent.get(event.id)?.version ?? null,
         transforms: settingsByEvent.get(event.id)?.transforms ?? [],
       })),
@@ -56,37 +59,47 @@ export class MonitoringController {
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       orderBy: [{ openedAt: 'desc' }, { id: 'desc' }],
       take,
-      select: { id: true, eventId: true, source: true, eventType: true, externalEntityId: true, externalEntityType: true, reason: true, diagnostic: true, status: true, openedAt: true, resolvedAt: true },
+      select: { id: true, eventId: true, source: true, eventType: true, externalEntityId: true, externalEntityType: true, entityLabel: true, fieldTitle: true, previousValue: true, proposedValue: true, reason: true, diagnostic: true, status: true, openedAt: true, resolvedAt: true },
     });
-    return { cases, nextCursor: getNextCursor(cases, take) };
+    return { cases: cases.map((item) => ({ ...item, entityLabel: item.entityLabel ?? entityLabel(item.externalEntityType), diagnostic: safeAuditJson(item.diagnostic), previousValue: safeAuditJson(item.previousValue), proposedValue: safeAuditJson(item.proposedValue) })), nextCursor: getNextCursor(cases, take) };
   }
 
   @Patch('incidents/:incidentId/resolve')
-  async resolveIncident(@Param('incidentId') incidentId: string, @Body() body: { confirmed?: unknown }) {
+  async resolveIncident(@Param('incidentId') incidentId: string, @Body() body: { confirmed?: unknown }, @Req() request: RequestWithHeaders) {
     if (body?.confirmed !== true) throw new BadRequestException('confirmed must be true');
-    const updated = await this.database.manualReviewCase.updateMany({
-      where: { id: incidentId, status: 'OPEN' },
-      data: { status: 'RESOLVED', resolvedAt: new Date() },
+    const actorId = await this.audit.resolveActorId(request);
+    const before = await this.database.$transaction(async (transaction) => {
+      const current = await transaction.manualReviewCase.findUnique({ where: { id: incidentId } });
+      if (!current || current.status !== 'OPEN') throw new NotFoundException();
+      const updated = await transaction.manualReviewCase.updateMany({
+        where: { id: incidentId, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: new Date() },
+      });
+      if (updated.count !== 1) throw new NotFoundException();
+      await createAdminAuditEntry(transaction, { actorId, action: 'MANUAL_REVIEW_RESOLVED', entityType: 'manual-review-case', entityId: incidentId, before: { status: current.status, reason: current.reason, previousValue: current.previousValue, proposedValue: current.proposedValue }, after: { status: 'RESOLVED' }, reason: current.reason });
+      return current;
     });
-    if (updated.count !== 1) throw new NotFoundException();
-    await writeOperationalLog(this.database, 'ADMIN', 'Manual-review case marked resolved', incidentId);
+    await writeOperationalLog(this.database, 'MANUAL', 'Manual-review case marked resolved', incidentId);
     return { id: incidentId, status: 'RESOLVED' };
   }
 
   @Post('incidents/:incidentId/retry')
-  async retryIncident(@Param('incidentId') incidentId: string) {
-    const incident = await this.database.manualReviewCase.findUnique({ where: { id: incidentId } });
-    if (!incident || incident.status !== 'OPEN') throw new NotFoundException();
-    const event = await this.database.inboundEvent.findUnique({ where: { id: incident.eventId } });
-    if (!event) throw new ConflictException('The event history has expired; this incident cannot be retried.');
-    if (!['MANUAL_REVIEW', 'RETRYABLE_FAILURE'].includes(event.status)) {
-      throw new ConflictException('The event is not waiting for retry.');
-    }
-    await this.database.inboundEvent.update({
-      where: { id: event.id },
-      data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
+  async retryIncident(@Param('incidentId') incidentId: string, @Req() request: RequestWithHeaders) {
+    const actorId = await this.audit.resolveActorId(request);
+    const { incident, event } = await this.database.$transaction(async (transaction) => {
+      const currentIncident = await transaction.manualReviewCase.findUnique({ where: { id: incidentId } });
+      if (!currentIncident || currentIncident.status !== 'OPEN') throw new NotFoundException();
+      const currentEvent = await transaction.inboundEvent.findUnique({ where: { id: currentIncident.eventId } });
+      if (!currentEvent) throw new ConflictException('The event history has expired; this incident cannot be retried.');
+      if (!['MANUAL_REVIEW', 'RETRYABLE_FAILURE'].includes(currentEvent.status)) throw new ConflictException('The event is not waiting for retry.');
+      await transaction.inboundEvent.update({
+        where: { id: currentEvent.id },
+        data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
+      });
+      await createAdminAuditEntry(transaction, { actorId, action: 'MANUAL_REVIEW_RETRY', entityType: currentIncident.externalEntityType ?? 'event', entityId: currentIncident.externalEntityId ?? currentEvent.id, before: { eventStatus: currentEvent.status, incidentStatus: currentIncident.status }, after: { eventStatus: 'RECEIVED', incidentStatus: currentIncident.status }, reason: currentIncident.reason });
+      return { incident: currentIncident, event: currentEvent };
     });
-    await writeOperationalLog(this.database, 'ADMIN', 'Manual-review event retry requested', incident.id);
+    await writeOperationalLog(this.database, 'MANUAL', 'Manual-review event retry requested', incident.id);
     this.processor.enqueue(event.id);
     const settings = this.fieldSettings ? await this.fieldSettings.eventSettings([event.id]) : new Map();
     const eventSettings = settings.get(event.id);
@@ -98,12 +111,19 @@ export class MonitoringController {
   }
 
   @Post('events/:eventId/recompute')
-  async recomputeEvent(@Param('eventId') eventId: string, @Body() body: { confirmed?: unknown }) {
+  async recomputeEvent(@Param('eventId') eventId: string, @Body() body: { confirmed?: unknown }, @Req() request: RequestWithHeaders) {
     if (body?.confirmed !== true) throw new BadRequestException('confirmed must be true');
     if (!this.fieldSettings) throw new ServiceUnavailableException('Field settings are not available');
-    const fieldSettingsVersion = await this.fieldSettings.repinEvent(eventId);
+    const actorId = await this.audit.resolveActorId(request);
+    const fieldSettingsVersion = await this.database.$transaction(async (transaction) => {
+      const before = await transaction.inboundEvent.findUnique({ where: { id: eventId }, select: { status: true, externalEntityType: true, externalEntityId: true } });
+      if (!before) throw new NotFoundException();
+      const version = await this.fieldSettings!.repinEvent(eventId, transaction);
+      await createAdminAuditEntry(transaction, { actorId, action: 'EVENT_RECOMPUTE_REQUESTED', entityType: before.externalEntityType ?? 'event', entityId: before.externalEntityId ?? eventId, before: { status: before.status }, after: { status: 'RECEIVED', fieldSettingsVersion: version } });
+      return version;
+    });
     this.processor.enqueue(eventId);
-    await writeOperationalLog(this.database, 'ADMIN', 'One event recompute requested with newer field settings', eventId);
+    await writeOperationalLog(this.database, 'MANUAL', 'One event recompute requested with newer field settings', eventId);
     return { eventId, status: 'RECEIVED', fieldSettingsVersion };
   }
 
@@ -145,4 +165,13 @@ function parseLimit(value?: string): number {
 
 function getNextCursor(rows: Array<{ id: string }>, take: number): string | null {
   return rows.length === take ? rows[rows.length - 1]?.id ?? null : null;
+}
+
+function entityLabel(value: string | null): string | null {
+  if (!value) return null;
+  const labels: Record<string, string> = {
+    deal: 'Сделка', customerorder: 'Заказ покупателя', company: 'Компания', contact: 'Контакт',
+    counterparty: 'Контрагент', contactperson: 'Контактное лицо', product: 'Товар', assortment: 'Товар или услуга', invoiceout: 'Счёт',
+  };
+  return labels[value.toLowerCase()] ?? value;
 }

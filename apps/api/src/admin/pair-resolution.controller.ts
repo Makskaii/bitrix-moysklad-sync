@@ -1,12 +1,16 @@
-import { BadRequestException, Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Inject, Optional, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
 import { AssignEntityPairInput, EntityPairService } from '../pairs/entity-pair.service';
 import { EntityType, isEntityType } from '../pairs/pair-resolver';
+import { AdminAuditService, RequestWithHeaders } from './admin-audit.service';
 
 @Controller('api/admin/pairs')
 @UseGuards(AdminAccessGuard)
 export class PairResolutionController {
-  constructor(private readonly pairs: EntityPairService) {}
+  constructor(
+    private readonly pairs: EntityPairService,
+    @Optional() @Inject(AdminAuditService) private readonly audit?: AdminAuditService,
+  ) {}
 
   @Get()
   list(@Query('entityType') entityType?: string) {
@@ -20,8 +24,9 @@ export class PairResolutionController {
   }
 
   @Post()
-  assign(@Body() body: AssignEntityPairInput | null) {
+  async assign(@Body() body: AssignEntityPairInput | null, @Req() request: RequestWithHeaders) {
     if (!body || typeof body !== 'object') return this.pairs.assign({} as AssignEntityPairInput);
-    return this.pairs.assign(body);
+    const actorId = this.audit ? await this.audit.resolveActorId(request) : null;
+    return this.pairs.assign(body, actorId ?? undefined);
   }
 }

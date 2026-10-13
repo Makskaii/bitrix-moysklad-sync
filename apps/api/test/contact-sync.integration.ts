@@ -703,7 +703,14 @@ test('a Bitrix24 contact with multiple email values is not silently reduced to o
     moyskladEmailPresent: true,
     bitrixEmailFieldCount: 2,
     snapshotRevision: 1,
+    entityLabel: 'Контакт contact-42',
+    fieldTitle: 'Email',
+    oldValue: 'before@example.test',
+    proposedValue: 'before@example.test',
   });
+  assert.equal(reviewCase?.fieldTitle, 'Email');
+  assert.equal(reviewCase?.previousValue, 'before@example.test');
+  assert.equal(reviewCase?.proposedValue, 'before@example.test');
   assert.deepEqual(externalWrites, []);
   assert.equal(moyskladState.email, 'before@example.test');
 });
@@ -728,6 +735,10 @@ test('a valid counterparty with no email opens a durable manual-review incident'
     moyskladEmailPresent: false,
     bitrixEmailFieldCount: 1,
     snapshotRevision: 1,
+    entityLabel: 'Контакт contact-42',
+    fieldTitle: 'Email',
+    oldValue: 'before@example.test',
+    proposedValue: 'after@example.test',
   });
 });
 

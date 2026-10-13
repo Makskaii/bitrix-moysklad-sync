@@ -6,6 +6,7 @@ import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
+import { createAdminAuditEntry } from '../admin/admin-audit.service';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -41,7 +42,7 @@ export class FieldSettingsService {
     return serializeVersion(rows[0]);
   }
 
-  async save(value: unknown, bitrixAccessToken: string) {
+  async save(value: unknown, bitrixAccessToken: string, auditActorId?: string) {
     const config = validateConfiguration(value);
     await this.ensureInitialized();
     await this.validateConfiguredFields(config, bitrixAccessToken);
@@ -80,6 +81,9 @@ export class FieldSettingsService {
       `;
       const previousVersion = states[0]?.version;
       if (!previousVersion) throw new Error('Active field settings state is unavailable');
+      const previousRows = await transaction.$queryRaw<VersionRow[]>`
+        SELECT "version", "config", "createdAt" FROM "FieldSettingsVersion" WHERE "version" = ${previousVersion}
+      `;
       const nextVersion = previousVersion + 1;
       await transaction.$executeRaw`
         INSERT INTO "FieldSettingsVersion" ("version", "config")
@@ -88,6 +92,16 @@ export class FieldSettingsService {
       await transaction.$executeRaw`
         UPDATE "FieldSettingsState" SET "version" = ${nextVersion} WHERE "id" = 'global'
       `;
+      if (auditActorId) {
+        await createAdminAuditEntry(transaction, {
+          actorId: auditActorId,
+          action: 'FIELD_SETTINGS_SAVED',
+          entityType: 'field-settings',
+          entityId: 'global',
+          before: { version: previousVersion, config: previousRows[0]?.config },
+          after: { version: nextVersion, config },
+        });
+      }
       return nextVersion;
     }, { isolationLevel: 'Serializable' });
 
@@ -308,9 +322,9 @@ export class FieldSettingsService {
     return new Map(rows.map((row) => [row.eventId, { version: row.version, transforms: configuredTransforms(row.config) }]));
   }
 
-  async repinEvent(eventId: string) {
+  async repinEvent(eventId: string, externalTransaction?: Prisma.TransactionClient) {
     await this.ensureInitialized();
-    return this.database.$transaction(async (transaction) => {
+    const repin = async (transaction: Prisma.TransactionClient) => {
       const states = await transaction.$queryRaw<Array<{ version: number }>>`
         SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR SHARE
       `;
@@ -334,7 +348,8 @@ export class FieldSettingsService {
         WHERE "id" = ${eventId}
       `;
       return activeVersion;
-    }, { isolationLevel: 'Serializable' });
+    };
+    return externalTransaction ? repin(externalTransaction) : this.database.$transaction(repin, { isolationLevel: 'Serializable' });
   }
 
   private async ensureInitialized() {

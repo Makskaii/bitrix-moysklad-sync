@@ -1,5 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Inject, Optional, Param, ParseIntPipe, Post, Put, Query, Req, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
+import { AdminAuditService } from './admin-audit.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 
 type RequestWithHeaders = { header(name: string): string | undefined };
@@ -7,7 +8,10 @@ type RequestWithHeaders = { header(name: string): string | undefined };
 @Controller('api/admin/field-settings')
 @UseGuards(AdminAccessGuard)
 export class FieldSettingsController {
-  constructor(@Optional() @Inject(FieldSettingsService) private readonly settings?: FieldSettingsService) {}
+  constructor(
+    @Optional() @Inject(FieldSettingsService) private readonly settings?: FieldSettingsService,
+    @Optional() @Inject(AdminAuditService) private readonly audit?: AdminAuditService,
+  ) {}
 
   @Get()
   active() {
@@ -37,8 +41,10 @@ export class FieldSettingsController {
   }
 
   @Put()
-  save(@Body() body: { config?: unknown } | null, @Req() request: RequestWithHeaders) {
-    return this.service().save(body?.config, accessToken(request));
+  async save(@Body() body: { config?: unknown } | null, @Req() request: RequestWithHeaders) {
+    const service = this.service();
+    const actorId = this.audit ? await this.audit.resolveActorId(request) : undefined;
+    return service.save(body?.config, accessToken(request), actorId);
   }
 
   @Post('preview')

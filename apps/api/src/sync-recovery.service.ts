@@ -387,6 +387,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     } catch {
       // API history is supplementary; a logging failure cannot change recovery behavior.
     }
+    await writeOperationalLog(this.database, 'API', `${provider} ${method} ${operation} ${statusCode ?? 'network error'} · ${succeeded ? 'OK' : 'error'}`);
   }
 }
 

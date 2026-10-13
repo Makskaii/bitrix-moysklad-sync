@@ -4,6 +4,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test:admin": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-access.integration.js",
+    "test:admin-audit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-audit.integration.js",
     "test:events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/events-intake.integration.js",
     "test:pair-first-events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/pair-first-event.processor.integration.js",
     "test:deal-order-baseline": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-baseline.integration.js",

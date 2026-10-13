@@ -4,6 +4,7 @@ import './style.css';
 import { FieldSettingsPage } from './field-settings';
 import { HistoricalInventoryPage } from './historical-inventory';
 import { HistoricalDealOrderMatchingPage } from './historical-deal-order-matching';
+import { AdminAuditPage } from './admin-audit';
 
 type TrialAction = { id: string; message: string; createdAt: string };
 type ServiceMode = 'on' | 'pause' | 'off';
@@ -11,16 +12,16 @@ type EntityControl = { key: string; label: string; ready: boolean; availability:
 type RecoveryStatus = { status: string; provider: string; bitrixStart: number; moyskladOffset: number; error: string | null };
 type BitrixAuth = { access_token: string };
 type BitrixSdk = { init(callback: () => void): void; getAuth(): BitrixAuth | false };
-type QueueEvent = { id: string; source: string; eventType: string | null; externalEntityId: string | null; status: string; receivedAt: string; attempts: number; direction: string | null; lastErrorCategory: string | null };
+type QueueEvent = { id: string; source: string; eventType: string | null; externalEntityId: string | null; externalEntityType?: string | null; entityLabel?: string | null; status: string; receivedAt: string; attempts: number; direction: string | null; lastErrorCategory: string | null };
 type QueueSnapshot = { counts: Record<string, number>; events: QueueEvent[]; nextCursor: string | null };
-type ReviewCase = { id: string; eventId: string; source: string; externalEntityId: string | null; reason: string; diagnostic: Record<string, string | number | boolean> | null; status: string; openedAt: string };
+type ReviewCase = { id: string; eventId: string; source: string; externalEntityId: string | null; externalEntityType?: string | null; entityLabel?: string | null; fieldTitle?: string | null; previousValue?: unknown; proposedValue?: unknown; reason: string; diagnostic: Record<string, unknown> | null; status: string; openedAt: string };
 type OperationalLog = { id: string; category: string; message: string; referenceId: string | null; occurredAt: string };
 type ApiAttempt = { id: string; eventId: string | null; provider: string; operation: string; method: string; statusCode: number | null; succeeded: boolean; occurredAt: string };
-type AdminSection = 'overview' | 'queue' | 'pairs' | 'history' | 'matching' | 'review' | 'settings' | 'dictionaries' | 'fields' | 'logs';
+type AdminSection = 'overview' | 'queue' | 'pairs' | 'history' | 'matching' | 'review' | 'settings' | 'dictionaries' | 'fields' | 'logs' | 'audit';
 declare global { interface Window { BX24?: BitrixSdk } }
 
 const trialActionsEndpoint = '/api/admin/trial-actions';
-const logCategories = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN'] as const;
+const logCategories = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN', 'MANUAL', 'SYSTEM', 'API'] as const;
 const sections: { id: AdminSection; label: string; icon: string }[] = [
   { id: 'overview', label: 'Обзор', icon: '⌂' },
   { id: 'queue', label: 'Очередь и попытки', icon: '≡' },
@@ -32,6 +33,7 @@ const sections: { id: AdminSection; label: string; icon: string }[] = [
   { id: 'dictionaries', label: 'Справочники', icon: '▦' },
   { id: 'fields', label: 'Соответствия полей', icon: '⇄' },
   { id: 'logs', label: 'Логи', icon: '▤' },
+  { id: 'audit', label: 'Журнал действий', icon: '◷' },
 ];
 
 function App() {
@@ -295,7 +297,7 @@ function App() {
           {queueSnapshot.events.length ? <><div className="monitor-list">{queueSnapshot.events.map((event) => <article key={event.id}><div><strong>{event.eventType ?? event.source}</strong><small>{event.source} · {event.externalEntityId ? `ID ${event.externalEntityId}` : 'без ID'} · {new Date(event.receivedAt).toLocaleString('ru-RU')}</small></div><span className={`event-status status-${event.status.toLowerCase()}`}>{event.status}</span><small>Попыток: {event.attempts}{event.lastErrorCategory ? ` · ${event.lastErrorCategory}` : ''}</small></article>)}</div>{queueSnapshot.nextCursor && <button className="load-more" type="button" onClick={() => void loadMore('queue').catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие события</button>}</> : <p className="empty">Очередь пуста.</p>}
         </>}
         {monitorView === 'incidents' && (incidents.length ? <><div className="monitor-list">{incidents.map((incident) => <article key={incident.id}><div><strong>{incident.reason}</strong><small>{incident.source} · {incident.externalEntityId ? `ID ${incident.externalEntityId}` : 'без ID'} · событие {incident.eventId}</small>{incident.diagnostic && <small>Диагностика: {Object.entries(incident.diagnostic).map(([key, value]) => `${key}=${value}`).join(' · ')}</small>}<small>{new Date(incident.openedAt).toLocaleString('ru-RU')}</small></div><div className="incident-actions"><button type="button" className="resolve-incident" onClick={() => void retryIncident(incident.id).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Повторить</button><button type="button" className="resolve-incident" onClick={() => void resolveIncident(incident.id).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Отметить решённым</button></div></article>)}</div>{incidentNextCursor && <button className="load-more" type="button" onClick={() => void loadMore('incidents').catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие случаи</button>}</> : <p className="empty">Открытых случаев ручной проверки нет.</p>)}
-        {monitorView === 'logs' && <><div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => void showLogCategory(category)}>{category}</button>)}</div>{logs.length ? <><div className="monitor-list">{logs.map((entry) => <article key={entry.id}><div><strong>{entry.message}</strong><small>{new Date(entry.occurredAt).toLocaleString('ru-RU')}{entry.referenceId ? ` · ${entry.referenceId}` : ''}</small></div><span className="event-status">{entry.category}</span></article>)}</div>{logNextCursor && <button className="load-more" type="button" onClick={() => void loadMore('logs').catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие записи</button>}</> : <p className="empty">Записей в этой категории пока нет.</p>}</>}
+        {monitorView === 'logs' && <><div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => void showLogCategory(category)}>{logCategoryLabel(category)}</button>)}</div>{logs.length ? <><div className="monitor-list">{logs.map((entry) => <article key={entry.id}><div><strong>{entry.message}</strong><small>{new Date(entry.occurredAt).toLocaleString('ru-RU')}{entry.referenceId ? ` · ${entry.referenceId}` : ''}</small></div><span className="event-status">{logCategoryLabel(entry.category)}</span></article>)}</div>{logNextCursor && <button className="load-more" type="button" onClick={() => void loadMore('logs').catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие записи</button>}</> : <p className="empty">Записей в этой категории пока нет.</p>}</>}
         {monitorView === 'api' && (apiAttempts.length ? <><div className="monitor-list">{apiAttempts.map((attempt) => <article key={attempt.id}><div><strong>{attempt.provider} · {attempt.operation}</strong><small>{attempt.method} · {new Date(attempt.occurredAt).toLocaleString('ru-RU')}{attempt.eventId ? ` · событие ${attempt.eventId}` : ''}</small></div><span className={`event-status ${attempt.succeeded ? 'status-succeeded' : 'status-manual_review'}`}>{attempt.statusCode ?? 'ошибка сети'} · {attempt.succeeded ? 'OK' : 'ошибка'}</span></article>)}</div>{attemptNextCursor && <button className="load-more" type="button" onClick={() => void loadMore('api').catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие вызовы</button>}</> : <p className="empty">История вызовов API пуста.</p>)}
         {error && <p role="alert" className="error">{error}</p>}
       </section>
@@ -353,6 +355,7 @@ function App() {
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}
           {activeSection === 'fields' && <FieldSettingsPage accessToken={accessToken} onForbidden={denyAdminAccess} onError={setError} />}
           {activeSection === 'logs' && <MonitoringPage kind="logs" logs={logs} logCategory={logCategory} onCategory={showLogCategory} logNextCursor={logNextCursor} attempts={apiAttempts} attemptNextCursor={attemptNextCursor} onLoadMore={loadMore} onError={setError} />}
+          {activeSection === 'audit' && <AdminAuditPage accessToken={accessToken} onForbidden={denyAdminAccess} onError={setError} />}
           {error && activeSection !== 'overview' && activeSection !== 'settings' && <p role="alert" className="inline-error">{error}</p>}
         </div>
       </section>
@@ -440,19 +443,19 @@ function MonitoringPage({ kind, queue, incidents, incidentNextCursor, logs, logC
       <section className="panel monitoring-panel" aria-label="Очередь событий">
         <div className="panel-heading"><div><p className="eyebrow">ТЕКУЩЕЕ СОСТОЯНИЕ</p><h3>События очереди</h3></div></div>
         <div className="metric-grid">{Object.entries(queue?.counts ?? {}).map(([status, count]) => <article className="metric" key={status}><span>{status}</span><strong>{count}</strong></article>)}</div>
-        {queue?.events.length ? <div className="monitor-list">{queue.events.map((event) => <article key={event.id}><div><strong>{event.eventType ?? event.source}</strong><small>{event.source} · {event.externalEntityId ? `ID ${event.externalEntityId}` : 'без ID'} · {new Date(event.receivedAt).toLocaleString('ru-RU')}</small></div><span className={`event-status status-${event.status.toLowerCase()}`}>{event.status}</span><small>Попыток: {event.attempts}{event.lastErrorCategory ? ` · ${event.lastErrorCategory}` : ''}</small></article>)}</div> : <p className="muted-empty">Очередь пуста.</p>}
+        {queue?.events.length ? <div className="monitor-list">{queue.events.map((event) => <article key={event.id}><div><strong>{event.entityLabel ?? event.eventType ?? event.source}</strong><small>{event.source} · {event.externalEntityId ? `ID ${event.externalEntityId}` : 'без ID'} · {new Date(event.receivedAt).toLocaleString('ru-RU')}</small></div><span className={`event-status status-${event.status.toLowerCase()}`}>{event.status}</span><small>Попыток: {event.attempts}{event.lastErrorCategory ? ` · ${event.lastErrorCategory}` : ''}</small></article>)}</div> : <p className="muted-empty">Очередь пуста.</p>}
         {queue?.nextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('queue'))}>Загрузить следующие события</button>}
       </section>
       <ApiAttempts attempts={attempts ?? []} nextCursor={attemptNextCursor} onLoadMore={onLoadMore} onError={onError} />
     </>}
     {kind === 'review' && <section className="panel monitoring-panel" aria-label="Случаи ручной проверки">
-      {incidents?.length ? <div className="monitor-list">{incidents.map((incident) => <article key={incident.id}><div><strong>{incident.reason}</strong><small>{incident.source} · {incident.externalEntityId ? `ID ${incident.externalEntityId}` : 'без ID'} · событие {incident.eventId}</small>{incident.diagnostic && <small>Диагностика: {Object.entries(incident.diagnostic).map(([key, value]) => `${key}=${value}`).join(' · ')}</small>}<small>{new Date(incident.openedAt).toLocaleString('ru-RU')}</small></div><div className="incident-actions"><button type="button" className="button-secondary" onClick={() => run(() => onRetry?.(incident.id) ?? Promise.resolve())}>Повторить</button><button type="button" className="button-secondary" onClick={() => run(() => onResolve?.(incident.id) ?? Promise.resolve())}>Отметить решённым</button></div></article>)}</div> : <p className="muted-empty">Открытых случаев ручной проверки нет.</p>}
+      {incidents?.length ? <div className="monitor-list">{incidents.map((incident) => <article key={incident.id}><div><strong>{incident.reason}</strong><small>{incident.source} · {incident.entityLabel ?? incident.externalEntityType ?? 'сущность'} · {incident.externalEntityId ? `ID ${incident.externalEntityId}` : 'без ID'} · событие {incident.eventId}</small>{incident.fieldTitle && <small>Поле: {incident.fieldTitle}</small>}{incident.previousValue !== undefined && <small>Было: {formatReviewValue(incident.previousValue)}</small>}{incident.proposedValue !== undefined && <small>Предлагается: {formatReviewValue(incident.proposedValue)}</small>}{incident.diagnostic && <small>Диагностика: {Object.entries(incident.diagnostic).map(([key, value]) => `${key}=${formatReviewValue(value)}`).join(' · ')}</small>}<small>{new Date(incident.openedAt).toLocaleString('ru-RU')}</small></div><div className="incident-actions"><button type="button" className="button-secondary" onClick={() => run(() => onRetry?.(incident.id) ?? Promise.resolve())}>Повторить</button><button type="button" className="button-secondary" onClick={() => run(() => onResolve?.(incident.id) ?? Promise.resolve())}>Отметить решённым</button></div></article>)}</div> : <p className="muted-empty">Открытых случаев ручной проверки нет.</p>}
       {incidentNextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('incidents'))}>Загрузить следующие случаи</button>}
     </section>}
     {kind === 'logs' && <>
       <section className="panel monitoring-panel" aria-label="Операционные журналы">
         <div className="panel-heading"><div><p className="eyebrow">СОБЫТИЯ И ДЕЙСТВИЯ</p><h3>Операционные журналы</h3></div></div>
-        <div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => onCategory && run(() => onCategory(category))}>{category}</button>)}</div>
+        <div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => onCategory && run(() => onCategory(category))}>{logCategoryLabel(category)}</button>)}</div>
         {logs?.length ? <div className="monitor-list">{logs.map((entry) => <article key={entry.id}><div><strong>{entry.message}</strong><small>{new Date(entry.occurredAt).toLocaleString('ru-RU')}{entry.referenceId ? ` · ${entry.referenceId}` : ''}</small></div><span className="event-status">{entry.category}</span></article>)}</div> : <p className="muted-empty">В этой категории пока нет записей.</p>}
         {logNextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('logs'))}>Загрузить следующие записи</button>}
       </section>
@@ -520,6 +523,19 @@ function Settings({ mode, entities, recovery, confirmMode, setConfirmMode, saveM
 
 function PageHeading({ eyebrow, title, subtitle }: { eyebrow: string; title: string; subtitle: string }) {
   return <div className="page-heading"><p className="eyebrow">{eyebrow}</p><h2>{title}</h2><p>{subtitle}</p></div>;
+}
+
+function formatReviewValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function logCategoryLabel(category: string): string {
+  const labels: Record<string, string> = {
+    EVENT: 'События', SCHEDULED: 'Ночная задача', SYSTEM: 'Система', ERROR: 'Ошибки',
+    ADMIN: 'Настройки', MANUAL: 'Ручная проверка', API: 'Вызовы API',
+  };
+  return labels[category] ?? category;
 }
 
 function UnavailablePage({ title, eyebrow, description, action, badge = 'Пока недоступно' }: { title: string; eyebrow: string; description: string; action: string; badge?: string }) {

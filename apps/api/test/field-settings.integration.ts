@@ -395,6 +395,14 @@ test('saving creates an immutable version and activates it for future events onl
   const reloaded = await activeResponse.json() as { version: number; config: Record<string, unknown> };
   assert.equal(reloaded.version, saved.version);
   assert.deepEqual(reloaded.config.rules, saved.config.rules);
+  const auditResponse = await fetch(`${apiUrl}/api/admin/audit?targetType=field-settings&limit=10`);
+  assert.equal(auditResponse.status, 200);
+  const audit = await auditResponse.json() as { entries: Array<{ actorId: string; action: string; before: { version: number }; after: { version: number; config: Record<string, unknown> } }> };
+  const change = audit.entries.find((entry) => entry.action === 'FIELD_SETTINGS_SAVED' && entry.after.version === saved.version);
+  assert.ok(change, 'field-settings save should be visible in the admin audit trail');
+  assert.equal(change.actorId, 'LOCAL_PREVIEW');
+  assert.equal(change.before.version, original.version);
+  assert.deepEqual(change.after.config.rules, saved.config.rules);
 });
 
 test('settings reject unknown field codes and read-only Bitrix24 targets', async () => {

@@ -1,5 +1,8 @@
 import { ConflictException, Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { Prisma } from '@prisma/client';
+
+type SyncSettingsClient = Pick<Prisma.TransactionClient, 'syncSetting' | 'syncDirectionSetting'>;
 
 export type ServiceMode = 'on' | 'pause' | 'off';
 
@@ -45,20 +48,20 @@ const entityControls = [
 export class SyncModeService {
   constructor(private readonly database: DatabaseService) {}
 
-  async read() {
-    const setting = await this.ensureGlobalSetting();
+  async read(client: SyncSettingsClient = this.database) {
+    const setting = await this.ensureGlobalSetting(client);
     return { mode: setting.serviceMode as ServiceMode };
   }
 
-  async setMode(mode: ServiceMode) {
-    const current = await this.ensureGlobalSetting();
+  async setMode(mode: ServiceMode, client: SyncSettingsClient = this.database) {
+    const current = await this.ensureGlobalSetting(client);
     if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
     const enteringOff = mode === 'off' && current.serviceMode !== 'off';
     const startingResume = mode === 'on' && current.serviceMode !== 'on' && current.offSince !== null &&
       ['idle', 'complete'].includes(current.resumeStatus);
     const now = new Date();
     const offSince = enteringOff ? new Date() : current.offSince;
-    const setting = await this.database.syncSetting.update({
+    const setting = await client.syncSetting.update({
       where: { id: 'global' },
       data: {
         serviceMode: mode,
@@ -91,9 +94,9 @@ export class SyncModeService {
     return { mode: setting.serviceMode as ServiceMode };
   }
 
-  async readEntitySettings() {
+  async readEntitySettings(client: SyncSettingsClient = this.database) {
     const ready = entityControls.find((entity) => entity.ready)!;
-    const directions = await this.ensureDirectionSetting(ready.key);
+    const directions = await this.ensureDirectionSetting(ready.key, client);
     return entityControls.map((entity) => ({
       ...entity,
       bitrix24ToMoysklad: entity.ready ? directions.bitrix24ToMoysklad : false,
@@ -104,13 +107,14 @@ export class SyncModeService {
   async setEntityDirections(
     entityKey: string,
     directions: { bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean },
+    client: SyncSettingsClient = this.database,
   ) {
     const entity = entityControls.find((control) => control.key === entityKey);
     if (!entity || !entity.ready) {
       throw new ConflictException('This entity is not ready to be enabled');
     }
-    await this.ensureDirectionSetting(entityKey);
-    const setting = await this.database.syncDirectionSetting.update({
+    await this.ensureDirectionSetting(entityKey, client);
+    const setting = await client.syncDirectionSetting.update({
       where: { entityKey },
       data: directions,
       select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
@@ -118,9 +122,9 @@ export class SyncModeService {
     return { key: entityKey, ...setting };
   }
 
-  private async ensureGlobalSetting() {
+  private async ensureGlobalSetting(client: SyncSettingsClient = this.database) {
     try {
-      return await this.database.syncSetting.upsert({
+      return await client.syncSetting.upsert({
         where: { id: 'global' },
         create: {},
         update: {},
@@ -128,7 +132,7 @@ export class SyncModeService {
       });
     } catch (error) {
       if (!isUniqueConstraintViolation(error)) throw error;
-      const setting = await this.database.syncSetting.findUnique({
+      const setting = await client.syncSetting.findUnique({
         where: { id: 'global' },
         select: { serviceMode: true, offSince: true, resumeStatus: true },
       });
@@ -137,9 +141,9 @@ export class SyncModeService {
     }
   }
 
-  private async ensureDirectionSetting(entityKey: string) {
+  private async ensureDirectionSetting(entityKey: string, client: SyncSettingsClient = this.database) {
     try {
-      return await this.database.syncDirectionSetting.upsert({
+      return await client.syncDirectionSetting.upsert({
         where: { entityKey },
         create: { entityKey },
         update: {},
@@ -147,7 +151,7 @@ export class SyncModeService {
       });
     } catch (error) {
       if (!isUniqueConstraintViolation(error)) throw error;
-      const setting = await this.database.syncDirectionSetting.findUnique({
+      const setting = await client.syncDirectionSetting.findUnique({
         where: { entityKey },
         select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
       });
