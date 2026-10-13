@@ -28,18 +28,24 @@ type DictionaryMap = {
   moyskladDirectoryId: string;
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
+type ReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages';
+type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: 'suggested' | 'confirmed' | 'unmapped' };
 type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   priceTypes: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string; values?: { bitrix24: DictionaryOption[]; moysklad: DictionaryOption[] } }>;
+  namedReferences: Partial<Record<ReferenceKind, { sources: Array<{ source: { id: string; code: string; label: string; group?: string }; targetId: string | null; targetLabel: string | null; status: string; suggestion: { id: string; code: string; label: string } | null; ambiguousSuggestions: Array<{ id: string; code: string; label: string }> }>; targets: Array<{ id: string; code: string; label: string }> }>>;
 };
-const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
+const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
+const referenceKinds: Array<[ReferenceKind, string]> = [
+  ['employees', 'Сотрудники'], ['currencies', 'Валюты'], ['organizations', 'Организации'], ['warehouses', 'Склады'], ['projects', 'Проекты'], ['dealStages', 'Стадии сделок ↔ статусы заказов'],
+];
 type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 type AutoMatch = { source: FieldCandidate; target: FieldCandidate; canBitrix24ToMoysklad: boolean; canMoyskladToBitrix24: boolean };
 type AutoMatchBlock = { matches: AutoMatch[]; unmatched: number; conflicts: number };
@@ -209,7 +215,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         void loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }).then((nextCatalogs) => {
           if (cancelled) return;
           setCatalogs(nextCatalogs);
-          setDraft((current) => current ? includeCurrentCatalogSources(current, nextCatalogs) : current);
+          setDraft((current) => current ? includeCurrentNamedSources(includeCurrentCatalogSources(current, nextCatalogs), nextCatalogs) : current);
           setCatalogError('');
         }).catch((cause) => {
           if (!cancelled) setCatalogError(cause instanceof Error ? cause.message : 'Не удалось загрузить справочники');
@@ -268,6 +274,15 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         }),
       },
     }));
+  }
+
+  function updateNamedPair(kind: ReferenceKind, source: { id: string; label: string }, targetId: string, status: NamedReferencePair['status']) {
+    changeDraft((current) => {
+      const pairs = current.references.namedPairs ?? [];
+      const target = catalogs.namedReferences[kind]?.targets.find((item) => item.id === targetId);
+      const next: NamedReferencePair = { kind, bitrix24Id: source.id, bitrix24Label: source.label, moyskladId: targetId || null, moyskladLabel: target?.label ?? null, status: targetId ? status : 'unmapped' };
+      return { ...current, references: { ...current.references, namedPairs: [...pairs.filter((pair) => pair.kind !== kind || pair.bitrix24Id !== source.id), next] } };
+    });
   }
 
   async function loadFieldMetadata(entity = mappingEntity) {
@@ -390,7 +405,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       if (!response.ok) throw new Error(body || 'Не удалось сохранить новую версию настроек');
       const nextDocument = JSON.parse(body) as SettingsDocument;
       setDocument(nextDocument);
-      setDraft(catalogs ? includeCurrentCatalogSources(nextDocument.config, catalogs) : structuredClone(nextDocument.config));
+      setDraft(catalogs ? includeCurrentNamedSources(includeCurrentCatalogSources(nextDocument.config, catalogs), catalogs) : structuredClone(nextDocument.config));
       setShowSaveWarning(false);
       setPreviewResults([]);
       setAutoMatchSummary(null);
@@ -552,6 +567,45 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         </article>;
         })}
       </section>
+      <section className="field-editor-section" aria-label="Сотрудники, стадии и справочные значения">
+        <div className="panel-heading"><div><p className="eyebrow">СВЯЗИ И СТАТУСЫ</p><h3>Сотрудники, организации и справочники</h3></div></div>
+        <p className="panel-description">Автопоиск предлагает совпадения по названию, но не подтверждает их автоматически. Выберите значение МойСклад и подтвердите каждую пару отдельно.</p>
+        {(() => {
+          const employees = draft.references.namedPairs ?? [];
+          const duplicateEmployees = new Map<string, NamedReferencePair[]>();
+          for (const pair of employees.filter((candidate) => candidate.kind === 'employees' && candidate.status === 'confirmed' && candidate.moyskladId)) {
+            duplicateEmployees.set(pair.moyskladId!, [...(duplicateEmployees.get(pair.moyskladId!) ?? []), pair]);
+          }
+          const conflicts = [...duplicateEmployees.entries()].filter(([, pairs]) => pairs.length > 1);
+          return conflicts.length ? <p role="alert" className="inline-error">Один сотрудник МойСклад сопоставлен с несколькими сотрудниками Bitrix24 ({conflicts.length} конфликтов). Проверьте назначения перед включением обмена.</p> : null;
+        })()}
+        {referenceKinds.map(([kind, title]) => {
+          const catalog = catalogs.namedReferences[kind];
+          const savedPairs = draft.references.namedPairs ?? [];
+          return <details key={kind} className="field-reference-group">
+            <summary>{title} · {savedPairs.filter((pair) => pair.kind === kind && pair.status === 'confirmed').length} подтверждено</summary>
+            {!catalog ? <p role="alert">Каталог недоступен.</p> : <div className="reference-map-list">{catalog.sources.map(({ source, targetId, targetLabel, status, suggestion, ambiguousSuggestions }) => {
+              const saved = savedPairs.find((pair) => pair.kind === kind && pair.bitrix24Id === source.id);
+              const selectedId = saved?.moyskladId ?? targetId ?? '';
+              return <article key={source.id} className="reference-map-row">
+                <div><strong>{source.label || source.id}</strong><small>Bitrix24{source.group ? ` · Воронка: ${source.group}` : ''} · {source.code || source.id} · {saved?.status ?? status}</small>
+                  {suggestion && <small>Предложение: {suggestion.label}</small>}
+                  {ambiguousSuggestions.length > 0 && <small role="alert">Несколько кандидатов: {ambiguousSuggestions.map((item) => item.label).join(', ')}</small>}
+                  {saved?.status === 'confirmed' && targetLabel && <small>Подтверждено: {targetLabel}</small>}
+                </div>
+                <label>МойСклад<select aria-label={`${title}: значение МойСклад для ${source.label}`} value={selectedId} onChange={(event) => updateNamedPair(kind, source, event.target.value, 'suggested')}>
+                  <option value="">Не сопоставлять</option>
+                  {selectedId && !catalog.targets.some((target) => target.id === selectedId) && <option value={selectedId}>{targetLabel ?? 'Сохранённое, отсутствующее в каталоге'} · {selectedId}</option>}
+                  {catalog.targets.map((target) => <option key={target.id} value={target.id}>{target.label} · {target.code || target.id}</option>)}
+                </select></label>
+                {suggestion && !selectedId && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, suggestion.id, 'suggested')}>Использовать предложение</button>}
+                {selectedId && saved?.status !== 'confirmed' && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, selectedId, 'confirmed')}>Подтвердить пару</button>}
+                {saved?.status === 'confirmed' && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, '', 'unmapped')}>Снять пару</button>}
+              </article>;
+            })}</div>}
+          </details>;
+        })}
+      </section>
       </details>
 
       <div className="field-save-bar"><p>Сохранение создаёт версию {document.version + 1} и сразу применяется к новым событиям.</p><button type="button" onClick={() => setShowSaveWarning(true)} disabled={saving}>Сохранить новую версию</button></div>
@@ -586,8 +640,29 @@ function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs
   return next;
 }
 
+function includeCurrentNamedSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {
+  const next = structuredClone(config);
+  const pairs = next.references.namedPairs ?? [];
+  const result = [...pairs];
+  for (const [kind] of referenceKinds) {
+    for (const item of catalogs.namedReferences[kind]?.sources ?? []) {
+      if (result.some((pair) => pair.kind === kind && pair.bitrix24Id === item.source.id)) continue;
+      result.push({
+        kind,
+        bitrix24Id: item.source.id,
+        bitrix24Label: item.source.label,
+        moyskladId: item.suggestion?.id ?? null,
+        moyskladLabel: item.suggestion?.label ?? null,
+        status: item.suggestion ? 'suggested' : 'unmapped',
+      });
+    }
+  }
+  next.references.namedPairs = result;
+  return next;
+}
+
 async function loadCatalogPages(headers: Record<string, string>, inspect: (response: Response) => void): Promise<Catalogs> {
-  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
+  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
   for (const kind of ['units', 'priceTypes'] as const) {
     for (const system of ['bitrix24', 'moysklad'] as const) {
       let cursor: string | null = null;
@@ -605,6 +680,8 @@ async function loadCatalogPages(headers: Record<string, string>, inspect: (respo
   const metaResponse = await fetch(`${endpoint}/catalogs`, { headers });
   inspect(metaResponse);
   if (!metaResponse.ok) throw new Error('Не удалось загрузить метаданные справочников');
-  result.dictionaries = (await metaResponse.json() as Catalogs).dictionaries;
+  const metadata = await metaResponse.json() as Catalogs;
+  result.dictionaries = metadata.dictionaries;
+  result.namedReferences = metadata.namedReferences;
   return result;
 }

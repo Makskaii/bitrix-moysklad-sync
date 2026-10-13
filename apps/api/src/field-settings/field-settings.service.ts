@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
-import { FieldSettingsConfigDto, VersionedFieldSettingsDto } from './field-settings.dto';
+import { FieldSettingsConfigDto, NamedReferenceKind, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 
@@ -49,6 +49,7 @@ export class FieldSettingsService {
     const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
+    const namedCatalogs = await this.readOnlyData.referenceCatalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
     const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
@@ -73,6 +74,13 @@ export class FieldSettingsService {
     const livePriceTypeIds = new Set(catalogs.priceTypes.moysklad.map((priceType) => priceType.id));
     for (const unit of config.references.units) if (unit.moyskladId && !liveUnitIds.has(unit.moyskladId)) throw new BadRequestException(`MySklad unit ${unit.moyskladId} no longer exists`);
     for (const priceType of config.references.priceTypes) if (priceType.moyskladId && !livePriceTypeIds.has(priceType.moyskladId)) throw new BadRequestException(`MySklad price type ${priceType.moyskladId} no longer exists`);
+    for (const pair of config.references.namedPairs ?? []) {
+      const sourceIds = new Set(namedCatalogs[pair.kind].bitrix24.map((item) => item.id));
+      const targetIds = new Set(namedCatalogs[pair.kind].moysklad.map((item) => item.id));
+      if (!sourceIds.has(pair.bitrix24Id)) throw new BadRequestException(`Bitrix24 reference ${pair.bitrix24Id} no longer exists in ${pair.kind}`);
+      if (pair.moyskladId && !targetIds.has(pair.moyskladId)) throw new BadRequestException(`MySklad reference ${pair.moyskladId} no longer exists in ${pair.kind}`);
+      if (pair.status === 'confirmed' && !pair.moyskladId) throw new BadRequestException(`Reference ${pair.bitrix24Id} in ${pair.kind} must have a target before it is confirmed`);
+    }
     }
     const version = await this.database.$transaction(async (transaction) => {
       const states = await transaction.$queryRaw<Array<{ version: number }>>`
@@ -96,12 +104,27 @@ export class FieldSettingsService {
   }
 
   async catalogs(bitrixAccessToken: string) {
-    const [live, dictionaryCatalogs] = await Promise.all([
+    const [live, dictionaryCatalogs, namedCatalogs] = await Promise.all([
       this.readOnlyData.catalogs(bitrixAccessToken),
       this.readOnlyData.dictionaryCatalogs(bitrixAccessToken),
+      this.readOnlyData.referenceCatalogs(bitrixAccessToken),
     ]);
+    const active = await this.active();
+    const namedPairs = active.config.references.namedPairs ?? [];
     return {
       ...live,
+      namedReferences: Object.fromEntries(Object.entries(namedCatalogs).map(([kind, catalogs]) => {
+        const pairs = namedPairs.filter((pair) => pair.kind === kind);
+        const sources = catalogs.bitrix24.map((source) => {
+          const saved = pairs.find((pair) => pair.bitrix24Id === source.id);
+          const candidates = kind === 'currencies' && source.code
+            ? catalogs.moysklad.filter((candidate) => candidate.code === source.code)
+            : catalogs.moysklad.filter((candidate) => normalizeReferenceLabel(candidate.label) === normalizeReferenceLabel(source.label));
+          const suggestion = candidates.length === 1 ? candidates[0]! : null;
+          return { source, targetId: saved?.moyskladId ?? null, targetLabel: saved?.moyskladLabel ?? null, status: saved?.status ?? 'unmapped', suggestion: saved ? null : suggestion, ambiguousSuggestions: !saved && candidates.length > 1 ? candidates : [] };
+        });
+        return [kind, { sources, targets: catalogs.moysklad }];
+      })) as Record<NamedReferenceKind, unknown>,
       dictionaries: DEFAULT_FIELD_SETTINGS.references.dictionaries.map(({ key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId }) => ({
         key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId,
         values: dictionaryCatalogs.find((candidate) => candidate.key === key),
@@ -185,6 +208,9 @@ export class FieldSettingsService {
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
       const reverse = rule.moyskladToBitrix24 as JsonRecord;
+      if (entity === 'catalog' && forward.enabled === true) {
+        throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
+      }
       if (forward.enabled === true && isRecord(forward.transform) && forward.transform.kind === 'copy') requireField(entity, 'moysklad', rule.targetField, true);
       if (reverse.enabled === true && isRecord(reverse.transform) && reverse.transform.kind === 'copy') requireField(entity, 'bitrix24', rule.sourceField, true);
     }
@@ -192,6 +218,9 @@ export class FieldSettingsService {
       const group = candidate as unknown as JsonRecord;
       const entity = String(group.entity);
       const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+      if (entity === 'catalog' && b24ToMs) {
+        throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
+      }
       for (const sourceField of group.sourceFields as string[]) requireField(entity, b24ToMs ? 'bitrix24' : 'moysklad', sourceField, false);
       requireField(entity, b24ToMs ? 'moysklad' : 'bitrix24', group.targetField, true);
     }
@@ -374,9 +403,30 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const units = validateUnits(references.units);
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
+  const namedPairs = validateNamedPairs(references.namedPairs ?? []);
   for (const rule of value.rules) validateRule(rule);
   for (const group of value.groups) validateGroup(group);
-  return { ...value, references: { ...references, units, priceTypes, dictionaries } } as FieldSettingsConfig;
+  return { ...value, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function validateNamedPairs(value: unknown) {
+  const kinds = new Set<NamedReferenceKind>(['employees', 'currencies', 'organizations', 'warehouses', 'projects', 'dealStages']);
+  if (!Array.isArray(value)) throw new BadRequestException('references.namedPairs must be an array');
+  const sources = new Set<string>();
+  return value.map((candidate) => {
+    if (!isRecord(candidate) || !isString(candidate.kind) || !kinds.has(candidate.kind as NamedReferenceKind) || !isString(candidate.bitrix24Id) || !isString(candidate.bitrix24Label) || !(candidate.moyskladId === null || isString(candidate.moyskladId)) || !(candidate.moyskladLabel === null || isString(candidate.moyskladLabel)) || !['suggested', 'confirmed', 'unmapped'].includes(String(candidate.status))) {
+      throw new BadRequestException('Each named reference pair needs a supported kind, source, target, labels, and status');
+    }
+    const key = `${candidate.kind}:${candidate.bitrix24Id}`;
+    if (sources.has(key)) throw new BadRequestException(`Named reference ${key} is duplicated`);
+    sources.add(key);
+    if (candidate.status === 'confirmed' && !candidate.moyskladId) throw new BadRequestException(`Named reference ${key} cannot be confirmed without a MySklad ID`);
+    return candidate;
+  });
+}
+
+function normalizeReferenceLabel(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
 }
 
 function validateDictionaries(value: unknown) {

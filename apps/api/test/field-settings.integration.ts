@@ -14,6 +14,7 @@ let apiUrl: string;
 const pairsByKey: Record<string, string> = {};
 const createdPairIds: string[] = [];
 const fakeUpstreamMethods: string[] = [];
+const fakeB24ListTypes: Array<{ id: string; type: string }> = [];
 const fakeB24UserFieldStarts: number[] = [];
 let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
@@ -90,8 +91,23 @@ before(async () => {
               ? { catalogs: [{ id: 11, name: 'Товары' }] }
             : method === 'catalog.product.get.json'
               ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
+            : method === 'crm.category.list.json'
+              ? []
+              : method === 'crm.status.list.json'
+                ? [{ STATUS_ID: 'NEW', NAME: 'Новая сделка' }]
+              : method === 'user.get.json'
+                ? [{ ID: 1, NAME: 'Ada', LAST_NAME: 'Lovelace' }]
+              : method === 'crm.currency.list.json'
+                ? [{ CURRENCY: 'RUB', FULL_NAME: 'Российский рубль' }]
             : method === 'lists.element.get.json'
-              ? (form.get('IBLOCK_ID') === '42' ? APPROVED_DICTIONARY_PAIRS.service : APPROVED_DICTIONARY_PAIRS.paymentMethod).map(([ID]) => ({ ID, CODE: `code-${ID}`, NAME: `Value ${ID}` }))
+              ? (() => {
+                const id = form.get('IBLOCK_ID') ?? '';
+                fakeB24ListTypes.push({ id, type: form.get('IBLOCK_TYPE_ID') ?? '' });
+                const approved = id === '42' ? APPROVED_DICTIONARY_PAIRS.service : id === '44' ? APPROVED_DICTIONARY_PAIRS.paymentMethod : null;
+                return approved
+                  ? approved.map(([ID]) => ({ ID, CODE: `code-${ID}`, NAME: `Value ${ID}` }))
+                  : [{ ID: Number(id) * 100, CODE: `list-${id}-code`, NAME: `List ${id} value` }];
+              })()
           : method === 'crm.company.get.json'
             ? { ID: form.get('id'), TITLE: 'Example Company' }
           : { ID: form.get('id'), NAME: 'Ada', LAST_NAME: 'Lovelace', TITLE: 'Sample', EMAIL: [{ VALUE: 'source@example.test', VALUE_TYPE: 'WORK' }] };
@@ -107,8 +123,11 @@ before(async () => {
       const dictionaryRows = serviceDirectory
         ? APPROVED_DICTIONARY_PAIRS.service.map(([, id]) => ({ id, name: `MS service ${id}` }))
         : paymentDirectory ? APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([, id]) => ({ id, name: `MS payment ${id}` })) : [];
+      const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project', '/entity/customerorder/metadata/states'].some((path) => url.pathname.endsWith(path));
       const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
+        : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
+        : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: url.pathname.endsWith('/metadata/states') ? 'Новая сделка' : 'Demo reference', code: 'REF' }], meta: { size: 1 } }
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
@@ -349,6 +368,28 @@ test('live service and payment catalogs expose current choices and preserve edit
   assert.equal(service.values.bitrix24[0].title, `Value ${service.values.bitrix24[0].id}`);
 });
 
+test('live reference catalogs include both systems, keep exact-name matches as suggestions, and include deal stages', async () => {
+  const before = fakeUpstreamMethods.length;
+  fakeB24ListTypes.length = 0;
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const body = await response.json() as { namedReferences: Record<string, { sources: Array<{ source: { id: string; label: string }; status: string; suggestion: { id: string } | null }>; targets: Array<{ id: string; label: string }> }> };
+  assert.equal(response.status, 200);
+  for (const kind of ['employees', 'currencies', 'organizations', 'warehouses', 'projects', 'dealStages']) {
+    assert.ok(body.namedReferences[kind]?.sources.length, `${kind} source catalog is visible`);
+    assert.ok(body.namedReferences[kind]?.targets.length, `${kind} target catalog is visible`);
+  }
+  assert.ok(body.namedReferences.dealStages.sources.some((row) => row.source.id === '0:NEW' && row.status === 'unmapped' && row.suggestion?.id === 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+  assert.ok(body.namedReferences.currencies.sources.some((row) => row.source.id === 'RUB' && row.suggestion?.id === 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'), 'currencies are suggested by their code even when display names differ');
+  for (const id of ['34', '38', '42', '44', '88']) {
+    assert.ok(fakeB24ListTypes.some((item) => item.id === id), `Bitrix24 rest_entity list ${id} is loaded`);
+    assert.ok(fakeB24ListTypes.filter((item) => item.id === id).every((item) => item.type === 'rest_entity'), `Bitrix24 list ${id} uses its actual rest_entity type`);
+  }
+  assert.ok(fakeUpstreamMethods.includes('crm.category.list.json'));
+  assert.ok(fakeUpstreamMethods.includes('crm.status.list.json'));
+  assert.ok(fakeUpstreamMethods.includes('states'), 'MySklad order states are loaded as read-only metadata');
+  assert.ok(fakeUpstreamMethods.length > before);
+});
+
 test('catalog paging exposes live candidates and allows manual reassignment to an existing unapproved ID', async () => {
   const pageResponse = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=units&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
   const page = await pageResponse.json() as { items: Array<{ id: string; code: string; label: string }>; nextCursor: string | null };
@@ -358,17 +399,35 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
 
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   const active = await activeResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }> } } };
-  const config = structuredClone(active.config) as { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }> }; [key: string]: unknown };
+  const config = structuredClone(active.config) as { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; namedPairs: Array<{ kind: string; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: string }> }; [key: string]: unknown };
   config.references.units = config.references.units.map((unit) => unit.bitrix24Id === 14
     ? { ...unit, moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', status: 'configured' }
     : unit);
+  config.references.namedPairs = [{ kind: 'dealStages', bitrix24Id: '0:NEW', bitrix24Label: 'Новая сделка', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Новая сделка', status: 'confirmed' }];
   const saveResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
     method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
     body: JSON.stringify({ config }),
   });
-  const saved = await saveResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null }> } } };
+  const saved = await saveResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null }>; namedPairs: Array<{ kind: string; bitrix24Id: string; moyskladId: string | null; status: string }> } } };
   assert.equal(saveResponse.status, 200);
   assert.equal(saved.config.references.units.find((unit) => unit.bitrix24Id === 14)?.moyskladId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  assert.deepEqual(saved.config.references.namedPairs, [{ kind: 'dealStages', bitrix24Id: '0:NEW', bitrix24Label: 'Новая сделка', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Новая сделка', status: 'confirmed' }]);
+
+  const invalidConfig = structuredClone(saved.config) as typeof config;
+  invalidConfig.references.namedPairs[0]!.moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const invalidSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: invalidConfig }),
+  });
+  assert.equal(invalidSave.status, 400, 'stale/deleted MySklad target references cannot be saved');
+
+  const invalidSourceConfig = structuredClone(saved.config) as typeof config;
+  invalidSourceConfig.references.namedPairs[0]!.bitrix24Id = '0:REMOVED';
+  const invalidSourceSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: invalidSourceConfig }),
+  });
+  assert.equal(invalidSourceSave.status, 400, 'stale/deleted Bitrix24 source references cannot be saved');
 });
 
 test('saving creates an immutable version and activates it for future events only', async () => {
@@ -436,6 +495,37 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
     }], groups: [] },
   }) });
   assert.equal(pairSpecific.status, 201, `entity-wide field mappings must not depend on the selected preview pair: ${await pairSpecific.text()}`);
+});
+
+test('catalog field settings reject Bitrix24-to-MySklad product writes for rules and groups', async () => {
+  const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const active = await activeResponse.json() as { config: Record<string, unknown> & { references: Record<string, unknown> } };
+  const ruleConfig = {
+    ...active.config,
+    rules: [{
+      id: 'forbidden-catalog-write', entity: 'catalog', sourceField: 'NAME', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+    }],
+  };
+  const ruleResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: ruleConfig }),
+  });
+  assert.equal(ruleResponse.status, 400, 'catalog rules cannot write Bitrix24 product changes into MySklad');
+
+  const groupConfig = {
+    ...active.config,
+    groups: [{
+      id: 'forbidden-catalog-group', entity: 'catalog', direction: 'BITRIX24_TO_MOYSKLAD',
+      sourceFields: ['NAME'], targetField: 'name', transform: { kind: 'join-non-empty', separator: ' ' },
+    }],
+  };
+  const groupResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: groupConfig }),
+  });
+  assert.equal(groupResponse.status, 400, 'catalog groups cannot write Bitrix24 product changes into MySklad');
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {
