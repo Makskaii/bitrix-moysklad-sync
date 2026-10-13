@@ -12,6 +12,8 @@ export type EntityPairDto = {
   entityType: EntityType;
   bitrix24Id: string;
   moyskladId: string;
+  moyskladType: string | null;
+  moyskladParentId: string | null;
   active: true;
   source: string;
   reason: string | null;
@@ -37,6 +39,8 @@ export type AssignEntityPairInput = {
   entityType: EntityType;
   bitrix24Id: string;
   moyskladId: string;
+  moyskladType?: 'counterparty' | 'contactperson' | 'customerorder' | 'product';
+  moyskladParentId?: string;
   replaceExisting?: boolean;
 };
 
@@ -48,7 +52,7 @@ export class EntityPairService {
     const rows = await this.database.entityPair.findMany({
       where: { active: true, ...(entityType ? { entityType } : {}) },
       orderBy: [{ entityType: 'asc' }, { createdAt: 'desc' }],
-      select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, active: true, source: true, reason: true, createdAt: true },
+      select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, moyskladParentId: true, active: true, source: true, reason: true, createdAt: true },
     });
     return rows.map((row) => ({ ...row, entityType: row.entityType as EntityType, active: true }));
   }
@@ -86,6 +90,8 @@ export class EntityPairService {
             entityType: input.entityType,
             bitrix24Id: input.bitrix24Id,
             moyskladId: input.moyskladId,
+            moyskladType: input.moyskladType ?? null,
+            moyskladParentId: input.moyskladParentId ?? null,
             active: true,
             source: 'MANUAL',
             reason: conflicts.length ? 'ADMIN_REASSIGNED' : 'ADMIN_ASSIGNED',
@@ -100,6 +106,12 @@ export class EntityPairService {
           },
           data: { status: 'RESOLVED', resolvedAt: new Date() },
         });
+        if (input.entityType === 'CONTACT' || input.entityType === 'COMPANY') {
+          await transaction.clientInventoryObject.updateMany({
+            where: { system: 'BITRIX24', entityType: input.entityType, externalId: input.bitrix24Id },
+            data: { status: 'MATCHED', reason: null },
+          });
+        }
         await transaction.pairReviewCase.updateMany({
           where: {
             entityType: input.entityType,
@@ -137,6 +149,16 @@ function validate(input: AssignEntityPairInput): void {
   if (!isEntityType(input.entityType)) throw new BadRequestException('entityType is unsupported');
   if (!isId(input.bitrix24Id)) throw new BadRequestException('bitrix24Id is required');
   if (!isId(input.moyskladId)) throw new BadRequestException('moyskladId is required');
+  if (input.moyskladType !== undefined && !['counterparty', 'contactperson', 'customerorder', 'product'].includes(input.moyskladType)) {
+    throw new BadRequestException('moyskladType is unsupported');
+  }
+  if (input.moyskladType === 'contactperson' && (input.entityType !== 'CONTACT' || !input.moyskladParentId)) {
+    throw new BadRequestException('A contactperson pair must be a CONTACT with its parent counterparty ID');
+  }
+  if (input.moyskladParentId !== undefined && input.moyskladType !== 'contactperson') {
+    throw new BadRequestException('Only a contactperson pair may specify moyskladParentId');
+  }
+  if (input.moyskladParentId !== undefined && !isId(input.moyskladParentId)) throw new BadRequestException('moyskladParentId is invalid');
   if (input.replaceExisting !== undefined && typeof input.replaceExisting !== 'boolean') {
     throw new BadRequestException('replaceExisting must be boolean');
   }

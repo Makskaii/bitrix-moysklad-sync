@@ -169,6 +169,8 @@ model EntityPair {
   entityType  String
   bitrix24Id  String
   moyskladId  String
+  moyskladType String?
+  moyskladParentId String?
   active      Boolean  @default(true)
   source      String   @default("MANUAL")
   reason      String?
@@ -179,6 +181,48 @@ model EntityPair {
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
+}
+
+model ClientInventoryJob {
+  id                       String   @id @default("client-map")
+  status                   String   @default("idle")
+  phase                    String   @default("BITRIX24_COMPANIES")
+  bitrix24CompanyStart     Int      @default(0)
+  bitrix24ContactStart     Int      @default(0)
+  moyskladCounterpartyOffset Int    @default(0)
+  moyskladContactpersonParentOffset Int @default(0)
+  moyskladContactpersonOffset Int   @default(0)
+  bitrix24CompanyProcessed Int      @default(0)
+  bitrix24ContactProcessed Int      @default(0)
+  moyskladCounterpartyProcessed Int @default(0)
+  moyskladContactpersonProcessed Int @default(0)
+  attempts                 Int      @default(0)
+  error                    String?
+  pauseRequested           Boolean  @default(false)
+  checkpointAt             DateTime?
+  leaseOwner               String?
+  leaseUntil               DateTime?
+  updatedAt                DateTime @updatedAt
+
+  @@index([leaseUntil])
+}
+
+model ClientInventoryObject {
+  id          String   @id @default(cuid())
+  system      String
+  entityType  String
+  nativeType  String
+  externalId  String
+  matchValue  String?
+  parentId    String?
+  status      String   @default("PENDING")
+  reason      String?
+  observedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([system, entityType, externalId])
+  @@index([system, entityType, matchValue])
+  @@index([system, entityType, status, externalId])
 }
 
 model EntityPairBaseline {
