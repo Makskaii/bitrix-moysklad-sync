@@ -1,5 +1,7 @@
 # Feature ticket drafts for the full synchronization scope
 
+> Историческая авторская копия от 09.10.2026. Не использовать как актуальные требования к реализации: действующие описания находятся в GitHub issues #53–#61, родительской спецификации #1, `requirements.md` и `docs/open-decisions-2026-10-12.md`. Позднейшие решения 12–13.10.2026 имеют приоритет; этот файл сохраняется только для истории планирования.
+
 Prepared from current requirements, #1, open issues and comments, closed-ticket/PR reports, and owner decisions Q11–Q36. These complete bodies are to be published as separate issues; this file is the authoring copy.
 
 <!-- ISSUE 1 -->
