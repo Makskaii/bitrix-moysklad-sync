@@ -34,6 +34,14 @@ export class DryRunDocumentReader {
     return { ...body.result, ...(await this.dryWrites?.readback('BITRIX24', 'deal', id)) };
   }
 
+  async readDealOrderCreationTimestamp(system: 'BITRIX24' | 'MOYSKLAD', id: string): Promise<Date | null> {
+    const record = system === 'BITRIX24'
+      ? await this.readBitrix24DealForBaseline(id)
+      : await this.readMoySkladCustomerOrderForBaseline(id);
+    const raw = system === 'BITRIX24' ? record.DATE_CREATE : record.created;
+    return system === 'BITRIX24' ? parseTimestamp(raw) : parseMoySkladTimestamp(raw);
+  }
+
   async readMoySkladCustomerOrder(id: string): Promise<Record<string, unknown>> {
     assertDryServerMode();
     return this.readMoySkladCustomerOrderForBaseline(id);
@@ -71,6 +79,18 @@ function assertConfiguredSyncMode() {
   if (process.env.SYNC_MODE !== 'dry' && process.env.SYNC_MODE !== 'apply') {
     throw new ServiceUnavailableException('Source reads require SYNC_MODE=dry or apply');
   }
+}
+
+function parseTimestamp(value: unknown): Date | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return null;
+  const result = new Date(value);
+  return Number.isNaN(result.getTime()) ? null : result;
+}
+
+function parseMoySkladTimestamp(value: unknown): Date | null {
+  if (typeof value !== 'string') return null;
+  const local = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)$/.exec(value);
+  return parseTimestamp(local ? `${local[1]}T${local[2]}+03:00` : value);
 }
 
 function withTrailingSlash(value: string): string {

@@ -25,6 +25,7 @@ import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
 import { EventIntakeDisabledError, FieldSettingsService } from './field-settings/field-settings.service';
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { EventDispatcherService } from './event-dispatcher.service';
+import { DatabaseRecoveryService } from './database-recovery.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -37,6 +38,7 @@ export class EventIntakeService {
     private readonly syncMode: SyncModeService,
     @Optional() @Inject(WebhookDiagnosticLog) private readonly diagnostics?: WebhookDiagnosticLog,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
+    @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
   ) {}
 
   async receiveBitrix24(payload: EventPayload) {
@@ -154,6 +156,9 @@ export class EventIntakeService {
   }
 
   private async ensureIntakeEnabled() {
+    if (this.databaseRecovery && !await this.databaseRecovery.assertReady()) {
+      throw new ServiceUnavailableException('Database loss recovery is required before webhook intake');
+    }
     const mode = process.env.SYNC_MODE;
     if (mode !== 'dry' && mode !== 'apply') {
       throw new ServiceUnavailableException('SYNC_MODE must be dry or apply');

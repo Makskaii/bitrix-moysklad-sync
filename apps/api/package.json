@@ -9,6 +9,7 @@
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
     "test:provider-failure-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/provider-failure.unit.js",
+    "test:database-recovery": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/database-recovery.unit.js ../../dist/apps/api-test/test/database-recovery.postgres.integration.js",
     "test:product-runtime-gate-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-runtime-gate.unit.js",
     "test:dry-isolation": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/dry-database-isolation.unit.js ../../dist/apps/api-test/test/dry-database-isolation.postgres.integration.js ../../dist/apps/api-test/test/dry-write-isolation.integration.js",
     "test:local-preview-di": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/local-preview-module.di.unit.js",

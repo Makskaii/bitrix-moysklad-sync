@@ -10,6 +10,8 @@ import { SyncModeService } from '../sync-mode.service';
 import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients/client-dependency-resolver';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { DatabaseRecoveryService } from '../database-recovery.service';
+import { writeOperationalLog } from '../monitoring-log';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -37,6 +39,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly syncMode?: SyncModeService,
     @Optional() @Inject(CLIENT_DEPENDENCY_RESOLVER) private readonly clientDependencies?: ClientDependencyResolver,
     @Optional() private readonly documentReader?: DryRunDocumentReader,
+    @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
   ) {}
 
   onApplicationBootstrap() {
@@ -104,6 +107,36 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true },
     });
     if (!event || !event.externalEntityId || !isDealOrderEvent(event) || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
+
+    if (this.databaseRecovery) {
+      const boundary = await this.databaseRecovery.launchBoundary().catch(() => null);
+      if (!boundary || !this.documentReader) {
+        await this.finishBeforeClaim(event, 'MANUAL_REVIEW', 'LAUNCH_BOUNDARY_GUARD_UNAVAILABLE');
+        return null;
+      }
+      let createdAt: Date | null;
+      try {
+        createdAt = await this.documentReader.readDealOrderCreationTimestamp(
+          event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD', event.externalEntityId,
+        );
+      } catch (error) {
+        if (error instanceof ProviderFailure && isRetryableFailure(error)) {
+          await this.finishBeforeClaim(event, 'RETRYABLE_FAILURE', 'CREATION_TIMESTAMP_READ_RETRYABLE', retryAtForFailure(error, event.attempts + 1));
+        } else {
+          await this.finishBeforeClaim(event, 'MANUAL_REVIEW', 'CREATION_TIMESTAMP_UNAVAILABLE');
+        }
+        return null;
+      }
+      if (!createdAt) {
+        await this.finishBeforeClaim(event, 'MANUAL_REVIEW', 'CREATION_TIMESTAMP_UNAVAILABLE');
+        return null;
+      }
+      if (createdAt.getTime() < boundary.getTime()) {
+        await this.finishBeforeClaim(event, 'SKIPPED_PRE_LAUNCH', 'PRE_LAUNCH_DOCUMENT');
+        return null;
+      }
+    }
+
     const staleBefore = new Date(Date.now() - EVENT_LEASE_MS);
     await workerLease?.assertOwned();
     const claim = await this.database.$transaction(async (transaction) => {
@@ -286,6 +319,16 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter: retryAfter ?? null },
       });
     });
+  }
+
+  private async finishBeforeClaim(
+    event: { id: string; status: string }, status: string, reason: string, retryAfter?: Date | null,
+  ) {
+    await this.database.inboundEvent.updateMany({
+      where: { id: event.id, status: event.status },
+      data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter: retryAfter ?? null },
+    });
+    await writeOperationalLog(this.database, status === 'SKIPPED_PRE_LAUNCH' ? 'EVENT' : 'ERROR', reason, event.id);
   }
 
   private async deferWhileInactive(eventId: string, workerLease?: EventWorkerLeaseContext) {

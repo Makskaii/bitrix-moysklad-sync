@@ -46,6 +46,8 @@ import { ProductCardEventProcessor } from './products/product-card-event.process
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
+import { DatabaseRecoveryService } from './database-recovery.service';
+import { setDatabaseRecoveryReady } from './external-write-guard';
 
 @Controller()
 class AppController {
@@ -63,7 +65,7 @@ class AppController {
   controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
     { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
-    EventWorkerLeaseService,
+    EventWorkerLeaseService, DatabaseRecoveryService,
     WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
@@ -77,7 +79,9 @@ class AppController {
 class AppModule {}
 
 async function bootstrap() {
+  setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
+  await app.get(DatabaseRecoveryService).initialize();
   app.useStaticAssets(resolve(__dirname, '../../../../apps/web/dist'));
   await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 }

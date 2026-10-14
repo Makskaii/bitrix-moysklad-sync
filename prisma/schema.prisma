@@ -14,65 +14,94 @@ model TrialAction {
 }
 
 model SyncSetting {
-  id        String   @id @default("global")
-  serviceMode String @default("off")
-  offSince  DateTime?
-  lastInactiveAt DateTime?
-  lastActiveAt DateTime?
-  resumeStatus String @default("idle")
-  resumeFrom DateTime?
-  resumeThrough DateTime?
-  resumeProvider String @default("BITRIX24")
-  resumeBitrixStart Int @default(0)
-  resumeMoyskladOffset Int @default(0)
-  resumeError String?
-  resumeRetryAfter DateTime?
-  resumeAttempts Int @default(0)
-  nightlyScheduledDate String?
-  nightlyStatus String @default("idle")
-  nightlyFrom DateTime?
-  nightlyThrough DateTime?
-  nightlyProvider String @default("BITRIX24")
-  nightlyBitrixStart Int @default(0)
-  nightlyBitrixEntityTypeId Int @default(3)
-  nightlyBitrixLastId String?
-  nightlyMoyskladOffset Int @default(0)
-  nightlyBitrixStatus String @default("pending")
-  nightlyMoyskladStatus String @default("pending")
-  nightlyLeaseToken String?
-  nightlyLeaseExpiresAt DateTime?
-  nightlyRetryAfter DateTime?
-  nightlyAttempts Int @default(0)
-  nightlyError String?
-  updatedAt DateTime @updatedAt
+  id                        String    @id @default("global")
+  serviceMode               String    @default("off")
+  offSince                  DateTime?
+  lastInactiveAt            DateTime?
+  lastActiveAt              DateTime?
+  resumeStatus              String    @default("idle")
+  resumeFrom                DateTime?
+  resumeThrough             DateTime?
+  resumeProvider            String    @default("BITRIX24")
+  resumeBitrixStart         Int       @default(0)
+  resumeMoyskladOffset      Int       @default(0)
+  resumeError               String?
+  resumeRetryAfter          DateTime?
+  resumeAttempts            Int       @default(0)
+  nightlyScheduledDate      String?
+  nightlyStatus             String    @default("idle")
+  nightlyFrom               DateTime?
+  nightlyThrough            DateTime?
+  nightlyProvider           String    @default("BITRIX24")
+  nightlyBitrixStart        Int       @default(0)
+  nightlyBitrixEntityTypeId Int       @default(3)
+  nightlyBitrixLastId       String?
+  nightlyMoyskladOffset     Int       @default(0)
+  nightlyBitrixStatus       String    @default("pending")
+  nightlyMoyskladStatus     String    @default("pending")
+  nightlyLeaseToken         String?
+  nightlyLeaseExpiresAt     DateTime?
+  nightlyRetryAfter         DateTime?
+  nightlyAttempts           Int       @default(0)
+  nightlyError              String?
+  updatedAt                 DateTime  @updatedAt
+}
+
+model DatabaseRecoveryState {
+  id                     String                  @id @default("global")
+  status                 String                  @default("RECOVERY_REQUIRED")
+  previousLaunchBoundary DateTime?
+  pairsRestored          Boolean                 @default(false)
+  lostEventsAcknowledged Boolean                 @default(false)
+  acknowledgedAt         DateTime?
+  acknowledgement        String?
+  updatedAt              DateTime                @updatedAt
+  audits                 DatabaseRecoveryAudit[]
+}
+
+model DatabaseRecoveryAudit {
+  id                     String                @id @default(cuid())
+  action                 String
+  actorType              String
+  actorId                String
+  oldBoundaryAt          DateTime?
+  boundaryAt             DateTime
+  pairsRestored          Boolean
+  lostEventsAcknowledged Boolean
+  acknowledgement        String
+  occurredAt             DateTime              @default(now())
+  recoveryStateId        String
+  recoveryState          DatabaseRecoveryState @relation(fields: [recoveryStateId], references: [id], onDelete: Restrict)
+
+  @@index([occurredAt])
 }
 
 model SyncDirectionSetting {
-  id                    String   @id @default(cuid())
-  entityKey             String   @unique
-  bitrix24ToMoysklad    Boolean  @default(true)
-  moyskladToBitrix24    Boolean  @default(true)
-  updatedAt             DateTime @updatedAt
+  id                 String   @id @default(cuid())
+  entityKey          String   @unique
+  bitrix24ToMoysklad Boolean  @default(true)
+  moyskladToBitrix24 Boolean  @default(true)
+  updatedAt          DateTime @updatedAt
 }
 
 model InboundEvent {
-  id               String   @id @default(cuid())
-  source           String
-  deliveryKey      String
-  eventType        String?
-  externalEntityId String?
-  externalEntityType String?
-  payload          Json
-  status           String   @default("RECEIVED")
-  receivedAt       DateTime @default(now())
-  attempts         Int      @default(0)
+  id                  String                @id @default(cuid())
+  source              String
+  deliveryKey         String
+  eventType           String?
+  externalEntityId    String?
+  externalEntityType  String?
+  payload             Json
+  status              String                @default("RECEIVED")
+  receivedAt          DateTime              @default(now())
+  attempts            Int                   @default(0)
   processingStartedAt DateTime?
-  direction        String?
-  snapshotRevision Int      @default(0)
-  lastSuccessfulAt DateTime?
-  lastErrorCategory String?
-  retryAfter       DateTime?
-  settings          InboundEventSettings?
+  direction           String?
+  snapshotRevision    Int                   @default(0)
+  lastSuccessfulAt    DateTime?
+  lastErrorCategory   String?
+  retryAfter          DateTime?
+  settings            InboundEventSettings?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
@@ -93,21 +122,21 @@ model FieldSettingsState {
 }
 
 model InboundEventSettings {
-  eventId        String              @id
+  eventId         String               @id
   settingsVersion Int
-  pinnedAt       DateTime            @default(now())
-  event          InboundEvent        @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  settings       FieldSettingsVersion @relation(fields: [settingsVersion], references: [version], onDelete: Restrict)
+  pinnedAt        DateTime             @default(now())
+  event           InboundEvent         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  settings        FieldSettingsVersion @relation(fields: [settingsVersion], references: [version], onDelete: Restrict)
 
   @@index([settingsVersion])
 }
 
 model InboundEntityLock {
-  entityKey String @id
-  ownerToken String
-  eventId String
+  entityKey      String   @id
+  ownerToken     String
+  eventId        String
   leaseExpiresAt DateTime
-  updatedAt DateTime @updatedAt
+  updatedAt      DateTime @updatedAt
 
   @@index([leaseExpiresAt])
 }
@@ -123,17 +152,17 @@ model EventWorkerLease {
 }
 
 model ManualReviewCase {
-  id                String   @id @default(cuid())
-  eventId           String   @unique
-  source            String
-  eventType         String?
-  externalEntityId  String?
+  id                 String    @id @default(cuid())
+  eventId            String    @unique
+  source             String
+  eventType          String?
+  externalEntityId   String?
   externalEntityType String?
-  reason            String
-  diagnostic        Json?
-  status            String   @default("OPEN")
-  openedAt          DateTime @default(now())
-  resolvedAt        DateTime?
+  reason             String
+  diagnostic         Json?
+  status             String    @default("OPEN")
+  openedAt           DateTime  @default(now())
+  resolvedAt         DateTime?
 
   @@index([status, openedAt])
 }
@@ -163,52 +192,52 @@ model OperationalLog {
 }
 
 model DryRunWriteProposal {
-  id          String   @id
-  eventId     String?
-  provider    String
-  entityType  String
-  entityId    String
-  operation   String
-  fields      Json
-  createdAt   DateTime @default(now())
+  id         String   @id
+  eventId    String?
+  provider   String
+  entityType String
+  entityId   String
+  operation  String
+  fields     Json
+  createdAt  DateTime @default(now())
 
   @@index([eventId, createdAt])
   @@index([provider, entityType, entityId, createdAt])
 }
 
 model ContactPair {
-  id                      String           @id @default(cuid())
-  bitrix24ContactId       String           @unique
-  moyskladCounterpartyId  String           @unique
-  moyskladType            String           @default("COUNTERPARTY")
-  active                  Boolean          @default(true)
-  snapshot                ContactSnapshot?
+  id                     String           @id @default(cuid())
+  bitrix24ContactId      String           @unique
+  moyskladCounterpartyId String           @unique
+  moyskladType           String           @default("COUNTERPARTY")
+  active                 Boolean          @default(true)
+  snapshot               ContactSnapshot?
 }
 
 model ContactSnapshot {
-  pairId              String      @id
-  bitrix24Email       String
-  moyskladEmail       String
-  bitrix24UpdatedAt   DateTime
-  moyskladUpdatedAt   DateTime
-  revision            Int         @default(1)
-  lastSuccessfulAt    DateTime?
-  pair                ContactPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+  pairId            String      @id
+  bitrix24Email     String
+  moyskladEmail     String
+  bitrix24UpdatedAt DateTime
+  moyskladUpdatedAt DateTime
+  revision          Int         @default(1)
+  lastSuccessfulAt  DateTime?
+  pair              ContactPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }
 
 model EntityPair {
-  id          String   @id @default(cuid())
-  entityType  String
-  bitrix24Id  String
-  moyskladId  String
-  moyskladType String?
+  id               String               @id @default(cuid())
+  entityType       String
+  bitrix24Id       String
+  moyskladId       String
+  moyskladType     String?
   moyskladParentId String?
-  active      Boolean  @default(true)
-  source      String   @default("MANUAL")
-  reason      String?
-  createdAt   DateTime @default(now())
-  baseline    EntityPairBaseline?
-  syncState   EntityPairSyncState?
+  active           Boolean              @default(true)
+  source           String               @default("MANUAL")
+  reason           String?
+  createdAt        DateTime             @default(now())
+  baseline         EntityPairBaseline?
+  syncState        EntityPairSyncState?
 
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
@@ -216,41 +245,41 @@ model EntityPair {
 }
 
 model ClientInventoryJob {
-  id                       String   @id @default("client-map")
-  status                   String   @default("idle")
-  phase                    String   @default("BITRIX24_COMPANIES")
-  bitrix24CompanyStart     Int      @default(0)
-  bitrix24ContactStart     Int      @default(0)
-  moyskladCounterpartyOffset Int    @default(0)
-  moyskladContactpersonParentOffset Int @default(0)
-  moyskladContactpersonOffset Int   @default(0)
-  bitrix24CompanyProcessed Int      @default(0)
-  bitrix24ContactProcessed Int      @default(0)
-  moyskladCounterpartyProcessed Int @default(0)
-  moyskladContactpersonProcessed Int @default(0)
-  attempts                 Int      @default(0)
-  error                    String?
-  pauseRequested           Boolean  @default(false)
-  checkpointAt             DateTime?
-  leaseOwner               String?
-  leaseUntil               DateTime?
-  updatedAt                DateTime @updatedAt
+  id                                String    @id @default("client-map")
+  status                            String    @default("idle")
+  phase                             String    @default("BITRIX24_COMPANIES")
+  bitrix24CompanyStart              Int       @default(0)
+  bitrix24ContactStart              Int       @default(0)
+  moyskladCounterpartyOffset        Int       @default(0)
+  moyskladContactpersonParentOffset Int       @default(0)
+  moyskladContactpersonOffset       Int       @default(0)
+  bitrix24CompanyProcessed          Int       @default(0)
+  bitrix24ContactProcessed          Int       @default(0)
+  moyskladCounterpartyProcessed     Int       @default(0)
+  moyskladContactpersonProcessed    Int       @default(0)
+  attempts                          Int       @default(0)
+  error                             String?
+  pauseRequested                    Boolean   @default(false)
+  checkpointAt                      DateTime?
+  leaseOwner                        String?
+  leaseUntil                        DateTime?
+  updatedAt                         DateTime  @updatedAt
 
   @@index([leaseUntil])
 }
 
 model ClientInventoryObject {
-  id          String   @id @default(cuid())
-  system      String
-  entityType  String
-  nativeType  String
-  externalId  String
-  matchValue  String?
-  parentId    String?
-  status      String   @default("PENDING")
-  reason      String?
-  observedAt  DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String   @id @default(cuid())
+  system     String
+  entityType String
+  nativeType String
+  externalId String
+  matchValue String?
+  parentId   String?
+  status     String   @default("PENDING")
+  reason     String?
+  observedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   @@unique([system, entityType, externalId])
   @@index([system, entityType, matchValue])
@@ -258,15 +287,15 @@ model ClientInventoryObject {
 }
 
 model EntityPairBaseline {
-  pairId              String     @id
-  eventId             String
-  settingsVersion     Int
-  bitrix24Values      Json
-  moyskladValues      Json
-  bitrix24UpdatedAt   DateTime?
-  moyskladUpdatedAt   DateTime?
-  capturedAt          DateTime   @default(now())
-  pair                EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+  pairId            String     @id
+  eventId           String
+  settingsVersion   Int
+  bitrix24Values    Json
+  moyskladValues    Json
+  bitrix24UpdatedAt DateTime?
+  moyskladUpdatedAt DateTime?
+  capturedAt        DateTime   @default(now())
+  pair              EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 
   @@index([eventId])
   @@index([capturedAt])
@@ -282,14 +311,14 @@ model EntityPairSyncState {
 }
 
 model PairReviewCase {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   entityType     String
   sourceSystem   String
   sourceEntityId String
   eventId        String?
   reason         String
-  status         String   @default("OPEN")
-  openedAt       DateTime @default(now())
+  status         String    @default("OPEN")
+  openedAt       DateTime  @default(now())
   resolvedAt     DateTime?
 
   @@index([status, openedAt])
@@ -334,63 +363,63 @@ model HistoricalInventoryEntry {
 }
 
 model HistoricalDealOrderMatchingRun {
-  id                       String   @id @default(cuid())
-  status                   String   @default("running")
-  phase                    String   @default("KEYS")
-  bitrixCursor             String?
-  moyskladCursor           String?
-  bitrixProcessed          Int      @default(0)
-  moyskladProcessed        Int      @default(0)
-  bitrixTotal              Int
-  moyskladTotal            Int
-  inventoryCheckpointAt    DateTime
-  inventoryRevision        Int
-  bitrixInventoryMaxUpdate DateTime?
+  id                         String                            @id @default(cuid())
+  status                     String                            @default("running")
+  phase                      String                            @default("KEYS")
+  bitrixCursor               String?
+  moyskladCursor             String?
+  bitrixProcessed            Int                               @default(0)
+  moyskladProcessed          Int                               @default(0)
+  bitrixTotal                Int
+  moyskladTotal              Int
+  inventoryCheckpointAt      DateTime
+  inventoryRevision          Int
+  bitrixInventoryMaxUpdate   DateTime?
   moyskladInventoryMaxUpdate DateTime?
-  inventoryFingerprint    String
-  counts                   Json     @default("{}")
-  applyStatus              String   @default("not_started")
-  applyCursor              String?
-  appliedCount             Int      @default(0)
-  applyError               String?
-  leaseOwner               String?
-  leaseUntil               DateTime?
-  error                    String?
-  createdAt                DateTime @default(now())
-  updatedAt                DateTime @updatedAt
-  results                  HistoricalDealOrderMatchResult[]
-  duplicateKeys            HistoricalDealOrderDuplicateKey[]
+  inventoryFingerprint       String
+  counts                     Json                              @default("{}")
+  applyStatus                String                            @default("not_started")
+  applyCursor                String?
+  appliedCount               Int                               @default(0)
+  applyError                 String?
+  leaseOwner                 String?
+  leaseUntil                 DateTime?
+  error                      String?
+  createdAt                  DateTime                          @default(now())
+  updatedAt                  DateTime                          @updatedAt
+  results                    HistoricalDealOrderMatchResult[]
+  duplicateKeys              HistoricalDealOrderDuplicateKey[]
 
   @@index([status, createdAt])
   @@index([leaseUntil])
 }
 
 model HistoricalDealOrderDuplicateKey {
-  runId      String
-  keyValue   String
+  runId       String
+  keyValue    String
   recordCount Int
-  run        HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  run         HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
   @@id([runId, keyValue])
 }
 
 model HistoricalDealOrderMatchResult {
-  id                 String   @id @default(cuid())
-  runId              String
-  sourceSystem       String
-  sourceEntityId     String
-  linkedEntityId     String?
-  category           String
-  keyValue           String?
-  sourceLabel        String?
-  linkedLabel        String?
-  keyFieldCode       String
-  keyFieldTitle      String?
-  applyStatus        String   @default("not_applicable")
-  pairId             String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-  run                HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  id             String                         @id @default(cuid())
+  runId          String
+  sourceSystem   String
+  sourceEntityId String
+  linkedEntityId String?
+  category       String
+  keyValue       String?
+  sourceLabel    String?
+  linkedLabel    String?
+  keyFieldCode   String
+  keyFieldTitle  String?
+  applyStatus    String                         @default("not_applicable")
+  pairId         String?
+  createdAt      DateTime                       @default(now())
+  updatedAt      DateTime                       @updatedAt
+  run            HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
   @@unique([runId, sourceSystem, sourceEntityId])
   @@index([runId, category, id])

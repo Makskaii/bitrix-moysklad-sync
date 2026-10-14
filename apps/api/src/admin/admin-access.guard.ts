@@ -30,9 +30,35 @@ export async function isBitrixAdministrator(
   }
 }
 
+export async function readBitrixAdministratorIdentity(accessToken: string, fetcher: typeof fetch = fetch): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), checkTimeoutMs);
+  try {
+    const body = new URLSearchParams({ auth: accessToken });
+    const response = await fetcher(bitrixAdminMethod.replace('user.admin.json', 'user.current.json'), {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body, signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !isRecord(payload.result)) return null;
+    const id = payload.result.ID ?? payload.result.id;
+    return (typeof id === 'string' && /^\d{1,20}$/.test(id)) || (typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
+      ? `BITRIX24_USER:${String(id)}`
+      : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function isAdminResponse(value: unknown): value is BitrixAdminResponse {
   return typeof value === 'object' && value !== null && 'result' in value &&
     typeof (value as { result?: unknown }).result === 'boolean';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 @Injectable()
