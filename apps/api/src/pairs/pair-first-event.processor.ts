@@ -9,6 +9,7 @@ import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worke
 import { SyncModeService } from '../sync-mode.service';
 import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients/client-dependency-resolver';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
+import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -100,7 +101,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     if (this.syncMode && (await this.syncMode.read()).mode !== 'on') return null;
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, processingStartedAt: true, retryAfter: true },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true },
     });
     if (!event || !event.externalEntityId || !isDealOrderEvent(event) || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
     const staleBefore = new Date(Date.now() - EVENT_LEASE_MS);
@@ -161,7 +162,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         await transaction.inboundEvent.updateMany({
           where: { id: event.id, status: 'PROCESSING' },
           data: unavailable
-            ? { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'PAIR_RESOLUTION_UNAVAILABLE', processingStartedAt: null, retryAfter: new Date(Date.now() + retryDelayMs(1)) }
+            ? { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'PAIR_RESOLUTION_UNAVAILABLE', processingStartedAt: null, retryAfter: retryAtForFailure(new Error('PAIR_RESOLUTION_UNAVAILABLE'), event.attempts + 1) }
             : { status: 'MANUAL_REVIEW', lastErrorCategory: 'PAIR_REVIEW_REQUIRED', processingStartedAt: null, retryAfter: null },
         });
         return result;
@@ -176,31 +177,41 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           return result;
         }
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        const dependencyResult = await this.resolveDocumentDependencies(event, result.pair, workerLease);
+        const attempt = event.attempts + 1;
+        const dependencyResult = await this.resolveDocumentDependencies(event, result.pair, workerLease, attempt);
         if (dependencyResult && dependencyResult.status !== 'RESOLVED') {
           await this.finish(
             event.id,
             dependencyResult.status === 'RETRY' ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW',
             dependencyResult.reason,
             workerLease,
-            dependencyResult.status === 'RETRY' ? new Date(Date.now() + retryDelayMs(1)) : null,
+            dependencyResult.status === 'RETRY' ? dependencyResult.retryAfter ?? retryAtForFailure(new Error(dependencyResult.reason), attempt) : null,
           );
           return result;
         }
-        const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig });
+        const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig, attempt });
         if (baseline.status !== 'READY') {
-          await this.finish(event.id, 'MANUAL_REVIEW', `BASELINE_${baseline.reason}`, workerLease);
+          if (baseline.status === 'DATABASE_FAILURE') {
+            // Leave the claimed PROCESSING row untouched. The lease-expiry
+            // recovery scan can retry it once PostgreSQL is available again.
+            return result;
+          } else if (baseline.status === 'RETRYABLE_FAILURE') {
+            await this.finish(event.id, 'RETRYABLE_FAILURE', `BASELINE_${baseline.reason}`, workerLease, baseline.retryAfter);
+          } else {
+            await this.finish(event.id, 'MANUAL_REVIEW', `BASELINE_${baseline.reason}`, workerLease);
+          }
         } else if (this.headerSync) {
           if (this.syncMode && (await this.syncMode.read()).mode !== 'on') {
             await this.deferWhileInactive(event.id, workerLease);
             return result;
           }
-          const headerResult = await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId, assertWorkerLease: workerLease?.assertOwned });
-          const holdReason = headerHoldReason(headerResult);
-          if (holdReason) {
-            await this.finish(event.id, 'MANUAL_REVIEW', holdReason, workerLease);
+          const headerResult = await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId, attempt, assertWorkerLease: workerLease?.assertOwned });
+          if (typeof headerResult !== 'string' && headerResult.status === 'RETRYABLE_FAILURE') {
+            await this.finish(event.id, 'RETRYABLE_FAILURE', 'DEAL_ORDER_HEADER_RETRY', workerLease, headerResult.retryAfter);
           } else {
-            await this.finish(event.id, headerResult === 'DISABLED' ? 'SKIPPED_DISABLED' : 'SUCCEEDED', headerResult === 'DISABLED' ? 'DEAL_ORDER_HEADER_DISABLED' : null, workerLease);
+            const holdReason = headerHoldReason(headerResult as string);
+            if (holdReason) await this.finish(event.id, 'MANUAL_REVIEW', holdReason, workerLease);
+            else await this.finish(event.id, headerResult === 'DISABLED' ? 'SKIPPED_DISABLED' : 'SUCCEEDED', headerResult === 'DISABLED' ? 'DEAL_ORDER_HEADER_DISABLED' : null, workerLease);
           }
         } else {
           await this.finish(event.id, 'SUCCEEDED', null, workerLease);
@@ -210,7 +221,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           await assertWorkerFenceInTransaction(workerLease, transaction);
           await transaction.inboundEvent.updateMany({
             where: { id: event.id, status: 'PROCESSING' },
-            data: { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'BASELINE_SETTINGS_UNAVAILABLE', processingStartedAt: null, retryAfter: new Date(Date.now() + retryDelayMs(1)) },
+            data: { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'BASELINE_SETTINGS_UNAVAILABLE', processingStartedAt: null, retryAfter: retryAtForFailure(new Error('BASELINE_SETTINGS_UNAVAILABLE'), event.attempts + 1) },
           });
         });
       }
@@ -226,6 +237,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     event: { id: string; source: string },
     pair: Extract<PairResolutionResult, { status: 'confirmed' }>['pair'],
     workerLease?: EventWorkerLeaseContext,
+    attempt = 1,
   ) {
     if (!this.clientDependencies || !this.documentReader) return null;
     try {
@@ -252,13 +264,17 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           entity: dependency.entity,
           sourceId: dependency.sourceId,
           primaryCompanySourceId: dependency.primaryCompanySourceId,
+          attempt,
         }, workerLease);
         await workerLease?.assertOwned();
         if (resolved.status === 'RETRY' || resolved.status === 'REVIEW') return resolved;
       }
       return { status: 'RESOLVED' as const, reason: 'CLIENT_DEPENDENCIES_RESOLVED' };
-    } catch {
-      return { status: 'RETRY' as const, reason: 'CLIENT_DEPENDENCY_READ_FAILED' };
+    } catch (error) {
+      if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
+        return { status: 'REVIEW' as const, reason: 'CLIENT_DEPENDENCY_READ_REJECTED' };
+      }
+      return { status: 'RETRY' as const, reason: 'CLIENT_DEPENDENCY_READ_FAILED', retryAfter: retryAtForFailure(error, attempt) };
     }
   }
 
@@ -304,10 +320,6 @@ function isDue(status: string, retryAfter: Date | null, processingStartedAt: Dat
   return status === 'RECEIVED' ||
     (status === 'RETRYABLE_FAILURE' && (!retryAfter || retryAfter.getTime() <= now)) ||
     (status === 'PROCESSING' && (!processingStartedAt || processingStartedAt.getTime() < now - EVENT_LEASE_MS));
-}
-
-function retryDelayMs(attempt: number): number {
-  return Math.min(5_000 * 2 ** Math.max(0, attempt - 1), 15 * 60_000);
 }
 
 function idValue(value: unknown): string | null {

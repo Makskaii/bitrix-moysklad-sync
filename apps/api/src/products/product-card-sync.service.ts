@@ -1,3 +1,5 @@
+import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
+
 export type ProductCardPair = {
   id: string;
   entityType: string;
@@ -36,7 +38,7 @@ export type ProductCardSyncResult =
   | { status: 'BASELINED' | 'UNCHANGED' | 'SYNCED'; changedFields: string[] }
   | { status: 'SKIPPED_DISABLED' | 'SKIPPED_DIRECTION_DISABLED' | 'DEFERRED_PAUSE'; reason: string; changedFields: [] }
   | { status: 'MANUAL_REVIEW'; reason: string; changedFields: string[] }
-  | { status: 'RETRYABLE_FAILURE'; reason: string; changedFields: string[] };
+  | { status: 'RETRYABLE_FAILURE'; reason: string; changedFields: string[]; retryAfter?: Date };
 
 type Side = 'BITRIX24' | 'MOYSKLAD';
 type FieldRule = { source: string; target: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean };
@@ -67,6 +69,7 @@ export class ProductCardSyncService {
     source: Side;
     settingsVersion: number;
     settings: ProductCardSettings;
+    attempt?: number;
   }): Promise<ProductCardSyncResult> {
     const { pair, settings, settingsVersion } = input;
     if (input.source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [] };
@@ -86,7 +89,8 @@ export class ProductCardSyncService {
       ]);
     } catch (error) {
       if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
-      return error instanceof ProductCardManualReviewError ? review(error.reason) : retry('PRODUCT_CARD_READ_FAILED');
+      return error instanceof ProductCardManualReviewError ? review(error.reason) : isRetryableFailure(error)
+        ? retry('PRODUCT_CARD_READ_FAILED', [], retryAtForFailure(error, input.attempt ?? 1)) : review('PRODUCT_PROVIDER_REJECTED');
     }
     if (!nonEmpty(bitrix24.name) || !nonEmpty(moysklad.name)) return review('PRODUCT_NAME_VALUE_MISSING');
 
@@ -141,6 +145,7 @@ export class ProductCardSyncService {
           if (!optional) break;
           continue;
         }
+        if (!isRetryableFailure(error)) return review('PRODUCT_PROVIDER_REJECTED', changedFields);
 
         // A transport error does not prove that the vendor rejected an absolute update.
         // Read the target again before committing state; never blindly replay a write.
@@ -151,7 +156,7 @@ export class ProductCardSyncService {
           if (readError instanceof ProductCardLeaseError) throw readError;
         }
         if (!verified) {
-          return retry('PRODUCT_CARD_WRITE_OUTCOME_PENDING', changedFields);
+          return retry('PRODUCT_CARD_WRITE_OUTCOME_PENDING', changedFields, retryAtForFailure(error, input.attempt ?? 1));
         }
       }
 
@@ -378,6 +383,6 @@ function sameCurrency(left: string, right: string): boolean {
 }
 function record(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function review(reason: string, changedFields: string[] = []): ProductCardSyncResult { return { status: 'MANUAL_REVIEW', reason, changedFields }; }
-function retry(reason: string, changedFields: string[] = []): ProductCardSyncResult {
-  return { status: 'RETRYABLE_FAILURE', reason, changedFields };
+function retry(reason: string, changedFields: string[] = [], retryAfter?: Date): ProductCardSyncResult {
+  return { status: 'RETRYABLE_FAILURE', reason, changedFields, ...(retryAfter ? { retryAfter } : {}) };
 }

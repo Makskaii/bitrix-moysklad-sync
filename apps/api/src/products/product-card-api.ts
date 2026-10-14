@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProductCardApi, ProductCardManualReviewError, ProductCardSnapshot } from './product-card-sync.service';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 
 const REQUEST_TIMEOUT_MS = 10_000;
 
@@ -141,9 +142,10 @@ export class ProductCardHttpApi implements ProductCardApi {
     const response = await fetch(url, {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
       redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    const payload: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(payload) || 'error' in payload || !('result' in payload)) throw new Error('BITRIX24_PRODUCT_API_FAILED');
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+    const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!isRecord(payload) || 'error' in payload || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
     return payload.result;
   }
 
@@ -158,9 +160,11 @@ export class ProductCardHttpApi implements ProductCardApi {
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
       redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    const payload: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(payload)) throw new Error('MOYSKLAD_PRODUCT_API_FAILED');
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    if (response.status === 204 && method !== 'GET') return {};
+    const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!isRecord(payload)) throw new ProviderFailure('MOYSKLAD', 400);
     return payload;
   }
 }

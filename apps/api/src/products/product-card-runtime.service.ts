@@ -57,7 +57,7 @@ export class ProductCardRuntimeService {
     return { status: 'READY' };
   }
 
-  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string; assertWorkerLease?: () => Promise<void> }) {
+  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string; attempt?: number; assertWorkerLease?: () => Promise<void> }) {
     const gate = await this.preflight(input.source);
     if (gate.status !== 'READY') return { ...gate, changedFields: [] as [] };
     let pair;
@@ -112,7 +112,7 @@ export class ProductCardRuntimeService {
     const stateStore = new DatabaseProductCardStateStore(this.database, withBothLeases);
     const reconciler = new ProductCardSyncService(guardedApi, stateStore);
     try {
-      return await reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings });
+      return await reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings, attempt: input.attempt });
     } catch (error) {
       if (error instanceof ProductCardWriteGateError) {
         return { ...error.gate, changedFields: [] as [] };

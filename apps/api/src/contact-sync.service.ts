@@ -3,6 +3,7 @@ import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional }
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { assertApplyExternalWrite } from './external-write-guard';
+import { ProviderFailure, isRetryableFailure, providerResponseFailure, retryAtForFailure } from './provider-failure';
 import { SyncModeService } from './sync-mode.service';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from './event-worker-lease.service';
@@ -26,8 +27,6 @@ const PROCESSING_LEASE_MS = 60_000;
 const ENTITY_LOCK_LEASE_MS = 60_000;
 const ENTITY_LOCK_RENEW_INTERVAL_MS = 15_000;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 15_000;
-const RETRY_BASE_DELAY_MS = 5_000;
-const RETRY_MAX_DELAY_MS = 15 * 60_000;
 const EVENT_BATCH_DELAY_MS = 250;
 
 @Injectable()
@@ -201,7 +200,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
                 data: {
                   status: category === 'REVIEW_REQUIRED' ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
                   lastErrorCategory: category,
-                  retryAfter: category === 'REVIEW_REQUIRED' ? null : retryAfterFrom(error) ?? new Date(Date.now() + retryDelayMs(attempt)),
+                  retryAfter: category === 'REVIEW_REQUIRED' ? null : retryAfterFrom(error) ?? retryAtForFailure(error, attempt),
                 },
               });
             }, workerLease,
@@ -566,22 +565,25 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         body: new URLSearchParams(fields),
         signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
       });
-    } catch (error) {
+    } catch {
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', null, false);
-      throw error;
+      throw new ProviderFailure('BITRIX24', null);
     }
     if (!response.ok) {
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
-      throw providerFailure(response);
+      throw providerFailure(response, 'BITRIX24');
     }
     let payload: unknown;
-    try { payload = await response.json(); } catch (error) {
+    try { payload = await response.json(); } catch {
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
-      throw error;
+      // The server may have applied an update before its response body was
+      // truncated or timed out. Leave the event retryable so a current-state
+      // read can establish whether another write is needed.
+      throw new ProviderFailure('BITRIX24', null);
     }
     const accepted = acceptsBitrixResponse(method, payload);
     await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, accepted);
-    if (!accepted || !isRecord(payload) || !('result' in payload)) throw new Error('EXTERNAL_API_FAILURE');
+    if (!accepted || !isRecord(payload) || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
     return payload.result;
   }
 
@@ -616,22 +618,22 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         ...(body ? { body: JSON.stringify(body) } : {}),
         signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
       });
-    } catch (error) {
+    } catch {
       await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, null, false);
-      throw error;
+      throw new ProviderFailure('MOYSKLAD', null);
     }
     if (!response.ok) {
       await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, false);
-      throw providerFailure(response);
+      throw providerFailure(response, 'MOYSKLAD');
     }
     let payload: unknown;
-    try { payload = await response.json(); } catch (error) {
+    try { payload = await response.json(); } catch {
       await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, false);
-      throw error;
+      throw new ProviderFailure('MOYSKLAD', null);
     }
     const accepted = accepts(payload);
     await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, accepted);
-    if (!accepted) throw new Error('EXTERNAL_API_FAILURE');
+    if (!accepted) throw new ProviderFailure('MOYSKLAD', 400);
     return payload;
   }
 
@@ -727,7 +729,7 @@ function chooseDirection(
 }
 
 function errorCategory(error: unknown): string {
-  return error instanceof ReviewRequiredError
+  return error instanceof ReviewRequiredError || (error instanceof ProviderFailure && !isRetryableFailure(error))
     ? 'REVIEW_REQUIRED'
     : 'EXTERNAL_API_FAILURE';
 }
@@ -760,24 +762,10 @@ function ensureTrailingSlash(value: string): string {
   return value.endsWith('/') ? value : `${value}/`;
 }
 
-function retryDelayMs(attempt: number): number {
-  return Math.min(RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)), RETRY_MAX_DELAY_MS);
-}
-
-function providerFailure(response: Response): Error & { retryAfterAt?: Date } {
-  const error = new Error('EXTERNAL_API_FAILURE') as Error & { retryAfterAt?: Date };
-  const value = response.headers.get('retry-after');
-  if (value) {
-    const seconds = Number(value);
-    const timestamp = Number.isFinite(seconds)
-      ? Date.now() + Math.max(0, seconds) * 1_000
-      : Date.parse(value);
-    if (Number.isFinite(timestamp)) error.retryAfterAt = new Date(timestamp);
-  }
-  return error;
-}
+function providerFailure(response: Response, provider: 'BITRIX24' | 'MOYSKLAD'): ProviderFailure { return providerResponseFailure(provider, response.status, response.headers.get('retry-after')); }
 
 function retryAfterFrom(error: unknown): Date | null {
+  if (error instanceof ProviderFailure) return error.retryAfterAt;
   if (typeof error !== 'object' || error === null || !('retryAfterAt' in error)) return null;
   const value = (error as { retryAfterAt?: unknown }).retryAfterAt;
   return value instanceof Date && Number.isFinite(value.getTime()) ? value : null;

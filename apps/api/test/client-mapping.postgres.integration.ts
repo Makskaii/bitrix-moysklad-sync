@@ -12,6 +12,7 @@ import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gate
 import { EntityPairService } from '../src/pairs/entity-pair.service';
 import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
 import { EventWorkerLeaseService } from '../src/event-worker-lease.service';
+import { ProviderFailure } from '../src/provider-failure';
 
 const suffix = randomUUID();
 const companyId = `client53-${suffix}`;
@@ -78,8 +79,10 @@ before(async () => {
   const parsed = new URL(process.env.DATABASE_URL);
   assert.match(parsed.hostname, /^(localhost|127\.0\.0\.1)$/i);
   assert.match(parsed.pathname, /client53_test/i);
-  process.env.SYNC_MODE = 'dry';
-  process.env.DRY_DATABASE_URL = process.env.DATABASE_URL;
+  process.env.SYNC_MODE = 'apply';
+  const dryTarget = new URL(process.env.DATABASE_URL);
+  dryTarget.searchParams.set('schema', 'dry_client53_test');
+  process.env.DRY_DATABASE_URL = dryTarget.toString();
   database = new DatabaseService();
   await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeCompanyId } });
@@ -130,7 +133,7 @@ after(async () => {
 
 test('unpaired company resolves and creates through fake APIs, then persists the runtime pair in PostgreSQL', async () => {
   const previousMode = process.env.SYNC_MODE;
-  process.env.SYNC_MODE = 'dry';
+  process.env.SYNC_MODE = 'apply';
   process.env.MOYSKLAD_API_BASE_URL = 'https://moysklad.fake/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-token';
   process.env.BITRIX24_REST_BASE_URL = 'https://bitrix.fake/rest/';
@@ -473,6 +476,52 @@ test('claimed deal event resolves and persists client dependency under worker fe
   assert.ok(durableHold, 'uncertain response remains held durably for reconciliation');
 });
 
+test('document client dependency preserves provider Retry-After as durable dueAt', async () => {
+  const eventId = `dependency-throttle-${suffix}`;
+  const sourceCompanyId = `throttled-company-${suffix}`;
+  const dealPair = { id: `throttled-deal-pair-${suffix}`, entityType: 'DEAL' as const, bitrix24Id: `throttled-deal-${suffix}`, moyskladId: randomUUID(), status: 'CONFIRMED' as const, source: 'PERSISTED' as const };
+  const retryAt = new Date(Date.now() + 30_000);
+  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
+  await settings.active();
+  const clientGateway: ClientSyncGateway = {
+    async readBitrix(entity, id) {
+      assert.equal(entity, 'COMPANY');
+      assert.equal(id, sourceCompanyId);
+      throw new ProviderFailure('BITRIX24', 429, retryAt);
+    },
+    async readMoysklad() { assert.fail('B24 read is rate limited first'); },
+    async updateBitrix() { assert.fail('document dependency never writes client fields'); },
+    async updateMoysklad() { assert.fail('document dependency never writes client fields'); },
+  };
+  const resolver = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, clientGateway, new HttpClientCandidateGateway(database, async () => { assert.fail('candidate search is not reached'); }));
+  const workerLease = new EventWorkerLeaseService(database);
+  await database.inboundEvent.create({ data: {
+    id: eventId, source: 'BITRIX24', deliveryKey: eventId, eventType: 'ONCRMDEALADD',
+    externalEntityId: dealPair.bitrix24Id, externalEntityType: 'deal', payload: { event: 'ONCRMDEALADD' }, status: 'RECEIVED',
+  } });
+  await settings.pinEvent(eventId);
+  const processor = new PairFirstEventProcessor(
+    database,
+    { resolve: async () => ({ status: 'confirmed', pair: dealPair }) } as never,
+    settings,
+    { ensureForConfirmedPair: async () => ({ status: 'READY', baselineId: dealPair.id }) } as never,
+    undefined,
+    workerLease,
+    { read: async () => ({ mode: 'on' }) } as never,
+    resolver,
+    { readBitrix24DealForBaseline: async () => ({ ID: dealPair.bitrix24Id, COMPANY_ID: sourceCompanyId }) } as never,
+  );
+  try {
+    await processor.process(eventId);
+    const event = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+    assert.equal(event.status, 'RETRYABLE_FAILURE');
+    assert.ok(event.retryAfter);
+    assert.ok(Math.abs(event.retryAfter!.getTime() - retryAt.getTime()) < 1_000);
+  } finally {
+    await database.inboundEvent.deleteMany({ where: { id: eventId } });
+  }
+});
+
 test('document dependency omits a duplicate contact only after validating the saved company pair', async () => {
   const existingCompanyPair = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: companyId, active: true } });
   assert.ok(existingCompanyPair, 'the preceding inventory test creates the company pair');
@@ -720,4 +769,65 @@ test('paired client update cannot commit sync state or terminal status after wor
   const savedState = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
   assert.deepEqual(savedState.bitrix24Values, { TITLE: 'old' });
   assert.deepEqual(savedState.moyskladValues, { name: 'old' });
+});
+
+test('ambiguous applied client update is read back before retry and never written twice', async () => {
+  const sourceId = `ambiguous-applied-source-${suffix}`;
+  const targetId = `ambiguous-applied-target-${suffix}`;
+  const eventId = `ambiguous-applied-event-${suffix}`;
+  const pair = await database.entityPair.create({ data: { entityType: 'COMPANY', bitrix24Id: sourceId, moyskladId: targetId, moyskladType: 'counterparty', active: true, source: 'TEST' } });
+  await database.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: 1, bitrix24Values: { TITLE: 'old' }, moyskladValues: { name: 'old' } } });
+  await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: eventId, eventType: 'ONCRMCOMPANYUPDATE', externalEntityId: sourceId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYUPDATE' }, status: 'RECEIVED' } });
+  const settings = {
+    eventConfig: async () => ({ version: 1, config: { rules: [{ entity: 'companies', sourceField: 'TITLE', targetField: 'name', bitrix24ToMoysklad: { enabled: true }, moyskladToBitrix24: { enabled: false } }], groups: [] } }),
+    transformField: (_config: unknown, _entity: string, _direction: string, _field: string, source: Record<string, unknown>) => ({ value: source.TITLE }),
+  };
+  let targetName = 'old'; let writes = 0;
+  const gateway: ClientSyncGateway = {
+    async readBitrix() { return { ID: sourceId, TITLE: 'new' }; },
+    async readMoysklad() { return { id: targetId, name: targetName }; },
+    async updateBitrix() { assert.fail('only MoySklad should be written'); },
+    async updateMoysklad() { writes += 1; targetName = 'new'; throw new ProviderFailure('MOYSKLAD', null); },
+  };
+  const processor = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway, new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }));
+  assert.equal(await processor.process(eventId), 'RETRY');
+  const pending = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+  assert.equal(pending.status, 'RETRYABLE_FAILURE');
+  assert.equal(await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } }).then((state) => (state.moyskladValues as { name: string }).name), 'old');
+  await database.inboundEvent.update({ where: { id: eventId }, data: { status: 'RECEIVED', retryAfter: null } });
+  assert.equal(await processor.process(eventId), 'UNCHANGED');
+  assert.equal(writes, 1);
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'SUCCEEDED');
+  await database.entityPair.delete({ where: { id: pair.id } });
+  await database.inboundEvent.delete({ where: { id: eventId } });
+});
+
+test('client update readback mismatch stays retryable and preserves the previous sync baseline', async () => {
+  const sourceId = `unapplied-source-${suffix}`;
+  const targetId = `unapplied-target-${suffix}`;
+  const eventId = `unapplied-event-${suffix}`;
+  const pair = await database.entityPair.create({ data: { entityType: 'COMPANY', bitrix24Id: sourceId, moyskladId: targetId, moyskladType: 'counterparty', active: true, source: 'TEST' } });
+  await database.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: 1, bitrix24Values: { TITLE: 'old' }, moyskladValues: { name: 'old' } } });
+  await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: eventId, eventType: 'ONCRMCOMPANYUPDATE', externalEntityId: sourceId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYUPDATE' }, status: 'RECEIVED' } });
+  const settings = {
+    eventConfig: async () => ({ version: 1, config: { rules: [{ entity: 'companies', sourceField: 'TITLE', targetField: 'name', bitrix24ToMoysklad: { enabled: true }, moyskladToBitrix24: { enabled: false } }], groups: [] } }),
+    transformField: (_config: unknown, _entity: string, _direction: string, _field: string, source: Record<string, unknown>) => ({ value: source.TITLE }),
+  };
+  let writes = 0;
+  const gateway: ClientSyncGateway = {
+    async readBitrix() { return { ID: sourceId, TITLE: 'new' }; },
+    async readMoysklad() { return { id: targetId, name: 'old' }; },
+    async updateBitrix() { assert.fail('only MoySklad should be written'); },
+    async updateMoysklad() { writes += 1; },
+  };
+  const processor = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway, new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }));
+  assert.equal(await processor.process(eventId), 'RETRY');
+  assert.equal(writes, 1);
+  const savedEvent = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+  assert.equal(savedEvent.status, 'RETRYABLE_FAILURE');
+  const savedState = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.deepEqual(savedState.bitrix24Values, { TITLE: 'old' });
+  assert.deepEqual(savedState.moyskladValues, { name: 'old' });
+  await database.entityPair.delete({ where: { id: pair.id } });
+  await database.inboundEvent.delete({ where: { id: eventId } });
 });

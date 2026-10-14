@@ -46,7 +46,7 @@ test('product event dispatches only to an exact active PRODUCT pair and uses pin
   });
   const result = await processor.process('event-1');
   assert.deepEqual(result, { status: 'SYNCED', changedFields: ['name'] });
-  assert.deepEqual(runtimeCalls, [{ pairId: 'pair-1', source: 'BITRIX24', settingsVersion: 9, eventId: 'event-1' }]);
+  assert.deepEqual(runtimeCalls, [{ pairId: 'pair-1', source: 'BITRIX24', settingsVersion: 9, eventId: 'event-1', attempt: 1 }]);
   assert.equal(storedEvent.status, 'SUCCEEDED');
 });
 
@@ -70,6 +70,7 @@ test('due retryable product events are claimed and reprocessed', async () => {
   assert.equal((await processor.process('event-1'))?.status, 'SYNCED');
   assert.equal(storedEvent.status, 'SUCCEEDED');
   assert.equal(runtimeCalls.length, 1);
+  assert.equal(runtimeCalls[0]?.attempt, 3, 'runtime receives the persisted attempt count plus the newly claimed attempt');
 });
 
 test('product event rejects unsupported B24 service and variation kinds without runtime writes', async () => {
@@ -88,7 +89,7 @@ test('Bitrix24 price event resolves its exact product through catalog.price.get 
     payload: { event: 'CATALOG.PRICE.ON.UPDATE', data: { FIELDS: { ID: 51 } } },
   });
   assert.equal((await processor.process('event-1'))?.status, 'SYNCED');
-  assert.deepEqual(runtimeCalls, [{ pairId: 'pair-1', source: 'BITRIX24', settingsVersion: 9, eventId: 'event-1' }]);
+  assert.deepEqual(runtimeCalls, [{ pairId: 'pair-1', source: 'BITRIX24', settingsVersion: 9, eventId: 'event-1', attempt: 1 }]);
   assert.equal(storedEvent.status, 'SUCCEEDED');
 });
 

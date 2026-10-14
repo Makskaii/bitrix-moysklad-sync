@@ -10,6 +10,8 @@ export type ClientDependencyInput = {
   sourceSystem: ClientSystem;
   entity: ClientEntity;
   sourceId: string;
+  /** Current durable attempt number for bounded fallback scheduling. */
+  attempt?: number;
   /** Explicit parent company relationship when the native contact record omits it. */
   primaryCompanySourceId?: string | null;
 };
@@ -17,7 +19,8 @@ export type ClientDependencyInput = {
 export type ClientDependencyResolution =
   | { status: 'RESOLVED'; pair: EntityPair; selectedSourceId: string; reason: string }
   | { status: 'OMITTED'; reason: 'DUPLICATE_CONTACT'; companyPair: EntityPair }
-  | { status: 'REVIEW' | 'RETRY'; reason: string };
+  | { status: 'REVIEW'; reason: string }
+  | { status: 'RETRY'; reason: string; retryAfter?: Date };
 
 /** Resolves only a document's explicit client dependencies; it does not scan or rewrite documents. */
 export interface ClientDependencyResolver {

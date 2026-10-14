@@ -1,5 +1,6 @@
 export type ClientRecord = Record<string, unknown>;
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 
 export interface ClientSyncGateway {
   readBitrix(entity: 'COMPANY' | 'CONTACT', id: string): Promise<ClientRecord>;
@@ -58,10 +59,10 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const response = await this.fetcher(new URL(method, withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
       redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => null);
-    if (!response?.ok) throw new Error('BITRIX24_CLIENT_API_FAILURE');
-    const payload: unknown = await response.json().catch(() => null);
-    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new Error('BITRIX24_CLIENT_API_FAILURE');
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+    const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
     return payload.result;
   }
 
@@ -73,10 +74,10 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const response = await this.fetcher(new URL(path, withSlash(base)), {
       method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => null);
-    if (!response?.ok) throw new Error('MOYSKLAD_CLIENT_API_FAILURE');
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
     if (response.status === 204) return {};
-    return await response.json().catch(() => ({}));
+    return await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
   }
 }
 

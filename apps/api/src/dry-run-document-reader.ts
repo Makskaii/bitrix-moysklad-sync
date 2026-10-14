@@ -1,5 +1,6 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DryRunWriteJournal } from './dry-run-write-journal';
+import { ProviderFailure, providerResponseFailure } from './provider-failure';
 
 const READ_TIMEOUT_MS = 10_000;
 
@@ -24,11 +25,11 @@ export class DryRunDocumentReader {
       body: new URLSearchParams({ id }),
       redirect: 'error',
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
-    }).catch(() => { throw new ServiceUnavailableException('Bitrix24 read failed'); });
-    if (!response.ok) throw new ServiceUnavailableException('Bitrix24 read failed');
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
     const body: unknown = await response.json().catch(() => null);
     if (!isRecord(body) || body.error || !isRecord(body.result) || String(body.result.ID ?? '') !== id) {
-      throw new ServiceUnavailableException('Bitrix24 returned an invalid deal record');
+      throw new ProviderFailure('BITRIX24', 400);
     }
     return { ...body.result, ...(await this.dryWrites?.readback('BITRIX24', 'deal', id)) };
   }
@@ -50,11 +51,11 @@ export class DryRunDocumentReader {
       headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       redirect: 'error',
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
-    }).catch(() => { throw new ServiceUnavailableException('MoySklad read failed'); });
-    if (!response.ok) throw new ServiceUnavailableException('MoySklad read failed');
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
     const body: unknown = await response.json().catch(() => null);
     if (!isRecord(body) || body.id !== id || !isRecord(body.meta) || body.meta.type !== 'customerorder') {
-      throw new ServiceUnavailableException('MoySklad returned an invalid customer-order record');
+      throw new ProviderFailure('MOYSKLAD', 400);
     }
     return { ...body, ...(await this.dryWrites?.readback('MOYSKLAD', 'customerorder', id)) };
   }

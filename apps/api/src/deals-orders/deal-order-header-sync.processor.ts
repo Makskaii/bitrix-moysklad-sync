@@ -8,9 +8,10 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
+import { ProviderFailure, isRetryableFailure, retryAtForFailure, providerResponseFailure } from '../provider-failure';
 
 type Pair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
-type HeaderResult = 'DISABLED' | 'UNSUPPORTED' | 'BASELINE_MISSING' | 'BASELINE_INITIALIZED' | 'NOOP' | 'UPDATED' | 'HOLD_CONFLICT' | 'HOLD_READ_FAILED' | 'HOLD_WRITE_FAILED';
+type HeaderResult = 'DISABLED' | 'UNSUPPORTED' | 'BASELINE_MISSING' | 'BASELINE_INITIALIZED' | 'NOOP' | 'UPDATED' | 'HOLD_CONFLICT' | 'HOLD_READ_FAILED' | 'HOLD_WRITE_FAILED' | { status: 'RETRYABLE_FAILURE'; retryAfter: Date };
 const FIELD = 'deal-order-comments';
 
 /** Local-release-only header exchange. It intentionally cannot update fields beyond COMMENTS/description. */
@@ -18,7 +19,7 @@ const FIELD = 'deal-order-comments';
 export class DealOrderHeaderSyncProcessor {
   constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService, private readonly dryWrites?: DryRunWriteJournal) {}
 
-  async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
+  async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; attempt?: number; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
     if (process.env.ADMIN_PREVIEW !== '1' || process.env.LOCAL_HEADER_EXCHANGE !== '1' || process.env.LOCAL_HEADER_EXCHANGE_READY !== '1' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || (await this.mode.read()).mode !== 'on') return 'DISABLED';
     if (input.pair.entityType !== 'DEAL' || input.baselineId !== input.pair.id) return 'UNSUPPORTED';
     const base24 = localEndpoint(process.env.BITRIX24_REST_BASE_URL);
@@ -56,7 +57,10 @@ export class DealOrderHeaderSyncProcessor {
         this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
         this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id),
       ]);
-    } catch { return 'HOLD_READ_FAILED'; }
+    } catch (error) {
+      if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
+      return 'HOLD_READ_FAILED';
+    }
     const b24Value = scalar(b24.COMMENTS);
     const msValue = scalar(ms.description);
     if (b24Value === null || msValue === null) return 'HOLD_CONFLICT';
@@ -98,8 +102,19 @@ export class DealOrderHeaderSyncProcessor {
         })
         : false;
       if (!proposed) {
-        if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
-        else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
+        try {
+          if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
+          else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
+        } catch (error) {
+          if (!(error instanceof ProviderFailure)) throw error;
+          if (!isRetryableFailure(error)) return 'HOLD_WRITE_FAILED';
+          const readback = writeTo === 'MOYSKLAD'
+            ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
+            : await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
+          if (scalar(writeTo === 'MOYSKLAD' ? readback.description : readback.COMMENTS) !== value) {
+            return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
+          }
+        }
       }
       const verified = writeTo === 'MOYSKLAD'
         ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
@@ -108,7 +123,11 @@ export class DealOrderHeaderSyncProcessor {
       await input.assertWorkerLease?.();
       await this.persist(transaction, pair.id, baseline.settingsVersion, writeTo === 'BITRIX24' ? value : b24Value, writeTo === 'MOYSKLAD' ? value : msValue);
       return 'UPDATED';
-    } catch { return 'HOLD_WRITE_FAILED'; }
+    } catch (error) {
+      if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
+      if (error instanceof ProviderFailure) return 'HOLD_WRITE_FAILED';
+      throw error;
+    }
     }, { timeout: 60_000 });
   }
 
@@ -119,8 +138,8 @@ export class DealOrderHeaderSyncProcessor {
     const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(id)}`, withSlash(base)), {
       method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ description: value }), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw new Error('write rejected');
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
   }
 
   private async writeBitrix24(base: URL, id: string, value: string) {
@@ -128,9 +147,10 @@ export class DealOrderHeaderSyncProcessor {
     const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ id, 'fields[COMMENTS]': value }), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    });
-    const body: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(body) || body.error || body.result !== true) throw new Error('write rejected');
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+    const body: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!isRecord(body) || body.error || body.result !== true) throw new ProviderFailure('BITRIX24', 400);
   }
 
   private async persist(transaction: Prisma.TransactionClient, pairId: string, settingsVersion: number, b24: string, ms: string) {
