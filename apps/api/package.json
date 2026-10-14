@@ -10,6 +10,7 @@
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
     "test:product-runtime-gate-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-runtime-gate.unit.js",
     "test:dry-isolation": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/dry-database-isolation.unit.js ../../dist/apps/api-test/test/dry-database-isolation.postgres.integration.js ../../dist/apps/api-test/test/dry-write-isolation.integration.js",
+    "test:local-preview-di": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/local-preview-module.di.unit.js",
     "test:pair-first-events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/pair-first-event.processor.integration.js",
     "test:deal-order-baseline": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-baseline.integration.js",
     "test:contactsync": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/contact-sync.integration.js",
