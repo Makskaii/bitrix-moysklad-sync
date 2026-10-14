@@ -46,6 +46,7 @@ const nightlyProviderQueries: string[] = [];
 let nightlyBitrixCompanyIds: string[] = [];
 let nightlyBitrixSecondPageIds: string[] = [];
 let nightlyMoyskladMetaSize = 0;
+const nightlyContactpersonsByParent = new Map<string, Array<{ id: string; updated: string }>>();
 let failNightlyBitrixFeed = false;
 let nightlyBitrixRetryAfter = '3600';
 let holdNightlyCompanyFeed = false;
@@ -542,7 +543,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
       moyskladStatus: 'complete',
       retryAfter: null,
       attempts: 1,
-      error: 'Nightly feeds cover updates for active contact/company pairs. Delete events and MoySklad contact-person changed-record feeds are outside this slice.',
+      error: 'Nightly feeds cover active Bitrix24 contact/company pairs and MoySklad contact persons attached to active company pairs. Delete and archival changes remain outside this slice.',
     });
     const bitrixQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query));
     assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [3, 4]);
@@ -806,6 +807,82 @@ test('MoySklad pagination beyond one documented page fails closed without checkp
   }
 });
 
+test('nightly MoySklad contact-person feed pages active company collections and queues only in-window contacts', async () => {
+  const database = app.get(DatabaseService);
+  const parentId = `nightly-contact-parent-${randomUUID()}`;
+  const changedContactId = `nightly-contact-changed-${randomUUID()}`;
+  const oldContactId = `nightly-contact-old-${randomUUID()}`;
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: `nightly-b24-company-${randomUUID()}`, moyskladId: parentId,
+    moyskladType: 'counterparty', active: true,
+  } });
+  nightlyContactpersonsByParent.set(parentId, [
+    ...Array.from({ length: 1_000 }, (_, index) => ({ id: `nightly-old-${index}`, updated: '2026-10-05 00:00:00.000' })),
+    { id: changedContactId, updated: '2026-10-05 12:00:00.000' },
+    { id: oldContactId, updated: '2026-10-03 12:00:00.000' },
+  ]);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
+    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyProviderQueries.length = 0;
+  try {
+    const service = app.get(SyncRecoveryService);
+    await (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const events = await database.inboundEvent.findMany({ where: {
+      source: 'MOYSKLAD', externalEntityType: 'contactperson', payload: { path: ['recovery'], equals: 'nightly' },
+    } });
+    assert.deepEqual(events.map((event) => event.externalEntityId), [changedContactId]);
+    assert.equal(events[0].eventType, 'UPDATE');
+    assert.equal((events[0].payload as { meta: { href: string } }).meta.href, `${mockUrl}/api/entity/counterparty/${parentId}/contactpersons/${changedContactId}`);
+    const pages = nightlyProviderQueries
+      .filter((query) => query.includes(`/api/entity/counterparty/${parentId}/contactpersons?`))
+      .map((query) => new URL(query, 'http://127.0.0.1'));
+    assert.deepEqual(pages.map((url) => url.searchParams.get('offset')), ['0', '1000']);
+    assert.equal((await database.syncSetting.findUnique({ where: { id: 'global' } }))?.nightlyMoyskladStatus, 'complete');
+  } finally {
+    nightlyContactpersonsByParent.delete(parentId);
+    await database.inboundEvent.deleteMany({ where: { externalEntityId: { in: [changedContactId, oldContactId] } } });
+    await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
+test('nightly MoySklad contact-person feed rejects invalid timestamps without queueing staged contacts', async () => {
+  const database = app.get(DatabaseService);
+  const parentId = `nightly-contact-invalid-parent-${randomUUID()}`;
+  const contactId = `nightly-contact-invalid-${randomUUID()}`;
+  const stagedContactId = `nightly-contact-staged-${randomUUID()}`;
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: `nightly-b24-company-${randomUUID()}`, moyskladId: parentId,
+    moyskladType: 'counterparty', active: true,
+  } });
+  nightlyContactpersonsByParent.set(parentId, [
+    { id: stagedContactId, updated: '2026-10-05 12:00:00.000' },
+    { id: contactId, updated: '2026-02-31 12:00:00.000' },
+  ]);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
+    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  try {
+    const service = app.get(SyncRecoveryService);
+    await (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const status = await readRecoveryStatus();
+    assert.equal(status.nightly.moyskladStatus, 'failed');
+    assert.equal(await database.inboundEvent.count({ where: { source: 'MOYSKLAD', externalEntityId: { in: [stagedContactId, contactId] } } }), 0);
+  } finally {
+    nightlyContactpersonsByParent.delete(parentId);
+    await database.inboundEvent.deleteMany({ where: { externalEntityId: { in: [stagedContactId, contactId] } } });
+    await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
 test('mid-run PAUSE marks unfinished provider feeds skipped and preserves completed feeds', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({ where: { id: 'global' }, data: {
@@ -887,6 +964,16 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
         resolve();
       }, writeDelayMs));
     });
+  }
+  if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty/') && request.url.includes('/contactpersons?')) {
+    nightlyProviderQueries.push(request.url);
+    const url = new URL(request.url, 'http://127.0.0.1');
+    const parts = url.pathname.split('/');
+    const parentId = decodeURIComponent(parts[parts.indexOf('counterparty') + 1] ?? '');
+    const rows = nightlyContactpersonsByParent.get(parentId) ?? [];
+    const limit = Number(url.searchParams.get('limit'));
+    const offset = Number(url.searchParams.get('offset'));
+    return sendJson(response, 200, { rows: rows.slice(offset, offset + limit), meta: { size: rows.length, limit, offset } });
   }
   if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty/')) {
     if (holdMoyskladReads) {
