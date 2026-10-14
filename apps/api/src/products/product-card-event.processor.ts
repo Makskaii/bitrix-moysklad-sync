@@ -65,7 +65,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   private async resumeProductEvents() {
-    if (process.env.SYNC_MODE !== 'apply') return;
+    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return;
     try {
       const now = new Date();
       const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);

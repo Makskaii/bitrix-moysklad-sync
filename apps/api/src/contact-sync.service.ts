@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { assertApplyExternalWrite } from './external-write-guard';
 import { SyncModeService } from './sync-mode.service';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from './event-worker-lease.service';
+import { DryRunWriteJournal } from './dry-run-write-journal';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -40,6 +42,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     private readonly syncMode: SyncModeService,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
+    @Optional() private readonly dryWrites?: DryRunWriteJournal,
   ) {}
 
   onApplicationBootstrap() {
@@ -341,7 +344,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async isApplyEnabled(): Promise<boolean> {
-    return process.env.SYNC_MODE === 'apply' && (await this.syncMode.read()).mode === 'on';
+    return (process.env.SYNC_MODE === 'apply' || process.env.SYNC_MODE === 'dry') && (await this.syncMode.read()).mode === 'on';
   }
 
   private async deferIfModeIsNoLongerOn(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<boolean> {
@@ -529,7 +532,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async readBitrixContact(eventId: string, contactId: string): Promise<JsonRecord> {
     const result = await this.bitrixRequest(eventId, 'crm.contact.get.json', { id: contactId });
     if (!isRecord(result)) throw new Error('EXTERNAL_API_FAILURE');
-    return result;
+    const proposed = await this.dryWrites?.readback('BITRIX24', 'contact', contactId);
+    return proposed?.EMAIL ? { ...result, EMAIL: proposed.EMAIL } : result;
   }
 
   private async writeBitrixEmail(
@@ -538,6 +542,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     currentEmail: { id: string; valueType: string },
     email: string,
   ): Promise<void> {
+    if (await this.dryWrites?.propose({ eventId, provider: 'BITRIX24', entityType: 'contact', entityId: contactId, operation: 'UPDATE', fields: {
+      EMAIL: [{ ID: currentEmail.id, VALUE: email, VALUE_TYPE: currentEmail.valueType }],
+    } })) return;
+    assertApplyExternalWrite('BITRIX24', 'CONTACT_EMAIL_UPDATE');
     await this.bitrixRequest(eventId, 'crm.contact.update.json', {
       id: contactId,
       'fields[EMAIL][0][ID]': currentEmail.id,
@@ -547,6 +555,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async bitrixRequest(eventId: string, method: string, fields: Record<string, string>): Promise<unknown> {
+    if (/\.update(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CONTACT_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('EXTERNAL_API_FAILURE');
     let response: Response;
@@ -579,16 +588,22 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async readMoyskladCounterparty(eventId: string, counterpartyId: string): Promise<JsonRecord> {
     const response = await this.moyskladRequest(eventId, counterpartyId, 'GET', undefined, isMoyskladCounterparty);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
-    return response;
+    return { ...response, ...(await this.dryWrites?.readback('MOYSKLAD', 'counterparty', counterpartyId)) };
   }
 
   private async writeMoyskladEmail(eventId: string, counterpartyId: string, email: string): Promise<JsonRecord> {
+    if (await this.dryWrites?.propose({ eventId, provider: 'MOYSKLAD', entityType: 'counterparty', entityId: counterpartyId, operation: 'UPDATE', fields: { email } })) {
+      const current = await this.readMoyskladCounterparty(eventId, counterpartyId);
+      return { ...current, email };
+    }
+    assertApplyExternalWrite('MOYSKLAD', 'CONTACT_EMAIL_UPDATE');
     const response = await this.moyskladRequest(eventId, counterpartyId, 'PUT', { email }, (payload) => isMoyskladCounterparty(payload) && readEmail(payload.email) === email);
     if (!isRecord(response)) throw new Error('EXTERNAL_API_FAILURE');
     return response;
   }
 
   private async moyskladRequest(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord, accepts: (payload: unknown) => boolean = isRecord): Promise<unknown> {
+    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CONTACT_REQUEST');
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('EXTERNAL_API_FAILURE');

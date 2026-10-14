@@ -10,4 +10,4 @@ COPY apps/api apps/api
 COPY apps/web apps/web
 RUN npx prisma generate --schema prisma/schema.prisma && npm run build --workspace @sync/web && npm run build --workspace @sync/api
 EXPOSE 3000
-CMD ["sh", "-c", "case \"${SYNC_MODE:-apply}\" in apply) ;; dry) export DATABASE_URL=\"${DRY_DATABASE_URL:?DRY_DATABASE_URL is required when SYNC_MODE=dry}\" ;; *) echo 'SYNC_MODE must be dry or apply' >&2; exit 1 ;; esac; npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/main.js"]
+CMD ["sh", "-c", "node -e \"require('./dist/apps/api/src/database-target.js').assertConfiguredDatabaseTargets()\" && { case \"${SYNC_MODE:-}\" in apply) migration_url=\"${DATABASE_URL:?DATABASE_URL is required when SYNC_MODE=apply}\" ;; dry) migration_url=\"${DRY_DATABASE_URL:?DRY_DATABASE_URL is required when SYNC_MODE=dry}\" ;; *) echo 'SYNC_MODE must be dry or apply' >&2; exit 1 ;; esac; } && DATABASE_URL=\"$migration_url\" npx prisma migrate deploy --schema prisma/schema.prisma && node dist/apps/api/src/main.js"]

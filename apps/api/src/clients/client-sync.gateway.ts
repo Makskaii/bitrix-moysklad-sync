@@ -1,30 +1,42 @@
 export type ClientRecord = Record<string, unknown>;
+import { assertApplyExternalWrite } from '../external-write-guard';
 
 export interface ClientSyncGateway {
   readBitrix(entity: 'COMPANY' | 'CONTACT', id: string): Promise<ClientRecord>;
   readMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null): Promise<ClientRecord>;
-  updateBitrix(entity: 'COMPANY' | 'CONTACT', id: string, fields: Record<string, unknown>): Promise<void>;
-  updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>): Promise<void>;
+  updateBitrix(entity: 'COMPANY' | 'CONTACT', id: string, fields: Record<string, unknown>, eventId?: string): Promise<void>;
+  updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>, eventId?: string): Promise<void>;
 }
+
+import { DryRunWriteJournal } from '../dry-run-write-journal';
 
 /** Runtime access is limited to exact IDs from an active pair and fields explicitly approved by field settings. */
 export class HttpClientSyncGateway implements ClientSyncGateway {
-  constructor(private readonly fetcher: typeof fetch = fetch) {}
+  constructor(private readonly fetcher: typeof fetch = fetch, private readonly dryWrites?: DryRunWriteJournal) {}
 
   async readBitrix(entity: 'COMPANY' | 'CONTACT', id: string): Promise<ClientRecord> {
+    const type = entity === 'COMPANY' ? 'company' : 'contact';
+    const created = await this.dryWrites?.createdRecord('BITRIX24', type, id);
+    if (created) return { ID: id, ...created };
     const method = entity === 'COMPANY' ? 'crm.company.get.json' : 'crm.contact.get.json';
     const payload = await this.bitrixRequest(method, { id });
     if (!isRecord(payload)) throw new Error('BITRIX24_CLIENT_READ_INVALID');
-    return payload;
+    const fields = await this.dryWrites?.readback('BITRIX24', entity === 'COMPANY' ? 'company' : 'contact', id);
+    return fields ? { ...payload, ...fields } : payload;
   }
 
   async readMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null): Promise<ClientRecord> {
+    const created = await this.dryWrites?.createdRecord('MOYSKLAD', type, id);
+    if (created) return { id, ...created, meta: { type } };
     const payload = await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'GET');
     if (!isRecord(payload)) throw new Error('MOYSKLAD_CLIENT_READ_INVALID');
-    return payload;
+    const fields = await this.dryWrites?.readback('MOYSKLAD', type, id);
+    return fields ? { ...payload, ...fields } : payload;
   }
 
-  async updateBitrix(entity: 'COMPANY' | 'CONTACT', id: string, fields: Record<string, unknown>): Promise<void> {
+  async updateBitrix(entity: 'COMPANY' | 'CONTACT', id: string, fields: Record<string, unknown>, eventId?: string): Promise<void> {
+    if (await this.dryWrites?.propose({ eventId, provider: 'BITRIX24', entityType: entity === 'COMPANY' ? 'company' : 'contact', entityId: id, operation: 'UPDATE', fields })) return;
+    assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE');
     const method = entity === 'COMPANY' ? 'crm.company.update.json' : 'crm.contact.update.json';
     const form = new URLSearchParams({ id });
     for (const [field, value] of Object.entries(fields)) appendFormValue(form, `fields[${field}]`, value);
@@ -32,11 +44,14 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     if (payload !== true) throw new Error('BITRIX24_CLIENT_WRITE_REJECTED');
   }
 
-  async updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>): Promise<void> {
+  async updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>, eventId?: string): Promise<void> {
+    if (await this.dryWrites?.propose({ eventId, provider: 'MOYSKLAD', entityType: type, entityId: id, operation: 'UPDATE', fields })) return;
+    assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE');
     await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'PUT', fields);
   }
 
   private async bitrixRequest(method: string, body: URLSearchParams | Record<string, string>): Promise<unknown> {
+    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CLIENT_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
     const form = body instanceof URLSearchParams ? body : new URLSearchParams(body);
@@ -51,6 +66,7 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'PUT', body?: Record<string, unknown>): Promise<unknown> {
+    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CLIENT_REQUEST');
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');

@@ -1,4 +1,6 @@
 import { Injectable } from '@nestjs/common';
+import { assertApplyExternalWrite } from '../external-write-guard';
+import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProductCardApi, ProductCardManualReviewError, ProductCardSnapshot } from './product-card-sync.service';
 
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -15,6 +17,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
  */
 @Injectable()
 export class ProductCardHttpApi implements ProductCardApi {
+  constructor(private readonly dryWrites?: DryRunWriteJournal) {}
+
   async readBitrix24PriceProductId(priceId: string): Promise<string> {
     if (!/^\d{1,20}$/.test(priceId)) throw new Error('PRODUCT_PRICE_ID_INVALID');
     const result = asRecord(await this.bitrixCall('catalog.price.get', { id: priceId }));
@@ -36,21 +40,25 @@ export class ProductCardHttpApi implements ProductCardApi {
       order: { id: 'ASC' },
       start: 0,
     }));
-    const prices = Array.isArray(pricesResult.prices) ? pricesResult.prices.filter(isRecord).map((price) => {
+    const prices = Array.isArray(pricesResult.prices) ? await Promise.all(pricesResult.prices.filter(isRecord).map(async (price) => {
       const idValue = scalarId(price.id);
       const typeId = scalarId(price.catalogGroupId);
-      const value = finiteNumber(price.price);
-      const currency = typeof price.currency === 'string' ? price.currency : '';
+      const proposed = idValue ? await this.dryWrites?.readback('BITRIX24', 'price', idValue) : undefined;
+      const value = finiteNumber(proposed?.value ?? price.price);
+      const currencyValue = proposed?.currency ?? price.currency;
+      const currency = typeof currencyValue === 'string' ? currencyValue : '';
       if (!idValue || !typeId || value === null) throw new Error('PRODUCT_PRICE_READ_INVALID');
       return { priceId: idValue, typeId, value, currency };
-    }) : [];
-    return {
-      name: nullableString(product.name),
-      detailText: nullableString(product.detailText),
-      unitId: product.measure === null || product.measure === undefined ? null : scalarId(product.measure),
+    })) : [];
+    const proposed = await this.dryWrites?.readback('BITRIX24', 'product', id);
+    const values = {
+      name: nullableString(proposed?.name ?? product.name),
+      detailText: nullableString(proposed?.detailText ?? product.detailText),
+      unitId: proposed?.measure === null ? null : proposed?.measure === undefined ? (product.measure === null || product.measure === undefined ? null : scalarId(product.measure)) : scalarId(proposed.measure),
       prices,
       updatedAt: nullableString(product.dateModify ?? product.dateCreate),
     };
+    return values;
   }
 
   async readMoysklad(id: string): Promise<ProductCardSnapshot> {
@@ -77,33 +85,54 @@ export class ProductCardHttpApi implements ProductCardApi {
       } } : undefined;
       return { priceId: typeId, typeId, value, currency: currencyCode ?? '', currencyRef };
     })) : [];
-    return {
-      name: nullableString(product.name),
-      detailText: nullableString(product.description),
-      unitId: uom,
+    const proposed = await this.dryWrites?.readback('MOYSKLAD', 'product', id);
+    const values = {
+      name: nullableString(proposed?.name ?? product.name),
+      detailText: nullableString(proposed?.description ?? product.description),
+      unitId: isRecord(proposed?.uom) && isRecord(proposed.uom.meta) ? idFromHref(proposed.uom.meta.href) : uom,
       prices,
       updatedAt: nullableString(product.updated),
     };
+    const proposedPrices = Array.isArray(proposed?.salePrices) ? proposed.salePrices.filter(isRecord).map((price) => {
+      const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
+      const typeId = idFromHref(typeMeta.href);
+      const current = typeId ? values.prices.find((entry) => entry.typeId === typeId) : undefined;
+      const value = finiteNumber(price.value);
+      if (!typeId || value === null) return null;
+      return {
+        priceId: typeId, typeId, value,
+        currency: current?.currency ?? '',
+        ...(isRecord(price.currency) ? { currencyRef: price.currency } : {}),
+      };
+    }).filter((price): price is NonNullable<typeof price> => price !== null) : null;
+    return { ...values, ...(proposedPrices ? { prices: proposedPrices } : {}) };
   }
 
   async updateBitrix24(id: string, fields: Record<string, unknown>): Promise<void> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
     if (Object.keys(fields).some((key) => !['name', 'detailText', 'measure'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'product', entityId: id, operation: 'UPDATE', fields })) return;
+    assertApplyExternalWrite('BITRIX24', 'PRODUCT_UPDATE');
     await this.bitrixCall('catalog.product.update', { id, fields });
   }
 
   async updateBitrix24Price(priceId: string, value: number, currency: string): Promise<void> {
     if (!/^\d{1,20}$/.test(priceId) || !Number.isFinite(value) || !currency) throw new Error('PRODUCT_PRICE_UPDATE_INVALID');
+    if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'price', entityId: priceId, operation: 'UPDATE', fields: { value, currency } })) return;
+    assertApplyExternalWrite('BITRIX24', 'PRODUCT_PRICE_UPDATE');
     await this.bitrixCall('catalog.price.update', { id: priceId, fields: { price: value, currency } });
   }
 
   async updateMoysklad(id: string, fields: Record<string, unknown>): Promise<void> {
     if (!isUuid(id)) throw new Error('PRODUCT_ID_INVALID');
     if (Object.keys(fields).some((key) => !['name', 'description', 'uom', 'salePrices'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'product', entityId: id, operation: 'UPDATE', fields })) return;
+    assertApplyExternalWrite('MOYSKLAD', 'PRODUCT_UPDATE');
     await this.moyskladRequest(`entity/product/${encodeURIComponent(id)}`, 'PUT', fields);
   }
 
   private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (/\.update(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'PRODUCT_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_PRODUCT_API_NOT_CONFIGURED');
     const url = new URL(`${method}.json`, ensureSlash(base));
@@ -119,6 +148,7 @@ export class ProductCardHttpApi implements ProductCardApi {
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'PUT', body?: Record<string, unknown>): Promise<unknown> {
+    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'PRODUCT_REQUEST');
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('MOYSKLAD_PRODUCT_API_NOT_CONFIGURED');

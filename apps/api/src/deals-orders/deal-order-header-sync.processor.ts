@@ -6,6 +6,8 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
+import { assertApplyExternalWrite } from '../external-write-guard';
+import { DryRunWriteJournal } from '../dry-run-write-journal';
 
 type Pair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type HeaderResult = 'DISABLED' | 'UNSUPPORTED' | 'BASELINE_MISSING' | 'BASELINE_INITIALIZED' | 'NOOP' | 'UPDATED' | 'HOLD_CONFLICT' | 'HOLD_READ_FAILED' | 'HOLD_WRITE_FAILED';
@@ -14,10 +16,10 @@ const FIELD = 'deal-order-comments';
 /** Local-release-only header exchange. It intentionally cannot update fields beyond COMMENTS/description. */
 @Injectable()
 export class DealOrderHeaderSyncProcessor {
-  constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService) {}
+  constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService, private readonly dryWrites?: DryRunWriteJournal) {}
 
   async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
-    if (process.env.ADMIN_PREVIEW !== '1' || process.env.LOCAL_HEADER_EXCHANGE !== '1' || process.env.LOCAL_HEADER_EXCHANGE_READY !== '1' || process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on') return 'DISABLED';
+    if (process.env.ADMIN_PREVIEW !== '1' || process.env.LOCAL_HEADER_EXCHANGE !== '1' || process.env.LOCAL_HEADER_EXCHANGE_READY !== '1' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || (await this.mode.read()).mode !== 'on') return 'DISABLED';
     if (input.pair.entityType !== 'DEAL' || input.baselineId !== input.pair.id) return 'UNSUPPORTED';
     const base24 = localEndpoint(process.env.BITRIX24_REST_BASE_URL);
     const baseMs = localEndpoint(process.env.MOYSKLAD_API_BASE_URL);
@@ -85,8 +87,20 @@ export class DealOrderHeaderSyncProcessor {
     if (!enabled || transform !== 'copy') return 'HOLD_CONFLICT';
     try {
       await input.assertWorkerLease?.();
-      if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
-      else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
+      const proposed = process.env.SYNC_MODE === 'dry' && this.dryWrites
+        ? await this.dryWrites.propose({
+          eventId: input.eventId,
+          provider: writeTo,
+          entityType: writeTo === 'MOYSKLAD' ? 'customerorder' : 'deal',
+          entityId: writeTo === 'MOYSKLAD' ? input.pair.moyskladId : input.pair.bitrix24Id,
+          operation: 'UPDATE',
+          fields: writeTo === 'MOYSKLAD' ? { description: value } : { COMMENTS: value },
+        })
+        : false;
+      if (!proposed) {
+        if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
+        else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
+      }
       const verified = writeTo === 'MOYSKLAD'
         ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
         : await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
@@ -99,6 +113,7 @@ export class DealOrderHeaderSyncProcessor {
   }
 
   private async writeMoySklad(base: URL, id: string, value: string) {
+    assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_HEADER_UPDATE');
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('write token unavailable');
     const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(id)}`, withSlash(base)), {
@@ -109,6 +124,7 @@ export class DealOrderHeaderSyncProcessor {
   }
 
   private async writeBitrix24(base: URL, id: string, value: string) {
+    assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_HEADER_UPDATE');
     const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ id, 'fields[COMMENTS]': value }), redirect: 'error', signal: AbortSignal.timeout(10_000),

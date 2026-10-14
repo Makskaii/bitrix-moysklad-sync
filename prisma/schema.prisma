@@ -162,6 +162,20 @@ model OperationalLog {
   @@index([category, occurredAt])
 }
 
+model DryRunWriteProposal {
+  id          String   @id
+  eventId     String?
+  provider    String
+  entityType  String
+  entityId    String
+  operation   String
+  fields      Json
+  createdAt   DateTime @default(now())
+
+  @@index([eventId, createdAt])
+  @@index([provider, entityType, entityId, createdAt])
+}
+
 model ContactPair {
   id                      String           @id @default(cuid())
   bitrix24ContactId       String           @unique

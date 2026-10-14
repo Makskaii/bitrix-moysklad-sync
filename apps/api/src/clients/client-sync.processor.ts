@@ -401,8 +401,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const direction = event.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : 'MOYSKLAD_TO_BITRIX24';
       const writes = buildWrites(config.config, mappingEntity, direction, bitrix, moysklad, prior, applicable, this.settings);
       if (writes.ambiguous) return this.hold(event, writes.ambiguous, { pairId: pair.id });
-      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await this.gateway.updateMoysklad(msType, pair.moyskladId, pair.moyskladParentId, writes.moysklad); }
-      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await this.gateway.updateBitrix(bitrixEntity, pair.bitrix24Id, writes.bitrix24); }
+      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await this.gateway.updateMoysklad(msType, pair.moyskladId, pair.moyskladParentId, writes.moysklad, event.id); }
+      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await this.gateway.updateBitrix(bitrixEntity, pair.bitrix24Id, writes.bitrix24, event.id); }
       const [afterBitrix, afterMoysklad] = await Promise.all([
         this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
         this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
@@ -502,7 +502,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       if (concurrentlyPaired) return concurrentlyPaired;
       targetId = await candidateGateway.createTarget({
         entity, targetSystem: resolution.targetSystem, targetType: resolution.targetType,
-        parentId: primaryCompanyTargetId, source: record, configuredFields,
+        parentId: primaryCompanyTargetId, source: record, configuredFields, eventId: event.id,
       });
       targetType = resolution.targetType;
     }
