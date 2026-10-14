@@ -114,14 +114,24 @@ test('assignment racing first-event resolution leaves the persisted pair authori
   const openReviews = await database.pairReviewCase.findMany({ where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: bitrix24Id, status: 'OPEN' } });
   assert.equal(openReviews.length, 0);
   const finalEvent = await database.inboundEvent.findUnique({ where: { id: event.id } });
-  assert.equal(finalEvent?.status, 'RECEIVED', 'pair assignment clears a stale manual hold and leaves downstream readiness separate');
+  assert.equal(finalEvent?.status, 'SUCCEEDED', 'pair assignment clears a stale manual hold and the claim-safe resolver completes');
   assert.equal(finalEvent?.lastErrorCategory, null);
-  const recoveredUnavailableEvent = await database.inboundEvent.findUnique({ where: { id: previouslyUnavailableEvent.id } });
-  assert.equal(recoveredUnavailableEvent?.status, 'RECEIVED', 'a successful explicit assignment also releases prior resolver-outage holds for that identity');
+  const recoveredUnavailableEvent = await waitForEventStatus(database, previouslyUnavailableEvent.id, 'SUCCEEDED');
+  assert.equal(recoveredUnavailableEvent?.status, 'SUCCEEDED', 'a successful explicit assignment releases prior resolver-outage holds and completes the event');
   assert.equal(recoveredUnavailableEvent?.lastErrorCategory, null);
   const allReviews = await database.pairReviewCase.findMany({ where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: bitrix24Id } });
   createdReviewIds.push(...allReviews.map((review) => review.id));
 });
+
+async function waitForEventStatus(database: DatabaseService, eventId: string, expected: string) {
+  const deadline = Date.now() + 3_000;
+  let event = await database.inboundEvent.findUnique({ where: { id: eventId } });
+  while (event?.status !== expected && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    event = await database.inboundEvent.findUnique({ where: { id: eventId } });
+  }
+  return event;
+}
 
 test('public webhook invokes first-event resolution and durably holds unresolved event for manual review', async () => {
   const id = `deal-${suffix}`;
@@ -134,7 +144,7 @@ test('public webhook invokes first-event resolution and durably holds unresolved
   createdEventIds.push(ack.eventId);
   const database = app.get(DatabaseService);
   let event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
-  for (let attempt = 0; attempt < 30 && event?.status === 'RECEIVED'; attempt++) {
+  for (let attempt = 0; attempt < 100 && ['RECEIVED', 'PROCESSING'].includes(event?.status ?? ''); attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
     event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
   }
@@ -160,7 +170,7 @@ test('confirmed pair lookup reports identity without mutating baseline readiness
   createdEventIds.push(ack.eventId);
   await new Promise((resolve) => setTimeout(resolve, 25));
   const event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
-  assert.equal(event?.status, 'RECEIVED');
+  assert.equal(event?.status, 'SUCCEEDED');
   assert.equal(event?.lastErrorCategory, null);
 });
 
@@ -178,7 +188,7 @@ test('public MoySklad customer-order webhook resolves through the canonical DEAL
   createdEventIds.push(ack.eventId);
   const database = app.get(DatabaseService);
   let event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
-  for (let attempt = 0; attempt < 30 && event?.status === 'RECEIVED'; attempt++) {
+  for (let attempt = 0; attempt < 100 && ['RECEIVED', 'PROCESSING'].includes(event?.status ?? ''); attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
     event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
   }

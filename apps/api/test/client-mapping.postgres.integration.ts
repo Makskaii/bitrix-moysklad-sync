@@ -10,6 +10,8 @@ import { ClientSyncProcessor } from '../src/clients/client-sync.processor';
 import { ClientSyncGateway } from '../src/clients/client-sync.gateway';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
 import { EntityPairService } from '../src/pairs/entity-pair.service';
+import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
+import { EventWorkerLeaseService } from '../src/event-worker-lease.service';
 
 const suffix = randomUUID();
 const companyId = `client53-${suffix}`;
@@ -27,6 +29,13 @@ const runtimeContactEventId = `runtime-contact-event-${suffix}`;
 const dependencyEventId = `dependency-event-${suffix}`;
 const duplicateContactEventId = `duplicate-contact-event-${suffix}`;
 const duplicateOrdinaryEventId = `duplicate-ordinary-event-${suffix}`;
+const ordinaryLeaseEventId = `ordinary-lease-event-${suffix}`;
+const ordinaryLeaseSecondEventId = `ordinary-lease-second-event-${suffix}`;
+const ordinarySourceLockEventId = `ordinary-source-lock-event-${suffix}`;
+const ordinarySourceLockSecondEventId = `ordinary-source-lock-second-event-${suffix}`;
+const ordinaryLeaseLossEventId = `ordinary-lease-loss-event-${suffix}`;
+const ordinaryLeaseLossSourceId = `ordinary-lease-loss-source-${suffix}`;
+const ordinaryLeaseLossTargetId = randomUUID();
 const duplicateCompanyId = `duplicate-company-${suffix}`;
 const canonicalCompanyId = `canonical-company-${suffix}`;
 const duplicateContactId = `duplicate-contact-${suffix}`;
@@ -36,6 +45,18 @@ const badContactTarget = randomUUID();
 const badContactEventId = `bad-contact-event-${suffix}`;
 const contactConflictEventId = `contact-conflict-event-${suffix}`;
 const missingMsParentEventId = `missing-ms-parent-event-${suffix}`;
+const combinedEventId = `combined-dependency-event-${suffix}`;
+const uncertainEventId = `uncertain-dependency-event-${suffix}`;
+const uncertainRetryEventId = `uncertain-retry-event-${suffix}`;
+const leaseLossEventId = `lease-loss-dependency-event-${suffix}`;
+const pairWorkerLeaseLossEventId = `pair-worker-lease-loss-event-${suffix}`;
+const combinedCompanyId = `combined-company-${suffix}`;
+const combinedCompanyTarget = randomUUID();
+const concurrentOrdinaryEventId = `concurrent-ordinary-event-${suffix}`;
+const concurrentDealEventId = `concurrent-deal-event-${suffix}`;
+const concurrentCompanyId = `concurrent-company-${suffix}`;
+const concurrentCompanyTarget = randomUUID();
+const uncertainCompanyId = `uncertain-company-${suffix}`;
 let database: DatabaseService;
 
 const fakeApi: ClientInventoryProvider = {
@@ -68,9 +89,15 @@ before(async () => {
   await database.inboundEvent.deleteMany({ where: { id: dependencyEventId } });
   await database.inboundEvent.deleteMany({ where: { id: duplicateContactEventId } });
   await database.inboundEvent.deleteMany({ where: { id: duplicateOrdinaryEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseSecondEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: { in: [ordinarySourceLockEventId, ordinarySourceLockSecondEventId] } } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseLossEventId } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: ordinaryLeaseLossSourceId } });
   await database.inboundEvent.deleteMany({ where: { id: badContactEventId } });
   await database.inboundEvent.deleteMany({ where: { id: contactConflictEventId } });
   await database.inboundEvent.deleteMany({ where: { id: missingMsParentEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: { in: [combinedEventId, uncertainEventId, uncertainRetryEventId, concurrentOrdinaryEventId, concurrentDealEventId, leaseLossEventId, pairWorkerLeaseLossEventId] } } });
 });
 
 after(async () => {
@@ -86,10 +113,18 @@ after(async () => {
   await database.inboundEvent.deleteMany({ where: { id: dependencyEventId } });
   await database.inboundEvent.deleteMany({ where: { id: duplicateContactEventId } });
   await database.inboundEvent.deleteMany({ where: { id: duplicateOrdinaryEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseSecondEventId } });
+  await database.inboundEvent.deleteMany({ where: { id: { in: [ordinarySourceLockEventId, ordinarySourceLockSecondEventId] } } });
+  await database.inboundEvent.deleteMany({ where: { id: ordinaryLeaseLossEventId } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: ordinaryLeaseLossSourceId } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: badContactId } });
   await database.inboundEvent.deleteMany({ where: { id: badContactEventId } });
   await database.inboundEvent.deleteMany({ where: { id: contactConflictEventId } });
   await database.inboundEvent.deleteMany({ where: { id: missingMsParentEventId } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: { in: [combinedCompanyId, uncertainCompanyId, concurrentCompanyId] } } });
+  await database.pairReviewCase.deleteMany({ where: { sourceEntityId: uncertainCompanyId } });
+  await database.inboundEvent.deleteMany({ where: { id: { in: [combinedEventId, uncertainEventId, uncertainRetryEventId, concurrentOrdinaryEventId, concurrentDealEventId, leaseLossEventId, pairWorkerLeaseLossEventId] } } });
   await database.$disconnect();
 });
 
@@ -244,6 +279,200 @@ test('document dependency canonicalizes a duplicate company to an unmarked equiv
   assert.ok(apiCalls.every((call) => call.url.includes('.fake/')));
 });
 
+test('claimed deal event resolves and persists client dependency under worker fencing; uncertain create leaves durable hold', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://moysklad.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-token';
+  process.env.BITRIX24_REST_BASE_URL = 'https://bitrix.fake/rest/';
+  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
+  await settings.active();
+  const calls: Array<{ url: string; method: string }> = [];
+  const fakeFetch: typeof fetch = async (input, init = {}) => {
+    const url = String(input); const method = init.method ?? 'GET'; calls.push({ url, method });
+    if (url.includes('crm.requisite.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('crm.company.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('/entity/counterparty') && method === 'GET') return Response.json({ rows: [], meta: { size: 0, limit: 1000, offset: 0 } });
+    if (url.includes('/entity/counterparty') && method === 'POST') return Response.json({ id: combinedCompanyTarget, name: 'Combined Company' });
+    throw new Error(`Unexpected fake API request: ${method} ${url}`);
+  };
+  const clientGateway: ClientSyncGateway = {
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, combinedCompanyId); return { ID: id, TITLE: 'Combined Company' }; },
+    async readMoysklad(type, id) { assert.equal(type, 'counterparty'); return { id, name: 'Combined Company' }; },
+    async updateBitrix() { assert.fail('dependency resolution must not write'); },
+    async updateMoysklad() { assert.fail('dependency resolution must not write'); },
+  };
+  const resolver = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, clientGateway, new HttpClientCandidateGateway(database, fakeFetch));
+  const workerLease = new EventWorkerLeaseService(database);
+  const dealPair = { id: `deal-pair-${suffix}`, entityType: 'DEAL' as const, bitrix24Id: `deal-${suffix}`, moyskladId: randomUUID(), status: 'CONFIRMED' as const, source: 'PERSISTED' as const };
+  const processor = new PairFirstEventProcessor(
+    database,
+    { resolve: async () => ({ status: 'confirmed', pair: dealPair }) } as never,
+    settings,
+    { ensureForConfirmedPair: async () => ({ status: 'READY', baselineId: `baseline-${suffix}` }) } as never,
+    undefined,
+    workerLease,
+    { read: async () => ({ mode: 'on' }) } as never,
+    resolver,
+    { readBitrix24DealForBaseline: async () => ({ ID: dealPair.bitrix24Id, COMPANY_ID: combinedCompanyId }) } as never,
+  );
+  await database.inboundEvent.create({ data: {
+    id: combinedEventId, source: 'BITRIX24', deliveryKey: combinedEventId, eventType: 'ONCRMDEALADD',
+    externalEntityId: dealPair.bitrix24Id, externalEntityType: 'deal', payload: { event: 'ONCRMDEALADD' }, status: 'RECEIVED',
+  } });
+  await settings.pinEvent(combinedEventId);
+  await processor.process(combinedEventId);
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: combinedEventId } })).status, 'SUCCEEDED');
+  const persisted = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: combinedCompanyId, active: true } });
+  assert.ok(persisted);
+  assert.equal(persisted.moyskladId, combinedCompanyTarget);
+  await processor.process(combinedEventId);
+  assert.equal(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/entity/counterparty')).length, 1);
+
+  let postEntered!: () => void;
+  let releasePost!: () => void;
+  const postStarted = new Promise<void>((resolve) => { postEntered = resolve; });
+  const postGate = new Promise<void>((resolve) => { releasePost = resolve; });
+  let concurrentPosts = 0;
+  const concurrentFetch: typeof fetch = async (input, init = {}) => {
+    const url = String(input); const method = init.method ?? 'GET';
+    if (url.includes('crm.requisite.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('crm.company.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('/entity/counterparty') && method === 'GET') return Response.json({ rows: [], meta: { size: 0, limit: 1000, offset: 0 } });
+    if (url.includes('/entity/counterparty') && method === 'POST') {
+      concurrentPosts++;
+      postEntered();
+      await postGate;
+      return Response.json({ id: concurrentCompanyTarget, name: 'Concurrent Company' });
+    }
+    throw new Error(`Unexpected fake API request: ${method} ${url}`);
+  };
+  const concurrentGateway: ClientSyncGateway = {
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, concurrentCompanyId); return { ID: id, TITLE: 'Concurrent Company' }; },
+    async readMoysklad(type, id) { assert.equal(type, 'counterparty'); return { id, name: 'Concurrent Company' }; },
+    async updateBitrix() { assert.fail('concurrent dependency resolution must not write'); },
+    async updateMoysklad() { assert.fail('concurrent dependency resolution must not write'); },
+  };
+  const concurrentResolver = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, concurrentGateway, new HttpClientCandidateGateway(database, concurrentFetch));
+  const concurrentTargetDealPair = { ...dealPair, id: `concurrent-deal-pair-${suffix}`, bitrix24Id: `concurrent-deal-${suffix}` };
+  const concurrentPairFirst = new PairFirstEventProcessor(
+    database,
+    { resolve: async () => ({ status: 'confirmed', pair: concurrentTargetDealPair }) } as never,
+    settings,
+    { ensureForConfirmedPair: async () => ({ status: 'READY', baselineId: `concurrent-baseline-${suffix}` }) } as never,
+    undefined,
+    workerLease,
+    { read: async () => ({ mode: 'on' }) } as never,
+    concurrentResolver,
+    { readBitrix24DealForBaseline: async () => ({ ID: concurrentTargetDealPair.bitrix24Id, COMPANY_ID: concurrentCompanyId }) } as never,
+  );
+  await database.inboundEvent.create({ data: {
+    id: concurrentOrdinaryEventId, source: 'BITRIX24', deliveryKey: concurrentOrdinaryEventId, eventType: 'ONCRMCOMPANYADD',
+    externalEntityId: concurrentCompanyId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYADD' }, status: 'RECEIVED',
+  } });
+  await database.inboundEvent.create({ data: {
+    id: concurrentDealEventId, source: 'BITRIX24', deliveryKey: concurrentDealEventId, eventType: 'ONCRMDEALADD',
+    externalEntityId: concurrentTargetDealPair.bitrix24Id, externalEntityType: 'deal', payload: { event: 'ONCRMDEALADD' }, status: 'RECEIVED',
+  } });
+  await settings.pinEvent(concurrentOrdinaryEventId);
+  await settings.pinEvent(concurrentDealEventId);
+  const ordinaryInFlight = concurrentResolver.process(concurrentOrdinaryEventId);
+  await postStarted;
+  await concurrentPairFirst.process(concurrentDealEventId);
+  const contended = await database.inboundEvent.findUniqueOrThrow({ where: { id: concurrentDealEventId } });
+  assert.equal(contended.status, 'RETRYABLE_FAILURE');
+  assert.equal(concurrentPosts, 1, 'document path must not POST while ordinary client event owns the source lease');
+  releasePost();
+  await ordinaryInFlight;
+  await database.inboundEvent.update({ where: { id: concurrentDealEventId }, data: { status: 'RECEIVED', retryAfter: null, processingStartedAt: null } });
+  await concurrentPairFirst.process(concurrentDealEventId);
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: concurrentDealEventId } })).status, 'SUCCEEDED');
+  assert.equal(concurrentPosts, 1, 'the retried dependency must reuse the pair persisted by ordinary processing');
+
+  await database.inboundEvent.create({ data: {
+    id: leaseLossEventId, source: 'MOYSKLAD', deliveryKey: leaseLossEventId, eventType: 'UPDATE',
+    externalEntityId: randomUUID(), externalEntityType: 'customerorder', payload: { event: 'UPDATE' }, status: 'PROCESSING', processingStartedAt: new Date(),
+  } });
+  await settings.pinEvent(leaseLossEventId);
+  const leaseLostResolver = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, concurrentGateway, new HttpClientCandidateGateway(database, concurrentFetch));
+  const leaseEvent = await database.inboundEvent.findUniqueOrThrow({ where: { id: leaseLossEventId } });
+  let leaseWasRejected = false;
+  try {
+    await (leaseLostResolver as any).dependencyHold(leaseEvent, 'STALE_WORKER_TEST', {}, {
+      assertOwned: async () => undefined,
+      assertOwnedIn: async () => { throw new Error('EVENT_WORKER_LEASE_LOST'); },
+    });
+  } catch (error) { leaseWasRejected = error instanceof Error && error.message === 'EVENT_WORKER_LEASE_LOST'; }
+  assert.equal(leaseWasRejected, true, 'dependency hold checks the worker fence inside its transaction before persistence');
+  assert.equal(await database.manualReviewCase.count({ where: { eventId: leaseLossEventId } }), 0, 'a stale worker cannot create a manual review case');
+  assert.equal(await database.operationalLog.count({ where: { referenceId: leaseLossEventId, category: 'CLIENT_DEPENDENCY' } }), 0, 'a stale worker cannot emit dependency logs');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: leaseLossEventId } })).status, 'PROCESSING');
+
+  await database.inboundEvent.create({ data: {
+    id: pairWorkerLeaseLossEventId, source: 'BITRIX24', deliveryKey: pairWorkerLeaseLossEventId, eventType: 'ONCRMDEALADD',
+    externalEntityId: `stale-deal-${suffix}`, externalEntityType: 'deal', payload: { event: 'ONCRMDEALADD' }, status: 'RECEIVED',
+  } });
+  let pairLeaseAssertions = 0;
+  const pairWorker = {
+    async run<T>(_eventId: string, work: (lease: { assertOwned(): Promise<void>; assertOwnedIn(): Promise<void> }) => Promise<T>) {
+      return work({ assertOwned: async () => undefined, assertOwnedIn: async () => {
+        pairLeaseAssertions++;
+        if (pairLeaseAssertions === 2) throw new Error('EVENT_WORKER_LEASE_LOST');
+      } });
+    },
+  };
+  const stalePairProcessor = new PairFirstEventProcessor(
+    database,
+    { resolve: async () => ({ status: 'unmatched', reason: 'NO_CANDIDATES' }) } as never,
+    undefined,
+    undefined,
+    undefined,
+    pairWorker as never,
+    { read: async () => ({ mode: 'on' }) } as never,
+  );
+  let pairLeaseRejected = false;
+  try { await stalePairProcessor.process(pairWorkerLeaseLossEventId); }
+  catch (error) { pairLeaseRejected = error instanceof Error && error.message === 'EVENT_WORKER_LEASE_LOST'; }
+  assert.equal(pairLeaseRejected, true, 'lease loss inside the retry/manual-review transaction aborts the transition');
+  assert.equal(pairLeaseAssertions, 2, 'claim is fenced, then the stale terminal transition is rejected');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: pairWorkerLeaseLossEventId } })).status, 'PROCESSING');
+
+  let uncertainPosts = 0;
+  const uncertainFetch: typeof fetch = async (input, init = {}) => {
+    const url = String(input); const method = init.method ?? 'GET';
+    if (url.includes('crm.requisite.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('crm.company.list')) return Response.json({ result: [], total: 0 });
+    if (url.includes('/entity/counterparty') && method === 'GET') return Response.json({ rows: [], meta: { size: 0, limit: 1000, offset: 0 } });
+    if (url.includes('/entity/counterparty') && method === 'POST') { uncertainPosts++; throw new Error('simulated lost create response'); }
+    throw new Error(`Unexpected fake API request: ${method} ${url}`);
+  };
+  const uncertainResolver = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, {
+    ...clientGateway,
+    async readBitrix(_entity: 'COMPANY' | 'CONTACT', id: string) { assert.equal(id, uncertainCompanyId); return { ID: id, TITLE: 'Uncertain Company' }; },
+  } as never, new HttpClientCandidateGateway(database, uncertainFetch));
+  const uncertainProcessor = new PairFirstEventProcessor(
+    database,
+    { resolve: async () => ({ status: 'confirmed', pair: { ...dealPair, id: `uncertain-deal-pair-${suffix}` } }) } as never,
+    settings,
+    { ensureForConfirmedPair: async () => ({ status: 'READY', baselineId: `uncertain-baseline-${suffix}` }) } as never,
+    undefined,
+    workerLease,
+    { read: async () => ({ mode: 'on' }) } as never,
+    uncertainResolver,
+    { readBitrix24DealForBaseline: async () => ({ ID: dealPair.bitrix24Id, COMPANY_ID: uncertainCompanyId }) } as never,
+  );
+  for (const eventId of [uncertainEventId, uncertainRetryEventId]) {
+    await database.inboundEvent.create({ data: {
+      id: eventId, source: 'BITRIX24', deliveryKey: eventId, eventType: 'ONCRMDEALADD',
+      externalEntityId: dealPair.bitrix24Id, externalEntityType: 'deal', payload: { event: 'ONCRMDEALADD' }, status: 'RECEIVED',
+    } });
+    await settings.pinEvent(eventId);
+    await uncertainProcessor.process(eventId);
+    assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'MANUAL_REVIEW');
+  }
+  assert.equal(uncertainPosts, 1, 'second distinct event must not repeat an uncertain provider create');
+  const durableHold = await database.pairReviewCase.findFirst({ where: { sourceEntityId: uncertainCompanyId, reason: 'CLIENT_CREATE_IN_PROGRESS', status: 'OPEN' } });
+  assert.ok(durableHold, 'uncertain response remains held durably for reconciliation');
+});
+
 test('document dependency omits a duplicate contact only after validating the saved company pair', async () => {
   const existingCompanyPair = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: companyId, active: true } });
   assert.ok(existingCompanyPair, 'the preceding inventory test creates the company pair');
@@ -352,4 +581,143 @@ test('ordinary client sync excludes a duplicate-marked company without searching
   const savedEvent = await database.inboundEvent.findUnique({ where: { id: duplicateOrdinaryEventId } });
   assert.equal(savedEvent?.status, 'SUCCEEDED');
   assert.equal(savedEvent?.lastErrorCategory, 'DUPLICATE_COMPANY_EXCLUDED_FROM_ORDINARY_SYNC');
+});
+
+test('two ordinary client workers atomically claim one event and only one reads the persisted pair', async () => {
+  const pair = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: companyId, active: true } });
+  assert.ok(pair, 'the inventory test provides an active persisted company pair');
+  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
+  await database.inboundEvent.create({ data: {
+    id: ordinaryLeaseEventId, source: 'BITRIX24', deliveryKey: ordinaryLeaseEventId, eventType: 'ONCRMCOMPANYUPDATE',
+    externalEntityId: companyId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYUPDATE' }, status: 'RECEIVED',
+  } });
+  await settings.pinEvent(ordinaryLeaseEventId);
+
+  let findArrivals = 0;
+  let releaseBothFinds!: () => void;
+  const bothFinds = new Promise<void>((resolve) => { releaseBothFinds = resolve; });
+  const inboundDelegate = new Proxy(database.inboundEvent, {
+    get(delegate, property) {
+      if (property === 'findUnique') return async (args: { where?: { id?: string } }) => {
+        const event = await delegate.findUnique(args as never);
+        if (args.where?.id === ordinaryLeaseEventId) {
+          findArrivals += 1;
+          if (findArrivals === 2) releaseBothFinds();
+          await bothFinds;
+        }
+        return event;
+      };
+      const value = Reflect.get(delegate, property, delegate);
+      return typeof value === 'function' ? value.bind(delegate) : value;
+    },
+  });
+  const racingDatabase = new Proxy(database, {
+    get(target, property) {
+      if (property === 'inboundEvent') return inboundDelegate;
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  let providerReads = 0;
+  const gateway: ClientSyncGateway = {
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, companyId); providerReads += 1; return { ID: id, TITLE: 'Example Company' }; },
+    async readMoysklad(type, id) { assert.equal(type, 'counterparty'); assert.equal(id, pair!.moyskladId); providerReads += 1; return { id, name: 'Example Company' }; },
+    async updateBitrix() { assert.fail('initial read must not update fields'); },
+    async updateMoysklad() { assert.fail('initial read must not update fields'); },
+  };
+  const leases = new EventWorkerLeaseService(database);
+  const first = new ClientSyncProcessor(racingDatabase as never, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }), leases);
+  const second = new ClientSyncProcessor(racingDatabase as never, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }), leases);
+  const results = await Promise.all([first.process(ordinaryLeaseEventId), second.process(ordinaryLeaseEventId)]);
+  assert.equal(results.filter((result) => result === 'BASELINE').length, 1);
+  assert.equal(results.filter((result) => result === 'IGNORED').length, 1);
+  assert.equal(providerReads, 3, 'only the event claimant performs the duplicate check and pair reads');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: ordinaryLeaseEventId } })).status, 'UNCHANGED');
+});
+
+test('ordinary events for the same persisted client serialize on the shared source lease', async () => {
+  const pair = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: companyId, active: true } });
+  assert.ok(pair);
+  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
+  for (const id of [ordinarySourceLockEventId, ordinarySourceLockSecondEventId]) {
+    await database.inboundEvent.create({ data: {
+      id, source: 'BITRIX24', deliveryKey: id, eventType: 'ONCRMCOMPANYUPDATE',
+      externalEntityId: companyId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYUPDATE' }, status: 'RECEIVED',
+    } });
+    await settings.pinEvent(id);
+  }
+  let announceRead!: () => void;
+  let releaseRead!: () => void;
+  const enteredRead = new Promise<void>((resolve) => { announceRead = resolve; });
+  const blockedRead = new Promise<void>((resolve) => { releaseRead = resolve; });
+  let firstRead = true;
+  let firstProviderReads = 0;
+  let secondProviderReads = 0;
+  const makeGateway = (countRead: () => void): ClientSyncGateway => ({
+    async readBitrix(entity, id) {
+      assert.equal(entity, 'COMPANY'); assert.equal(id, companyId); countRead();
+      if (firstRead) { firstRead = false; announceRead(); await blockedRead; }
+      return { ID: id, TITLE: 'Example Company' };
+    },
+    async readMoysklad(type, id) { assert.equal(type, 'counterparty'); assert.equal(id, pair!.moyskladId); countRead(); return { id, name: 'Example Company' }; },
+    async updateBitrix() { assert.fail('baseline state is unchanged'); },
+    async updateMoysklad() { assert.fail('baseline state is unchanged'); },
+  });
+  const leases = new EventWorkerLeaseService(database);
+  const first = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, makeGateway(() => { firstProviderReads += 1; }), new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }), leases);
+  const second = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, makeGateway(() => { secondProviderReads += 1; }), new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }), leases);
+  const firstRun = first.process(ordinarySourceLockEventId);
+  await enteredRead;
+  const secondResult = await second.process(ordinarySourceLockSecondEventId);
+  releaseRead();
+  const firstResult = await firstRun;
+  assert.equal(firstResult, 'UNCHANGED');
+  assert.equal(secondResult, 'RETRY');
+  assert.ok(firstProviderReads > 0);
+  assert.equal(secondProviderReads, 0, 'the busy second event must not read or write the same source pair concurrently');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: ordinarySourceLockEventId } })).status, 'SUCCEEDED');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: ordinarySourceLockSecondEventId } })).status, 'RETRYABLE_FAILURE');
+});
+
+test('paired client update cannot commit sync state or terminal status after worker lease is stolen during provider write', async () => {
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: ordinaryLeaseLossSourceId, moyskladId: ordinaryLeaseLossTargetId,
+    moyskladType: 'counterparty', active: true, source: 'TEST',
+  } });
+  await database.entityPairSyncState.create({ data: {
+    pairId: pair.id, settingsVersion: 1, bitrix24Values: { TITLE: 'old' }, moyskladValues: { name: 'old' },
+  } });
+  await database.inboundEvent.create({ data: {
+    id: ordinaryLeaseLossEventId, source: 'BITRIX24', deliveryKey: ordinaryLeaseLossEventId, eventType: 'ONCRMCOMPANYUPDATE',
+    externalEntityId: ordinaryLeaseLossSourceId, externalEntityType: 'company', payload: { event: 'ONCRMCOMPANYUPDATE' }, status: 'RECEIVED',
+  } });
+  const settings = {
+    eventConfig: async () => ({ version: 1, config: { rules: [{
+      entity: 'companies', sourceField: 'TITLE', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: true }, moyskladToBitrix24: { enabled: false },
+    }], groups: [] } }),
+    transformField: (_config: unknown, _entity: string, _direction: string, _sourceField: string, source: Record<string, unknown>) => ({ value: source.TITLE }),
+  };
+  let targetName = 'old';
+  let leaseLost = false;
+  let writes = 0;
+  const gateway: ClientSyncGateway = {
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, ordinaryLeaseLossSourceId); return { ID: id, TITLE: 'new' }; },
+    async readMoysklad(type, id) { assert.equal(type, 'counterparty'); assert.equal(id, ordinaryLeaseLossTargetId); return { id, name: targetName }; },
+    async updateBitrix() { assert.fail('only the configured MoySklad target field should be written'); },
+    async updateMoysklad(_type, _id, _parent, values) { writes += 1; assert.deepEqual(values, { name: 'new' }); targetName = 'new'; leaseLost = true; },
+  };
+  const workerLease = {
+    assertOwned: async () => { if (leaseLost) throw new Error('EVENT_WORKER_LEASE_LOST'); },
+    assertOwnedIn: async () => { if (leaseLost) throw new Error('EVENT_WORKER_LEASE_LOST'); },
+  };
+  const processor = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway, new HttpClientCandidateGateway(database, async () => { throw new Error('saved pair must not search'); }));
+  const run = (processor as unknown as { processWithLease(eventId: string, lease: typeof workerLease): Promise<string> }).processWithLease.bind(processor);
+  assert.equal(await run(ordinaryLeaseLossEventId, workerLease), 'RETRY');
+  assert.equal(writes, 1);
+  const savedEvent = await database.inboundEvent.findUniqueOrThrow({ where: { id: ordinaryLeaseLossEventId } });
+  assert.equal(savedEvent.status, 'PROCESSING', 'stale worker must not record a retry or terminal transition');
+  const savedState = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.deepEqual(savedState.bitrix24Values, { TITLE: 'old' });
+  assert.deepEqual(savedState.moyskladValues, { name: 'old' });
 });

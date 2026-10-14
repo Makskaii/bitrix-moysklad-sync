@@ -22,8 +22,9 @@ import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { WebhookDiagnosticLog } from './webhook-diagnostic-log';
-import { FieldSettingsService } from './field-settings/field-settings.service';
+import { EventIntakeDisabledError, FieldSettingsService } from './field-settings/field-settings.service';
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
+import { EventDispatcherService } from './event-dispatcher.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
@@ -70,12 +71,15 @@ export class EventIntakeService {
     const directionDisabled = eventType?.startsWith('ONCRMCONTACT') === true &&
       !await this.syncMode.isDirectionEnabled('contacts-companies', 'bitrix24ToMoysklad');
 
-    return this.save('BITRIX24', sha256(canonicalJson(safePayload)), {
+    const event = {
       eventType,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
       externalEntityType: bitrixEntityType(eventType),
       payload: safePayload,
-    }, directionDisabled);
+    };
+    // Bitrix's webhook body has no documented stable delivery ID. A payload hash
+    // would collapse two legitimate identical updates, so preserve each arrival.
+    return this.save('BITRIX24', `delivery:${randomUUID()}`, event, directionDisabled);
   }
 
   async receiveMoySklad(
@@ -122,17 +126,22 @@ export class EventIntakeService {
     const contactEventIds: string[] = [];
     const pairEventIds: string[] = [];
     for (const [index, event] of events.entries()) {
-      const deliveryKey = typeof requestId === 'string'
-        ? `request:${JSON.stringify([requestId, index])}`
-        : `unkeyed:${randomUUID()}`;
-      const directionDisabled = event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty' &&
-        !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
-      const acknowledgement = await this.save('MOYSKLAD', deliveryKey, {
+      const payload = { ...safePayload, ...(Array.isArray(safePayload.events) ? { events: [event.payload] } : {}) };
+      const queueEvent = {
         eventType: event.eventType,
         externalEntityId: event.externalEntityId,
         externalEntityType: event.externalEntityType,
-        payload: { ...safePayload, ...(Array.isArray(safePayload.events) ? { events: [event.payload] } : {}) },
-      }, directionDisabled);
+        payload,
+      };
+      const fingerprint = eventFingerprint('MOYSKLAD', queueEvent);
+      const deliveryKey = typeof requestId === 'string'
+        ? `request:${sha256(canonicalJson([requestId, index, fingerprint]))}`
+        // No stable key means at-least-once intake: retain every arrival rather
+        // than risk dropping a later real change with an identical envelope.
+        : `delivery:${randomUUID()}`;
+      const directionDisabled = event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty' &&
+        !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
+      const acknowledgement = await this.save('MOYSKLAD', deliveryKey, queueEvent, directionDisabled);
       eventIds.push(acknowledgement.eventId);
       if (event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty') {
         contactEventIds.push(acknowledgement.eventId);
@@ -166,19 +175,39 @@ export class EventIntakeService {
         ? await this.fieldSettings.saveAcceptedEvent({
           source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
           externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue, directionDisabled,
+          requireServiceNotOff: true,
         })
-        : await this.database.inboundEvent.upsert({
-          where: { source_deliveryKey: { source, deliveryKey } },
-          create: {
-            source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
-            externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue,
-            status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
-            lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
-          },
-          update: {},
-          select: { id: true },
-        });
-    } catch {
+        : typeof this.database.$transaction === 'function'
+          ? await this.database.$transaction(async (transaction) => {
+            const mode = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
+              SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+            `;
+            if (!mode[0] || mode[0].serviceMode === 'off') throw new EventIntakeDisabledError();
+            return transaction.inboundEvent.upsert({
+              where: { source_deliveryKey: { source, deliveryKey } },
+              create: {
+                source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
+                externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue,
+                status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
+                lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
+              },
+              update: {},
+              select: { id: true },
+            });
+          })
+          : await this.database.inboundEvent.upsert({
+            where: { source_deliveryKey: { source, deliveryKey } },
+            create: {
+              source, deliveryKey, eventType: event.eventType, externalEntityId: event.externalEntityId,
+              externalEntityType: event.externalEntityType, payload: event.payload as Prisma.InputJsonValue,
+              status: directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
+              lastErrorCategory: directionDisabled ? 'DIRECTION_DISABLED' : null,
+            },
+            update: {},
+            select: { id: true },
+          });
+    } catch (error) {
+      if (error instanceof EventIntakeDisabledError) throw new GoneException('Event intake is disabled');
       const receivedAt = new Date().toISOString();
       const supportedType = source === 'BITRIX24'
         ? safeDealEventType(event.eventType)
@@ -212,6 +241,7 @@ export class EventsController {
     private readonly intake: EventIntakeService,
     @Optional() private readonly contactSync?: ContactSyncProcessor,
     @Optional() private readonly pairFirstEvent?: PairFirstEventProcessor,
+    @Optional() private readonly dispatcher?: EventDispatcherService,
   ) {}
 
   @Post('bitrix24')
@@ -222,10 +252,12 @@ export class EventsController {
   ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
     const acknowledgement = await this.intake.receiveBitrix24(payload);
-    if (isContactBitrixEvent(readString(payload.event))) {
+    if (this.dispatcher) {
+      response.once('finish', () => { void this.dispatcher!.dispatch(acknowledgement.eventId).catch(() => undefined); });
+    } else if (isContactBitrixEvent(readString(payload.event))) {
       response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
     }
-    if (isDealBitrixEvent(readString(payload.event))) {
+    if (!this.dispatcher && isDealBitrixEvent(readString(payload.event))) {
       response.once('finish', () => this.pairFirstEvent?.enqueue(acknowledgement.eventId));
     }
     return acknowledgement;
@@ -242,10 +274,14 @@ export class EventsController {
   ) {
     if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
     return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
-      if (acknowledgement.contactEventIds.length > 0) {
+      if (this.dispatcher) {
+        response.once('finish', () => acknowledgement.eventIds.forEach((eventId) => {
+          void this.dispatcher!.dispatch(eventId).catch(() => undefined);
+        }));
+      } else if (acknowledgement.contactEventIds.length > 0) {
         response.once('finish', () => acknowledgement.contactEventIds.forEach((eventId) => this.contactSync?.enqueue(eventId)));
       }
-      if (acknowledgement.pairEventIds.length > 0) {
+      if (!this.dispatcher && acknowledgement.pairEventIds.length > 0) {
         response.once('finish', () => acknowledgement.pairEventIds.forEach((eventId) => this.pairFirstEvent?.enqueue(eventId)));
       }
       const { contactEventIds, pairEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
@@ -285,6 +321,19 @@ function canonicalJson(value: unknown): string {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function eventFingerprint(
+  source: InboundSource,
+  event: { eventType: string | null; externalEntityId: string | null; externalEntityType: string | null; payload: EventPayload },
+): string {
+  return sha256(canonicalJson([
+    source,
+    event.externalEntityType,
+    event.externalEntityId,
+    event.eventType,
+    event.payload,
+  ]));
 }
 
 function readMoySkladEvent(payload: EventPayload): {

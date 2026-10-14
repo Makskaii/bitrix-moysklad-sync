@@ -54,8 +54,7 @@ export class SyncModeService {
     const current = await this.ensureGlobalSetting();
     if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
     const enteringOff = mode === 'off' && current.serviceMode !== 'off';
-    const startingResume = mode === 'on' && current.serviceMode !== 'on' && current.offSince !== null &&
-      ['idle', 'complete'].includes(current.resumeStatus);
+    const leavingOffInterval = mode === 'on' && current.offSince !== null;
     const now = new Date();
     const offSince = enteringOff ? new Date() : current.offSince;
     const setting = await this.database.syncSetting.update({
@@ -63,27 +62,30 @@ export class SyncModeService {
       data: {
         serviceMode: mode,
         offSince,
+        ...((mode === 'pause' || mode === 'off') ? { lastInactiveAt: now } : {}),
+        ...(mode === 'on' && current.serviceMode !== 'on' ? { lastActiveAt: now } : {}),
         ...(enteringOff ? {
-          resumeStatus: 'idle',
+          resumeStatus: 'skipped',
           resumeFrom: null,
           resumeThrough: null,
           resumeProvider: 'BITRIX24',
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
-          resumeError: null,
+          resumeError: 'Events missed during OFF are intentionally not replayed.',
           resumeRetryAfter: null,
           resumeAttempts: 0,
         } : {}),
-        ...(startingResume ? {
-          resumeStatus: 'pending',
-          resumeFrom: new Date(Math.floor(current.offSince!.getTime() / 1_000) * 1_000),
-          resumeThrough: now,
+        ...(leavingOffInterval ? {
+          resumeStatus: 'skipped',
+          resumeFrom: null,
+          resumeThrough: null,
           resumeProvider: 'BITRIX24',
           resumeBitrixStart: 0,
           resumeMoyskladOffset: 0,
-          resumeError: null,
+          resumeError: 'Events missed during OFF are intentionally not replayed.',
           resumeRetryAfter: null,
           resumeAttempts: 0,
+          offSince: null,
         } : {}),
       },
       select: { serviceMode: true },

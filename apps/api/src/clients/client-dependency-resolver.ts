@@ -1,5 +1,6 @@
 import { EntityPair } from '@prisma/client';
 import { ClientEntity, ClientSystem } from './client-runtime-resolver';
+import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
 export const CLIENT_DEPENDENCY_RESOLVER = Symbol('CLIENT_DEPENDENCY_RESOLVER');
 
@@ -20,5 +21,5 @@ export type ClientDependencyResolution =
 
 /** Resolves only a document's explicit client dependencies; it does not scan or rewrite documents. */
 export interface ClientDependencyResolver {
-  resolveForDocument(input: ClientDependencyInput): Promise<ClientDependencyResolution>;
+  resolveForDocument(input: ClientDependencyInput, lease?: EventWorkerLeaseContext): Promise<ClientDependencyResolution>;
 }

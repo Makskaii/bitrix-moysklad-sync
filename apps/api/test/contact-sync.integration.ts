@@ -69,7 +69,8 @@ let serviceMode: 'on' | 'pause' = 'on';
 
 const database = {
   $transaction: async (callback: (transaction: unknown) => Promise<unknown>) => callback(database),
-  $queryRaw: async (_query: TemplateStringsArray, ...values: unknown[]) => {
+  $queryRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+    if (query.join('').includes('SyncSetting')) return [{ serviceMode }];
     const ownerToken = entityLocks.get(String(values[0]));
     return ownerToken ? [{ ownerToken, leaseExpiresAt: new Date(Date.now() + 60_000) }] : [];
   },
@@ -511,19 +512,18 @@ test('dry mode preserves intake without performing an external write', async () 
   assert.equal(moyskladState.email, 'before@example.test');
 });
 
-test('temporary destination failure keeps the prior snapshot and a repeated webhook retries the same event', async () => {
+test('temporary destination failure keeps the prior snapshot and background retry reuses the stored event', async () => {
   failNextMoyskladWrite = true;
   const body = JSON.stringify({
     event: 'ONCRMCONTACTUPDATE',
     data: { FIELDS: { ID: 'contact-42' } },
     auth: { application_token: 'synthetic-b24-event-token' },
   });
-  const post = () => fetch(`${apiUrl}/webhooks/bitrix24`, {
+  const first = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body,
   });
-  const first = await post();
   assert.equal(first.status, 200);
   const firstAck = await first.json() as { eventId: string };
   const failedStatus = await waitForStatus(firstAck.eventId, 'RETRYABLE_FAILURE');
@@ -534,11 +534,7 @@ test('temporary destination failure keeps the prior snapshot and a repeated webh
   assert.equal(moyskladState.email, 'before@example.test');
   assert.deepEqual(externalWrites, []);
 
-  const repeated = await post();
-  assert.equal(repeated.status, 200);
-  const repeatedAck = await repeated.json() as { eventId: string };
-  assert.equal(repeatedAck.eventId, firstAck.eventId);
-  const succeededStatus = await waitForStatus(firstAck.eventId, 'SUCCEEDED');
+  const succeededStatus = await waitForStatusWithin(firstAck.eventId, 'SUCCEEDED', 8_000);
   const succeeded = await succeededStatus.json() as { attempts: number; snapshotRevision: number };
   assert.equal(succeeded.attempts, 2);
   assert.equal(succeeded.snapshotRevision, 2);
@@ -642,7 +638,7 @@ test('a same-second timestamp conflict is resolved in favor of MoySklad', async 
   assert.deepEqual(externalWrites, ['BITRIX24']);
 });
 
-test('repeated successful delivery keeps the same event and does not write twice', async () => {
+test('repeated successful delivery is preserved but current-state reread avoids a second write', async () => {
   const body = JSON.stringify({
     event: 'ONCRMCONTACTUPDATE',
     data: { FIELDS: { ID: 'contact-42' } },
@@ -661,7 +657,9 @@ test('repeated successful delivery keeps the same event and does not write twice
   const repeated = await post();
   assert.equal(repeated.status, 200);
   const repeatedAck = await repeated.json() as { eventId: string };
-  assert.equal(repeatedAck.eventId, firstAck.eventId);
+  assert.notEqual(repeatedAck.eventId, firstAck.eventId);
+  const repeatedStatus = await waitForStatus(repeatedAck.eventId, 'UNCHANGED');
+  assert.equal(repeatedStatus.status, 200);
   const statusResponse = await fetch(`${apiUrl}/api/admin/contact-sync/events/${firstAck.eventId}`, {
     headers: { authorization: 'Bearer synthetic-admin-token' },
   });
@@ -743,6 +741,19 @@ async function waitForStatus(eventId: string, expectedStatus = 'SUCCEEDED'): Pro
       if (body.status === expectedStatus) return response;
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return response ?? new Response(null, { status: 0 });
+}
+
+async function waitForStatusWithin(eventId: string, expectedStatus: string, timeoutMs: number): Promise<Response> {
+  const deadline = Date.now() + timeoutMs;
+  let response: Response | undefined;
+  while (Date.now() < deadline) {
+    response = await fetch(`${apiUrl}/api/admin/contact-sync/events/${eventId}`, {
+      headers: { authorization: 'Bearer synthetic-admin-token' },
+    });
+    if (response.ok && ((await response.clone().json()) as { status?: string }).status === expectedStatus) return response;
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return response ?? new Response(null, { status: 0 });
 }

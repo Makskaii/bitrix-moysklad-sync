@@ -31,7 +31,6 @@ export class SyncModeController {
       return this.syncMode.setMode(body.mode as ServiceMode);
     }).then((result) => {
       void writeOperationalLog(this.database, 'ADMIN', `Service mode set to ${result.mode}`);
-      if (result.mode === 'on') void this.recovery.processPending();
       return result;
     });
   }

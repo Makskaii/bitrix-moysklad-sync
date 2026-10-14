@@ -34,8 +34,9 @@ const resolvedPairInputs: PairResolutionInput[] = [];
 let pairResolution: PairResolutionResult = { status: 'manual_review', reason: 'NO_APPROVED_MATCH_KEY', entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: 'fixture', reviewCaseId: 'review-test' };
 const inboundEvent = {
   findUnique: async ({ where }: { where: { id: string } }) => [...rows.values()].find((row) => row.id === where.id) ?? null,
-  updateMany: async ({ where, data }: { where: { id: string; status: string }; data: { status: string; lastErrorCategory: string } }) => {
-    const row = [...rows.values()].find((candidate) => candidate.id === where.id && candidate.status === where.status);
+  updateMany: async ({ where, data }: { where: { id: string; status?: string; OR?: Array<{ status: string }> }; data: Record<string, unknown> }) => {
+    const statuses = where.status ? [where.status] : where.OR?.map((condition) => condition.status) ?? [];
+    const row = [...rows.values()].find((candidate) => candidate.id === where.id && statuses.includes(candidate.status));
     if (!row) return { count: 0 };
     Object.assign(row, data);
     return { count: 1 };
@@ -76,14 +77,16 @@ const inboundEvent = {
 const fakeDatabase: {
   inboundEvent: typeof inboundEvent;
   entityPair: { findFirst: () => Promise<null> };
-  $queryRaw: () => Promise<never[]>;
+  $queryRaw: (strings?: TemplateStringsArray) => Promise<Array<{ serviceMode: string }>>;
   $transaction: <T>(operation: (transaction: unknown) => Promise<T>) => Promise<T>;
   syncSetting: { upsert: () => Promise<{ serviceMode: string }> };
   syncDirectionSetting: { findUnique: () => Promise<{ bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean }> };
 } = {
   inboundEvent,
   entityPair: { findFirst: async () => null },
-  $queryRaw: async () => [],
+  $queryRaw: async (strings?: TemplateStringsArray) => strings?.join('').includes('FROM "SyncSetting"')
+    ? [{ serviceMode: intakeMode }]
+    : [],
   $transaction: async <T>(operation: (transaction: unknown) => Promise<T>) => operation(fakeDatabase as unknown),
   syncSetting: { upsert: async () => ({ serviceMode: intakeMode }) },
   syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
@@ -146,7 +149,7 @@ test('dry webhook diagnostics initially report all deal and customer-order subsc
   process.env.SYNC_MODE = 'apply';
 });
 
-test('Bitrix24 event is stored before acknowledgement and repeat delivery is idempotent', async () => {
+test('Bitrix24 event is stored before acknowledgement and identical deliveries are preserved without a stable event ID', async () => {
   rows.clear();
   upsertCalls = 0;
   const body = 'event=ONCRMDEALUPDATE&ts=1770000000&auth%5Bapplication_token%5D=bitrix-test-application-token&data%5BFIELDS%5D%5BID%5D=42';
@@ -169,9 +172,9 @@ test('Bitrix24 event is stored before acknowledgement and repeat delivery is ide
   });
   assert.equal(repeated.status, 200);
   const repeatedAck = (await repeated.json()) as { eventId: string };
-  assert.equal(repeatedAck.eventId, firstAck.eventId);
-  assert.equal(rows.size, 1, 'the same delivery key must not create another event');
-  assert.equal(upsertCalls, 2, 'both deliveries reach the idempotent database operation');
+  assert.notEqual(repeatedAck.eventId, firstAck.eventId);
+  assert.equal(rows.size, 2, 'a later identical envelope must not be collapsed as a false duplicate');
+  assert.equal(upsertCalls, 2, 'both deliveries are durably accepted');
 });
 
 test('unverified sources are rejected without a database write', async () => {
@@ -215,7 +218,7 @@ test('dry diagnostics report a safe processing error when event persistence fail
   process.env.SYNC_MODE = 'apply';
 });
 
-test('MoySklad webhook uses the secret URL and requestId for idempotent persistence', async () => {
+test('MoySklad webhook uses the secret URL and fingerprints event payloads for idempotent persistence', async () => {
   rows.clear();
   const url = `${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=delivery-123&id=entity-456&type=CustomerOrder`;
   const first = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
@@ -229,13 +232,13 @@ test('MoySklad webhook uses the secret URL and requestId for idempotent persiste
   assert.equal(repeatedAck.eventId, firstAck.eventId);
   assert.equal(rows.size, 1);
 
-  const laterUpdate = await fetch(url.replace('delivery-123', 'delivery-124'), {
+  const laterUpdate = await fetch(url.replace('id=entity-456', 'id=entity-789'), {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
   });
   assert.equal(laterUpdate.status, 200);
   const laterUpdateAck = (await laterUpdate.json()) as { eventId: string };
   assert.notEqual(laterUpdateAck.eventId, firstAck.eventId);
-  assert.equal(rows.size, 2, 'different source delivery IDs must remain separate even for the same entity');
+  assert.equal(rows.size, 2, 'a different entity is a distinct queued event');
 
   const rejected = await fetch(url.replace('moysklad-test-path-secret', 'wrong-secret'), {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ events: [
@@ -255,7 +258,7 @@ test('MoySklad webhook uses the secret URL and requestId for idempotent persiste
   process.env.SYNC_MODE = 'apply';
 });
 
-test('native MoySklad event envelope is accepted without query parameters and keeps each arrival', async () => {
+test('native MoySklad event envelope without requestId preserves identical notifications', async () => {
   rows.clear();
   const payload = {
     events: [{
@@ -280,7 +283,33 @@ test('native MoySklad event envelope is accepted without query parameters and ke
   const repeated = await post();
   assert.equal(repeated.status, 200);
   const repeatedAck = (await repeated.json()) as { eventId: string };
-  assert.notEqual(repeatedAck.eventId, firstAck.eventId, 'without a source delivery ID, do not collapse potentially distinct updates');
+  assert.notEqual(repeatedAck.eventId, firstAck.eventId, 'without a provider delivery ID, preserving events is safer than false deduplication');
+  assert.equal(rows.size, 2);
+});
+
+test('MoySklad event fingerprint distinguishes changed payloads even when requestId and batch index are reused', async () => {
+  rows.clear();
+  const url = `${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=reused-request`;
+  const post = (description: string) => fetch(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'product', href: 'https://online.moysklad.ru/api/remap/1.2/entity/product/native-id' },
+      action: 'UPDATE', description,
+    }] }),
+  });
+
+  const first = await post('first version');
+  const firstAck = await first.json() as { eventId: string };
+  const changed = await post('second version');
+  const changedAck = await changed.json() as { eventId: string };
+  const repeated = await post('second version');
+  const repeatedAck = await repeated.json() as { eventId: string };
+
+  assert.equal(first.status, 200);
+  assert.equal(changed.status, 200);
+  assert.equal(repeated.status, 200);
+  assert.notEqual(changedAck.eventId, firstAck.eventId);
+  assert.equal(repeatedAck.eventId, changedAck.eventId);
   assert.equal(rows.size, 2);
 });
 
@@ -313,7 +342,7 @@ test('MoySklad delivery stores every customer-order event and deduplicates a rep
   assert.equal(rows.size, 2);
 });
 
-test('MoySklad requestId and batch index cannot collide across separate deliveries', async () => {
+test('MoySklad requestId plus batch position deduplicates retries while distinct request IDs remain separate', async () => {
   rows.clear();
   const url = `${apiUrl}/webhooks/moysklad/moysklad-test-path-secret`;
   const event = (id: string) => ({
@@ -326,13 +355,17 @@ test('MoySklad requestId and batch index cannot collide across separate deliveri
 
   const batch = await send('foo', [event('first'), event('second')]);
   const batchAck = await batch.json() as { eventIds: string[] };
-  const single = await send('foo%3A1', [event('independent')]);
-  const singleAck = await single.json() as { eventId: string };
+  const repeatedSingle = await send('another-id', [event('first')]);
+  const repeatedSingleAck = await repeatedSingle.json() as { eventId: string };
+  const independent = await send('foo%3A1', [event('independent')]);
+  const independentAck = await independent.json() as { eventId: string };
 
   assert.equal(batch.status, 200);
-  assert.equal(single.status, 200);
-  assert.equal(rows.size, 3);
-  assert.notEqual(singleAck.eventId, batchAck.eventIds[1]);
+  assert.equal(repeatedSingle.status, 200);
+  assert.equal(independent.status, 200);
+  assert.equal(rows.size, 4);
+  assert.notEqual(repeatedSingleAck.eventId, batchAck.eventIds[0]);
+  assert.notEqual(independentAck.eventId, batchAck.eventIds[1]);
 });
 
 test('MoySklad does not acknowledge a malformed events array as fully stored', async () => {
@@ -400,7 +433,7 @@ test('first-event intake recognizes persisted confirmed identity without conflat
   await new Promise((resolve) => setTimeout(resolve, 25));
   const event = [...rows.values()][0];
   assert.ok(event);
-  assert.equal(event.status, 'RECEIVED', 'confirmed identity is reported separately from downstream baseline readiness');
+  assert.equal(event.status, 'SUCCEEDED', 'the claim-safe resolver completes the event when no downstream stage is registered');
   assert.equal(event.lastErrorCategory, null);
   assert.equal(resolvedPairInputs.length, 1);
   assert.equal(resolvedPairInputs[0].entityType, 'DEAL');
@@ -453,4 +486,28 @@ test('pause stores verified events and off declines intake without storing', asy
   assert.equal(off.status, 410);
   assert.equal(rows.size, 1);
   intakeMode = 'on';
+});
+
+test('the transactional Off recheck closes the mode-change race after preflight', async () => {
+  rows.clear();
+  upsertCalls = 0;
+  intakeMode = 'on';
+  const syncMode = app.get(SyncModeService);
+  const originalRead = syncMode.read.bind(syncMode);
+  syncMode.read = async () => {
+    intakeMode = 'off';
+    return { mode: 'on' };
+  };
+  try {
+    const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event: 'ONCRMDEALUPDATE', auth: { application_token: 'bitrix-test-application-token' } }),
+    });
+    assert.equal(response.status, 410);
+    assert.equal(upsertCalls, 0);
+    assert.equal(rows.size, 0);
+  } finally {
+    syncMode.read = originalRead;
+    intakeMode = 'on';
+  }
 });

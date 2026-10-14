@@ -457,13 +457,9 @@ test('Pause during external reads defers a contact event before any outbound wri
   raceCounterpartyId = null;
 });
 
-test('On resumes Off with a bounded changed-since scan and completes every provider page', async () => {
+test('On does not scan or replay changes missed during Off', async () => {
   const token = { authorization: 'Bearer admin-test-token' };
   recoveryPageRequests.length = 0;
-  await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
-    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
-  });
   await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
     method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
     body: JSON.stringify({ mode: 'off', confirmed: true }),
@@ -473,86 +469,23 @@ test('On resumes Off with a bounded changed-since scan and completes every provi
     body: JSON.stringify({ mode: 'on', confirmed: true }),
   });
   assert.equal(on.status, 200);
-  const deadline = Date.now() + 4_000;
-  let recovery: Response;
-  do {
-    recovery = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token });
-    if (recovery.status === 200 && (await recovery.clone().json() as { status: string }).status === 'complete') break;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  } while (Date.now() < deadline);
-  assert.equal(recovery.status, 200);
-  assert.equal((await recovery.json() as { status: string }).status, 'complete');
-  assert.equal(recoveryPageRequests.filter((request) => request.includes('crm.contact.list.json')).length, 2);
-  assert.equal(recoveryPageRequests.filter((request) => request.includes('/entity/counterparty?')).length, 2);
-  assert.ok(recoveryPageRequests.some((request) => request.includes('filter%5B%3E%3DDATE_MODIFY%5D')));
-  assert.ok(recoveryPageRequests.some((request) => request.includes('filter%5B%3C%3DDATE_MODIFY%5D')));
-  assert.ok(recoveryPageRequests.some((request) => request.includes('updated%3E%3D')));
-  assert.ok(recoveryPageRequests.some((request) => request.includes('updated%3C%3D')));
+  const recovery = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token }).then((response) => response.json()) as { status: string; error: string | null };
+  assert.equal(recovery.status, 'skipped');
+  assert.match(recovery.error ?? '', /not replayed/i);
+  assert.equal(recoveryPageRequests.length, 0);
 });
 
-test('failed Off recovery keeps the incomplete page cursor and retry resumes there', async () => {
+test('legacy pending Off recovery jobs are cancelled without provider requests after restart', async () => {
   const token = { authorization: 'Bearer admin-test-token' };
   recoveryPageRequests.length = 0;
-  failResumeMoyskladSecondPage = true;
-  await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
-    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ mode: 'off', confirmed: true }),
-  });
-  await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
-    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ mode: 'on', confirmed: true }),
-  });
-  const deadline = Date.now() + 4_000;
-  let status = { status: '' };
-  while (Date.now() < deadline) {
-    const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token });
-    status = await response.json() as { status: string };
-    if (status.status === 'failed') break;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  }
-  assert.equal(status.status, 'failed');
-  const failed = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token }).then((response) => response.json()) as { provider: string; moyskladOffset: number };
-  assert.equal(failed.provider, 'MOYSKLAD');
-  assert.equal(failed.moyskladOffset, 1_000);
-
   await app.close();
   app = await NestFactory.create(SyncModeTestModule, { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
-  let restartedFailure = { status: '', provider: '', moyskladOffset: 0 };
-  const restartDeadline = Date.now() + 4_000;
-  while (Date.now() < restartDeadline) {
-    restartedFailure = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token }).then((response) => response.json()) as typeof restartedFailure;
-    const failedPageRetries = recoveryPageRequests.filter((request) =>
-      request.includes('/entity/counterparty?') && new URL(request).searchParams.get('offset') === '1000').length;
-    if (restartedFailure.status === 'failed' && failedPageRetries >= 2) {
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      restartedFailure = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token }).then((response) => response.json()) as typeof restartedFailure;
-      if (restartedFailure.status === 'failed') break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  }
-  assert.equal(restartedFailure.status, 'failed');
-  assert.equal(restartedFailure.provider, 'MOYSKLAD');
-  assert.equal(restartedFailure.moyskladOffset, 1_000);
-
-  failResumeMoyskladSecondPage = false;
-  await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
-    method: 'PATCH', headers: { ...token, 'content-type': 'application/json' },
-    body: JSON.stringify({ mode: 'on', confirmed: true }),
-  });
-  const retryDeadline = Date.now() + 4_000;
-  while (Date.now() < retryDeadline) {
-    const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token });
-    status = await response.json() as { status: string };
-    if (status.status === 'complete') break;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  }
-  assert.equal(status.status, 'complete');
-  const offsets = recoveryPageRequests.filter((request) => request.includes('/entity/counterparty?')).map((request) => Number(new URL(request).searchParams.get('offset')));
-  assert.equal(offsets[0], 0);
-  assert.equal(offsets.filter((offset) => offset === 0).length, 1, 'retry must not restart the completed first page');
-  assert.ok(offsets.length >= 3 && offsets.slice(1).every((offset) => offset === 1_000), 'retry must remain on the incomplete second page until completion');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const status = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: token }).then((response) => response.json()) as { status: string };
+  assert.equal(status.status, 'skipped');
+  assert.equal(recoveryPageRequests.length, 0);
 });
 
 test('Off stops webhook intake while the administrator settings remain available', async () => {

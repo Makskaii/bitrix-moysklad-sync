@@ -34,6 +34,11 @@ import { CLIENT_SYNC_GATEWAY, ClientSyncProcessor } from '../clients/client-sync
 import { HttpClientSyncGateway } from '../clients/client-sync.gateway';
 import { CLIENT_CANDIDATE_GATEWAY, HttpClientCandidateGateway } from '../clients/client-candidate.gateway';
 import { CLIENT_DEPENDENCY_RESOLVER } from '../clients/client-dependency-resolver';
+import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from '../event-dispatcher.service';
+import { EventWorkerLeaseService } from '../event-worker-lease.service';
+import { ProductCardEventProcessor } from '../products/product-card-event.processor';
+import { ProductCardHttpApi } from '../products/product-card-api';
+import { ProductCardRuntimeService } from '../products/product-card-runtime.service';
 
 @Module({})
 export class LocalAdminPreviewModule {
@@ -48,6 +53,7 @@ export class LocalAdminPreviewModule {
         ContactSyncProcessor,
         ContactSyncStatusReader,
         EventIntakeService,
+        ...(databaseProvider === DatabaseService ? [EventDispatcherService, EventWorkerLeaseService] : []),
         RetentionService,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
@@ -56,6 +62,8 @@ export class LocalAdminPreviewModule {
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
           HttpClientSyncGateway, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
           HttpClientCandidateGateway, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
+          ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor,
+          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,
