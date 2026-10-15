@@ -1233,7 +1233,7 @@ test('ordinary company processor pins requisite and bank child IDs, baselines th
     async updateMoysklad() { assert.fail('dry child sync never calls scalar writes'); },
   };
   const resolver = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway,
-    new HttpClientCandidateGateway(database, fakeFetch), undefined, new ClientChildResourceSync(fakeFetch, new DryRunWriteJournal(database)));
+    new HttpClientCandidateGateway(database, fakeFetch), undefined, new ClientChildResourceSync(fakeFetch, new DryRunWriteJournal(database), { allowTestProviderOrigins: true }));
   try {
     assert.equal(await resolver.process(eventIds[0]!), 'BASELINE');
     let state = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
@@ -1301,7 +1301,7 @@ test('processor keeps child snapshot and event retryable when APPLY writes are b
     async updateMoysklad() { assert.fail('child writes are blocked before scalar writes'); },
   };
   const processor = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway,
-    new HttpClientCandidateGateway(database, fakeFetch), undefined, new ClientChildResourceSync(fakeFetch, new DryRunWriteJournal(database)));
+    new HttpClientCandidateGateway(database, fakeFetch), undefined, new ClientChildResourceSync(fakeFetch, new DryRunWriteJournal(database), { allowTestProviderOrigins: true }));
   setDatabaseRecoveryReady(false);
   try {
     assert.equal(await processor.process(eventId), 'RETRY');

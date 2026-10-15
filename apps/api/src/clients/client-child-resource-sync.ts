@@ -7,7 +7,7 @@ export type ClientChildSyncDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BIT
 export type AssertClientChildSyncLease = () => Promise<void>;
 export type ClientChildSyncResult =
   | { status: 'BASELINE' | 'SYNCED' | 'JOURNALED' | 'UNCHANGED'; bindingId: string; fields: string[]; state: ClientChildResourceSnapshot }
-  | { status: 'MANUAL_REVIEW'; reason: 'CHILD_RESOURCE_BINDING_MISSING' | 'CHILD_RESOURCE_BINDING_AMBIGUOUS' | 'CHILD_RESOURCE_ID_MISSING' | 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED'; bindingId?: string };
+  | { status: 'MANUAL_REVIEW'; reason: 'CHILD_RESOURCE_BINDING_MISSING' | 'CHILD_RESOURCE_BINDING_AMBIGUOUS' | 'CHILD_RESOURCE_ID_MISSING' | 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED' | 'CHILD_RESOURCE_TARGET_REGION_UNSUPPORTED' | 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED'; bindingId?: string };
 
 export type ClientChildResourceSnapshot = { bitrix24: { requisite: RecordValue; bankDetail: RecordValue }; moysklad: { counterparty: RecordValue; account: RecordValue } };
 
@@ -16,11 +16,17 @@ export interface ChildWriteJournal {
   readback?(provider: 'BITRIX24' | 'MOYSKLAD', entityType: string, entityId: string): Promise<RecordValue>;
 }
 
+export type ClientChildResourceSyncOptions = { allowTestProviderOrigins?: boolean };
+
 type RecordValue = Record<string, unknown>;
-const REQUISITE_FIELDS = new Set(['RQ_COMPANY_NAME', 'RQ_COMPANY_FULL_NAME', 'RQ_INN', 'RQ_KPP', 'RQ_OGRN', 'RQ_OKPO']);
-const COUNTERPARTY_FIELDS = new Set(['legalTitle', 'inn', 'kpp', 'ogrn', 'okpo']);
+const REQUISITE_FIELDS = new Set(['RQ_COMPANY_NAME', 'RQ_COMPANY_FULL_NAME', 'RQ_INN', 'RQ_KPP', 'RQ_OGRN', 'RQ_OGRNIP', 'RQ_OKPO']);
+const COUNTERPARTY_FIELDS = new Set(['legalTitle', 'inn', 'kpp', 'ogrn', 'ogrnip', 'okpo']);
 const BANK_FIELDS = new Set(['RQ_BANK_NAME', 'RQ_BANK_ADDR', 'RQ_BIK', 'RQ_BIC', 'RQ_ACC_NUM', 'RQ_COR_ACC_NUM']);
 const ACCOUNT_FIELDS = new Set(['bankName', 'bankLocation', 'bic', 'accountNumber', 'correspondentAccount']);
+const LEGAL_FIELD_PAIRS = new Set([
+  'RQ_COMPANY_NAME:legalTitle', 'RQ_COMPANY_FULL_NAME:legalTitle', 'RQ_INN:inn', 'RQ_KPP:kpp',
+  'RQ_OGRN:ogrn', 'RQ_OGRNIP:ogrnip', 'RQ_OKPO:okpo',
+]);
 
 /**
  * Handles only explicitly bound company child resources. It never lists or creates
@@ -30,6 +36,7 @@ export class ClientChildResourceSync {
   constructor(
     private readonly fetcher: typeof fetch = fetch,
     private readonly journal?: ChildWriteJournal,
+    private readonly options: ClientChildResourceSyncOptions = {},
   ) {}
 
   async syncForPair(input: {
@@ -82,14 +89,11 @@ export class ClientChildResourceSync {
     assertRecordId(counterparty, 'id', input.moyskladCounterpartyId, 'MOYSKLAD_COUNTERPARTY_ID_MISMATCH');
     const companyType = typeof counterparty.companyType === 'string' ? counterparty.companyType.toLowerCase() : '';
     if (!['legal', 'entrepreneur', 'legaluz', 'entrepreneuruz'].includes(companyType)) {
-      return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id };
+      const hasRecognizedBusinessTypeWithUnsupportedRegion = /^(?:legal|entrepreneur)[a-z]{2}$/.test(companyType);
+      return { status: 'MANUAL_REVIEW', reason: hasRecognizedBusinessTypeWithUnsupportedRegion ? 'CHILD_RESOURCE_TARGET_REGION_UNSUPPORTED' : 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id };
     }
-    // The official counterparty schema marks the standard inn/kpp/ogrn/okpo
-    // fields RU-only and exposes a distinct UZ requisites group. Do not send
-    // Russian requisite mappings to UZ counterparties; bank-account mappings
-    // remain valid for company counterparties in either region.
-    if (legalEnabled && companyType.endsWith('uz')) {
-      return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id };
+    if (binding.legalFields.some((field) => !isLegalFieldCompatible(companyType, field.bitrix24Field, field.moyskladField))) {
+      return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED', bindingId: binding.id };
     }
     if (legalEnabled) {
       currentRequisite = requisite; currentCounterparty = counterparty;
@@ -215,8 +219,7 @@ export class ClientChildResourceSync {
   }
 
   private async bitrixRead(method: string, params: Record<string, string>): Promise<RecordValue> {
-    const base = process.env.BITRIX24_REST_BASE_URL;
-    if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
+    const base = this.providerBase('BITRIX24', process.env.BITRIX24_REST_BASE_URL);
     const form = new URLSearchParams(params);
     const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
     if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
@@ -227,8 +230,7 @@ export class ClientChildResourceSync {
   }
 
   private async bitrixUpdate(method: string, id: string, fields: RecordValue) {
-    const base = process.env.BITRIX24_REST_BASE_URL;
-    if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
+    const base = this.providerBase('BITRIX24', process.env.BITRIX24_REST_BASE_URL);
     const form = new URLSearchParams({ id });
     for (const [key, value] of Object.entries(fields)) form.append(`fields[${key}]`, String(value ?? ''));
     const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
@@ -251,14 +253,35 @@ export class ClientChildResourceSync {
   }
 
   private async msRequest(path: string, method: 'GET' | 'PUT', fields?: RecordValue): Promise<Response> {
-    const base = process.env.MOYSKLAD_API_BASE_URL;
+    const base = this.providerBase('MOYSKLAD', process.env.MOYSKLAD_API_BASE_URL);
     const token = process.env.MOYSKLAD_API_TOKEN;
-    if (!base || !token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
+    if (!token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
     const response = await this.fetcher(new URL(path, base.endsWith('/') ? base : `${base}/`), { method,
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(fields ? { 'content-type': 'application/json' } : {}) },
       ...(fields ? { body: JSON.stringify(fields) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
     return response;
+  }
+
+  private providerBase(provider: 'BITRIX24' | 'MOYSKLAD', raw: string | undefined): string {
+    if (!raw) throw new Error(`${provider}_API_NOT_CONFIGURED`);
+    let url: URL;
+    try { url = new URL(raw); }
+    catch { throw new ProviderFailure(provider, 400); }
+    if (url.username || url.password || url.search || url.hash) throw new ProviderFailure(provider, 400);
+    if (!url.pathname.endsWith('/')) url.pathname += '/';
+    const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname.toLowerCase());
+    const reservedFake = /\.(?:fake|test|invalid|example)$/i.test(url.hostname);
+    const testAllowed = this.options.allowTestProviderOrigins === true && (local || reservedFake);
+    if (!testAllowed && (local || reservedFake)) throw new ProviderFailure(provider, 400);
+    if (url.protocol !== 'https:' && !(testAllowed && local && url.protocol === 'http:')) throw new ProviderFailure(provider, 400);
+    if (provider === 'BITRIX24') {
+      if (!url.pathname.startsWith('/rest/') && !testAllowed) throw new ProviderFailure(provider, 400);
+      if (testAllowed && !url.pathname.startsWith('/rest/')) throw new ProviderFailure(provider, 400);
+    } else if (!testAllowed) {
+      if (!['api.moysklad.ru', 'online.moysklad.ru'].includes(url.hostname.toLowerCase()) || !url.pathname.startsWith('/api/remap/1.2/')) throw new ProviderFailure(provider, 400);
+    } else if (!url.pathname.includes('/api/remap/1.2/')) throw new ProviderFailure(provider, 400);
+    return url.href;
   }
 }
 
@@ -322,6 +345,16 @@ function validateBinding(binding: ClientChildResourceBindingDto): string | null 
 
 function assertParent(record: RecordValue, field: string, expected: string, reason: string) {
   if (String(record[field] ?? '') !== expected) throw new ProviderFailure(reason.includes('BITRIX24') ? 'BITRIX24' : 'MOYSKLAD', 404);
+}
+function isLegalFieldCompatible(companyType: string, bitrixField: string, moyskladField: string): boolean {
+  if (!LEGAL_FIELD_PAIRS.has(`${bitrixField}:${moyskladField}`)) return false;
+  if (companyType === 'legal') return ['legalTitle', 'inn', 'kpp', 'ogrn', 'okpo'].includes(moyskladField);
+  if (companyType === 'entrepreneur') return ['legalTitle', 'inn', 'ogrnip', 'okpo'].includes(moyskladField);
+  // Remap counterparty schema documents legalTitle for UZ counterparties but
+  // places UZ identifiers under mod__requisites__uz rather than the standard
+  // Russian fields exposed by this flat child-resource mapping.
+  if (companyType === 'legaluz' || companyType === 'entrepreneuruz') return moyskladField === 'legalTitle';
+  return false;
 }
 function assertRecordId(record: RecordValue, field: string, expected: string, _reason: string) {
   const actual = record[field] ?? (field === 'id' ? record.accountId : undefined);

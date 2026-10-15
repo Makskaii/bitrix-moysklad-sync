@@ -145,7 +145,7 @@ before(async () => {
     if (url.includes(`/counterparty/${companyTargetId}/accounts/${companyAccountId}`)) return Response.json({ id: companyAccountId, accountNumber: '40700000000000000000', bic: '044000001' });
     if (url.includes(`/counterparty/${companyTargetId}`)) return Response.json({ id: companyTargetId, companyType: 'legal', meta: { type: 'counterparty' }, inn: '1234567890', kpp: '123456789' });
     throw new Error(`Unexpected fake child-resource read ${url} ${init.method ?? 'GET'}`);
-  }, journal);
+  }, journal, { allowTestProviderOrigins: true });
   processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, { readCompanyInn: async () => '1111111111' } as never, undefined, childAdapter);
   const accepted = await event(`client-field-baseline-${suffix}`, 'BITRIX24', sourceId, 'contact');
   baseEventId = accepted.id;
