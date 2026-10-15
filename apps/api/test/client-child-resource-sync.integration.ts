@@ -171,6 +171,23 @@ test('APPLY maps requisite/bank-detail through their official update methods and
   assert.equal(calls.filter((call) => call.method === 'PUT').length, writeCount, 'echo uses reconciled snapshot and does not repeat writes');
 });
 
+test('lease loss aborts child transfer before provider write', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync();
+  const baseline = await adapter.syncForPair({ eventId: 'lease-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  requisite = { ...requisite, RQ_INN: 'lease-change' };
+  let checks = 0;
+  await assert.rejects(adapter.syncForPair({
+    eventId: 'lease-lost', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding],
+    bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state,
+    assertLease: async () => { checks += 1; throw new Error('LEASE_LOST'); },
+  }), /LEASE_LOST/);
+  assert.equal(checks, 1);
+  assert.equal(calls.some((call) => call.method === 'PUT' || call.path.endsWith('/crm.requisite.update.json') || call.path.endsWith('/crm.requisite.bankdetail.update.json')), false);
+});
+
 test('reverse sync retains explicit child IDs and updates correct B24 requisite/bank detail', async () => {
   process.env.SYNC_MODE = 'apply';
   calls = [];

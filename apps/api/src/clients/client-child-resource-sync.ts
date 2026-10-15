@@ -3,6 +3,7 @@ import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { ClientChildResourceBindingDto } from '../field-settings/field-settings.dto';
 
 export type ClientChildSyncDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
+export type AssertClientChildSyncLease = () => Promise<void>;
 export type ClientChildSyncResult =
   | { status: 'BASELINE' | 'SYNCED' | 'JOURNALED' | 'UNCHANGED'; bindingId: string; fields: string[]; state: ClientChildResourceSnapshot }
   | { status: 'MANUAL_REVIEW'; reason: 'CHILD_RESOURCE_BINDING_MISSING' | 'CHILD_RESOURCE_BINDING_AMBIGUOUS' | 'CHILD_RESOURCE_ID_MISSING'; bindingId?: string };
@@ -33,6 +34,7 @@ export class ClientChildResourceSync {
   async syncForPair(input: {
     eventId: string; direction: ClientChildSyncDirection; bindings: ClientChildResourceBindingDto[] | undefined;
     bitrix24CompanyId: string; moyskladCounterpartyId: string; fallbackMatch?: 'exact_name_and_phone'; prior?: ClientChildResourceSnapshot | null;
+    assertLease?: AssertClientChildSyncLease;
   }): Promise<ClientChildSyncResult> {
     const matches = (input.bindings ?? []).filter((binding) => binding.bitrix24CompanyId === input.bitrix24CompanyId && binding.moyskladCounterpartyId === input.moyskladCounterpartyId);
     if (matches.length === 0) return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_BINDING_MISSING' };
@@ -48,6 +50,7 @@ export class ClientChildResourceSync {
     moyskladCounterpartyId: string;
     fallbackMatch?: 'exact_name_and_phone';
     prior?: ClientChildResourceSnapshot | null;
+    assertLease?: AssertClientChildSyncLease;
   }): Promise<ClientChildSyncResult> {
     const { binding } = input;
     if (!binding) return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_BINDING_MISSING' };
@@ -91,6 +94,7 @@ export class ClientChildResourceSync {
         parentId: isForward ? input.moyskladCounterpartyId : input.bitrix24CompanyId,
         childId: isForward ? '' : binding.bitrix24RequisiteId,
         fallbackSuppressInn: Boolean(input.fallbackMatch && isForward),
+        assertLease: input.assertLease,
       });
       changed.push(...result);
       }
@@ -115,11 +119,13 @@ export class ClientChildResourceSync {
         parentId: isForward ? input.moyskladCounterpartyId : binding.bitrix24RequisiteId,
         childId: isForward ? binding.bankDetail.moyskladAccountId : binding.bankDetail.bitrix24Id,
         fallbackSuppressInn: false,
+        assertLease: input.assertLease,
       });
       changed.push(...result);
       }
     }
     const state = snapshot(binding, currentRequisite, currentBankDetail, currentCounterparty, currentAccount);
+    await input.assertLease?.();
     if (!input.prior) return { status: 'BASELINE', bindingId: binding.id, fields: [], state };
     return { status: changed.length ? (process.env.SYNC_MODE === 'dry' ? 'JOURNALED' : 'SYNCED') : 'UNCHANGED', bindingId: binding.id, fields: changed, state };
   }
@@ -129,6 +135,7 @@ export class ClientChildResourceSync {
     fields: Array<{ bitrix24Field: string; moyskladField: string }>; b24Allowed: Set<string>; msAllowed: Set<string>;
     targetResource: 'MOYSKLAD_COUNTERPARTY' | 'MOYSKLAD_ACCOUNT' | 'BITRIX24_REQUISITE' | 'BITRIX24_BANK_DETAIL';
     parentId: string; childId: string; fallbackSuppressInn: boolean;
+    assertLease?: AssertClientChildSyncLease;
   }): Promise<string[]> {
     const output: RecordValue = {};
     for (const field of input.fields) {
@@ -152,9 +159,11 @@ export class ClientChildResourceSync {
     if (!Object.keys(output).length) return [];
     if (process.env.SYNC_MODE === 'dry') {
       if (!this.journal) throw new Error('CHILD_RESOURCE_DRY_JOURNAL_REQUIRED');
+      await input.assertLease?.();
       const accepted = await this.journal.propose({ eventId: input.eventId, provider: input.targetResource.startsWith('BITRIX24') ? 'BITRIX24' : 'MOYSKLAD',
         entityType: input.targetResource, entityId: `${input.parentId}/${input.childId || 'root'}`, operation: 'UPDATE', fields: output });
       if (!accepted) throw new Error('CHILD_RESOURCE_DRY_JOURNAL_REJECTED');
+      await input.assertLease?.();
       Object.assign(input.target, output);
       return Object.keys(output);
     }
@@ -162,25 +171,33 @@ export class ClientChildResourceSync {
       const path = input.targetResource === 'MOYSKLAD_ACCOUNT'
         ? `entity/counterparty/${encodeURIComponent(input.parentId)}/accounts/${encodeURIComponent(input.childId)}`
         : `entity/counterparty/${encodeURIComponent(input.parentId)}`;
+      await input.assertLease?.();
       try { await this.msWrite(path, output); }
       catch (error) {
+        await input.assertLease?.();
         const readback = await this.msRead(path).catch(() => null);
         if (!readback || !matches(readback, output)) throw error;
       }
+      await input.assertLease?.();
       const readback = await this.msRead(path);
       if (!matches(readback, output)) throw new ProviderFailure('MOYSKLAD', null);
+      await input.assertLease?.();
       Object.assign(input.target, readback);
     } else {
       const method = input.targetResource === 'BITRIX24_BANK_DETAIL' ? 'crm.requisite.bankdetail.update.json' : 'crm.requisite.update.json';
       const endpoint = input.targetResource === 'BITRIX24_BANK_DETAIL' ? 'crm.requisite.bankdetail.get.json' : 'crm.requisite.get.json';
       const id = input.childId;
+      await input.assertLease?.();
       try { await this.bitrixUpdate(method, id, output); }
       catch (error) {
+        await input.assertLease?.();
         const readback = await this.bitrixRead(endpoint, { id }).catch(() => null);
         if (!readback || !matches(readback, output)) throw error;
       }
+      await input.assertLease?.();
       const readback = await this.bitrixRead(endpoint, { id });
       if (!matches(readback, output)) throw new ProviderFailure('BITRIX24', null);
+      await input.assertLease?.();
       Object.assign(input.target, readback);
     }
     return Object.keys(output);
@@ -240,11 +257,12 @@ export async function syncPinnedClientChildResources(input: {
   settings: { eventConfig(eventId: string): Promise<{ version: number; config: { childResourceBindings?: ClientChildResourceBindingDto[] } }> };
   eventId: string; direction: ClientChildSyncDirection; bitrix24CompanyId: string; moyskladCounterpartyId: string;
   prior?: ClientChildResourceSnapshot | null; fallbackMatch?: 'exact_name_and_phone';
+  assertLease?: AssertClientChildSyncLease;
 }): Promise<{ settingsVersion: number; result: ClientChildSyncResult }> {
   const pinned = await input.settings.eventConfig(input.eventId);
   const result = await input.adapter.syncForPair({ eventId: input.eventId, direction: input.direction,
     bindings: pinned.config.childResourceBindings, bitrix24CompanyId: input.bitrix24CompanyId,
-    moyskladCounterpartyId: input.moyskladCounterpartyId, prior: input.prior, fallbackMatch: input.fallbackMatch });
+    moyskladCounterpartyId: input.moyskladCounterpartyId, prior: input.prior, fallbackMatch: input.fallbackMatch, assertLease: input.assertLease });
   return { settingsVersion: pinned.version, result };
 }
 
