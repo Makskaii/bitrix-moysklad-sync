@@ -64,9 +64,10 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     return this.candidates(rows.map((row) => ({ ...row, ...(input.inn && !row.inn ? { inn: input.inn } : {}) })), 'COMPANY', 'BITRIX24');
   }
 
-  async findPair(entity: ClientEntity, sourceId: string, sourceSystem: ClientSystem = 'BITRIX24') {
+  async findPair(entity: ClientEntity, sourceId: string, sourceSystem: ClientSystem = 'BITRIX24', companyTargetId?: string | null) {
     const pair = await this.database.entityPair.findFirst({
-      where: { entityType: entity, active: true, ...(sourceSystem === 'BITRIX24' ? { bitrix24Id: sourceId } : { moyskladId: sourceId }) },
+      where: { entityType: entity, active: true, ...(sourceSystem === 'BITRIX24' ? { bitrix24Id: sourceId } : { moyskladId: sourceId }),
+        ...(entity === 'CONTACT' && sourceSystem === 'BITRIX24' && companyTargetId !== undefined ? { moyskladParentId: companyTargetId } : {}) },
       select: { bitrix24Id: true, moyskladId: true, moyskladType: true },
     });
     if (!pair) return null;

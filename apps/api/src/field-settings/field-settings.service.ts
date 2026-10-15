@@ -432,11 +432,16 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
   const namedPairs = validateNamedPairs(references.namedPairs ?? []);
+  const serviceCounterpartyId = value.serviceCounterpartyId === undefined || value.serviceCounterpartyId === null || value.serviceCounterpartyId === ''
+    ? null
+    : isString(value.serviceCounterpartyId) && isUuid(value.serviceCounterpartyId)
+      ? value.serviceCounterpartyId
+      : (() => { throw new BadRequestException('serviceCounterpartyId must be a MoySklad counterparty UUID or empty'); })();
   const rules = value.rules.map(validateRule);
   const groups = value.groups.map(validateGroup);
   assertUniqueIds(rules, 'Field rule');
   assertUniqueIds(groups, 'Field group');
-  return { ...value, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  return { ...value, serviceCounterpartyId, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

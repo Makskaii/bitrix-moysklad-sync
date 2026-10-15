@@ -55,6 +55,8 @@ export type FieldGroupDto = {
 
 export type FieldSettingsConfigDto = {
   schemaVersion: 1;
+  /** MoySklad counterparty used only when a newly created customer order has no client. */
+  serviceCounterpartyId?: string | null;
   rules: FieldRuleDto[];
   groups: FieldGroupDto[];
   references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };

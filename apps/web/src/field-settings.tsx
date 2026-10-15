@@ -36,7 +36,7 @@ type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; serviceCounterpartyId?: string | null; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
@@ -446,6 +446,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     <section className="panel field-settings-panel" aria-label="Редактор соответствий полей">
       <div className="field-version-line"><strong>Версия {document.version}</strong><span>Активна для новых событий</span></div>
 
+      <section className="field-editor-section" aria-label="Служебный контрагент">
+        <div className="panel-heading"><div><p className="eyebrow">ЗАКАЗ БЕЗ КЛИЕНТА</p><h3>Служебный контрагент МойСклад</h3></div></div>
+        <p className="panel-description">Используется только при создании заказа покупателя по сделке без компании и контакта. Вставьте UUID контрагента МойСклад; пустое значение блокирует только такое создание.</p>
+        <label>UUID контрагента<input aria-label="UUID служебного контрагента МойСклад" value={draft.serviceCounterpartyId ?? ''} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" onChange={(event) => setDraft((current) => current ? { ...current, serviceCounterpartyId: event.currentTarget.value.trim() || null } : current)} /></label>
+      </section>
+
       <section className="field-editor-section" aria-label="Правила полей">
         <div className="field-mapping-context">
           <label>Сущность<select aria-label="Сущность соответствий" value={mappingEntity} onChange={(event) => {
@@ -509,7 +515,10 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <form className="field-rule-form" onSubmit={addGroup}>
           <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD">Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
-          <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => setGroupForm({ ...groupForm, sourceFields: [...event.currentTarget.selectedOptions].map((option) => option.value).join(',') })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
+            const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
+            setGroupForm({ ...groupForm, sourceFields: selected.join(',') });
+          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           <button type="submit" className="button-secondary">Добавить составное правило</button>
