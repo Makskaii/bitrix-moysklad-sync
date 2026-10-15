@@ -10,6 +10,7 @@ type TrialAction = { id: string; message: string; createdAt: string };
 type ServiceMode = 'on' | 'pause' | 'off';
 type EntityControl = { key: string; label: string; ready: boolean; availability: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean };
 type RecoveryStatus = { status: string; provider: string; bitrixStart: number; moyskladOffset: number; error: string | null };
+type DatabaseRecoveryStatus = { status: string; previousLaunchBoundary: string | null; pairsRestored: boolean; lostEventsAcknowledged: boolean; acknowledgedAt?: string | null; acknowledgement?: string | null; audit?: Array<{ action: string; actorId: string; oldBoundaryAt: string | null; boundaryAt: string; occurredAt: string; acknowledgement: string }> };
 type BitrixAuth = { access_token: string };
 type BitrixSdk = { init(callback: () => void): void; getAuth(): BitrixAuth | false };
 type QueueEvent = { id: string; source: string; eventType: string | null; externalEntityId: string | null; status: string; receivedAt: string; attempts: number; direction: string | null; lastErrorCategory: string | null };
@@ -59,6 +60,7 @@ function App() {
   const [confirmMode, setConfirmMode] = useState<ServiceMode | null>(null);
   const [confirmDirections, setConfirmDirections] = useState<{ entity: EntityControl; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } | null>(null);
   const [recovery, setRecovery] = useState<RecoveryStatus>({ status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null });
+  const [databaseRecovery, setDatabaseRecovery] = useState<DatabaseRecoveryStatus>({ status: 'RECOVERY_REQUIRED', previousLaunchBoundary: null, pairsRestored: false, lostEventsAcknowledged: false });
 
   function denyAdminAccess() {
     setAuthorized(false);
@@ -78,17 +80,18 @@ function App() {
 
   async function refresh(token = accessToken) {
     const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
-    const [actionsResponse, modeResponse, entitiesResponse, recoveryResponse] = await Promise.all([
+    const [actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse] = await Promise.all([
       fetch(trialActionsEndpoint, { headers }),
       fetch('/api/admin/sync-mode', { headers }),
       fetch('/api/admin/sync-mode/entities', { headers }),
       fetch('/api/admin/sync-mode/recovery', { headers }),
+      fetch('/api/admin/sync-mode/database-recovery', { headers }),
     ]);
-    if ([actionsResponse, modeResponse, entitiesResponse, recoveryResponse].some((response) => response.status === 403)) {
+    if ([actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse].some((response) => response.status === 403)) {
       denyAdminAccess();
       throw new Error('Доступ только для администратора Bitrix24');
     }
-    if (!actionsResponse.ok || !modeResponse.ok || !entitiesResponse.ok || !recoveryResponse.ok) {
+    if (!actionsResponse.ok || !modeResponse.ok || !entitiesResponse.ok || !recoveryResponse.ok || !databaseRecoveryResponse.ok) {
       throw new Error('Не удалось загрузить состояние админки');
     }
 
@@ -96,6 +99,7 @@ function App() {
     setMode((await modeResponse.json() as { mode: ServiceMode }).mode);
     setEntities(await entitiesResponse.json() as EntityControl[]);
     setRecovery(await recoveryResponse.json() as RecoveryStatus);
+    setDatabaseRecovery(await databaseRecoveryResponse.json() as DatabaseRecoveryStatus);
     const [queueResponse, incidentResponse, logResponse, attemptResponse] = await Promise.all([
       fetch('/api/admin/monitoring/queue', { headers }),
       fetch('/api/admin/monitoring/incidents?status=OPEN', { headers }),
@@ -352,7 +356,7 @@ function App() {
           {activeSection === 'history' && <HistoricalInventoryPage accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
           {activeSection === 'matching' && <HistoricalDealOrderMatchingPage accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
           {activeSection === 'review' && <MonitoringPage kind="review" incidents={incidents} incidentNextCursor={incidentNextCursor} onLoadMore={loadMore} onResolve={resolveIncident} onRetry={retryIncident} onError={setError} />}
-          {activeSection === 'settings' && <Settings mode={mode} entities={entities} recovery={recovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
+          {activeSection === 'settings' && <Settings accessToken={accessToken} mode={mode} entities={entities} recovery={recovery} databaseRecovery={databaseRecovery} setDatabaseRecovery={setDatabaseRecovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}
           {activeSection === 'fields' && <FieldSettingsPage accessToken={accessToken} onForbidden={denyAdminAccess} onError={setError} />}
           {activeSection === 'logs' && <MonitoringPage kind="logs" logs={logs} logCategory={logCategory} onCategory={showLogCategory} logNextCursor={logNextCursor} attempts={apiAttempts} attemptNextCursor={attemptNextCursor} onLoadMore={loadMore} onError={setError} />}
@@ -475,10 +479,13 @@ function Metric({ label }: { label: string }) {
   return <div className="metric"><span>{label}</span><strong aria-label={`${label}: данных нет`}>—</strong><small>Нет достоверных данных</small></div>;
 }
 
-function Settings({ mode, entities, recovery, confirmMode, setConfirmMode, saveMode, confirmDirections, setConfirmDirections, saveDirections, error, setError }: {
+function Settings({ accessToken, mode, entities, recovery, databaseRecovery, setDatabaseRecovery, confirmMode, setConfirmMode, saveMode, confirmDirections, setConfirmDirections, saveDirections, error, setError }: {
+  accessToken: string;
   mode: ServiceMode;
   entities: EntityControl[];
   recovery: RecoveryStatus;
+  databaseRecovery: DatabaseRecoveryStatus;
+  setDatabaseRecovery: (status: DatabaseRecoveryStatus) => void;
   confirmMode: ServiceMode | null;
   setConfirmMode: (mode: ServiceMode | null) => void;
   saveMode: (mode: ServiceMode) => Promise<void>;
@@ -518,7 +525,66 @@ function Settings({ mode, entities, recovery, confirmMode, setConfirmMode, saveM
       {error && <p role="alert" className="inline-error">{error}</p>}
     </section>
     <p className="security-caption"><span aria-hidden="true">✓</span> Настройки загружаются через защищённые административные запросы Bitrix24.</p>
+    <DatabaseRecoveryPanel accessToken={accessToken} status={databaseRecovery} onUpdated={setDatabaseRecovery} onError={setError} />
   </>;
+}
+
+function DatabaseRecoveryPanel({ accessToken, status, onUpdated, onError }: {
+  accessToken: string;
+  status: DatabaseRecoveryStatus;
+  onUpdated: (status: DatabaseRecoveryStatus) => void;
+  onError: (message: string) => void;
+}) {
+  const [boundary, setBoundary] = useState('');
+  const [pairsRestored, setPairsRestored] = useState(false);
+  const [lostEventsAcknowledged, setLostEventsAcknowledged] = useState(false);
+  const [acknowledgement, setAcknowledgement] = useState('');
+  const [saving, setSaving] = useState(false);
+  const ready = status.status === 'READY';
+
+  async function confirm() {
+    setSaving(true);
+    try {
+      const response = await fetch('/api/admin/sync-mode/database-recovery/confirm', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+        body: JSON.stringify({ previousLaunchBoundary: boundary, pairsRestored, lostEventsAcknowledged, acknowledgement }),
+      });
+      if (response.status === 403) throw new Error('Доступ только для администратора Bitrix24');
+      const payload = await response.json().catch(() => ({})) as DatabaseRecoveryStatus & { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? 'Не удалось подтвердить восстановление базы');
+      onUpdated(payload);
+      setBoundary('');
+      setPairsRestored(false);
+      setLostEventsAcknowledged(false);
+      setAcknowledgement('');
+      onError('');
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <section className="panel settings-panel" aria-label="Восстановление после потери базы">
+    <div className="panel-heading"><div><p className="eyebrow">ЦЕЛОСТНОСТЬ ДАННЫХ</p><h3>Восстановление после потери базы</h3></div><span className={`mode-chip mode-${ready ? 'on' : 'off'}`}>{ready ? 'Подтверждено' : 'Требуется'}</span></div>
+    {ready ? <>
+      <p className="panel-description">Восстановление подтверждено {status.acknowledgedAt ? new Date(status.acknowledgedAt).toLocaleString() : ''}. Граница запуска: <strong>{status.previousLaunchBoundary ? new Date(status.previousLaunchBoundary).toLocaleString() : 'не задана'}</strong>. Подтверждены пары: {status.pairsRestored ? 'да' : 'нет'}; утраченные события признаны: {status.lostEventsAcknowledged ? 'да' : 'нет'}.</p>
+      {status.audit?.map((entry, index) => <p key={`${entry.occurredAt}-${index}`} className="recovery-line">Аудит: {entry.actorId}, {new Date(entry.occurredAt).toLocaleString()}, граница {new Date(entry.boundaryAt).toLocaleString()}. {entry.acknowledgement}</p>)}
+    </> : <>
+      <p className="panel-description">База не содержит подтверждённого состояния. Очередь, снимки, аудит и решения, которые хранились только в потерянной базе, невозможно гарантированно восстановить. Автоматическое сопоставление и replay истории не выполняются. Сверьте прежнюю границу с независимой эксплуатационной записью и восстановите пары до подтверждения.</p>
+      <label>Прежняя граница рабочего запуска из независимой записи
+        <input value={boundary} onChange={(event) => setBoundary(event.target.value)} placeholder="2026-09-01T10:00:00+03:00" autoComplete="off" />
+      </label>
+      <label className="pair-check"><input type="checkbox" checked={pairsRestored} onChange={(event) => setPairsRestored(event.target.checked)} />Я восстановил и проверил пары по точным внешним ID/UUID; неоднозначные пары разобраны вручную.</label>
+      <label className="pair-check"><input type="checkbox" checked={lostEventsAcknowledged} onChange={(event) => setLostEventsAcknowledged(event.target.checked)} />Я признаю, что очередь, снимки, журнал аудита и решения, существовавшие только в утраченной базе, не могут быть гарантированно восстановлены.</label>
+      <label>Основание восстановления и принятый риск
+        <textarea value={acknowledgement} onChange={(event) => setAcknowledgement(event.target.value)} minLength={20} maxLength={1000} rows={3} placeholder="Укажите независимую запись границы и принятые ограничения восстановления." />
+      </label>
+      <button type="button" disabled={saving || !boundary || !pairsRestored || !lostEventsAcknowledged || acknowledgement.trim().length < 20} onClick={() => void confirm()}>{saving ? 'Сохраняем подтверждение…' : 'Подтвердить восстановление'}</button>
+      <p className="security-caption">Это действие сохранит аудит администратора и оставит сервис выключенным. После него включение Apply требует отдельного действия.</p>
+    </>}
+  </section>;
 }
 
 function PageHeading({ eyebrow, title, subtitle }: { eyebrow: string; title: string; subtitle: string }) {

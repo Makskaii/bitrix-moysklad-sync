@@ -1,5 +1,6 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Inject, Injectable, Optional } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { DatabaseRecoveryService } from './database-recovery.service';
 
 export type ServiceMode = 'on' | 'pause' | 'off';
 
@@ -43,14 +44,21 @@ const entityControls = [
 
 @Injectable()
 export class SyncModeService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
+  ) {}
 
   async read() {
     const setting = await this.ensureGlobalSetting();
+    if (this.databaseRecovery) await this.databaseRecovery.assertReady();
     return { mode: setting.serviceMode as ServiceMode };
   }
 
   async setMode(mode: ServiceMode) {
+    if (mode === 'on' && this.databaseRecovery && !await this.databaseRecovery.assertReady()) {
+      throw new ConflictException('Database loss recovery must be explicitly confirmed before Apply can be enabled');
+    }
     const current = await this.ensureGlobalSetting();
     if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
     const enteringOff = mode === 'off' && current.serviceMode !== 'off';

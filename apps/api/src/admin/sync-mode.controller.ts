@@ -1,9 +1,11 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Param, Patch, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Optional, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
 import { ServiceMode, SyncModeService } from '../sync-mode.service';
 import { SyncRecoveryService } from '../sync-recovery.service';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
+import { DatabaseRecoveryService } from '../database-recovery.service';
+import { readBitrixAdministratorIdentity } from './admin-access.guard';
 
 @Controller('api/admin/sync-mode')
 @UseGuards(AdminAccessGuard)
@@ -12,6 +14,7 @@ export class SyncModeController {
     private readonly syncMode: SyncModeService,
     private readonly recovery: SyncRecoveryService,
     private readonly database: DatabaseService,
+    @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
   ) {}
 
   @Get()
@@ -24,15 +27,39 @@ export class SyncModeController {
     if (body?.mode !== 'on' && body?.mode !== 'pause' && body?.mode !== 'off') {
       throw new BadRequestException('mode must be on, pause, or off');
     }
-    return this.syncMode.read().then((current) => {
+    return this.syncMode.read().then(async (current) => {
       if (current.mode !== body.mode && body.confirmed !== true) {
         throw new ConflictException('Explicit confirmation is required for mode transitions');
+      }
+      if (body.mode === 'on' && this.databaseRecovery && !await this.databaseRecovery.assertReady()) {
+        throw new ConflictException('Database loss recovery must be explicitly confirmed before Apply can be enabled');
       }
       return this.syncMode.setMode(body.mode as ServiceMode);
     }).then((result) => {
       void writeOperationalLog(this.database, 'ADMIN', `Service mode set to ${result.mode}`);
       return result;
     });
+  }
+
+  @Get('database-recovery')
+  readDatabaseRecoveryStatus() {
+    if (!this.databaseRecovery) throw new ConflictException('Database recovery service is unavailable');
+    return this.databaseRecovery.readStatus();
+  }
+
+  @Post('database-recovery/confirm')
+  async confirmDatabaseRecovery(
+    @Body() body: Record<string, unknown> | null,
+    @Req() request: { header(name: string): string | undefined },
+  ) {
+    if (!body) throw new BadRequestException('Recovery confirmation is required');
+    if (!this.databaseRecovery) throw new ConflictException('Database recovery service is unavailable');
+    const token = request.header('authorization')?.match(/^Bearer ([^\s]+)$/i)?.[1];
+    const actorId = token ? await readBitrixAdministratorIdentity(token) : null;
+    if (!actorId) throw new ForbiddenException('Administrator identity could not be verified');
+    const result = await this.databaseRecovery.confirmRecovery(body, actorId);
+    await writeOperationalLog(this.database, 'ADMIN', 'Database loss recovery acknowledged; service remains Off');
+    return result;
   }
 
   @Get('recovery')

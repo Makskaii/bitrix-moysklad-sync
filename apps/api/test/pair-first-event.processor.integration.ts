@@ -107,6 +107,33 @@ test('a baseline-missing result returned after readiness is durably held for man
   assert.equal(state.event.lastErrorCategory, 'DEAL_ORDER_BASELINE_MISSING');
 });
 
+test('a pre-boundary deal event received after recovery and later On stays terminally skipped', async () => {
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  const state = createDatabase(2);
+  let resolverCalls = 0;
+  const processor = new PairFirstEventProcessor(
+    state.database as never,
+    { resolve: async () => { resolverCalls++; return { status: 'confirmed', pair }; } } as never,
+    undefined, undefined, undefined, undefined,
+    { read: async () => ({ mode: 'on' }) } as never,
+    undefined,
+    { readDealOrderCreationTimestamp: async () => new Date('2026-08-31T10:00:00.000Z') } as never,
+    { launchBoundary: async () => new Date('2026-09-01T10:00:00.000Z') } as never,
+  );
+
+  try {
+    await processor.process('event-1');
+  } finally {
+    if (previousMode === undefined) delete process.env.SYNC_MODE;
+    else process.env.SYNC_MODE = previousMode;
+  }
+
+  assert.equal(state.event.status, 'SKIPPED_PRE_LAUNCH');
+  assert.equal(state.event.lastErrorCategory, 'PRE_LAUNCH_DOCUMENT');
+  assert.equal(resolverCalls, 0);
+});
+
 test('a concurrent baseline created for another event version is not accepted after readback', async () => {
   const previousMode = process.env.SYNC_MODE;
   process.env.SYNC_MODE = 'apply';
