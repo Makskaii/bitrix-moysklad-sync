@@ -8,6 +8,7 @@ import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
 import { SyncModeService } from '../sync-mode.service';
 import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients/client-dependency-resolver';
+import type { DocumentClientResolution } from '../clients/document-client-contract';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
@@ -16,6 +17,12 @@ import { writeOperationalLog } from '../monitoring-log';
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
 const RECOVERY_INTERVAL_MS = 1_000;
+
+type PairFirstResult = PairResolutionResult & { documentClient?: DocumentClientResolution };
+type DocumentDependencyResult =
+  | { status: 'RESOLVED'; reason: string; client: DocumentClientResolution }
+  | { status: 'RETRY'; reason: string; retryAfter?: Date }
+  | { status: 'REVIEW'; reason: string };
 
 /**
  * Resolves persisted deal/order webhook events before any sync work can be
@@ -93,12 +100,12 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     }
   }
 
-  async process(eventId: string): Promise<PairResolutionResult | null> {
+  async process(eventId: string): Promise<PairFirstResult | null> {
     if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
     return this.processWithLease(eventId);
   }
 
-  private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairResolutionResult | null> {
+  private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairFirstResult | null> {
     // Pairing and synchronization are both deferred while paused or Off. The
     // durable RECEIVED event remains eligible when the service returns On.
     if (this.syncMode && (await this.syncMode.read()).mode !== 'on') return null;
@@ -202,6 +209,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       });
     }
 
+    let documentClient: DocumentClientResolution | undefined;
     if (result.status === 'confirmed' && this.fieldSettings && this.baseline) {
       try {
         await workerLease?.assertOwned();
@@ -222,6 +230,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           );
           return result;
         }
+        documentClient = dependencyResult?.client;
         const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig, attempt });
         if (baseline.status !== 'READY') {
           if (baseline.status === 'DATABASE_FAILURE') {
@@ -263,7 +272,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     }
 
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
-    return result;
+    return documentClient && result.status === 'confirmed' ? { ...result, documentClient } : result;
   }
 
   private async resolveDocumentDependencies(
@@ -271,7 +280,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     pair: Extract<PairResolutionResult, { status: 'confirmed' }>['pair'],
     workerLease?: EventWorkerLeaseContext,
     attempt = 1,
-  ) {
+  ): Promise<DocumentDependencyResult | null> {
     if (!this.clientDependencies || !this.documentReader) return null;
     try {
       await workerLease?.assertOwned();
@@ -288,6 +297,28 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         : [
             { entity: 'COMPANY' as const, sourceId: referenceId(record.agent, 'counterparty'), primaryCompanySourceId: null },
           ];
+      const eventSettings = await this.fieldSettings?.eventConfig(event.id);
+      const serviceCounterpartyId = typeof eventSettings?.config.serviceCounterpartyId === 'string' ? eventSettings.config.serviceCounterpartyId : null;
+      if (sourceSystem === 'BITRIX24' && !dependencies.some((dependency) => dependency.sourceId) && !serviceCounterpartyId) {
+        return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_NOT_CONFIGURED' };
+      }
+      if (sourceSystem === 'BITRIX24' && !dependencies.some((dependency) => dependency.sourceId) && serviceCounterpartyId) {
+        if (!this.clientDependencies.verifyServiceCounterparty) return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_UNAVAILABLE' };
+        try {
+          if (!await this.clientDependencies.verifyServiceCounterparty(serviceCounterpartyId)) {
+            return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_INVALID' };
+          }
+        } catch (error) {
+          if (error instanceof ProviderFailure && isRetryableFailure(error)) {
+            return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_FAILED', retryAfter: retryAtForFailure(error, attempt) };
+          }
+          if (isRetryableFailure(error)) return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_FAILED', retryAfter: retryAtForFailure(error, attempt) };
+          return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_INVALID' };
+        }
+        await writeOperationalLog(this.database, 'EVENT', `Document has no client; configured service counterparty ${serviceCounterpartyId} is available.`, event.id);
+      }
+      let companyPair: import('@prisma/client').EntityPair | null = null;
+      let contactPair: import('@prisma/client').EntityPair | null = null;
       for (const dependency of dependencies) {
         if (!dependency.sourceId) continue;
         await workerLease?.assertOwned();
@@ -298,11 +329,34 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           sourceId: dependency.sourceId,
           primaryCompanySourceId: dependency.primaryCompanySourceId,
           attempt,
+          optionalDependency: dependency.entity === 'CONTACT',
         }, workerLease);
         await workerLease?.assertOwned();
+        if ((resolved.status === 'RETRY' || resolved.status === 'REVIEW') && dependency.entity === 'CONTACT') {
+          await this.clientDependencies.scheduleOptionalContactRetry({
+            eventId: event.id, sourceSystem, entity: 'CONTACT', sourceId: dependency.sourceId,
+            primaryCompanySourceId: dependency.primaryCompanySourceId, optionalDependency: true,
+          }, resolved.reason, resolved.status === 'RETRY' ? resolved.retryAfter : undefined);
+          continue;
+        }
         if (resolved.status === 'RETRY' || resolved.status === 'REVIEW') return resolved;
+        if (dependency.entity === 'COMPANY' && resolved.status === 'RESOLVED') companyPair = resolved.pair;
+        if (dependency.entity === 'CONTACT') {
+          if (resolved.status === 'RESOLVED') {
+            contactPair = resolved.pair;
+            companyPair ??= resolved.companyPair;
+          } else if (resolved.status === 'OMITTED') companyPair ??= resolved.companyPair;
+        }
       }
-      return { status: 'RESOLVED' as const, reason: 'CLIENT_DEPENDENCIES_RESOLVED' };
+      return {
+        status: 'RESOLVED' as const,
+        reason: 'CLIENT_DEPENDENCIES_RESOLVED',
+        client: {
+          company: companyPair,
+          contact: contactPair,
+          serviceCounterpartyId: !companyPair && !contactPair ? serviceCounterpartyId : null,
+        },
+      };
     } catch (error) {
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
         return { status: 'REVIEW' as const, reason: 'CLIENT_DEPENDENCY_READ_REJECTED' };
