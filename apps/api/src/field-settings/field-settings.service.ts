@@ -262,14 +262,26 @@ export class FieldSettingsService {
     payload: Prisma.InputJsonValue;
     directionDisabled: boolean;
     requireServiceNotOff?: boolean;
+    nightlyLeaseToken?: string;
   }) {
     await this.ensureInitialized();
     return this.database.$transaction(async (transaction) => {
       if (input.requireServiceNotOff) {
-        const mode = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
-          SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+        const mode = await transaction.$queryRaw<Array<{ serviceMode: string; nightlyLeaseToken: string | null; nightlyLeaseExpiresAt: Date | null }>>`
+          SELECT "serviceMode", "nightlyLeaseToken", "nightlyLeaseExpiresAt" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
         `;
         if (!mode[0] || mode[0].serviceMode === 'off') throw new EventIntakeDisabledError();
+        if (input.nightlyLeaseToken && mode[0].serviceMode !== 'on') throw new EventIntakeDisabledError();
+        if (input.nightlyLeaseToken && mode[0].nightlyLeaseToken !== input.nightlyLeaseToken) {
+          throw new Error('Nightly run lease was lost before durable enqueue');
+        }
+        if (input.nightlyLeaseToken) {
+          const renewed = await transaction.$executeRaw`
+            UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds'
+            WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken} AND "nightlyLeaseExpiresAt" > NOW()
+          `;
+          if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
+        }
       }
       const event = await transaction.inboundEvent.upsert({
         where: { source_deliveryKey: { source: input.source, deliveryKey: input.deliveryKey } },

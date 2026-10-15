@@ -14,10 +14,14 @@ import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
 import { SyncModeService } from '../src/sync-mode.service';
 import { SyncRecoveryService } from '../src/sync-recovery.service';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from '../src/field-settings/read-only-field-data.provider';
+import { EntityPairService } from '../src/pairs/entity-pair.service';
 
 @Module({
   controllers: [EventsController, AdminController, ContactSyncStatusController, SyncModeController],
-  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard, SyncModeService, SyncRecoveryService],
+  providers: [DatabaseService, EventIntakeService, ContactSyncProcessor, ContactSyncStatusReader, AdminAccessGuard,
+    SyncModeService, SyncRecoveryService, ReadOnlyFieldDataProvider, EntityPairService, FieldSettingsService],
 })
 class RealDatabaseContactSyncModule {}
 
@@ -38,6 +42,14 @@ let moyskladReadArrivals = 0;
 let releaseMoyskladReads = () => {};
 let moyskladReadBarrier = Promise.resolve();
 const nightlyProviderQueries: string[] = [];
+let nightlyBitrixCompanyIds: string[] = [];
+let nightlyBitrixSecondPageIds: string[] = [];
+let nightlyMoyskladMetaSize = 0;
+let failNightlyBitrixFeed = false;
+let nightlyBitrixRetryAfter = '3600';
+let holdNightlyCompanyFeed = false;
+let nightlyCompanyFeedArrived = false;
+let releaseNightlyCompanyFeed = () => {};
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to the isolated ephemeral PostgreSQL database');
@@ -484,22 +496,32 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   nightlyProviderQueries.length = 0;
   try {
     freezeTime('2026-10-05T22:00:00.000Z');
-    await waitForNightlyStatus('complete');
+    await waitForNightlyStatus('complete_with_limitations');
     const status = await readRecoveryStatus();
     assert.deepEqual(status.nightly, {
       scheduledDate: '2026-10-06',
-      status: 'complete',
+      status: 'complete_with_limitations',
       from: '2026-10-04T22:00:00.000Z',
       through: '2026-10-05T22:00:00.000Z',
       provider: 'COMPLETE',
       bitrixStart: 0,
+      bitrixEntityTypeId: 5,
+      bitrixLastId: null,
       moyskladOffset: 0,
+      bitrixStatus: 'complete',
+      moyskladStatus: 'complete',
       retryAfter: null,
       attempts: 1,
-      error: null,
+      error: 'Nightly feeds cover updates for active contact/company pairs. Delete events and MoySklad contact-person changed-record feeds are outside this slice.',
     });
-    assert.equal(nightlyProviderQueries.some((query) => query.includes('2026-10-04T22%3A00%3A00.000Z')), true);
-    assert.equal(nightlyProviderQueries.some((query) => query.includes('2026-10-05T22%3A00%3A00.000Z')), true);
+    const bitrixQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query));
+    assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [3, 4]);
+    assert.deepEqual(bitrixQueries.map((query) => [query.filter['>=updatedTime'], query.filter['<=updatedTime']]), [
+      ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
+      ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
+    ]);
+    const moyskladQuery = new URL(nightlyProviderQueries.find((query) => query.includes('/api/entity/counterparty?'))!, 'http://127.0.0.1');
+    assert.equal(moyskladQuery.searchParams.get('filter'), 'updated>=2026-10-05 01:00:00;updated<=2026-10-06 01:00:00');
   } finally {
     restoreTime();
   }
@@ -529,6 +551,40 @@ test('nightly schedule is skipped while paused and is not backfilled after resum
   }
 });
 
+test('nightly changed IDs are deduplicated, limited to active pairs, and pinned to field settings', async () => {
+  const database = app.get(DatabaseService);
+  const bitrixCompanyId = `nightly-company-${randomUUID()}`;
+  const pair = await database.entityPair.create({
+    data: { entityType: 'COMPANY', bitrix24Id: bitrixCompanyId, moyskladId: `nightly-ms-${randomUUID()}`, moyskladType: 'counterparty', active: true },
+  });
+  await database.syncSetting.update({
+    where: { id: 'global' }, data: {
+      serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle',
+      nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending', nightlyFrom: null, nightlyThrough: null,
+    },
+  });
+  nightlyBitrixCompanyIds = [bitrixCompanyId, bitrixCompanyId, `unpaired-${randomUUID()}`];
+  nightlyProviderQueries.length = 0;
+  try {
+    freezeTime('2026-10-08T22:00:00.000Z');
+    await waitForNightlyStatus('complete_with_limitations');
+    const events = await database.inboundEvent.findMany({ where: { source: 'BITRIX24', externalEntityId: bitrixCompanyId } });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].eventType, 'ONCRMCOMPANYUPDATE');
+    assert.equal(events[0].status, 'RECEIVED');
+    assert.equal((events[0].payload as { recovery?: string }).recovery, 'nightly');
+    const pin = await database.inboundEventSettings.findUnique({ where: { eventId: events[0].id } });
+    assert.equal(pin?.settingsVersion, 1);
+    const unpairedEvents = await database.inboundEvent.findMany({ where: { source: 'BITRIX24', externalEntityId: { startsWith: 'unpaired-' } } });
+    assert.equal(unpairedEvents.length, 0);
+  } finally {
+    restoreTime();
+    nightlyBitrixCompanyIds = [];
+    await database.inboundEvent.deleteMany({ where: { externalEntityId: bitrixCompanyId } });
+    await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
 test('nightly schedule is skipped while Off', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
@@ -546,11 +602,231 @@ test('nightly schedule is skipped while Off', async () => {
   }
 });
 
+test('nightly provider failure leaves independent feed completed and retryable', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({
+    where: { id: 'global' }, data: {
+      serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null,
+      nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyBitrixStatus: 'pending',
+      nightlyMoyskladStatus: 'pending', nightlyFrom: null, nightlyThrough: null,
+      nightlyRetryAfter: null, nightlyBitrixStart: 0, nightlyMoyskladOffset: 0,
+    },
+  });
+  nightlyProviderQueries.length = 0;
+  failNightlyBitrixFeed = true;
+  try {
+    freezeTime('2026-10-09T22:00:00.000Z');
+    await waitForNightlyStatus('failed');
+    let status = await readRecoveryStatus();
+    const deadline = NativeDate.now() + 8_000;
+    while (status.nightly.moyskladStatus !== 'complete' && NativeDate.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      status = await readRecoveryStatus();
+    }
+    assert.equal(status.nightly.bitrixStatus, 'failed');
+    assert.equal(status.nightly.moyskladStatus, 'complete');
+    assert.ok(nightlyProviderQueries.some((query) => query.includes('/api/entity/counterparty?')));
+    assert.equal(new Date(status.nightly.retryAfter!).getTime(), Date.parse('2026-10-09T23:00:00.000Z'));
+  } finally {
+    restoreTime();
+    failNightlyBitrixFeed = false;
+    nightlyBitrixRetryAfter = '3600';
+  }
+});
+
+test('nightly run lease fences two API instances from querying and advancing the same cursors', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-10', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-09T22:00:00.000Z'), nightlyThrough: new Date('2026-10-10T22:00:00.000Z'),
+    nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyProviderQueries.length = 0;
+  const first = app.get(SyncRecoveryService);
+  const second = new SyncRecoveryService(
+    database, app.get(SyncModeService), app.get(ContactSyncProcessor), undefined, app.get(FieldSettingsService),
+  );
+  const run = (service: SyncRecoveryService) => (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+  await Promise.all([run(first), run(second)]);
+  const status = await readRecoveryStatus();
+  assert.equal(status.nightly.status, 'complete_with_limitations');
+  assert.equal(nightlyProviderQueries.filter((query) => query.startsWith('{')).length, 2);
+  assert.equal(nightlyProviderQueries.filter((query) => query.includes('/api/entity/counterparty?')).length, 1);
+  const stored = await database.syncSetting.findUnique({ where: { id: 'global' } });
+  assert.equal(stored?.nightlyLeaseToken, null);
+  assert.equal(stored?.nightlyLeaseExpiresAt, null);
+});
+
+test('lease loss during a provider call replays the page without duplicate durable events', async () => {
+  const database = app.get(DatabaseService);
+  const bitrixId = `nightly-lease-company-${randomUUID()}`;
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: bitrixId, moyskladId: `nightly-ms-${randomUUID()}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-11', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-10T22:00:00.000Z'), nightlyThrough: new Date('2026-10-11T22:00:00.000Z'),
+    nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyBitrixCompanyIds = [bitrixId];
+  nightlyCompanyFeedArrived = false;
+  holdNightlyCompanyFeed = true;
+  const service = app.get(SyncRecoveryService);
+  const run = () => (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+  try {
+    const firstRun = run();
+    const deadline = NativeDate.now() + 8_000;
+    while (!nightlyCompanyFeedArrived && NativeDate.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(nightlyCompanyFeedArrived, true);
+    await database.syncSetting.update({ where: { id: 'global' }, data: {
+      nightlyLeaseToken: randomUUID(), nightlyLeaseExpiresAt: new Date(NativeDate.now() + 60_000),
+    } });
+    releaseNightlyCompanyFeed();
+    await firstRun;
+    let state = await database.syncSetting.findUnique({ where: { id: 'global' } });
+    assert.equal(state?.nightlyBitrixEntityTypeId, 4);
+    assert.equal(state?.nightlyBitrixStart, 0);
+    assert.equal(await database.inboundEvent.count({ where: { source: 'BITRIX24', externalEntityId: bitrixId } }), 0);
+
+    await database.syncSetting.update({ where: { id: 'global' }, data: { nightlyLeaseToken: null, nightlyLeaseExpiresAt: null } });
+    holdNightlyCompanyFeed = false;
+    await run();
+    state = await database.syncSetting.findUnique({ where: { id: 'global' } });
+    assert.equal(state?.nightlyStatus, 'complete_with_limitations');
+    assert.equal(await database.inboundEvent.count({ where: { source: 'BITRIX24', externalEntityId: bitrixId } }), 1);
+  } finally {
+    releaseNightlyCompanyFeed();
+    holdNightlyCompanyFeed = false;
+    nightlyBitrixCompanyIds = [];
+    await database.inboundEvent.deleteMany({ where: { externalEntityId: bitrixId } });
+    await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
+test('Bitrix keyset pagination survives a moving result set between pages', async () => {
+  const database = app.get(DatabaseService);
+  const pairId = '51';
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: pairId, moyskladId: `nightly-ms-${randomUUID()}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-12', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-11T22:00:00.000Z'), nightlyThrough: new Date('2026-10-12T22:00:00.000Z'),
+    nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyBitrixCompanyIds = Array.from({ length: 50 }, (_, index) => String(index + 1));
+  nightlyBitrixSecondPageIds = [pairId];
+  nightlyProviderQueries.length = 0;
+  try {
+    const service = app.get(SyncRecoveryService);
+    await (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const companyQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query)).filter((query) => query.entityTypeId === 4);
+    assert.equal(companyQueries.length, 2);
+    assert.equal(companyQueries[0].start, -1);
+    assert.deepEqual(companyQueries[0].order, { id: 'ASC' });
+    assert.equal(companyQueries[1].start, -1);
+    assert.equal(companyQueries[1].filter['>id'], '50');
+    assert.equal(await database.inboundEvent.count({ where: { source: 'BITRIX24', externalEntityId: pairId } }), 1);
+    const state = await database.syncSetting.findUnique({ where: { id: 'global' } });
+    assert.equal(state?.nightlyBitrixStatus, 'complete');
+    assert.equal(state?.nightlyBitrixLastId, null);
+  } finally {
+    nightlyBitrixCompanyIds = [];
+    nightlyBitrixSecondPageIds = [];
+    await database.inboundEvent.deleteMany({ where: { externalEntityId: pairId } });
+    await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
+test('MoySklad pagination beyond one documented page fails closed without checkpoint', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-13', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-12T22:00:00.000Z'), nightlyThrough: new Date('2026-10-13T22:00:00.000Z'),
+    nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyMoyskladMetaSize = 1_001;
+  try {
+    const service = app.get(SyncRecoveryService);
+    await (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const status = await readRecoveryStatus();
+    assert.equal(status.nightly.bitrixStatus, 'complete');
+    assert.equal(status.nightly.moyskladStatus, 'failed');
+    assert.ok(status.nightly.error);
+    assert.match(status.nightly.error!, /stable keyset pagination is not verified/);
+    const state = await database.syncSetting.findUnique({ where: { id: 'global' } });
+    assert.equal(state?.nightlyMoyskladOffset, 0);
+    assert.equal(await database.inboundEvent.count({ where: { source: 'MOYSKLAD', payload: { path: ['recovery'], equals: 'nightly' } } }), 0);
+  } finally {
+    nightlyMoyskladMetaSize = 0;
+  }
+});
+
+test('mid-run PAUSE marks unfinished provider feeds skipped and preserves completed feeds', async () => {
+  const database = app.get(DatabaseService);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: '2026-10-14', nightlyStatus: 'pending',
+    nightlyFrom: new Date('2026-10-13T22:00:00.000Z'), nightlyThrough: new Date('2026-10-14T22:00:00.000Z'),
+    nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+  } });
+  nightlyCompanyFeedArrived = false;
+  holdNightlyCompanyFeed = true;
+  const service = app.get(SyncRecoveryService);
+  const run = (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+  try {
+    const deadline = NativeDate.now() + 8_000;
+    while (!nightlyCompanyFeedArrived && NativeDate.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(nightlyCompanyFeedArrived, true);
+    await setAdminMode('pause');
+    releaseNightlyCompanyFeed();
+    await run;
+    const status = await readRecoveryStatus();
+    assert.equal(status.nightly.status, 'skipped');
+    assert.equal(status.nightly.bitrixStatus, 'skipped');
+    assert.equal(status.nightly.moyskladStatus, 'skipped');
+  } finally {
+    releaseNightlyCompanyFeed();
+    holdNightlyCompanyFeed = false;
+    await setAdminMode('on');
+  }
+});
+
 async function handleExternalRequest(request: IncomingMessage, response: ServerResponse) {
-  if (request.method === 'POST' && request.url === '/rest/crm.contact.list.json') {
-    return readBody(request).then((body) => {
+  if (request.method === 'POST' && request.url === '/rest/crm.item.list.json') {
+    return readBody(request).then(async (body) => {
       nightlyProviderQueries.push(body);
-      return sendJson(response, 200, { result: [] });
+      if (failNightlyBitrixFeed) return sendJson(response, 503, { error: 'synthetic rate limit' }, { 'retry-after': nightlyBitrixRetryAfter });
+      const requestBody = JSON.parse(body) as { entityTypeId: number; filter?: Record<string, unknown> };
+      if (requestBody.entityTypeId === 4 && holdNightlyCompanyFeed) {
+        nightlyCompanyFeedArrived = true;
+        await new Promise<void>((resolve) => { releaseNightlyCompanyFeed = resolve; });
+      }
+      const items = requestBody.entityTypeId === 4
+        ? (requestBody.filter?.['>id'] ? nightlyBitrixSecondPageIds : nightlyBitrixCompanyIds).map((id) => ({ id }))
+        : [];
+      const result = sendJson(response, 200, { result: { items } });
+      if (requestBody.entityTypeId === 4 && requestBody.filter?.['>id'] === undefined && nightlyBitrixSecondPageIds.length) {
+        // Model an in-window row moving out of the fixed through-time filter after page one.
+        nightlyBitrixCompanyIds = nightlyBitrixCompanyIds.slice(1);
+      }
+      return result;
     });
   }
   if (request.method === 'POST' && request.url === '/rest/crm.contact.get.json') {
@@ -600,7 +876,7 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
   }
   if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty?')) {
     nightlyProviderQueries.push(request.url);
-    return sendJson(response, 200, { rows: [], meta: { size: 0, limit: 1_000, offset: 0 } });
+    return sendJson(response, 200, { rows: [], meta: { size: nightlyMoyskladMetaSize, limit: 1_000, offset: 0 } });
   }
   return sendJson(response, 404, {});
 }
@@ -661,7 +937,8 @@ async function readRecoveryStatus() {
   return response.json() as Promise<{
     nightly: {
       scheduledDate: string | null; status: string; from: string | null; through: string | null;
-      provider: string; bitrixStart: number; moyskladOffset: number; retryAfter: string | null;
+      provider: string; bitrixStart: number; bitrixEntityTypeId: number; bitrixLastId: string | null; moyskladOffset: number;
+      bitrixStatus: string; moyskladStatus: string; retryAfter: string | null;
       attempts: number; error: string | null;
     };
   }>;
