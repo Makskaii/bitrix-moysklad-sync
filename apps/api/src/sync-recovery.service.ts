@@ -9,6 +9,7 @@ import { ClientSyncProcessor } from './clients/client-sync.processor';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 
 const MOYSKLAD_PAGE_SIZE = 1_000;
+const MOYSKLAD_CONTACTPERSON_MAX_PAGES = 20;
 const REQUEST_TIMEOUT_MS = 15_000;
 const NIGHTLY_TICK_MS = 5_000;
 const NIGHTLY_REQUEST_INTERVAL_MS = 1_000;
@@ -192,7 +193,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           nightlyStatus: final?.nightlyStatus === 'skipped' ? 'skipped' : complete ? 'complete_with_limitations' : failed ? 'failed' : 'running',
           nightlyProvider: complete ? 'COMPLETE' : 'BITRIX24',
           nightlyRetryAfter: failed ? retryAfter : null,
-          ...(complete ? { nightlyError: 'Nightly feeds cover updates for active contact/company pairs. Delete events and MoySklad contact-person changed-record feeds are outside this slice.' } : {}),
+          ...(complete ? { nightlyError: 'Nightly feeds cover active Bitrix24 contact/company pairs and MoySklad contact persons attached to active company pairs. Delete and archival changes remain outside this slice.' } : {}),
         },
       });
     } catch {
@@ -263,15 +264,131 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() }, nightlyMoyskladOffset: queriedOffset },
           data: page.hasNext
             ? { nightlyMoyskladOffset: setting.nightlyMoyskladOffset + page.count }
-            : { nightlyMoyskladStatus: 'complete', nightlyMoyskladOffset: 0 },
+            : { nightlyMoyskladOffset: 0 },
         });
         if (result.count !== 1) throw new Error('Nightly lease or MoySklad cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
-        if (!page.hasNext) return;
+        if (!page.hasNext) break;
       }
+      await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+      const latest = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+      if (latest?.nightlyStatus === 'skipped') return;
+      const completed = await this.database.syncSetting.updateMany({
+        where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() } },
+        data: { nightlyMoyskladStatus: 'complete', nightlyMoyskladOffset: 0 },
+      });
+      if (completed.count !== 1) throw new Error('Nightly lease was lost before MoySklad feed completion');
     } catch (error) {
       await this.markProviderFailed('MOYSKLAD', error, leaseToken);
     }
+  }
+
+  private async runMoyskladContactpersonFeed(from: Date, through: Date, jobKey: string, leaseToken: string) {
+    const entityPairs = await this.database.entityPair.findMany({
+      where: { entityType: 'COMPANY', active: true, moyskladType: 'counterparty' },
+      select: { moyskladId: true },
+    });
+    const parents = [...new Set(entityPairs.map((pair) => pair.moyskladId))].filter(Boolean).sort();
+    const changed: Array<{ id: string; parentId: string }> = [];
+    for (const parentId of parents) {
+      let offset = 0;
+      let expectedSize: number | null = null;
+      let pageNumber = 0;
+      while (true) {
+        if (++pageNumber > MOYSKLAD_CONTACTPERSON_MAX_PAGES) {
+          throw new UnsupportedPaginationError('MoySklad contact-person collection exceeds the 20-page nightly safety bound; no contact-person events were queued.');
+        }
+        await this.renewNightlyLease(leaseToken);
+        const page = await this.readMoyskladContactpersonPage(parentId, offset);
+        await this.renewNightlyLease(leaseToken);
+        const current = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+        if (!current || await this.nightlyMustSkip(current, new Date())) { await this.markNightlySkipped(leaseToken); return; }
+        if (expectedSize === null) expectedSize = page.size;
+        if (page.size !== expectedSize) {
+          throw new UnsupportedPaginationError('MoySklad contact-person collection changed during pagination; no contact-person events were queued.');
+        }
+        for (const row of page.rows) {
+          const updatedAt = moyskladMoment(row.updated);
+          if (updatedAt === null) throw new Error('MoySklad contact-person row has an invalid updated timestamp');
+          if (updatedAt >= from.getTime() && updatedAt <= through.getTime()) changed.push({ id: row.id, parentId });
+        }
+        if (offset + page.rows.length >= page.size) break;
+        if (page.rows.length === 0) throw new UnsupportedPaginationError('MoySklad contact-person pagination returned an empty page before the advertised total; no contact-person events were queued.');
+        offset += page.rows.length;
+      }
+    }
+    await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
+  }
+
+  private async readMoyskladContactpersonPage(parentId: string, offset: number): Promise<{ rows: Array<{ id: string; updated: string }>; size: number }> {
+    const base = process.env.MOYSKLAD_API_BASE_URL;
+    const token = process.env.MOYSKLAD_API_TOKEN;
+    if (!base || !token) throw new Error('MoySklad API is not configured');
+    const url = new URL(`entity/counterparty/${encodeURIComponent(parentId)}/contactpersons`, base.endsWith('/') ? base : `${base}/`);
+    url.searchParams.set('limit', String(MOYSKLAD_PAGE_SIZE));
+    url.searchParams.set('offset', String(offset));
+    let response: Response;
+    try {
+      await this.waitForNightlyRequestSlot();
+      response = await fetch(url, {
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}/contactpersons', 'GET', null, false);
+      throw error;
+    }
+    await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}/contactpersons', 'GET', response.status, response.ok);
+    if (!response.ok) throw providerFeedError(response);
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) ||
+        !Number.isInteger(payload.meta.size) || typeof payload.meta.size !== 'number' ||
+        payload.meta.limit !== MOYSKLAD_PAGE_SIZE || payload.meta.offset !== offset) {
+      throw new UnsupportedPaginationError('MoySklad returned invalid contact-person pagination metadata; no contact-person events were queued.');
+    }
+    if (payload.meta.size < 0 || payload.meta.size > MOYSKLAD_PAGE_SIZE * MOYSKLAD_CONTACTPERSON_MAX_PAGES ||
+        payload.rows.length > MOYSKLAD_PAGE_SIZE || payload.rows.length !== Math.min(MOYSKLAD_PAGE_SIZE, payload.meta.size - offset)) {
+      throw new UnsupportedPaginationError('MoySklad contact-person page did not match its advertised size; no contact-person events were queued.');
+    }
+    const rows = payload.rows.map((row) => isRecord(row) && readId(row.id) !== null && typeof row.updated === 'string'
+      ? { id: readId(row.id)!, updated: row.updated }
+      : null);
+    if (rows.some((row) => row === null)) throw new Error('Invalid MoySklad contact-person row');
+    return { rows: rows as Array<{ id: string; updated: string }>, size: payload.meta.size };
+  }
+
+  private async saveMoyskladContactpersonEvents(records: Array<{ id: string; parentId: string }>, jobKey: string, leaseToken: string) {
+    const unique = [...new Map(records.map((record) => [record.id, record])).values()];
+    if (!unique.length) return;
+    const enabled = await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
+    const base = process.env.MOYSKLAD_API_BASE_URL;
+    if (!base) throw new Error('MoySklad API is not configured');
+    const root = base.endsWith('/') ? base : `${base}/`;
+    const failures: unknown[] = [];
+    for (const record of unique) {
+      try {
+        const event = {
+          source: 'MOYSKLAD' as const,
+          deliveryKey: `${jobKey}:CONTACT:${record.id}`,
+          eventType: 'UPDATE',
+          externalEntityId: record.id,
+          externalEntityType: 'contactperson',
+          payload: {
+            recovery: 'nightly', entity: 'CONTACT',
+            meta: { href: new URL(`entity/counterparty/${encodeURIComponent(record.parentId)}/contactpersons/${encodeURIComponent(record.id)}`, root).href },
+          } as Prisma.InputJsonValue,
+        };
+        const row = this.fieldSettings
+          ? await this.fieldSettings.saveAcceptedEvent({ ...event, directionDisabled: !enabled, requireServiceNotOff: true, nightlyLeaseToken: leaseToken })
+          : await this.database.inboundEvent.upsert({
+            where: { source_deliveryKey: { source: event.source, deliveryKey: event.deliveryKey } },
+            create: { ...event, status: enabled ? 'RECEIVED' : 'SKIPPED_DIRECTION_DISABLED', lastErrorCategory: enabled ? null : 'DIRECTION_DISABLED' },
+            update: {}, select: { id: true },
+          });
+        if (enabled) this.clients?.enqueue(row.id);
+      } catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new Error(`Could not durably queue ${failures.length} changed MoySklad contact-person event(s)`);
   }
 
   private async markProviderFailed(provider: 'BITRIX24' | 'MOYSKLAD', error: unknown, leaseToken: string) {
@@ -492,6 +609,21 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
 
 function readId(value: unknown): string | null {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : null;
+}
+
+function moyskladMoment(value: string): number | null {
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)$/.exec(value);
+  if (!match) return null;
+  const timestamp = Date.parse(`${match[1]}T${match[2]}+03:00`);
+  if (!Number.isFinite(timestamp)) return null;
+  const [year, month, day] = match[1].split('-').map(Number);
+  const [hour, minute, secondsAndMillis] = match[2].split(':');
+  const [second, fraction = '000'] = secondsAndMillis.split('.');
+  const local = new Date(timestamp + 3 * 60 * 60_000);
+  if (local.getUTCFullYear() !== year || local.getUTCMonth() + 1 !== month || local.getUTCDate() !== day ||
+      local.getUTCHours() !== Number(hour) || local.getUTCMinutes() !== Number(minute) ||
+      local.getUTCSeconds() !== Number(second) || local.getUTCMilliseconds() !== Number(fraction.padEnd(3, '0'))) return null;
+  return timestamp;
 }
 
 function isRecord(value: unknown): value is RecordValue {
