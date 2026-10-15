@@ -156,8 +156,8 @@ test('Bitrix24 company searches request and retain the duplicate marker', async 
     calls.push({ method, body: String(init?.body) });
     if (method === 'crm.requisite.list') return response({ result: [{ ENTITY_ID: 'marked', RQ_INN: '7700000000' }, { ENTITY_ID: 'unmarked', RQ_INN: '7700000000' }] });
     if (method === 'crm.company.list') return response({ result: [
-      { ID: 'marked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: '1' },
-      { ID: 'unmarked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: '0' },
+      { ID: 'marked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: 'Дубль' },
+      { ID: 'unmarked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: '' },
     ] });
     if (method === 'crm.deal.list') return response({ result: [], total: 0 });
     throw new Error(`Unexpected fake API request ${method}`);

@@ -324,7 +324,10 @@ function stringValue(value: unknown): string | null { return typeof value === 's
 function firstString(...values: unknown[]) { return values.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim() ?? null; }
 function personName(record: Record<string, unknown>) { return firstString(record.name, [record.LAST_NAME, record.NAME, record.SECOND_NAME].filter((part) => typeof part === 'string' && part.trim()).join(' ')); }
 function exactName(actual: unknown, expected: string) { return typeof actual === 'string' && actual === expected; }
-function isMarkedDuplicate(value: unknown) { return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'; }
+function isMarkedDuplicate(value: unknown) {
+  return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'
+    || typeof value === 'string' && value.trim().toLocaleLowerCase('ru-RU') === 'дубль';
+}
 function duplicateMarker(row: Record<string, unknown>): boolean | null {
   if (!Object.prototype.hasOwnProperty.call(row, 'UF_CRM_1789126724375')) return null;
   const value = row.UF_CRM_1789126724375;

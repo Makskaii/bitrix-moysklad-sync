@@ -219,7 +219,7 @@ test('document dependency canonicalizes a duplicate company to an unmarked equiv
     async readBitrix(entity, id) {
       assert.equal(entity, 'COMPANY');
       assert.ok([duplicateCompanyId, canonicalCompanyId].includes(id));
-      return { ID: id, TITLE: 'Canonical LLC', PHONE: '+7 999 222-33-44', UF_CRM_1789126724375: id === duplicateCompanyId ? '1' : '0' };
+      return { ID: id, TITLE: 'Canonical LLC', PHONE: '+7 999 222-33-44', UF_CRM_1789126724375: id === duplicateCompanyId ? 'Дубль' : '' };
     },
     async readMoysklad(type, id) { assert.equal(type, 'counterparty'); return { id, name: 'Canonical LLC' }; },
     async updateBitrix() { assert.fail('dependency mapping must not write fields'); },
@@ -344,7 +344,7 @@ test('ordinary client sync excludes a duplicate-marked company without searching
   } });
   await settings.pinEvent(duplicateOrdinaryEventId);
   const syncGateway: ClientSyncGateway = {
-    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, duplicateCompanyId); return { ID: id, TITLE: 'Duplicate', UF_CRM_1789126724375: '1' }; },
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, duplicateCompanyId); return { ID: id, TITLE: 'Duplicate', UF_CRM_1789126724375: 'Дубль' }; },
     async readMoysklad() { assert.fail('duplicate-marked company must not access the target'); },
     async updateBitrix() { assert.fail('duplicate-marked company must not sync'); },
     async updateMoysklad() { assert.fail('duplicate-marked company must not sync'); },

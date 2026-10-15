@@ -515,7 +515,10 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
 function equal(a: unknown, b: unknown) { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function safeReason(error: unknown) { return error instanceof Error ? error.message.slice(0, 120) : 'unknown'; }
-function isMarkedDuplicate(value: unknown) { return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'; }
+function isMarkedDuplicate(value: unknown) {
+  return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'
+    || typeof value === 'string' && value.trim().toLocaleLowerCase('ru-RU') === 'дубль';
+}
 async function readSourceRecord(gateway: ClientSyncGateway, sourceSystem: ClientSystem, entity: 'COMPANY' | 'CONTACT', id: string, parentId: string | null) {
   if (sourceSystem === 'BITRIX24') return gateway.readBitrix(entity, id);
   return gateway.readMoysklad(entity === 'CONTACT' && parentId ? 'contactperson' : 'counterparty', id, parentId);
