@@ -173,6 +173,14 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByRole('button', { name: '＋ Добавить пару полей' }).first().click();
   await page.getByLabel('Юридическое поле Bitrix24 1 1').selectOption('RQ_INN');
   await page.getByLabel('Юридическое поле МойСклад 1 1').selectOption('inn');
+  await page.getByRole('button', { name: '＋ Добавить пару полей' }).first().click();
+  await page.getByLabel('Юридическое поле Bitrix24 1 2').selectOption('RQ_OGRNIP');
+  await expect(page.getByLabel('Юридическое поле МойСклад 1 2').locator('option[value="inn"]')).toHaveAttribute('disabled', '');
+  await page.getByLabel('Юридическое поле МойСклад 1 2').selectOption('ogrnip');
+  await page.getByRole('button', { name: '＋ Добавить пару полей' }).first().click();
+  await page.getByLabel('Юридическое поле Bitrix24 1 3').selectOption('RQ_COMPANY_NAME');
+  await expect(page.getByLabel('Юридическое поле МойСклад 1 3').locator('option[value="legalTitle"]')).toHaveAttribute('disabled', '');
+  await page.getByRole('button', { name: 'Удалить поле 3 связи 1' }).click();
   await page.getByLabel('Включить банковские реквизиты 1').check();
   await expect(page.getByRole('alert').filter({ hasText: 'ID банковских реквизитов Bitrix24' })).toBeVisible();
   await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
@@ -196,7 +204,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   expect(writes).toEqual(['PUT', 'PUT']);
   expect(config.childResourceBindings).toEqual([expect.objectContaining({
     entity: 'companies', bitrix24CompanyId: '44', bitrix24RequisiteId: '9001', moyskladCounterpartyId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
-    legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }],
+    legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }, { bitrix24Field: 'RQ_OGRNIP', moyskladField: 'ogrnip' }],
     bankDetail: { bitrix24Id: '9002', moyskladAccountId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', fields: [{ bitrix24Field: 'RQ_BIC', moyskladField: 'bic' }] },
   })]);
   await page.reload();
