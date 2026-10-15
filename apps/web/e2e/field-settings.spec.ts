@@ -31,7 +31,7 @@ test('field settings select, save, and reload field pairs while preview stays re
       : [];
     return route.fulfill({ json: { items, nextCursor: null } });
   });
-  await page.route('**/api/admin/field-settings/catalogs', (route) => route.fulfill({ json: { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [
+  await page.route('**/api/admin/field-settings/catalogs', (route) => route.fulfill({ json: { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, namedReferences: {}, dictionaries: [
     { key: 'service', bitrix24Field: 'UF_CRM_1766085949', bitrix24ListId: '42', moyskladAttributeId: '0ad997c8-8e75-11e3-1ec9-002590a28eca', moyskladDirectoryId: 'f0177126-8e74-11e3-b761-002590a28eca', values: { bitrix24: [{ id: '42', title: 'Delivery', code: 'DELIVERY' }], moysklad: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', title: 'Delivery MS', code: '' }, { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', title: 'Install MS', code: '' }] } },
     { key: 'payment-method', bitrix24Field: 'UF_CRM_1766072752', bitrix24ListId: '44', moyskladAttributeId: 'f214f966-dc1a-11f0-0a80-0ef700278459', moyskladDirectoryId: '0ecffb86-d8a3-11eb-0a80-0dbc000256e5', values: { bitrix24: [{ id: '44', title: 'Card', code: 'CARD' }], moysklad: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', title: 'Card MS', code: '' }] } },
   ] } }));
@@ -78,13 +78,19 @@ test('field settings select, save, and reload field pairs while preview stays re
   });
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
 
+  const referenceCatalogsLoaded = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === '/api/admin/field-settings/catalogs' && response.ok();
+  });
   await page.goto('/');
   await page.getByRole('button', { name: 'Соответствия полей' }).click();
+  await referenceCatalogsLoaded;
   await expect(page.getByText('Версия 1', { exact: true })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'Bitrix24' })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'МойСклад' })).toBeVisible();
   await expect(page.locator('option[value="smart-invoices"]').first()).toHaveAttribute('disabled', '');
-  await page.getByText('Дополнительные настройки:', { exact: false }).click();
+  await page.locator('details.field-advanced-settings > summary').click();
+  await expect(page.getByRole('heading', { name: 'Услуги и способы оплаты' })).toBeVisible();
   await expect(page.getByLabel('Пара сущностей группы')).toHaveValue('contacts');
   await page.getByLabel('Сущность соответствий').selectOption('contacts');
   await expect(page.getByLabel('Пара записей для метаданных')).toHaveCount(0);
@@ -142,7 +148,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   expect(writes).toEqual(['PUT']);
   await expect(page.getByLabel('Сохранено').first()).toBeVisible();
   await expect(page.getByText('Сохранённая пара · код TEST-UOM')).toBeVisible();
-  await page.getByText('Дополнительные настройки:', { exact: false }).click();
+  await page.locator('details.field-advanced-settings > summary').click();
   await page.screenshot({ path: 'test-results/field-settings-mapping.png' });
 
   await page.reload();

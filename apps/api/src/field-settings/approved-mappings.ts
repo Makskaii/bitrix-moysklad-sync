@@ -117,6 +117,7 @@ export const DEFAULT_FIELD_SETTINGS = {
         pairs: APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([bitrix24Id, moyskladId]) => ({ bitrix24Id, moyskladId })),
       },
     ],
+    namedPairs: [],
   },
 };
 

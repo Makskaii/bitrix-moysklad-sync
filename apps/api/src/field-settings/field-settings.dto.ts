@@ -23,6 +23,16 @@ export type DictionaryReference = {
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
 
+export type NamedReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages';
+export type NamedReferencePair = {
+  kind: NamedReferenceKind;
+  bitrix24Id: string;
+  bitrix24Label: string;
+  moyskladId: string | null;
+  moyskladLabel: string | null;
+  status: 'suggested' | 'confirmed' | 'unmapped';
+};
+
 export type FieldRuleDto = {
   id: string;
   entity: string;
@@ -45,7 +55,7 @@ export type FieldSettingsConfigDto = {
   schemaVersion: 1;
   rules: FieldRuleDto[];
   groups: FieldGroupDto[];
-  references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[] };
+  references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };
 } & Record<string, unknown>;
 
 export type VersionedFieldSettingsDto = {
