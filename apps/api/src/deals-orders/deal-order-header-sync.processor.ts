@@ -16,7 +16,7 @@ const FIELD = 'deal-order-comments';
 export class DealOrderHeaderSyncProcessor {
   constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService) {}
 
-  async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string }): Promise<HeaderResult> {
+  async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
     if (process.env.ADMIN_PREVIEW !== '1' || process.env.LOCAL_HEADER_EXCHANGE !== '1' || process.env.LOCAL_HEADER_EXCHANGE_READY !== '1' || process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on') return 'DISABLED';
     if (input.pair.entityType !== 'DEAL' || input.baselineId !== input.pair.id) return 'UNSUPPORTED';
     const base24 = localEndpoint(process.env.BITRIX24_REST_BASE_URL);
@@ -62,6 +62,7 @@ export class DealOrderHeaderSyncProcessor {
     const lastMs = scalar((previous.moyskladValues as Record<string, unknown>)[FIELD]);
     if (lastB24 === null || lastMs === null) return 'HOLD_CONFLICT';
     if (b24Value === msValue) {
+      await input.assertWorkerLease?.();
       await this.persist(transaction, pair.id, baseline.settingsVersion, b24Value, msValue);
       return 'NOOP';
     }
@@ -83,12 +84,14 @@ export class DealOrderHeaderSyncProcessor {
     const transform = writeTo === 'MOYSKLAD' ? rule.bitrix24ToMoysklad.transform.kind : rule.moyskladToBitrix24.transform.kind;
     if (!enabled || transform !== 'copy') return 'HOLD_CONFLICT';
     try {
+      await input.assertWorkerLease?.();
       if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
       else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
       const verified = writeTo === 'MOYSKLAD'
         ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
         : await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
       if (scalar(writeTo === 'MOYSKLAD' ? verified.description : verified.COMMENTS) !== value) return 'HOLD_WRITE_FAILED';
+      await input.assertWorkerLease?.();
       await this.persist(transaction, pair.id, baseline.settingsVersion, writeTo === 'BITRIX24' ? value : b24Value, writeTo === 'MOYSKLAD' ? value : msValue);
       return 'UPDATED';
     } catch { return 'HOLD_WRITE_FAILED'; }

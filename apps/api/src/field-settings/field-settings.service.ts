@@ -11,6 +11,10 @@ type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
 type VersionRow = { version: number; config: FieldSettingsConfigDto; createdAt: Date };
 
+export class EventIntakeDisabledError extends Error {
+  constructor() { super('Event intake is disabled by the persisted service mode'); }
+}
+
 @Injectable()
 export class FieldSettingsService {
   constructor(
@@ -257,9 +261,16 @@ export class FieldSettingsService {
     externalEntityType: string | null;
     payload: Prisma.InputJsonValue;
     directionDisabled: boolean;
+    requireServiceNotOff?: boolean;
   }) {
     await this.ensureInitialized();
     return this.database.$transaction(async (transaction) => {
+      if (input.requireServiceNotOff) {
+        const mode = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
+          SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+        `;
+        if (!mode[0] || mode[0].serviceMode === 'off') throw new EventIntakeDisabledError();
+      }
       const event = await transaction.inboundEvent.upsert({
         where: { source_deliveryKey: { source: input.source, deliveryKey: input.deliveryKey } },
         create: {

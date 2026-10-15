@@ -27,6 +27,7 @@ function harness(event: Record<string, unknown>, pairs: Array<Record<string, unk
       updateMany: async () => ({ count: 0 }),
     },
   };
+  Object.assign(database, { $transaction: async (callback: (transaction: typeof database) => Promise<unknown>) => callback(database) });
   let priceReadCount = 0;
   const bitrixApi = { readBitrix24PriceProductId: async (id: string) => { priceReadCount += 1; return id === '51' ? '101' : '999'; } };
   const fieldSettings = { eventConfig: async () => ({ version: 9 }) };
@@ -112,4 +113,24 @@ test('missing product hardpair opens manual review without guessing or creating 
   assert.equal(storedEvent.status, 'MANUAL_REVIEW');
   assert.equal(reviewCases.length, 1);
   assert.equal(runtimeCalls.length, 0);
+});
+
+test('product event rolls back terminal status when the worker lease is lost at transactional fence', async () => {
+  const { processor, storedEvent } = harness({
+    eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
+    payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } },
+  });
+  let fenceCount = 0;
+  let lost = false;
+  const workerLease = {
+    assertOwned: async () => { if (lost) throw Object.assign(new Error('EVENT_WORKER_LEASE_LOST'), { code: 'EVENT_WORKER_LEASE_LOST' }); },
+    assertOwnedIn: async () => {
+      fenceCount += 1;
+      if (fenceCount >= 2) { lost = true; throw Object.assign(new Error('EVENT_WORKER_LEASE_LOST'), { code: 'EVENT_WORKER_LEASE_LOST' }); }
+    },
+  };
+  const run = (processor as unknown as { processWithLease(eventId: string, lease: typeof workerLease): Promise<unknown> }).processWithLease.bind(processor);
+  await assert.rejects(run('event-1', workerLease));
+  assert.equal(storedEvent.status, 'PROCESSING');
+  assert.equal(fenceCount, 2);
 });

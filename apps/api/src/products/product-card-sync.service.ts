@@ -85,7 +85,7 @@ export class ProductCardSyncService {
         this.state.read(pair.id),
       ]);
     } catch (error) {
-      if (error instanceof ProductCardLeaseError) throw error;
+      if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
       return error instanceof ProductCardManualReviewError ? review(error.reason) : retry('PRODUCT_CARD_READ_FAILED');
     }
     if (!nonEmpty(bitrix24.name) || !nonEmpty(moysklad.name)) return review('PRODUCT_NAME_VALUE_MISSING');
@@ -96,7 +96,7 @@ export class ProductCardSyncService {
         await this.state.write(pair.id, settingsVersion, current);
         return { status: 'BASELINED', changedFields: [] };
       } catch (error) {
-        if (error instanceof ProductCardLeaseError) throw error;
+        if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
         return retry('PRODUCT_CARD_STATE_WRITE_FAILED');
       }
     }
@@ -134,7 +134,7 @@ export class ProductCardSyncService {
         if (!same(actual, direction.value)) throw new Error('PRODUCT_CARD_READBACK_MISMATCH');
         verified = true;
       } catch (error) {
-        if (error instanceof ProductCardLeaseError) throw error;
+        if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
         if (error instanceof ProductCardManualReviewError) {
           const optional = direction.field === 'description' || direction.field.startsWith('price:');
           (optional ? optionalReasons : criticalReasons).push(error.reason);
@@ -164,7 +164,7 @@ export class ProductCardSyncService {
           await this.state.write(pair.id, settingsVersion, next);
           changedFields.push(direction.field);
         } catch (error) {
-          if (error instanceof ProductCardLeaseError) throw error;
+          if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
           return retry('PRODUCT_CARD_STATE_WRITE_FAILED', changedFields);
         }
       }
@@ -249,6 +249,10 @@ export class ProductCardSyncService {
     const typeId = side === 'BITRIX24' ? direction.bitrix24Key : direction.moyskladKey;
     return snapshot.prices.find((price) => price.typeId === typeId)?.value;
   }
+}
+
+function isRuntimeGateError(error: unknown): error is Error & { productCardRuntimeGate: true } {
+  return error instanceof Error && 'productCardRuntimeGate' in error;
 }
 
 function productRules(settings: ProductCardSettings): { name?: FieldRule; description?: FieldRule } {

@@ -40,6 +40,11 @@ import { CLIENT_SYNC_GATEWAY, ClientSyncProcessor } from './clients/client-sync.
 import { HttpClientSyncGateway } from './clients/client-sync.gateway';
 import { CLIENT_CANDIDATE_GATEWAY, HttpClientCandidateGateway } from './clients/client-candidate.gateway';
 import { CLIENT_DEPENDENCY_RESOLVER } from './clients/client-dependency-resolver';
+import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from './event-dispatcher.service';
+import { EventWorkerLeaseService } from './event-worker-lease.service';
+import { ProductCardEventProcessor } from './products/product-card-event.processor';
+import { ProductCardHttpApi } from './products/product-card-api';
+import { ProductCardRuntimeService } from './products/product-card-runtime.service';
 
 @Controller()
 class AppController {
@@ -55,7 +60,17 @@ class AppController {
 
 @Module({
   controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService, HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService, HttpClientSyncGateway, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway }, HttpClientCandidateGateway, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
+    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
+    EventWorkerLeaseService,
+    WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
+    FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+    EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
+    ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor,
+    HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
+    HttpClientSyncGateway, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
+    HttpClientCandidateGateway, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor,
+    { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 

@@ -3,8 +3,8 @@ import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional }
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { SyncModeService } from './sync-mode.service';
-import { writeOperationalLog } from './monitoring-log';
 import { FieldSettingsService } from './field-settings/field-settings.service';
+import { EventWorkerLeaseContext, EventWorkerLeaseService } from './event-worker-lease.service';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -39,6 +39,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     private readonly database: DatabaseService,
     private readonly syncMode: SyncModeService,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
+    @Optional() private readonly workerLease?: EventWorkerLeaseService,
   ) {}
 
   onApplicationBootstrap() {
@@ -98,6 +99,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   async process(eventId: string) {
+    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
+    return this.processWithLease(eventId);
+  }
+
+  private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext) {
     if (this.active.has(eventId)) return;
     if (!await this.isApplyEnabled()) return;
     const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
@@ -114,11 +120,12 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         if (!acquired) return;
         lockRenewalTimer = this.renewEntityLockWhileProcessing(entityKey, lockOwner);
       }
-      if (await this.skipIfDirectionDisabled(candidate)) return;
-      const latestEventId = await this.coalescePendingEvents(candidate, eventId);
+      await workerLease?.assertOwned();
+      if (await this.skipIfDirectionDisabled(candidate, workerLease)) return;
+      const latestEventId = await this.coalescePendingEvents(candidate, eventId, workerLease);
       const now = new Date();
       const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
-      const claim = await this.database.inboundEvent.updateMany({
+      const claim = await this.commitWithEntityLease(entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, (tx) => tx.inboundEvent.updateMany({
         where: {
           id: latestEventId,
           OR: [
@@ -138,25 +145,27 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
           lastErrorCategory: null,
           retryAfter: null,
         },
-      });
+      }), workerLease);
       if (claim.count !== 1) return;
       const event = await this.database.inboundEvent.findUnique({ where: { id: latestEventId } });
       if (!event) return;
-      if (await this.skipIfDirectionDisabled(event)) return;
+      if (await this.skipIfDirectionDisabled(event, workerLease)) return;
       const attempt = event.attempts;
 
       try {
         const pinnedSettings = await this.fieldSettings?.eventConfig(event.id);
-        await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, pinnedSettings?.config);
+        await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, pinnedSettings?.config, workerLease);
       } catch (error) {
+        if (error instanceof Error && error.message === 'EVENT_WORKER_LEASE_LOST') return;
         if (error instanceof EntityLockLostError) return;
         if (error instanceof EntityMappingChangedError) {
           try {
+            await workerLease?.assertOwned();
             await this.commitWithEntityLease(entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, (tx) =>
               tx.inboundEvent.update({
                 where: { id: latestEventId },
                 data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null, retryAfter: null },
-              }));
+              }), workerLease);
           } catch (commitError) {
             if (!(commitError instanceof EntityLockLostError)) throw commitError;
           }
@@ -164,6 +173,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         }
         const category = errorCategory(error);
         try {
+          await workerLease?.assertOwned();
           await this.commitWithEntityLease(
             entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null,
             async (tx) => {
@@ -188,12 +198,18 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
                 data: {
                   status: category === 'REVIEW_REQUIRED' ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
                   lastErrorCategory: category,
-                  retryAfter: category === 'REVIEW_REQUIRED' ? null : new Date(Date.now() + retryDelayMs(attempt)),
+                  retryAfter: category === 'REVIEW_REQUIRED' ? null : retryAfterFrom(error) ?? new Date(Date.now() + retryDelayMs(attempt)),
                 },
               });
-            },
+            }, workerLease,
           );
-          await writeOperationalLog(this.database, 'ERROR', `Sync attempt failed: ${category}`, event.id);
+          await this.commitWithEntityLease(
+            entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null,
+            (tx) => tx.operationalLog.create({
+              data: { category: 'ERROR', message: `Sync attempt failed: ${category}`, referenceId: event.id },
+            }),
+            workerLease,
+          );
         } catch (commitError) {
           if (!(commitError instanceof EntityLockLostError)) throw commitError;
         }
@@ -270,9 +286,13 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async commitWithEntityLease<T>(
     lease: EntityLeaseIdentity | null,
     commit: (transaction: Prisma.TransactionClient) => Promise<T>,
+    workerLease?: EventWorkerLeaseContext,
   ): Promise<T> {
-    if (!lease) return commit(this.database as unknown as Prisma.TransactionClient);
+    if (!lease && !workerLease) return commit(this.database as unknown as Prisma.TransactionClient);
     return this.database.$transaction(async (transaction) => {
+      if (workerLease?.assertOwnedIn) await workerLease.assertOwnedIn(transaction);
+      else await workerLease?.assertOwned();
+      if (!lease) return commit(transaction);
       const rows = await transaction.$queryRaw<Array<{ ownerToken: string; leaseExpiresAt: Date }>>`
         SELECT "ownerToken", "leaseExpiresAt"
         FROM "InboundEntityLock"
@@ -290,6 +310,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async coalescePendingEvents(
     candidate: { id: string; source: string; externalEntityId: string | null },
     fallbackId: string,
+    workerLease?: EventWorkerLeaseContext,
   ): Promise<string> {
     if (!candidate.externalEntityId) return fallbackId;
     const now = new Date();
@@ -311,10 +332,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     const latestEventId = pending[0]?.id ?? fallbackId;
     const supersededIds = pending.slice(1).map((event) => event.id);
     if (supersededIds.length) {
-      await this.database.inboundEvent.updateMany({
+      await this.commitWithEntityLease(null, (tx) => tx.inboundEvent.updateMany({
         where: { id: { in: supersededIds }, status: { in: ['RECEIVED', 'RETRYABLE_FAILURE'] } },
         data: { status: 'SUPERSEDED', processingStartedAt: null, lastErrorCategory: null, retryAfter: null },
-      });
+      }), workerLease);
     }
     return latestEventId;
   }
@@ -323,24 +344,24 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     return process.env.SYNC_MODE === 'apply' && (await this.syncMode.read()).mode === 'on';
   }
 
-  private async deferIfModeIsNoLongerOn(eventId: string): Promise<boolean> {
+  private async deferIfModeIsNoLongerOn(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<boolean> {
     if (await this.isApplyEnabled()) return false;
-    await this.database.inboundEvent.updateMany({
+    await this.commitWithEntityLease(null, (tx) => tx.inboundEvent.updateMany({
       where: { id: eventId, status: 'PROCESSING' },
       data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
-    });
+    }), workerLease);
     return true;
   }
 
   private async skipIfDirectionDisabled(event: {
     id: string; source: string; eventType: string | null; externalEntityType: string | null; status: string;
-  }): Promise<boolean> {
+  }, workerLease?: EventWorkerLeaseContext): Promise<boolean> {
     const direction = event.source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (await this.syncMode.isDirectionEnabled('contacts-companies', direction)) return false;
-    const skipped = await this.database.inboundEvent.updateMany({
+    const skipped = await this.commitWithEntityLease(null, (tx) => tx.inboundEvent.updateMany({
       where: { id: event.id, status: event.status },
       data: { status: 'SKIPPED_DIRECTION_DISABLED', lastErrorCategory: 'DIRECTION_DISABLED', processingStartedAt: null },
-    });
+    }), workerLease);
     return skipped.count === 1;
   }
 
@@ -349,6 +370,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     attempt: number,
     lease: EntityLeaseIdentity | null,
     pinnedConfig?: unknown,
+    workerLease?: EventWorkerLeaseContext,
   ) {
     const sourceEntityId = event.externalEntityId;
     if (!sourceEntityId) throw new ReviewRequiredError('SOURCE_ENTITY_ID_MISSING');
@@ -389,17 +411,19 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       moyskladCounterparty.updated,
     );
     if (!direction) {
+      await workerLease?.assertOwned();
       await this.commitWithEntityLease(lease, (tx) => tx.inboundEvent.update({
         where: { id: event.id },
         data: { status: 'UNCHANGED', attempts: attempt, direction: null, snapshotRevision: snapshot.revision },
-      }));
-      await this.resolveManualReview(event.id);
+      }), workerLease);
+      await this.resolveManualReview(event.id, workerLease);
       return;
     }
 
     if (bitrixEmail === moyskladEmail) {
       const now = new Date();
       const newRevision = snapshot.revision + 1;
+      await workerLease?.assertOwned();
       await this.commitWithEntityLease(lease, async (tx) => {
         await tx.contactSnapshot.update({
           where: { pairId: pair.id },
@@ -423,8 +447,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
             lastErrorCategory: null,
           },
         });
-      });
-      await this.resolveManualReview(event.id);
+      }, workerLease);
+      await this.resolveManualReview(event.id, workerLease);
       return;
     }
 
@@ -444,15 +468,19 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
     const configuredDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!await this.syncMode.isDirectionEnabled('contacts-companies', configuredDirection)) {
+      await workerLease?.assertOwned();
       await this.commitWithEntityLease(lease, (tx) => tx.inboundEvent.update({
         where: { id: event.id },
         data: { status: 'SKIPPED_DIRECTION_DISABLED', lastErrorCategory: 'DIRECTION_DISABLED', processingStartedAt: null },
-      }));
+      }), workerLease);
       return;
     }
-    if (await this.deferIfModeIsNoLongerOn(event.id)) return;
+    if (await this.deferIfModeIsNoLongerOn(event.id, workerLease)) return;
+    await workerLease?.assertOwned();
     await this.assertEntityLockOwner(lease);
     if (direction === 'BITRIX24_TO_MOYSKLAD') {
+      await workerLease?.assertOwned();
+      await this.assertEntityLockOwner(lease);
       const result = await this.writeMoyskladEmail(event.id, pair.moyskladCounterpartyId, value);
       if (readEmail(result.email) !== value) throw new Error('EXTERNAL_API_FAILURE');
     } else {
@@ -461,6 +489,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         moyskladEmailPresent: Boolean(moyskladEmail),
         snapshotRevision: snapshot.revision,
       });
+      await workerLease?.assertOwned();
+      await this.assertEntityLockOwner(lease);
       await this.writeBitrixEmail(event.id, pair.bitrix24ContactId, bitrixEmailField, value);
     }
 
@@ -468,6 +498,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     const bitrixTimestamp = readTimestamp(bitrixContact.DATE_MODIFY);
     const moyskladTimestamp = readTimestamp(moyskladCounterparty.updated);
     const newRevision = snapshot.revision + 1;
+    await workerLease?.assertOwned();
     await this.commitWithEntityLease(lease, async (tx) => {
       await tx.contactSnapshot.update({
         where: { pairId: pair.id },
@@ -491,8 +522,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
           lastErrorCategory: null,
         },
       });
-    });
-    await this.resolveManualReview(event.id);
+    }, workerLease);
+    await this.resolveManualReview(event.id, workerLease);
   }
 
   private async readBitrixContact(eventId: string, contactId: string): Promise<JsonRecord> {
@@ -532,7 +563,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
     if (!response.ok) {
       await this.recordApiAttempt(eventId, 'BITRIX24', method.replace(/\.json$/, ''), 'POST', response.status, false);
-      throw new Error('EXTERNAL_API_FAILURE');
+      throw providerFailure(response);
     }
     let payload: unknown;
     try { payload = await response.json(); } catch (error) {
@@ -576,7 +607,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
     if (!response.ok) {
       await this.recordApiAttempt(eventId, 'MOYSKLAD', 'entity/counterparty/{id}', method, response.status, false);
-      throw new Error('EXTERNAL_API_FAILURE');
+      throw providerFailure(response);
     }
     let payload: unknown;
     try { payload = await response.json(); } catch (error) {
@@ -606,12 +637,12 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
   }
 
-  private async resolveManualReview(eventId: string) {
+  private async resolveManualReview(eventId: string, workerLease?: EventWorkerLeaseContext) {
     try {
-      await this.database.manualReviewCase.updateMany({
+      await this.commitWithEntityLease(null, (tx) => tx.manualReviewCase.updateMany({
         where: { eventId, status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
-      });
+      }), workerLease);
     } catch {
       // Incident history is separate from event processing; an auxiliary update cannot undo a successful sync.
     }
@@ -716,6 +747,25 @@ function ensureTrailingSlash(value: string): string {
 
 function retryDelayMs(attempt: number): number {
   return Math.min(RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)), RETRY_MAX_DELAY_MS);
+}
+
+function providerFailure(response: Response): Error & { retryAfterAt?: Date } {
+  const error = new Error('EXTERNAL_API_FAILURE') as Error & { retryAfterAt?: Date };
+  const value = response.headers.get('retry-after');
+  if (value) {
+    const seconds = Number(value);
+    const timestamp = Number.isFinite(seconds)
+      ? Date.now() + Math.max(0, seconds) * 1_000
+      : Date.parse(value);
+    if (Number.isFinite(timestamp)) error.retryAfterAt = new Date(timestamp);
+  }
+  return error;
+}
+
+function retryAfterFrom(error: unknown): Date | null {
+  if (typeof error !== 'object' || error === null || !('retryAfterAt' in error)) return null;
+  const value = (error as { retryAfterAt?: unknown }).retryAfterAt;
+  return value instanceof Date && Number.isFinite(value.getTime()) ? value : null;
 }
 
 function isUniqueConstraintError(error: unknown): boolean {

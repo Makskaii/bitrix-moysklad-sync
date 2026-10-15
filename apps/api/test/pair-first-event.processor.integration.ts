@@ -12,7 +12,7 @@ const currentConfig = { version: 2, config: { rules: [], groups: [] } } as never
 function createDatabase(baselineVersion: number, baselineAppearsAfterCapture = false) {
   const event: {
     id: string; source: string; eventType: string; externalEntityType: string;
-    externalEntityId: string; status: string; lastErrorCategory?: string;
+    externalEntityId: string; status: string; lastErrorCategory?: string; processingStartedAt?: Date | null; retryAfter?: Date | null; attempts?: number;
   } = {
     id: 'event-1', source: 'BITRIX24', eventType: 'ONCRMDEALUPDATE',
     externalEntityType: 'deal', externalEntityId: 'deal-1', status: 'RECEIVED',
@@ -23,28 +23,30 @@ function createDatabase(baselineVersion: number, baselineAppearsAfterCapture = f
   };
   let baselineReads = 0;
   const updates: Array<{ where: unknown; data: Record<string, unknown> }> = [];
+  const database = {
+    inboundEvent: {
+      findUnique: async () => event,
+      updateMany: async ({ where, data }: { where: unknown; data: Record<string, unknown> }) => {
+        updates.push({ where, data });
+        if (event.status === 'RECEIVED' || event.status === 'PROCESSING' || event.status === 'RETRYABLE_FAILURE') Object.assign(event, data);
+        return { count: 1 };
+      },
+    },
+    entityPair: { findFirst: async () => ({ id: pair.id }) },
+    entityPairBaseline: {
+      findUnique: async () => {
+        baselineReads++;
+        return baselineAppearsAfterCapture && baselineReads === 1 ? null : baseline;
+      },
+      createMany: async () => ({ count: 0 }),
+    },
+    $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work(database),
+  };
   return {
     event,
     baseline,
     updates,
-    database: {
-      inboundEvent: {
-        findUnique: async () => event,
-        updateMany: async ({ where, data }: { where: unknown; data: Record<string, unknown> }) => {
-          updates.push({ where, data });
-          if (event.status === 'RECEIVED') Object.assign(event, data);
-          return { count: 1 };
-        },
-      },
-      entityPair: { findFirst: async () => ({ id: pair.id }) },
-      entityPairBaseline: {
-        findUnique: async () => {
-          baselineReads++;
-          return baselineAppearsAfterCapture && baselineReads === 1 ? null : baseline;
-        },
-        createMany: async () => ({ count: 0 }),
-      },
-    },
+    database,
   };
 }
 
@@ -134,4 +136,51 @@ test('a concurrent baseline created for another event version is not accepted af
   assert.equal(state.baseline.settingsVersion, 1);
   assert.equal(sourceReads, 2);
   assert.equal(headerCalls, 0);
+});
+
+test('pair-first workers leave durable events unclaimed while paused', async () => {
+  let reads = 0;
+  const processor = new PairFirstEventProcessor(
+    { inboundEvent: { findUnique: async () => { reads++; return null; } } } as never,
+    { resolve: async () => ({ status: 'unavailable', reason: 'unused' }) } as never,
+    undefined, undefined, undefined, undefined,
+    { read: async () => ({ mode: 'pause' }) } as never,
+  );
+  assert.equal(await processor.process('event-paused'), null);
+  assert.equal(reads, 0);
+});
+
+test('a deal event resolves its pinned company and contact dependencies before baseline processing', async () => {
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  const state = createDatabase(2);
+  const calls: Array<{ eventId: string; sourceSystem: string; entity: string; sourceId: string; primaryCompanySourceId?: string | null; lease?: unknown }> = [];
+  const processor = new PairFirstEventProcessor(
+    state.database as never,
+    { resolve: async () => ({ status: 'confirmed', pair }) } as never,
+    { eventConfig: async () => currentConfig } as never,
+    new DealOrderBaselineService(state.database as never, {
+      readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }),
+      readMoySkladCustomerOrderForBaseline: async () => ({}),
+    } as never),
+    { process: async () => 'NOOP' } as never,
+    undefined,
+    { read: async () => ({ mode: 'on' }) } as never,
+    { resolveForDocument: async (input: typeof calls[number]) => { calls.push(input); return { status: 'RESOLVED', pair, selectedSourceId: input.sourceId, reason: 'PERSISTED_PAIR' }; } } as never,
+    { readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }) } as never,
+  );
+
+  try {
+    await processor.process('event-1');
+  } finally {
+    if (previousMode === undefined) delete process.env.SYNC_MODE;
+    else process.env.SYNC_MODE = previousMode;
+  }
+
+  assert.deepEqual(calls.map(({ entity, sourceId, primaryCompanySourceId }) => ({ entity, sourceId, primaryCompanySourceId })), [
+    { entity: 'COMPANY', sourceId: 'company-8', primaryCompanySourceId: null },
+    { entity: 'CONTACT', sourceId: 'contact-9', primaryCompanySourceId: 'company-8' },
+  ]);
+  assert.ok(calls.every((call) => call.eventId === 'event-1' && call.sourceSystem === 'BITRIX24'));
+  assert.equal(state.event.status, 'SUCCEEDED');
 });

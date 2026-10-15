@@ -17,6 +17,8 @@ model SyncSetting {
   id        String   @id @default("global")
   serviceMode String @default("off")
   offSince  DateTime?
+  lastInactiveAt DateTime?
+  lastActiveAt DateTime?
   resumeStatus String @default("idle")
   resumeFrom DateTime?
   resumeThrough DateTime?
@@ -100,6 +102,16 @@ model InboundEntityLock {
   eventId String
   leaseExpiresAt DateTime
   updatedAt DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
+}
+
+model EventWorkerLease {
+  slot           Int      @id
+  ownerToken     String
+  eventId        String
+  leaseExpiresAt DateTime
+  updatedAt      DateTime @updatedAt
 
   @@index([leaseExpiresAt])
 }

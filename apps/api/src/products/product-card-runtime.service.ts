@@ -22,6 +22,11 @@ export type ProductCardRuntimeGate =
   | { status: 'DEFERRED_PAUSE'; reason: string }
   | { status: 'RETRYABLE_FAILURE'; reason: string };
 
+class ProductCardWriteGateError extends Error {
+  readonly productCardRuntimeGate = true;
+  constructor(readonly gate: Exclude<ProductCardRuntimeGate, { status: 'READY' }>) { super(gate.reason); }
+}
+
 @Injectable()
 export class ProductCardRuntimeService {
   constructor(
@@ -52,7 +57,7 @@ export class ProductCardRuntimeService {
     return { status: 'READY' };
   }
 
-  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string }) {
+  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string; assertWorkerLease?: () => Promise<void> }) {
     const gate = await this.preflight(input.source);
     if (gate.status !== 'READY') return { ...gate, changedFields: [] as [] };
     let pair;
@@ -81,12 +86,37 @@ export class ProductCardRuntimeService {
     }
 
     const renewalTimer = this.renewPairLease(lease);
-    const guardedApi = new LeaseBoundProductCardApi(this.api, (operation) => this.withPairLease(lease, operation));
-    const stateStore = new DatabaseProductCardStateStore(this.database, (operation) => this.withPairLease(lease, operation));
+    const withBothLeases = async <T>(operation: ProductPairLeaseOperation<T>) => {
+      await input.assertWorkerLease?.();
+      return this.withPairLease(lease, async (transaction) => {
+        const settings = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
+          SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+        `;
+        if (!settings[0]) throw new ProductCardWriteGateError({ status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_RUNTIME_MODE_READ_FAILED' });
+        if (process.env.SYNC_MODE !== 'apply' || settings[0].serviceMode === 'off') {
+          throw new ProductCardWriteGateError({ status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF' });
+        }
+        if (settings[0].serviceMode === 'pause') {
+          throw new ProductCardWriteGateError({ status: 'DEFERRED_PAUSE', reason: 'SERVICE_PAUSED' });
+        }
+        const directions = await transaction.$queryRaw<Array<{ moyskladToBitrix24: boolean }>>`
+          SELECT "moyskladToBitrix24" FROM "SyncDirectionSetting" WHERE "entityKey" = 'products-variations' FOR SHARE
+        `;
+        if (directions[0] && !directions[0].moyskladToBitrix24) {
+          throw new ProductCardWriteGateError({ status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' });
+        }
+        return operation(transaction);
+      });
+    };
+    const guardedApi = new LeaseBoundProductCardApi(this.api, withBothLeases);
+    const stateStore = new DatabaseProductCardStateStore(this.database, withBothLeases);
     const reconciler = new ProductCardSyncService(guardedApi, stateStore);
     try {
       return await reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings });
     } catch (error) {
+      if (error instanceof ProductCardWriteGateError) {
+        return { ...error.gate, changedFields: [] as [] };
+      }
       if (error instanceof ProductCardLeaseError) {
         return { status: 'RETRYABLE_FAILURE' as const, reason: error.reason, changedFields: [] };
       }

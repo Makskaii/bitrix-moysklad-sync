@@ -30,6 +30,7 @@ const NativeDate = globalThis.Date;
 let destinationEmail = 'before@example.test';
 let writeCount = 0;
 let failNextWrite = false;
+let failNextWriteRetryAfter: string | null = null;
 let writeDelayMs = 0;
 let barrierMoyskladReads = false;
 let holdMoyskladReads = false;
@@ -138,7 +139,7 @@ test('real PostgreSQL persists the public intake and processing status across AP
   assert.equal(writeCount, 1);
 });
 
-test('two API instances claim one duplicate public delivery only once', async () => {
+test('two API instances preserve identical public notifications and serialize their processing', async () => {
   destinationEmail = 'before@example.test';
   writeCount = 0;
   writeDelayMs = 200;
@@ -182,12 +183,13 @@ test('two API instances claim one duplicate public delivery only once', async ()
     })));
     assert.deepEqual(responses.map((response) => response.status), [200, 200]);
     const acknowledgements = await Promise.all(responses.map((response) => response.json() as Promise<{ eventId: string }>));
-    assert.equal(acknowledgements[0].eventId, initialAck.eventId);
-    assert.equal(acknowledgements[1].eventId, initialAck.eventId);
-    assert.equal(acknowledgements[0].eventId, acknowledgements[1].eventId);
-    const status = await waitForStatus(apiUrl, acknowledgements[0].eventId, 'SUCCEEDED');
-    assert.equal(status.attempts, 1);
-    assert.equal(status.snapshotRevision, 2);
+    assert.notEqual(acknowledgements[0].eventId, initialAck.eventId);
+    assert.notEqual(acknowledgements[1].eventId, initialAck.eventId);
+    assert.notEqual(acknowledgements[0].eventId, acknowledgements[1].eventId);
+    const settled = await Promise.all([initialAck, ...acknowledgements].map(({ eventId }) => waitForSettledStatus(apiUrl, eventId)));
+    assert.deepEqual(settled.map((event) => event.status).sort(), ['SUCCEEDED', 'SUPERSEDED', 'SUPERSEDED']);
+    assert.equal(await database.inboundEvent.count({ where: { externalEntityId: contactId } }), 3);
+    assert.equal(settled.find((event) => event.status === 'SUCCEEDED')?.attempts, 1);
     assert.equal(destinationEmail, 'after@example.test');
     assert.equal(writeCount, 1);
   } finally {
@@ -375,7 +377,7 @@ test('a stale PROCESSING event is recovered after restart without repeating a co
   assert.equal(writeCount, previousWrites);
 });
 
-test('a temporary external failure stays durable and retries the same event after backoff', async () => {
+test('a temporary external failure stays durable and retries the same stored event after backoff', async () => {
   destinationEmail = 'before@example.test';
   const suffix = randomUUID();
   const contactId = `t20-retry-contact-${suffix}`;
@@ -394,26 +396,24 @@ test('a temporary external failure stays durable and retries the same event afte
     },
   });
   failNextWrite = true;
+  failNextWriteRetryAfter = '2';
   const previousWrites = writeCount;
   const body = JSON.stringify({
     event: 'ONCRMCONTACTUPDATE',
     data: { FIELDS: { ID: contactId } },
     auth: { application_token: 'synthetic-b24-event-token' },
   });
-  const post = () => fetch(`${apiUrl}/webhooks/bitrix24`, {
+  const first = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
-  const first = await post();
   assert.equal(first.status, 200);
   const firstAck = await first.json() as { eventId: string };
   const failed = await waitForStatus(apiUrl, firstAck.eventId, 'RETRYABLE_FAILURE');
   assert.equal(failed.attempts, 1);
+  const savedFailure = await database.inboundEvent.findUnique({ where: { id: firstAck.eventId }, select: { retryAfter: true } });
+  assert.ok(savedFailure?.retryAfter && savedFailure.retryAfter.getTime() >= NativeDate.now() + 1_000);
   assert.equal(destinationEmail, 'before@example.test');
 
-  const repeated = await post();
-  assert.equal(repeated.status, 200);
-  const repeatedAck = await repeated.json() as { eventId: string };
-  assert.equal(repeatedAck.eventId, firstAck.eventId);
   assert.equal(await database.inboundEvent.count({ where: { externalEntityId: contactId } }), 1);
   await new Promise((resolve) => setTimeout(resolve, 100));
   const waiting = await readStatus(apiUrl, firstAck.eventId);
@@ -475,7 +475,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   await database.syncSetting.update({
     where: { id: 'global' },
     data: {
-      serviceMode: 'on', nightlyScheduledDate: null, nightlyStatus: 'idle',
+      serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle',
       nightlyFrom: null, nightlyThrough: null, nightlyProvider: 'BITRIX24',
       nightlyBitrixStart: 0, nightlyMoyskladOffset: 0, nightlyRetryAfter: null,
       nightlyAttempts: 0, nightlyError: null,
@@ -483,10 +483,6 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   });
   nightlyProviderQueries.length = 0;
   try {
-    freezeTime('2026-10-05T20:00:00.000Z');
-    await setAdminMode('pause');
-    freezeTime('2026-10-05T20:15:00.000Z');
-    await setAdminMode('on');
     freezeTime('2026-10-05T22:00:00.000Z');
     await waitForNightlyStatus('complete');
     const status = await readRecoveryStatus();
@@ -512,7 +508,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
 test('nightly schedule is skipped while paused and is not backfilled after resume', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
-    where: { id: 'global' }, data: { serviceMode: 'on', nightlyScheduledDate: null, nightlyStatus: 'idle' },
+    where: { id: 'global' }, data: { serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
   });
   nightlyProviderQueries.length = 0;
   freezeTime('2026-10-06T21:59:00.000Z');
@@ -536,7 +532,7 @@ test('nightly schedule is skipped while paused and is not backfilled after resum
 test('nightly schedule is skipped while Off', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
-    where: { id: 'global' }, data: { serviceMode: 'on', offSince: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
+    where: { id: 'global' }, data: { serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
   });
   nightlyProviderQueries.length = 0;
   freezeTime('2026-10-07T21:59:00.000Z');
@@ -574,7 +570,9 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
     return readBody(request).then((body) => {
       if (failNextWrite) {
         failNextWrite = false;
-        return sendJson(response, 503, { error: 'synthetic temporary failure' });
+        const retryAfter = failNextWriteRetryAfter;
+        failNextWriteRetryAfter = null;
+        return sendJson(response, 503, { error: 'synthetic temporary failure' }, retryAfter ? { 'retry-after': retryAfter } : {});
       }
       destinationEmail = (JSON.parse(body) as { email: string }).email;
       writeCount++;
@@ -717,7 +715,7 @@ function readBody(request: IncomingMessage): Promise<string> {
   });
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown) {
-  response.writeHead(status, { 'content-type': 'application/json' });
+function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  response.writeHead(status, { 'content-type': 'application/json', ...headers });
   response.end(JSON.stringify(body));
 }
