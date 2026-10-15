@@ -2,7 +2,7 @@ export type ClientMapEntity = 'COMPANY' | 'CONTACT';
 export type ClientMapTargetType = 'counterparty' | 'contactperson';
 
 export type ClientMapSource = { entity: ClientMapEntity; bitrix24Id: string; uuid: string | null };
-export type ClientMapTarget = { id: string; type: ClientMapTargetType; parentId?: string | null };
+export type ClientMapTarget = { id: string; type: ClientMapTargetType; parentId?: string | null; companyType?: string | null };
 export type ExistingClientPair = { entity: ClientMapEntity; bitrix24Id: string; moyskladId: string; moyskladType?: ClientMapTargetType | null; moyskladParentId?: string | null };
 export type ClientMapDecision =
   | { status: 'MATCHED'; entity: ClientMapEntity; bitrix24Id: string; moyskladId: string; moyskladType: ClientMapTargetType; moyskladParentId: string | null; source: 'UUID' | 'EXISTING' }
@@ -49,12 +49,16 @@ export function planInitialClientMap(input: {
     if (!source.uuid) return unmatched(source, 'UUID_MISSING');
     if (repeatedUuids.has(`${source.entity}:${source.uuid}`)) return unmatched(source, 'UUID_REPEATED');
 
-    const matchingTypes: ClientMapTargetType[] = source.entity === 'COMPANY'
-      ? ['counterparty']
-      : ['counterparty', 'contactperson'];
-    const candidates = matchingTypes.flatMap((type) => {
-      return (byTarget.get(source.uuid!) ?? []).filter((target) => target.type === type);
-    });
+    const uuidTargets = byTarget.get(source.uuid!) ?? [];
+    const applicableTargets = uuidTargets.filter((target) => target.type === 'counterparty' || (source.entity === 'CONTACT' && target.type === 'contactperson'));
+    // A counterparty's native type is required to distinguish B24 companies
+    // (legal entities/entrepreneurs) from standalone contacts (individuals).
+    if (applicableTargets.some((target) => target.type === 'counterparty' && !target.companyType)) {
+      return unmatched(source, 'INCOMPLETE_VERIFICATION');
+    }
+    const candidates = applicableTargets.filter((target) => source.entity === 'COMPANY'
+      ? target.type === 'counterparty' && isCompanyCounterparty(target.companyType)
+      : target.type === 'contactperson' || target.type === 'counterparty' && isIndividualCounterparty(target.companyType));
     if (!candidates.length) return unmatched(source, 'NO_CANDIDATE');
     if (candidates.length > 1) return unmatched(source, 'MULTIPLE_CANDIDATES');
     const candidate = candidates[0]!;
@@ -65,6 +69,15 @@ export function planInitialClientMap(input: {
       moyskladParentId: candidate.parentId ?? null,
     };
   });
+}
+
+function isCompanyCounterparty(value: string | null | undefined): boolean {
+  const type = value?.toLocaleLowerCase('en-US');
+  return type === 'legal' || type === 'entrepreneur';
+}
+
+function isIndividualCounterparty(value: string | null | undefined): boolean {
+  return value?.toLocaleLowerCase('en-US') === 'individual';
 }
 
 function unmatched(source: ClientMapSource, reason: Extract<ClientMapDecision, { status: 'UNMATCHED' }>['reason']): ClientMapDecision {

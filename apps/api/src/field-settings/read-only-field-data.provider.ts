@@ -6,6 +6,8 @@ export type LiveFieldCatalogs = {
   units: { bitrix24: CatalogCandidate[]; moysklad: CatalogCandidate[] };
   priceTypes: { bitrix24: CatalogCandidate[]; moysklad: CatalogCandidate[] };
 };
+export type NamedReferenceItem = { id: string; code: string; label: string; group?: string };
+export type LiveReferenceCatalogs = Record<'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages', { bitrix24: NamedReferenceItem[]; moysklad: NamedReferenceItem[] }>;
 export type PairSnapshot = {
   sourceLabel: string;
   sourceValues: Record<string, unknown>;
@@ -19,6 +21,31 @@ const REQUEST_TIMEOUT_MS = 10_000;
 
 @Injectable()
 export class ReadOnlyFieldDataProvider {
+  async referenceCatalogs(bitrixAccessToken: string): Promise<LiveReferenceCatalogs> {
+    const [users, currencies, organizations, warehouses, projects, stages, msEmployees, msCurrencies, msOrganizations, msWarehouses, msProjects, msStates] = await Promise.all([
+      this.bitrixList(bitrixAccessToken, 'user.get'),
+      this.bitrixList(bitrixAccessToken, 'crm.currency.list'),
+      this.bitrixListElements(bitrixAccessToken, '88'),
+      this.bitrixListElements(bitrixAccessToken, '38'),
+      this.bitrixListElements(bitrixAccessToken, '34'),
+      this.bitrixDealStages(bitrixAccessToken),
+      this.moyskladList('/entity/employee'),
+      this.moyskladList('/entity/currency'),
+      this.moyskladList('/entity/organization'),
+      this.moyskladList('/entity/store'),
+      this.moyskladList('/entity/project'),
+      this.moyskladList('/entity/customerorder/metadata/states'),
+    ]);
+    return {
+      employees: { bitrix24: users.map((row) => named(row, row.ID, `${row.NAME ?? ''} ${row.SECOND_NAME ?? ''} ${row.LAST_NAME ?? ''}`.trim())), moysklad: msEmployees.map((row) => named(row, row.id, row.shortFio ?? row.fullName ?? `${row.name ?? ''} ${row.lastName ?? ''}`.trim())) },
+      currencies: { bitrix24: currencies.map((row) => named(row, row.CURRENCY, row.FULL_NAME ?? row.FORMAT_STRING ?? row.CURRENCY)), moysklad: msCurrencies.map((row) => named(row, row.id, row.name, row.code)) },
+      organizations: { bitrix24: organizations.map((row) => named(row, row.ID ?? row.id, row.NAME ?? row.name)), moysklad: msOrganizations.map((row) => named(row, row.id, row.name)) },
+      warehouses: { bitrix24: warehouses.map((row) => named(row, row.ID ?? row.id, row.NAME ?? row.name)), moysklad: msWarehouses.map((row) => named(row, row.id, row.name)) },
+      projects: { bitrix24: projects.map((row) => named(row, row.ID ?? row.id, row.NAME ?? row.name)), moysklad: msProjects.map((row) => named(row, row.id, row.name, row.code)) },
+      dealStages: { bitrix24: stages, moysklad: msStates.map((row) => named(row, row.id, row.name)) },
+    };
+  }
+
   async catalogs(bitrixAccessToken: string): Promise<LiveFieldCatalogs> {
     const [b24Units, b24Prices, msUnits, msPrices] = await Promise.all([
       this.bitrixList(bitrixAccessToken, 'catalog.measure.list'),
@@ -123,6 +150,26 @@ export class ReadOnlyFieldDataProvider {
     throw new ServiceUnavailableException(`Bitrix24 ${method} catalog exceeds the supported ${MAX_PAGES * PAGE_SIZE} records; use a narrower catalog filter`);
   }
 
+  private async bitrixDealStages(accessToken: string): Promise<NamedReferenceItem[]> {
+    const categories = await this.bitrixCall(accessToken, 'crm.category.list', { entityTypeId: 2 });
+    const root = asRecord(categories);
+    const categoryRows = Array.isArray(root.categories) ? root.categories : Array.isArray(categories) ? categories : [];
+    const pipelineRows = [{ id: '0', name: 'Основная воронка' }, ...categoryRows.filter(isRecord).map((row) => ({ id: text(row.id), name: text(row.name) }))];
+    const stages: NamedReferenceItem[] = [];
+    for (const pipeline of pipelineRows) {
+      const entityId = pipeline.id === '0' ? 'DEAL_STAGE' : `DEAL_STAGE_${pipeline.id}`;
+      const rows = await this.bitrixCall(accessToken, 'crm.status.list', { 'filter[ENTITY_ID]': entityId });
+      const values = Array.isArray(rows) ? rows : isRecord(rows) && Array.isArray(rows.statuses) ? rows.statuses : null;
+      if (!values) throw new ServiceUnavailableException(`Bitrix24 returned an invalid stage catalog for pipeline ${pipeline.id}`);
+      for (const row of values.filter(isRecord)) {
+        const statusId = text(row.STATUS_ID ?? row.STATUS);
+        if (!statusId) throw new ServiceUnavailableException(`Bitrix24 returned a deal stage without an ID for pipeline ${pipeline.id}`);
+        stages.push({ ...named(row, `${pipeline.id}:${statusId}`, row.NAME, statusId), group: pipeline.name });
+      }
+    }
+    return stages;
+  }
+
   private async bitrixUserFieldList(accessToken: string, method: string): Promise<Array<Record<string, unknown>>> {
     const rows: Array<Record<string, unknown>> = [];
     const seenCursors = new Set<number>();
@@ -176,7 +223,7 @@ export class ReadOnlyFieldDataProvider {
     const rows: Array<Record<string, unknown>> = [];
     for (let page = 0, start = 0; page < MAX_PAGES; page += 1, start += PAGE_SIZE) {
       const result = await this.bitrixCall(accessToken, 'lists.element.get', {
-        IBLOCK_TYPE_ID: 'lists', IBLOCK_ID: listId, start,
+        IBLOCK_TYPE_ID: 'rest_entity', IBLOCK_ID: listId, start,
         'SELECT[0]': 'ID', 'SELECT[1]': 'CODE', 'SELECT[2]': 'NAME',
       });
       if (!Array.isArray(result)) throw new ServiceUnavailableException(`Bitrix24 returned an invalid list ${listId}`);
@@ -373,6 +420,10 @@ function sourceLabel(value: unknown): string {
   const person = [row.NAME, row.LAST_NAME, row.SECOND_NAME].filter((part) => typeof part === 'string' && part.trim()).join(' ');
   if (person) return person;
   return [row.TITLE, row.name, row.PRODUCT_NAME].find((part) => typeof part === 'string' && part.trim()) as string | undefined ?? 'Без подписи';
+}
+function named(row: Record<string, unknown>, id: unknown, label: unknown, code?: unknown): NamedReferenceItem {
+  const normalizedLabel = text(label).trim();
+  return { id: text(id), code: text(code ?? id), label: normalizedLabel || text(id) };
 }
 function asRecord(value: unknown): Record<string, unknown> { return isRecord(value) ? value : {}; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
