@@ -120,10 +120,11 @@ test('field settings select, save, and reload field pairs while preview stays re
   expect(writes).toEqual([]);
   await page.getByLabel('Поле Bitrix24').last().selectOption('EMAIL');
   await page.getByLabel('Поле МойСклад').last().selectOption('email');
+  await mappingRow.locator('details.mapping-row-advanced > summary').click();
+  await page.getByLabel('Критичность EMAIL → email').selectOption('critical');
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveValue('EMAIL');
   await expect(page.getByLabel('Поле МойСклад').last()).toHaveValue('email');
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
-  await mappingRow.getByText('Направления и коды').click();
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
   await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
   await mappingRow.getByText('Технические коды').click();
@@ -143,6 +144,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
   await expect(page.getByRole('alertdialog', { name: 'Предупреждение о настройках' })).toBeVisible();
   await expect(page.getByText(/обычный повтор не переключает версию/i)).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'Добавлен ключ: contacts EMAIL → email' })).toBeVisible();
   await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
   await expect(page.getByText('Версия 2', { exact: true })).toBeVisible();
   expect(writes).toEqual(['PUT']);
@@ -161,4 +163,5 @@ test('field settings select, save, and reload field pairs while preview stays re
     expect.objectContaining({ sourceField: 'UF_CRM_ALIAS', targetField: 'attributes.alias', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }),
     expect.objectContaining({ sourceField: 'EMAIL', targetField: 'email' }),
   ]));
+  expect(config.rules.find((rule: { sourceField: string }) => rule.sourceField === 'EMAIL')).toEqual(expect.objectContaining({ criticality: 'critical' }));
 });

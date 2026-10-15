@@ -7,6 +7,7 @@ type FieldRule = {
   entity: string;
   sourceField: string;
   targetField: string;
+  criticality: 'critical' | 'optional' | 'tbd';
   bitrix24ToMoysklad: RuleDirection;
   moyskladToBitrix24: RuleDirection;
 };
@@ -16,6 +17,7 @@ type FieldGroup = {
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
   targetField: string;
   sourceFields: string[];
+  criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string };
 };
 type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
@@ -316,6 +318,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     setSaveValidationError('');
     changeDraft((current) => ({ ...current, rules: [...current.rules, {
       id: newLocalId(), entity: mappingEntity, sourceField: '', targetField: '',
+      criticality: 'tbd',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
     }] }));
@@ -327,6 +330,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
+      criticality: 'tbd',
       transform: { kind: 'join-non-empty', separator: groupForm.separator },
     };
     changeDraft((current) => ({ ...current, groups: [...current.groups, group] }));
@@ -348,6 +352,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         ...current,
         rules: [...current.rules, ...suggestions.map(({ source, target }) => ({
           id: newLocalId(), entity: mappingEntity, sourceField: source.code, targetField: target.code,
+          criticality: 'tbd' as const,
           // Matching proposes field identity only. Direction and transformation need explicit review.
           bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' as const } },
           moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' as const } },
@@ -362,7 +367,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     const saved = document?.config.rules.find((candidate) => candidate.id === rule.id);
     return Boolean(saved && saved.entity === rule.entity && saved.sourceField === rule.sourceField && saved.targetField === rule.targetField &&
       saved.bitrix24ToMoysklad.enabled === rule.bitrix24ToMoysklad.enabled && saved.bitrix24ToMoysklad.transform.kind === rule.bitrix24ToMoysklad.transform.kind &&
-      saved.moyskladToBitrix24.enabled === rule.moyskladToBitrix24.enabled && saved.moyskladToBitrix24.transform.kind === rule.moyskladToBitrix24.transform.kind);
+      saved.moyskladToBitrix24.enabled === rule.moyskladToBitrix24.enabled && saved.moyskladToBitrix24.transform.kind === rule.moyskladToBitrix24.transform.kind &&
+      (saved.criticality ?? 'tbd') === rule.criticality);
   }
 
   async function preview() {
@@ -480,6 +486,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <span className={saved ? 'mapping-status is-saved' : 'mapping-status is-unsaved'} role="cell" aria-label={saved ? 'Сохранено' : 'Не сохранено'} title={saved ? 'Сохранено в активную версию' : 'Есть несохранённые изменения'}>{saved ? '✓ Сохранено' : '• Не сохранено'}</span>
               <details className="mapping-row-advanced"><summary>Направления и коды</summary>
                 <div className="mapping-advanced-content">
+                  <label>Критичность<select aria-label={`Критичность ${rule.sourceField || 'поля'} → ${rule.targetField || 'поля'}`} value={rule.criticality ?? 'tbd'} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, criticality: event.target.value as FieldRule['criticality'] }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label>
                   <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
                   <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
                   <details className="mapping-codes"><summary>Технические коды</summary><code>{rule.sourceField || '—'} → {rule.targetField || '—'}</code><small>{source?.type ?? 'тип недоступен'} → {target?.type ?? 'тип недоступен'}</small></details>
@@ -507,7 +514,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           <button type="submit" className="button-secondary">Добавить составное правило</button>
         </form>
-        {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
+        {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small><label>Критичность<select aria-label={`Критичность группы ${group.targetField}`} value={group.criticality ?? 'tbd'} onChange={(event) => changeDraft((current) => ({ ...current, groups: current.groups.map((item) => item.id === group.id ? { ...item, criticality: event.target.value as FieldGroup['criticality'] } : item) }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
       </section>
 
       <section className="field-editor-section" aria-label="Предпросмотр настройки">
@@ -612,6 +619,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       {showSaveWarning && <div className="field-save-warning" role="alertdialog" aria-label="Предупреждение о настройках">
         <h3>Подтвердите изменение настроек</h3>
         <p>Новая версия начнёт действовать для новых событий. Уже принятые события сохранят прежние правила; обычный повтор не переключает версию. Массового пересчёта не будет.</p>
+        {document && draft && fieldRuleRiskChanges(document.config, draft).length > 0 && <div role="alert"><strong>Рискованные изменения ключей или направлений:</strong><ul>{fieldRuleRiskChanges(document.config, draft).map((change) => <li key={change}>{change}</li>)}</ul><p>После подтверждения эти изменения будут записаны в журнал администрирования.</p></div>}
         <button type="button" onClick={() => void save()} disabled={saving}>{saving ? 'Сохраняем…' : 'Подтвердить и сохранить'}</button>
         <button type="button" className="button-secondary" onClick={() => setShowSaveWarning(false)} disabled={saving}>Отмена</button>
       </div>}
@@ -621,6 +629,41 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
 function newLocalId() {
   return globalThis.crypto?.randomUUID?.() ?? `field-rule-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function fieldRuleRiskChanges(previous: SettingsConfig, next: SettingsConfig): string[] {
+  const oldRules = new Map(previous.rules.map((rule) => [rule.id, rule]));
+  const newRules = new Map(next.rules.map((rule) => [rule.id, rule]));
+  const changes: string[] = [];
+  for (const [id, oldRule] of oldRules) {
+    const newRule = newRules.get(id);
+    if (!newRule) {
+      changes.push(`Удалено: ${oldRule.entity} ${oldRule.sourceField} → ${oldRule.targetField}`);
+      continue;
+    }
+    if (oldRule.entity !== newRule.entity || oldRule.sourceField !== newRule.sourceField || oldRule.targetField !== newRule.targetField) {
+      changes.push(`Изменён ключ: ${oldRule.entity} ${oldRule.sourceField} → ${oldRule.targetField}`);
+    }
+    if (oldRule.bitrix24ToMoysklad.enabled !== newRule.bitrix24ToMoysklad.enabled || oldRule.moyskladToBitrix24.enabled !== newRule.moyskladToBitrix24.enabled) {
+      changes.push(`Изменено направление: ${newRule.entity} ${newRule.sourceField} → ${newRule.targetField}`);
+    }
+  }
+  for (const [id, newRule] of newRules) if (!oldRules.has(id)) changes.push(`Добавлен ключ: ${newRule.entity} ${newRule.sourceField} → ${newRule.targetField}`);
+  const oldGroups = new Map(previous.groups.map((group) => [group.id, group]));
+  const newGroups = new Map(next.groups.map((group) => [group.id, group]));
+  for (const [id, oldGroup] of oldGroups) {
+    const newGroup = newGroups.get(id);
+    if (!newGroup) {
+      changes.push(`Удалена группа: ${oldGroup.entity} ${oldGroup.sourceFields.join(' + ')} → ${oldGroup.targetField}`);
+      continue;
+    }
+    if (oldGroup.entity !== newGroup.entity || oldGroup.targetField !== newGroup.targetField || oldGroup.sourceFields.join('\0') !== newGroup.sourceFields.join('\0')) {
+      changes.push(`Изменён ключ группы: ${oldGroup.entity} ${oldGroup.sourceFields.join(' + ')} → ${oldGroup.targetField}`);
+    }
+    if (oldGroup.direction !== newGroup.direction) changes.push(`Изменено направление группы: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
+  }
+  for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`Добавлена группа: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
+  return changes;
 }
 
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {

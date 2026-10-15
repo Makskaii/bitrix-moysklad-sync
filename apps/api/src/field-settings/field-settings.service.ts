@@ -46,6 +46,7 @@ export class FieldSettingsService {
     await this.ensureInitialized();
     await this.validateConfiguredFields(config, bitrixAccessToken);
     const active = await this.active();
+    const riskChanges = fieldRuleRiskChanges(active.config, config);
     const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
@@ -100,6 +101,9 @@ export class FieldSettingsService {
     }, { isolationLevel: 'Serializable' });
 
     await writeOperationalLog(this.database, 'ADMIN', `Field settings version ${version} activated`, String(version));
+    if (riskChanges.length) {
+      await writeOperationalLog(this.database, 'ADMIN', `Risky field mapping changes activated in version ${version}: ${riskChanges.join('; ')}`, String(version));
+    }
     return this.version(version);
   }
 
@@ -387,11 +391,12 @@ export class FieldSettingsService {
 }
 
 function serializeVersion(row: VersionRow): VersionedFieldSettingsDto {
+  const config = normalizePersistedConfig(row.config);
   return {
     version: row.version,
     createdAt: row.createdAt.toISOString(),
-    config: row.config,
-    references: row.config.references,
+    config,
+    references: config.references,
   };
 }
 
@@ -404,9 +409,20 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
   const namedPairs = validateNamedPairs(references.namedPairs ?? []);
-  for (const rule of value.rules) validateRule(rule);
-  for (const group of value.groups) validateGroup(group);
-  return { ...value, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  const rules = value.rules.map(validateRule);
+  const groups = value.groups.map(validateGroup);
+  assertUniqueIds(rules, 'Field rule');
+  assertUniqueIds(groups, 'Field group');
+  return { ...value, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function assertUniqueIds(items: unknown[], label: string) {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const id = isRecord(item) && isString(item.id) ? item.id : '';
+    if (seen.has(id)) throw new BadRequestException(`${label} ID ${id} is duplicated`);
+    seen.add(id);
+  }
 }
 
 function validateNamedPairs(value: unknown) {
@@ -495,8 +511,10 @@ function validateRule(value: unknown) {
   if (!isRecord(value) || !isString(value.id) || !isString(value.entity) || !isString(value.sourceField) || !isString(value.targetField)) {
     throw new BadRequestException('Each field rule needs an ID, entity, and source/target field codes');
   }
+  const criticality = validateCriticality(value.criticality);
   validateDirection(value.bitrix24ToMoysklad);
   validateDirection(value.moyskladToBitrix24);
+  return { ...value, criticality };
 }
 
 function validateGroup(value: unknown) {
@@ -509,6 +527,58 @@ function validateGroup(value: unknown) {
   if (!isRecord(value.transform) || value.transform.kind !== 'join-non-empty' || typeof value.transform.separator !== 'string') {
     throw new BadRequestException('Field groups currently support the join-non-empty transform');
   }
+  return { ...value, criticality: validateCriticality(value.criticality) };
+}
+
+function validateCriticality(value: unknown): 'critical' | 'optional' | 'tbd' {
+  if (value === undefined) return 'tbd';
+  if (value !== 'critical' && value !== 'optional' && value !== 'tbd') {
+    throw new BadRequestException('Field criticality must be critical, optional, or tbd');
+  }
+  return value;
+}
+
+function normalizePersistedConfig(config: FieldSettingsConfigDto): FieldSettingsConfigDto {
+  return {
+    ...config,
+    rules: config.rules.map((rule) => ({ ...rule, criticality: validateCriticality(rule.criticality) })),
+    groups: config.groups.map((group) => ({ ...group, criticality: validateCriticality(group.criticality) })),
+  };
+}
+
+function fieldRuleRiskChanges(before: FieldSettingsConfigDto, after: FieldSettingsConfigDto): string[] {
+  const previous = new Map(before.rules.map((rule) => [rule.id, rule]));
+  const next = new Map(after.rules.map((rule) => [rule.id, rule]));
+  const changes: string[] = [];
+  for (const [id, oldRule] of previous) {
+    const newRule = next.get(id);
+    if (!newRule) {
+      changes.push(`removed ${oldRule.entity}:${oldRule.sourceField} → ${oldRule.targetField}`);
+      continue;
+    }
+    if (oldRule.entity !== newRule.entity || oldRule.sourceField !== newRule.sourceField || oldRule.targetField !== newRule.targetField) {
+      changes.push(`key changed ${oldRule.entity}:${oldRule.sourceField} → ${oldRule.targetField} to ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+    }
+    if (oldRule.bitrix24ToMoysklad.enabled !== newRule.bitrix24ToMoysklad.enabled || oldRule.moyskladToBitrix24.enabled !== newRule.moyskladToBitrix24.enabled) {
+      changes.push(`direction changed for ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+    }
+  }
+  for (const [id, newRule] of next) if (!previous.has(id)) changes.push(`added ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+  const oldGroups = new Map(before.groups.map((group) => [group.id, group]));
+  const newGroups = new Map(after.groups.map((group) => [group.id, group]));
+  for (const [id, oldGroup] of oldGroups) {
+    const newGroup = newGroups.get(id);
+    if (!newGroup) {
+      changes.push(`removed group ${oldGroup.entity}:${oldGroup.sourceFields.join('+')} → ${oldGroup.targetField}`);
+      continue;
+    }
+    if (oldGroup.entity !== newGroup.entity || oldGroup.targetField !== newGroup.targetField || oldGroup.sourceFields.join('\0') !== newGroup.sourceFields.join('\0')) {
+      changes.push(`group key changed ${oldGroup.entity}:${oldGroup.sourceFields.join('+')} → ${oldGroup.targetField}`);
+    }
+    if (oldGroup.direction !== newGroup.direction) changes.push(`group direction changed for ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
+  }
+  for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`added group ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
+  return changes;
 }
 
 function validateDirection(value: unknown) {

@@ -398,20 +398,29 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.ok(page.items.some((item) => item.id === 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
 
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
-  const active = await activeResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }> } } };
-  const config = structuredClone(active.config) as { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; namedPairs: Array<{ kind: string; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: string }> }; [key: string]: unknown };
+  const active = await activeResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }> } } };
+  const config = structuredClone(active.config) as { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }>; namedPairs: Array<{ kind: string; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: string }> }; [key: string]: unknown };
   config.references.units = config.references.units.map((unit) => unit.bitrix24Id === 14
     ? { ...unit, moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', status: 'configured' }
     : unit);
-  config.references.namedPairs = [{ kind: 'dealStages', bitrix24Id: '0:NEW', bitrix24Label: 'Новая сделка', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Новая сделка', status: 'confirmed' }];
+  config.references.namedPairs = [
+    { kind: 'employees', bitrix24Id: '1', bitrix24Label: 'Ada Lovelace', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Demo reference', status: 'confirmed' },
+    { kind: 'currencies', bitrix24Id: 'RUB', bitrix24Label: 'Российский рубль', moyskladId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', moyskladLabel: 'Рубли', status: 'confirmed' },
+    { kind: 'organizations', bitrix24Id: '8800', bitrix24Label: 'List 88 value', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Demo reference', status: 'confirmed' },
+    { kind: 'warehouses', bitrix24Id: '3800', bitrix24Label: 'List 38 value', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Demo reference', status: 'suggested' },
+    { kind: 'projects', bitrix24Id: '3400', bitrix24Label: 'List 34 value', moyskladId: null, moyskladLabel: null, status: 'unmapped' },
+    { kind: 'dealStages', bitrix24Id: '0:NEW', bitrix24Label: 'Новая сделка', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Новая сделка', status: 'confirmed' },
+  ];
   const saveResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
     method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
     body: JSON.stringify({ config }),
   });
-  const saved = await saveResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null }>; namedPairs: Array<{ kind: string; bitrix24Id: string; moyskladId: string | null; status: string }> } } };
+  const saved = await saveResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }>; namedPairs: Array<{ kind: string; bitrix24Id: string; moyskladId: string | null; status: string }> } } };
   assert.equal(saveResponse.status, 200);
   assert.equal(saved.config.references.units.find((unit) => unit.bitrix24Id === 14)?.moyskladId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
-  assert.deepEqual(saved.config.references.namedPairs, [{ kind: 'dealStages', bitrix24Id: '0:NEW', bitrix24Label: 'Новая сделка', moyskladId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', moyskladLabel: 'Новая сделка', status: 'confirmed' }]);
+  assert.equal(saved.config.references.priceTypes.length, active.config.references.priceTypes.length, 'price types survive the settings version roundtrip');
+  assert.deepEqual(saved.config.references.dictionaries, active.config.references.dictionaries, 'service and payment dictionary pairs survive the settings version roundtrip');
+  assert.deepEqual(saved.config.references.namedPairs, config.references.namedPairs, 'all named reference kinds and confirmation states survive the settings version roundtrip');
 
   const invalidConfig = structuredClone(saved.config) as typeof config;
   invalidConfig.references.namedPairs[0]!.moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -437,8 +446,13 @@ test('saving creates an immutable version and activates it for future events onl
   const config = structuredClone(original.config) as Record<string, unknown>;
   config.rules = [{
     id: 'title-copy', entity: 'deals-orders', sourceField: 'TITLE', targetField: 'name',
+    criticality: 'critical',
     bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
     moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }];
+  config.groups = [{
+    id: 'name-join', entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD', sourceFields: ['NAME', 'LAST_NAME'], targetField: 'name',
+    criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' ' },
   }];
   const savedResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
     method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
@@ -447,6 +461,8 @@ test('saving creates an immutable version and activates it for future events onl
   assert.equal(savedResponse.status, 200, body);
   const saved = JSON.parse(body) as { version: number; config: Record<string, unknown> };
   assert.equal(saved.version, original.version + 1);
+  assert.equal((saved.config.rules as Array<{ criticality?: string }>)[0]?.criticality, 'critical');
+  assert.equal((saved.config.groups as Array<{ criticality?: string }>)[0]?.criticality, 'optional');
   const previousResponse = await fetch(`${apiUrl}/api/admin/field-settings/versions/${original.version}`);
   const previous = await previousResponse.json() as { config: Record<string, unknown> };
   assert.deepEqual(previous.config.rules, []);
@@ -454,6 +470,32 @@ test('saving creates an immutable version and activates it for future events onl
   const reloaded = await activeResponse.json() as { version: number; config: Record<string, unknown> };
   assert.equal(reloaded.version, saved.version);
   assert.deepEqual(reloaded.config.rules, saved.config.rules);
+  assert.deepEqual(reloaded.config.groups, saved.config.groups);
+  const auditEntries = await app.get(DatabaseService).operationalLog.findMany({ where: { category: 'ADMIN', referenceId: String(saved.version) } });
+  assert.ok(auditEntries.some((entry) => entry.message.includes('added deals-orders:TITLE → name')), 'risky added keys are audited against the activated version');
+
+  const legacyConfig = structuredClone(reloaded.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
+  delete legacyConfig.rules[0]!.criticality;
+  delete legacyConfig.groups[0]!.criticality;
+  const legacyResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: legacyConfig }) });
+  const legacySaved = await legacyResponse.json() as { config: { rules: Array<{ criticality: string }>; groups: Array<{ criticality: string }> } };
+  assert.equal(legacyResponse.status, 200);
+  assert.equal(legacySaved.config.rules[0]?.criticality, 'tbd', 'legacy clients that omit rule criticality retain an explicit unresolved value');
+  assert.equal(legacySaved.config.groups[0]?.criticality, 'tbd', 'legacy clients that omit group criticality retain an explicit unresolved value');
+  const invalidCriticality = structuredClone(legacySaved.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
+  invalidCriticality.rules[0]!.criticality = 'mandatory';
+  const invalidCriticalityResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: invalidCriticality }) });
+  assert.equal(invalidCriticalityResponse.status, 400, 'server rejects unknown criticality values');
+
+  const duplicateRuleId = structuredClone(legacySaved.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
+  duplicateRuleId.rules.push({ ...duplicateRuleId.rules[0], sourceField: 'LAST_NAME' });
+  const duplicateRuleResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: duplicateRuleId }) });
+  assert.equal(duplicateRuleResponse.status, 400, 'server rejects duplicate rule IDs so risk comparisons cannot hide a changed mapping');
+
+  const duplicateGroupId = structuredClone(legacySaved.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
+  duplicateGroupId.groups.push({ ...duplicateGroupId.groups[0], targetField: 'title' });
+  const duplicateGroupResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config: duplicateGroupId }) });
+  assert.equal(duplicateGroupResponse.status, 400, 'server rejects duplicate group IDs so risk comparisons cannot hide a changed mapping');
 });
 
 test('settings reject unknown field codes and read-only Bitrix24 targets', async () => {
