@@ -43,11 +43,11 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       const requisites = await this.bitrixList('crm.requisite.list', { filter: { ENTITY_TYPE_ID: 4, RQ_INN: input.inn }, select: ['ENTITY_ID', 'RQ_INN'] });
       const ids = [...new Set(requisites.filter((row) => String(row.RQ_INN ?? '') === input.inn).map((row) => id(row.ENTITY_ID)).filter((value): value is string => Boolean(value)))];
       rows = await this.bitrixCompaniesByIds(ids);
-      rows = rows.filter((row) => id(row.ID) !== input.id && !isMarkedDuplicate(row.UF_CRM_1789126724375));
+      rows = rows.filter((row) => id(row.ID) !== input.id && duplicateMarker(row) === false);
     }
     if (!rows.length && input.name && input.phone) {
       rows = await this.bitrixList('crm.company.list', { filter: { TITLE: input.name, PHONE: input.phone }, select: ['ID', 'TITLE', 'PHONE', 'DATE_CREATE', 'UF_CRM_1789126724375'] });
-      rows = rows.filter((row) => id(row.ID) !== input.id && !isMarkedDuplicate(row.UF_CRM_1789126724375)
+      rows = rows.filter((row) => id(row.ID) !== input.id && duplicateMarker(row) === false
         && exactName(row.TITLE, input.name!) && hasExactPhone(row.PHONE, input.phone!));
       if (input.inn) {
         const inss = await Promise.all(rows.map(async (row) => [String(row.ID), await this.readCompanyInn('BITRIX24', String(row.ID))] as const));
@@ -89,7 +89,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       return this.candidates(rows.filter((row) => row.companyType !== 'individual' && exactName(row.name, name) && exactPhone(row.phone, phone)), 'COMPANY', targetSystem);
     }
     const rows = await this.bitrixList('crm.company.list', {
-      filter: { TITLE: name, PHONE: phone }, select: ['ID', 'TITLE', 'PHONE', 'DATE_CREATE'],
+      filter: { TITLE: name, PHONE: phone }, select: ['ID', 'TITLE', 'PHONE', 'DATE_CREATE', 'UF_CRM_1789126724375'],
     });
     return this.candidates(rows.filter((row) => exactName(row.TITLE, name) && hasExactPhone(row.PHONE, phone)), 'COMPANY', targetSystem);
   }
@@ -177,10 +177,14 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   private async candidates(rows: Record<string, unknown>[], entity: ClientEntity, system: ClientSystem, enrich: (row: Record<string, unknown>) => Record<string, unknown> = (row) => row): Promise<ClientCandidate[]> {
+    if (system === 'BITRIX24' && entity === 'COMPANY' && rows.some((row) => duplicateMarker(row) === null)) {
+      throw new Error('CLIENT_COMPANY_DUPLICATE_MARKER_UNVERIFIED');
+    }
     const candidates = rows.map(enrich).filter((row) => id(row.id ?? row.ID)).map((row) => ({
       id: id(row.id ?? row.ID)!,
       parentId: stringValue(row.parentId),
       type: system === 'MOYSKLAD' ? entity === 'COMPANY' || row.companyType === 'individual' ? 'counterparty' as const : row.parentId ? 'contactperson' as const : 'contactperson' as const : entity === 'COMPANY' ? 'company' as const : 'contact' as const,
+      duplicateMarked: system === 'BITRIX24' && entity === 'COMPANY' ? duplicateMarker(row) : false,
       inn: stringValue(row.inn), name: stringValue(row.name ?? row.TITLE), phone: stringValue(row.phone), email: stringValue(row.email),
       createdAt: stringValue(row.created ?? row.DATE_CREATE) ?? 'invalid', usageCount: null as number | null,
       filledFields: countFilled(row), occupiedByPair: false,
@@ -321,6 +325,13 @@ function firstString(...values: unknown[]) { return values.find((value): value i
 function personName(record: Record<string, unknown>) { return firstString(record.name, [record.LAST_NAME, record.NAME, record.SECOND_NAME].filter((part) => typeof part === 'string' && part.trim()).join(' ')); }
 function exactName(actual: unknown, expected: string) { return typeof actual === 'string' && actual === expected; }
 function isMarkedDuplicate(value: unknown) { return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'; }
+function duplicateMarker(row: Record<string, unknown>): boolean | null {
+  if (!Object.prototype.hasOwnProperty.call(row, 'UF_CRM_1789126724375')) return null;
+  const value = row.UF_CRM_1789126724375;
+  if (isMarkedDuplicate(value)) return true;
+  if (value === null || value === '' || value === 0 || value === '0' || value === false || value === 'N' || value === 'n' || value === 'false') return false;
+  return null;
+}
 function exactPersonName(actual: unknown, expected: string) { return typeof actual === 'string' && normName(actual) === normName(expected); }
 function exactPhone(actual: unknown, expected: string) { return phone(actual) === phone(expected); }
 function exactEmail(actual: unknown, expected: string) { return typeof actual === 'string' && actual.trim().toLowerCase() === expected.trim().toLowerCase(); }

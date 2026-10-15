@@ -44,7 +44,7 @@ const fakeApi: ClientInventoryProvider = {
     return { rows: entity === 'COMPANY' ? [{ id: companyId, uuid: companyUuid }] : [{ id: contactId, uuid: contactUuid }], next: null, total: 1 };
   },
   async counterpartyPage(offset) {
-    return offset === 0 ? { rows: [{ id: companyTarget }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
+    return offset === 0 ? { rows: [{ id: companyTarget, companyType: 'legal' }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
   },
   async contactpersonPage(parentId, offset) {
     return offset === 0 ? { rows: [{ id: contactTarget, parentId }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
@@ -154,6 +154,8 @@ test('resumable inventory maps exact company/contact UUIDs to native IDs, includ
   assert.deepEqual(pairs.map((pair) => [pair.entityType, pair.moyskladId, pair.moyskladType, pair.moyskladParentId]), [
     ['COMPANY', companyTarget, 'counterparty', null], ['CONTACT', contactTarget, 'contactperson', companyTarget],
   ], JSON.stringify({ status, objects: await database.clientInventoryObject.findMany({ where: { externalId: { in: [companyId, contactId, companyTarget, contactTarget] } } }) }));
+  const inventoriedCompany = await database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: companyTarget } });
+  assert.equal(inventoriedCompany?.companyType, 'legal');
   const unmatched = await service.listUnmatched();
   assert.equal(unmatched.entries.some((row) => row.externalId === companyId || row.externalId === contactId), false);
 });

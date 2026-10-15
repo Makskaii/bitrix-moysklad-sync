@@ -16,6 +16,7 @@ export type ClientCandidate = {
   usageMetricUnavailable?: boolean;
   filledFields: number;
   occupiedByPair: boolean;
+  duplicateMarked?: boolean | null;
 };
 
 export type ClientSource = {
@@ -73,7 +74,8 @@ export class ClientRuntimeResolver {
     const exactInn = inn ? await this.gateway.companyByInn(inn, targetSystem) : [];
     // A search result with no INN is not an exact-INN match and must not be
     // selected (nor populated with the source's INN as a side effect).
-    const permittedByInn = exactInn.filter((candidate) => !candidate.occupiedByPair && candidate.inn === inn);
+    const innMatches = exactInn.filter((candidate) => !candidate.occupiedByPair && candidate.inn === inn);
+    const permittedByInn = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(innMatches) : innMatches;
     const innChoice = chooseCandidate(permittedByInn, 'exact_inn', targetSystem);
     if (innChoice) return innChoice;
     if (inn && permittedByInn.length) return permittedByInn.length > 1
@@ -83,7 +85,8 @@ export class ClientRuntimeResolver {
     const name = nonEmpty(source.name);
     const phone = nonEmpty(source.phone);
     const fallback = name && phone ? await this.gateway.companyByExactNameAndPhone(name, phone, targetSystem) : [];
-    const permitted = fallback.filter((candidate) => !candidate.occupiedByPair && (!nonEmpty(candidate.inn) || !inn || candidate.inn === inn));
+    const fallbackMatches = fallback.filter((candidate) => !candidate.occupiedByPair && (!nonEmpty(candidate.inn) || !inn || candidate.inn === inn));
+    const permitted = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(fallbackMatches) : fallbackMatches;
     const choice = chooseCandidate(permitted, 'exact_name_and_phone', targetSystem);
     if (choice) return choice;
     if (permitted.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permitted.map((candidate) => candidate.id) };
@@ -115,6 +118,13 @@ export class ClientRuntimeResolver {
     if (permitted.length === 1) return candidateResolution(permitted[0], phone ? 'normalized_name_and_phone' : 'normalized_name_and_email', false, targetSystem);
     return { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? primaryCompanyTargetId ? 'contactperson' : 'counterparty' : 'contact', targetSystem, reason: 'NO_CANDIDATE' };
   }
+}
+
+/** A duplicate-marked company is a fallback only when no eligible unmarked
+ * company matches the same approved search keys. */
+function preferUnmarkedCompany(candidates: ClientCandidate[]): ClientCandidate[] {
+  const unmarked = candidates.filter((candidate) => candidate.duplicateMarked === false);
+  return unmarked.length ? unmarked : candidates.filter((candidate) => candidate.duplicateMarked === true);
 }
 
 /** Returns a choice only when the approved metrics make one candidate unique. */

@@ -215,6 +215,7 @@ model ClientInventoryObject {
   externalId  String
   matchValue  String?
   parentId    String?
+  companyType String?
   status      String   @default("PENDING")
   reason      String?
   observedAt  DateTime @default(now())

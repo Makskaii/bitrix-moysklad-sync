@@ -1,7 +1,7 @@
 export type ClientInventoryEntity = 'COMPANY' | 'CONTACT';
 export type ClientInventoryTargetType = 'counterparty' | 'contactperson';
 export type BitrixClientRow = { id: string; uuid: string | null };
-export type MoyskladClientRow = { id: string; parentId?: string | null };
+export type MoyskladClientRow = { id: string; parentId?: string | null; companyType?: string | null };
 export type ClientPage<T> = { rows: T[]; next: number | null; total: number | null };
 
 export interface ClientInventoryProvider {
@@ -37,7 +37,9 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     const url = this.moyskladUrl('entity/counterparty');
     url.searchParams.set('limit', '1000');
     url.searchParams.set('offset', String(offset));
-    url.searchParams.set('fields', 'id');
+    // companyType is the minimal native metadata needed to distinguish
+    // organization counterparties from individual clients in the UUID map.
+    url.searchParams.set('fields', 'id,companyType');
     return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }));
   }
 
@@ -75,7 +77,10 @@ function readMoyskladPage(payload: unknown, parentId?: string): ClientPage<Moysk
   if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta)) throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_RESPONSE');
   const rows = payload.rows.map((row) => {
     if (!isRecord(row) || !readId(row.id)) throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_ROW');
-    return { id: readId(row.id)!, parentId: parentId ?? null };
+    return {
+      id: readId(row.id)!, parentId: parentId ?? null,
+      ...(parentId === undefined ? { companyType: readOptionalString(row.companyType) } : {}),
+    };
   });
   const size = Number(payload.meta.size);
   const offset = Number(payload.meta.offset);
