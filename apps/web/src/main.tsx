@@ -620,7 +620,7 @@ const pairReviewReasonLabels: Record<string, string> = {
   ENTITY_TYPE_UNSUPPORTED: 'Этот тип записи не поддерживается',
   PAIR_STORE_UNAVAILABLE: 'Хранилище пар временно недоступно',
 };
-type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; source: string; reason: string | null; createdAt: string };
+type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; source: string; reason: string | null; createdAt: string };
 type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; eventId: string | null; reason: string; openedAt: string };
 
 function PairManager({ accessToken, onError, onForbidden }: { accessToken: string; onError: (message: string) => void; onForbidden: () => void }) {
@@ -649,7 +649,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       .finally(() => setLoading(false));
   }, []);
 
-  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) {
+  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) {
     setSaving(true);
     try {
       const response = await fetch('/api/admin/pairs', {
@@ -676,7 +676,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       <div className="records-head"><div><p className="eyebrow">АКТИВНЫЕ ПАРЫ</p><h3>Сохранённые связи</h3></div><button type="button" className="refresh-monitoring" onClick={() => void refresh().catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Обновить</button></div>
       {loading ? <p>Загрузка пар…</p> : pairs.length ? <div className="pair-list">{pairs.map((pair) => <article className="pair-card" key={pair.id}>
         <div><span className="pair-entity">{pairEntityTypes.find((type) => type.id === pair.entityType)?.label ?? pair.entityType}</span><span className="pair-state">{pair.source === 'MANUAL' ? 'Подтверждена администратором' : 'Сохранённая подтверждённая пара'}</span></div>
-        <div className="pair-sides"><p><small>Bitrix24 · ID записи</small><code>{pair.bitrix24Id}</code></p><b aria-hidden="true">↔</b><p><small>МойСклад · ID записи</small><code>{pair.moyskladId}</code></p></div>
+        <div className="pair-sides"><p><small>Bitrix24 · ID записи</small><code>{pair.bitrix24Id}</code></p><b aria-hidden="true">↔</b><p><small>МойСклад · {pair.moyskladType === 'contactperson' ? 'Контактное лицо' : pair.moyskladType === 'counterparty' ? 'Контрагент' : 'ID записи'}</small><code>{pair.moyskladId}</code>{pair.moyskladParentId && <small>Родительский контрагент · ID {pair.moyskladParentId}</small>}</p></div>
         {pair.reason && <small>Основание: {pair.reason}</small>}
       </article>)}</div> : <p className="empty-state">Сохранённых пар пока нет.</p>}
     </section>
@@ -692,9 +692,11 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
   </>;
 }
 
-function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) => Promise<void> }) {
+function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [bitrix24Id, setBitrix24Id] = useState(review.sourceSystem === 'BITRIX24' ? review.sourceEntityId : '');
   const [moyskladId, setMoyskladId] = useState(review.sourceSystem === 'MOYSKLAD' ? review.sourceEntityId : '');
+  const [moyskladType, setMoyskladType] = useState<'counterparty' | 'contactperson'>('counterparty');
+  const [moyskladParentId, setMoyskladParentId] = useState('');
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [localError, setLocalError] = useState('');
@@ -703,7 +705,7 @@ function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; s
     event.preventDefault();
     setLocalError('');
     try {
-      await onAssign({ entityType: review.entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), replaceExisting });
+      await onAssign({ entityType: review.entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(review.entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : review.entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : {}), replaceExisting });
     } catch (cause) {
       setLocalError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -714,6 +716,7 @@ function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; s
     <form onSubmit={(event) => void submit(event)}>
       <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
       <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
+      {review.entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
       <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
       <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
       <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
@@ -722,10 +725,12 @@ function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; s
   </article>;
 }
 
-function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; replaceExisting: boolean }) => Promise<void> }) {
+function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [entityType, setEntityType] = useState<PairEntityType>('DEAL');
   const [bitrix24Id, setBitrix24Id] = useState('');
   const [moyskladId, setMoyskladId] = useState('');
+  const [moyskladType, setMoyskladType] = useState<'counterparty' | 'contactperson'>('counterparty');
+  const [moyskladParentId, setMoyskladParentId] = useState('');
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [localError, setLocalError] = useState('');
@@ -734,7 +739,7 @@ function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (inpu
     event.preventDefault();
     setLocalError('');
     try {
-      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), replaceExisting });
+      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : {}), replaceExisting });
       setBitrix24Id('');
       setMoyskladId('');
       setReplaceExisting(false);
@@ -748,11 +753,19 @@ function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (inpu
     <label>Сущность<select required value={entityType} onChange={(event) => setEntityType(event.target.value as PairEntityType)}>{pairEntityTypes.map((type) => <option key={type.id} value={type.id}>{type.label}</option>)}</select></label>
     <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
     <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
+      {entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
     <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
     <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
     <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
     {localError && <p className="inline-error" role="alert">{localError}</p>}
   </form>;
+}
+
+function MoyskladContactTypeFields({ moyskladType, setMoyskladType, moyskladParentId, setMoyskladParentId }: { moyskladType: 'counterparty' | 'contactperson'; setMoyskladType: (value: 'counterparty' | 'contactperson') => void; moyskladParentId: string; setMoyskladParentId: (value: string) => void }) {
+  return <>
+    <label>Тип записи МойСклад<select required value={moyskladType} onChange={(event) => setMoyskladType(event.target.value as 'counterparty' | 'contactperson')}><option value="counterparty">Контрагент · физическое лицо</option><option value="contactperson">Контактное лицо компании</option></select></label>
+    {moyskladType === 'contactperson' && <label>Родительский контрагент · ID<input required maxLength={200} value={moyskladParentId} onChange={(event) => setMoyskladParentId(event.target.value)} /></label>}
+  </>;
 }
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
