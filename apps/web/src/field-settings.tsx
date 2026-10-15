@@ -71,10 +71,10 @@ const entityOptions = [
 const deferredEntities = new Set(['smart-invoices']);
 const requisiteFields: Array<[string, string]> = [
   ['RQ_COMPANY_NAME', 'Краткое наименование'], ['RQ_COMPANY_FULL_NAME', 'Полное наименование'], ['RQ_INN', 'ИНН'],
-  ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OKPO', 'ОКПО'],
+  ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OGRNIP', 'ОГРНИП'], ['RQ_OKPO', 'ОКПО'],
 ];
 const counterpartyFields: Array<[string, string]> = [
-  ['legalTitle', 'Полное наименование'], ['inn', 'ИНН'], ['kpp', 'КПП'], ['ogrn', 'ОГРН'], ['okpo', 'ОКПО'],
+  ['legalTitle', 'Полное наименование'], ['inn', 'ИНН'], ['kpp', 'КПП'], ['ogrn', 'ОГРН'], ['ogrnip', 'ОГРНИП'], ['okpo', 'ОКПО'],
 ];
 const bankDetailFields: Array<[string, string]> = [
   ['RQ_BANK_NAME', 'Название банка'], ['RQ_BANK_ADDR', 'Адрес банка'], ['RQ_BIK', 'БИК'], ['RQ_BIC', 'BIC'],
@@ -498,13 +498,13 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <label>{kind === 'legalFields' ? 'Реквизит Bitrix24' : 'Банковское поле Bitrix24'}<select aria-label={`${kind === 'legalFields' ? 'Юридическое поле Bitrix24' : 'Банковское поле Bitrix24'} ${index + 1} ${rowIndex + 1}`} value={row.bitrix24Field} onChange={(event) => updateBinding((current) => kind === 'legalFields'
                 ? { ...current, legalFields: current.legalFields.map((item, i) => i === rowIndex ? { ...item, bitrix24Field: event.target.value } : item) }
                 : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: current.bankDetail.fields.map((item, i) => i === rowIndex ? { ...item, bitrix24Field: event.target.value } : item) } : undefined })}>
-                <option value="">Выберите поле</option>{leftFields.map(([code, title]) => <option key={code} value={code}>{title} · {code}</option>)}
+                <option value="">Выберите поле</option>{leftFields.map(([code, title]) => <option key={code} value={code} disabled={kind === 'legalFields' && Boolean(row.moyskladField) && !isSupportedChildFieldPair(code, row.moyskladField)}>{title} · {code}</option>)}
               </select></label>
               <span aria-hidden="true">→</span>
               <label>Поле МойСклад<select aria-label={`${kind === 'legalFields' ? 'Юридическое поле МойСклад' : 'Банковское поле МойСклад'} ${index + 1} ${rowIndex + 1}`} value={row.moyskladField} onChange={(event) => updateBinding((current) => kind === 'legalFields'
                 ? { ...current, legalFields: current.legalFields.map((item, i) => i === rowIndex ? { ...item, moyskladField: event.target.value } : item) }
                 : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: current.bankDetail.fields.map((item, i) => i === rowIndex ? { ...item, moyskladField: event.target.value } : item) } : undefined })}>
-                <option value="">Выберите поле</option>{rightFields.map(([code, title]) => <option key={code} value={code}>{title} · {code}</option>)}
+                <option value="">Выберите поле</option>{rightFields.map(([code, title]) => <option key={code} value={code} disabled={kind === 'legalFields' && Boolean(row.bitrix24Field) && !isSupportedChildFieldPair(row.bitrix24Field, code)}>{title} · {code}</option>)}
               </select></label>
               <button type="button" className="mapping-remove" aria-label={`Удалить поле ${rowIndex + 1} связи ${index + 1}`} onClick={() => updateBinding((current) => kind === 'legalFields'
                 ? { ...current, legalFields: current.legalFields.filter((_, i) => i !== rowIndex) }
@@ -805,12 +805,19 @@ function validateChildFieldPairs(rows: ChildFieldPair[], allowedSources: Array<[
   for (const [index, row] of rows.entries()) {
     if (!row.bitrix24Field || !row.moyskladField) { errors.push(`${label}, строка ${index + 1}: выберите оба поля`); continue; }
     if (!allowedSources.some(([code]) => code === row.bitrix24Field) || !allowedTargets.some(([code]) => code === row.moyskladField)) { errors.push(`${label}, строка ${index + 1}: поле не поддерживается`); continue; }
+    if (!isSupportedChildFieldPair(row.bitrix24Field, row.moyskladField)) { errors.push(`${label}, строка ${index + 1}: неподдерживаемая пара ${row.bitrix24Field} → ${row.moyskladField}`); continue; }
     if (sources.has(row.bitrix24Field) || targets.has(row.moyskladField)) errors.push(`${label}: поля должны использоваться только один раз`);
     sources.add(row.bitrix24Field);
     targets.add(row.moyskladField);
     count += 1;
   }
   return { errors, count };
+}
+
+function isSupportedChildFieldPair(bitrix24Field: string, moyskladField: string) {
+  if ((bitrix24Field === 'RQ_OGRNIP') !== (moyskladField === 'ogrnip')) return false;
+  if (bitrix24Field === 'RQ_COMPANY_NAME' && moyskladField === 'legalTitle') return false;
+  return true;
 }
 
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {
