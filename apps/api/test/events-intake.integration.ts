@@ -5,6 +5,7 @@ import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DatabaseService } from '../src/database.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
+import { EventDispatcherService } from '../src/event-dispatcher.service';
 import { SyncModeService } from '../src/sync-mode.service';
 import { WebhookDiagnosticsController } from '../src/webhook-diagnostics.controller';
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from '../src/admin/admin-access.guard';
@@ -177,7 +178,81 @@ test('Bitrix24 event is stored before acknowledgement and identical deliveries a
   assert.equal(upsertCalls, 2, 'both deliveries are durably accepted');
 });
 
-test('unverified sources are rejected without a database write', async () => {
+test('Bitrix24 and MoySklad acknowledge durable intake without waiting for worker completion', async () => {
+  const persisted: string[] = [];
+  const dispatched: string[] = [];
+  const dispatchStarted = new Map<string, () => void>();
+  const dispatchStartedPromises = new Map<string, Promise<void>>();
+  const workerReleasePromises = new Map<string, Promise<void>>();
+  const workerReleases = new Map<string, () => void>();
+
+  for (const eventId of ['quick-ack-bitrix', 'quick-ack-moysklad']) {
+    dispatchStartedPromises.set(eventId, new Promise<void>((resolve) => dispatchStarted.set(eventId, resolve)));
+    workerReleasePromises.set(eventId, new Promise<void>((resolve) => workerReleases.set(eventId, resolve)));
+  }
+
+  const intake = {
+    receiveBitrix24: async () => {
+      persisted.push('quick-ack-bitrix');
+      return { accepted: true, eventId: 'quick-ack-bitrix' };
+    },
+    receiveMoySklad: async () => {
+      persisted.push('quick-ack-moysklad');
+      return {
+        accepted: true,
+        eventId: 'quick-ack-moysklad',
+        eventIds: ['quick-ack-moysklad'],
+        contactEventIds: [],
+        pairEventIds: [],
+      };
+    },
+  };
+  const dispatcher = {
+    dispatch: async (eventId: string) => {
+      dispatched.push(eventId);
+      dispatchStarted.get(eventId)?.();
+      await workerReleasePromises.get(eventId);
+    },
+  };
+
+  @Module({
+    controllers: [EventsController],
+    providers: [
+      { provide: EventIntakeService, useValue: intake },
+      { provide: EventDispatcherService, useValue: dispatcher },
+    ],
+  })
+  class DeferredWorkerModule {}
+
+  const deferredWorkerApp = await NestFactory.create(DeferredWorkerModule, { logger: false });
+  try {
+    await deferredWorkerApp.listen(0, '127.0.0.1');
+    const deferredApiUrl = await deferredWorkerApp.getUrl();
+
+    const bitrixResponse = await fetch(`${deferredApiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ event: 'ONCRMDEALUPDATE' }),
+    });
+    assert.equal(bitrixResponse.status, 200);
+    assert.deepEqual(await bitrixResponse.json(), { accepted: true, eventId: 'quick-ack-bitrix' });
+    await dispatchStartedPromises.get('quick-ack-bitrix');
+    assert.deepEqual(persisted, ['quick-ack-bitrix']);
+    assert.deepEqual(dispatched, ['quick-ack-bitrix']);
+
+    const moyskladResponse = await fetch(`${deferredApiUrl}/webhooks/moysklad/test-secret?requestId=quick-ack`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ events: [{ action: 'UPDATE' }] }),
+    });
+    assert.equal(moyskladResponse.status, 200);
+    assert.deepEqual(await moyskladResponse.json(), { accepted: true, eventId: 'quick-ack-moysklad' });
+    await dispatchStartedPromises.get('quick-ack-moysklad');
+    assert.deepEqual(persisted, ['quick-ack-bitrix', 'quick-ack-moysklad']);
+    assert.deepEqual(dispatched, ['quick-ack-bitrix', 'quick-ack-moysklad']);
+  } finally {
+    for (const release of workerReleases.values()) release();
+    await deferredWorkerApp.close();
+  }
+});
+
+test('unverified sources and credentials from the other provider are rejected without a database write', async () => {
   rows.clear();
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST',
@@ -185,6 +260,19 @@ test('unverified sources are rejected without a database write', async () => {
     body: JSON.stringify({ event: 'ONCRMDEALUPDATE', auth: { application_token: 'wrong-token' } }),
   });
   assert.equal(response.status, 401);
+
+  const moyskladSecretAtBitrixEndpoint = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMDEALUPDATE', auth: { application_token: 'moysklad-test-path-secret' } }),
+  });
+  assert.equal(moyskladSecretAtBitrixEndpoint.status, 401);
+
+  const bitrixTokenAtMoyskladEndpoint = await fetch(`${apiUrl}/webhooks/moysklad/bitrix-test-application-token`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+  });
+  assert.equal(bitrixTokenAtMoyskladEndpoint.status, 401);
+
   assert.equal(rows.size, 0);
   process.env.SYNC_MODE = 'dry';
   const reportResponse = await fetch(`${apiUrl}/api/admin/dry-webhooks`);
