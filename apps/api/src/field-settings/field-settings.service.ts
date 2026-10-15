@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
-import { FieldSettingsConfigDto, VersionedFieldSettingsDto } from './field-settings.dto';
+import { FieldSettingsConfigDto, NamedReferenceKind, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 
@@ -50,9 +50,11 @@ export class FieldSettingsService {
     await this.ensureInitialized();
     await this.validateConfiguredFields(config, bitrixAccessToken);
     const active = await this.active();
+    const riskChanges = fieldRuleRiskChanges(active.config, config);
     const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
+    const namedCatalogs = await this.readOnlyData.referenceCatalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
     const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
@@ -77,6 +79,13 @@ export class FieldSettingsService {
     const livePriceTypeIds = new Set(catalogs.priceTypes.moysklad.map((priceType) => priceType.id));
     for (const unit of config.references.units) if (unit.moyskladId && !liveUnitIds.has(unit.moyskladId)) throw new BadRequestException(`MySklad unit ${unit.moyskladId} no longer exists`);
     for (const priceType of config.references.priceTypes) if (priceType.moyskladId && !livePriceTypeIds.has(priceType.moyskladId)) throw new BadRequestException(`MySklad price type ${priceType.moyskladId} no longer exists`);
+    for (const pair of config.references.namedPairs ?? []) {
+      const sourceIds = new Set(namedCatalogs[pair.kind].bitrix24.map((item) => item.id));
+      const targetIds = new Set(namedCatalogs[pair.kind].moysklad.map((item) => item.id));
+      if (!sourceIds.has(pair.bitrix24Id)) throw new BadRequestException(`Bitrix24 reference ${pair.bitrix24Id} no longer exists in ${pair.kind}`);
+      if (pair.moyskladId && !targetIds.has(pair.moyskladId)) throw new BadRequestException(`MySklad reference ${pair.moyskladId} no longer exists in ${pair.kind}`);
+      if (pair.status === 'confirmed' && !pair.moyskladId) throw new BadRequestException(`Reference ${pair.bitrix24Id} in ${pair.kind} must have a target before it is confirmed`);
+    }
     }
     const version = await this.database.$transaction(async (transaction) => {
       const states = await transaction.$queryRaw<Array<{ version: number }>>`
@@ -96,16 +105,34 @@ export class FieldSettingsService {
     }, { isolationLevel: 'Serializable' });
 
     await writeOperationalLog(this.database, 'ADMIN', `Field settings version ${version} activated`, String(version));
+    if (riskChanges.length) {
+      await writeOperationalLog(this.database, 'ADMIN', `Risky field mapping changes activated in version ${version}: ${riskChanges.join('; ')}`, String(version));
+    }
     return this.version(version);
   }
 
   async catalogs(bitrixAccessToken: string) {
-    const [live, dictionaryCatalogs] = await Promise.all([
+    const [live, dictionaryCatalogs, namedCatalogs] = await Promise.all([
       this.readOnlyData.catalogs(bitrixAccessToken),
       this.readOnlyData.dictionaryCatalogs(bitrixAccessToken),
+      this.readOnlyData.referenceCatalogs(bitrixAccessToken),
     ]);
+    const active = await this.active();
+    const namedPairs = active.config.references.namedPairs ?? [];
     return {
       ...live,
+      namedReferences: Object.fromEntries(Object.entries(namedCatalogs).map(([kind, catalogs]) => {
+        const pairs = namedPairs.filter((pair) => pair.kind === kind);
+        const sources = catalogs.bitrix24.map((source) => {
+          const saved = pairs.find((pair) => pair.bitrix24Id === source.id);
+          const candidates = kind === 'currencies' && source.code
+            ? catalogs.moysklad.filter((candidate) => candidate.code === source.code)
+            : catalogs.moysklad.filter((candidate) => normalizeReferenceLabel(candidate.label) === normalizeReferenceLabel(source.label));
+          const suggestion = candidates.length === 1 ? candidates[0]! : null;
+          return { source, targetId: saved?.moyskladId ?? null, targetLabel: saved?.moyskladLabel ?? null, status: saved?.status ?? 'unmapped', suggestion: saved ? null : suggestion, ambiguousSuggestions: !saved && candidates.length > 1 ? candidates : [] };
+        });
+        return [kind, { sources, targets: catalogs.moysklad }];
+      })) as Record<NamedReferenceKind, unknown>,
       dictionaries: DEFAULT_FIELD_SETTINGS.references.dictionaries.map(({ key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId }) => ({
         key, bitrix24Field, bitrix24ListId, moyskladAttributeId, moyskladDirectoryId,
         values: dictionaryCatalogs.find((candidate) => candidate.key === key),
@@ -189,6 +216,9 @@ export class FieldSettingsService {
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
       const reverse = rule.moyskladToBitrix24 as JsonRecord;
+      if (entity === 'catalog' && forward.enabled === true) {
+        throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
+      }
       if (forward.enabled === true && isRecord(forward.transform) && forward.transform.kind === 'copy') requireField(entity, 'moysklad', rule.targetField, true);
       if (reverse.enabled === true && isRecord(reverse.transform) && reverse.transform.kind === 'copy') requireField(entity, 'bitrix24', rule.sourceField, true);
     }
@@ -196,6 +226,9 @@ export class FieldSettingsService {
       const group = candidate as unknown as JsonRecord;
       const entity = String(group.entity);
       const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+      if (entity === 'catalog' && b24ToMs) {
+        throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
+      }
       for (const sourceField of group.sourceFields as string[]) requireField(entity, b24ToMs ? 'bitrix24' : 'moysklad', sourceField, false);
       requireField(entity, b24ToMs ? 'moysklad' : 'bitrix24', group.targetField, true);
     }
@@ -369,11 +402,12 @@ export class FieldSettingsService {
 }
 
 function serializeVersion(row: VersionRow): VersionedFieldSettingsDto {
+  const config = normalizePersistedConfig(row.config);
   return {
     version: row.version,
     createdAt: row.createdAt.toISOString(),
-    config: row.config,
-    references: row.config.references,
+    config,
+    references: config.references,
   };
 }
 
@@ -385,9 +419,41 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const units = validateUnits(references.units);
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
-  for (const rule of value.rules) validateRule(rule);
-  for (const group of value.groups) validateGroup(group);
-  return { ...value, references: { ...references, units, priceTypes, dictionaries } } as FieldSettingsConfig;
+  const namedPairs = validateNamedPairs(references.namedPairs ?? []);
+  const rules = value.rules.map(validateRule);
+  const groups = value.groups.map(validateGroup);
+  assertUniqueIds(rules, 'Field rule');
+  assertUniqueIds(groups, 'Field group');
+  return { ...value, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function assertUniqueIds(items: unknown[], label: string) {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const id = isRecord(item) && isString(item.id) ? item.id : '';
+    if (seen.has(id)) throw new BadRequestException(`${label} ID ${id} is duplicated`);
+    seen.add(id);
+  }
+}
+
+function validateNamedPairs(value: unknown) {
+  const kinds = new Set<NamedReferenceKind>(['employees', 'currencies', 'organizations', 'warehouses', 'projects', 'dealStages']);
+  if (!Array.isArray(value)) throw new BadRequestException('references.namedPairs must be an array');
+  const sources = new Set<string>();
+  return value.map((candidate) => {
+    if (!isRecord(candidate) || !isString(candidate.kind) || !kinds.has(candidate.kind as NamedReferenceKind) || !isString(candidate.bitrix24Id) || !isString(candidate.bitrix24Label) || !(candidate.moyskladId === null || isString(candidate.moyskladId)) || !(candidate.moyskladLabel === null || isString(candidate.moyskladLabel)) || !['suggested', 'confirmed', 'unmapped'].includes(String(candidate.status))) {
+      throw new BadRequestException('Each named reference pair needs a supported kind, source, target, labels, and status');
+    }
+    const key = `${candidate.kind}:${candidate.bitrix24Id}`;
+    if (sources.has(key)) throw new BadRequestException(`Named reference ${key} is duplicated`);
+    sources.add(key);
+    if (candidate.status === 'confirmed' && !candidate.moyskladId) throw new BadRequestException(`Named reference ${key} cannot be confirmed without a MySklad ID`);
+    return candidate;
+  });
+}
+
+function normalizeReferenceLabel(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
 }
 
 function validateDictionaries(value: unknown) {
@@ -456,8 +522,10 @@ function validateRule(value: unknown) {
   if (!isRecord(value) || !isString(value.id) || !isString(value.entity) || !isString(value.sourceField) || !isString(value.targetField)) {
     throw new BadRequestException('Each field rule needs an ID, entity, and source/target field codes');
   }
+  const criticality = validateCriticality(value.criticality);
   validateDirection(value.bitrix24ToMoysklad);
   validateDirection(value.moyskladToBitrix24);
+  return { ...value, criticality };
 }
 
 function validateGroup(value: unknown) {
@@ -470,6 +538,58 @@ function validateGroup(value: unknown) {
   if (!isRecord(value.transform) || value.transform.kind !== 'join-non-empty' || typeof value.transform.separator !== 'string') {
     throw new BadRequestException('Field groups currently support the join-non-empty transform');
   }
+  return { ...value, criticality: validateCriticality(value.criticality) };
+}
+
+function validateCriticality(value: unknown): 'critical' | 'optional' | 'tbd' {
+  if (value === undefined) return 'tbd';
+  if (value !== 'critical' && value !== 'optional' && value !== 'tbd') {
+    throw new BadRequestException('Field criticality must be critical, optional, or tbd');
+  }
+  return value;
+}
+
+function normalizePersistedConfig(config: FieldSettingsConfigDto): FieldSettingsConfigDto {
+  return {
+    ...config,
+    rules: config.rules.map((rule) => ({ ...rule, criticality: validateCriticality(rule.criticality) })),
+    groups: config.groups.map((group) => ({ ...group, criticality: validateCriticality(group.criticality) })),
+  };
+}
+
+function fieldRuleRiskChanges(before: FieldSettingsConfigDto, after: FieldSettingsConfigDto): string[] {
+  const previous = new Map(before.rules.map((rule) => [rule.id, rule]));
+  const next = new Map(after.rules.map((rule) => [rule.id, rule]));
+  const changes: string[] = [];
+  for (const [id, oldRule] of previous) {
+    const newRule = next.get(id);
+    if (!newRule) {
+      changes.push(`removed ${oldRule.entity}:${oldRule.sourceField} → ${oldRule.targetField}`);
+      continue;
+    }
+    if (oldRule.entity !== newRule.entity || oldRule.sourceField !== newRule.sourceField || oldRule.targetField !== newRule.targetField) {
+      changes.push(`key changed ${oldRule.entity}:${oldRule.sourceField} → ${oldRule.targetField} to ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+    }
+    if (oldRule.bitrix24ToMoysklad.enabled !== newRule.bitrix24ToMoysklad.enabled || oldRule.moyskladToBitrix24.enabled !== newRule.moyskladToBitrix24.enabled) {
+      changes.push(`direction changed for ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+    }
+  }
+  for (const [id, newRule] of next) if (!previous.has(id)) changes.push(`added ${newRule.entity}:${newRule.sourceField} → ${newRule.targetField}`);
+  const oldGroups = new Map(before.groups.map((group) => [group.id, group]));
+  const newGroups = new Map(after.groups.map((group) => [group.id, group]));
+  for (const [id, oldGroup] of oldGroups) {
+    const newGroup = newGroups.get(id);
+    if (!newGroup) {
+      changes.push(`removed group ${oldGroup.entity}:${oldGroup.sourceFields.join('+')} → ${oldGroup.targetField}`);
+      continue;
+    }
+    if (oldGroup.entity !== newGroup.entity || oldGroup.targetField !== newGroup.targetField || oldGroup.sourceFields.join('\0') !== newGroup.sourceFields.join('\0')) {
+      changes.push(`group key changed ${oldGroup.entity}:${oldGroup.sourceFields.join('+')} → ${oldGroup.targetField}`);
+    }
+    if (oldGroup.direction !== newGroup.direction) changes.push(`group direction changed for ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
+  }
+  for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`added group ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
+  return changes;
 }
 
 function validateDirection(value: unknown) {
