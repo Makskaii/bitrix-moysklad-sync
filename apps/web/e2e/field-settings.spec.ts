@@ -4,7 +4,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
   const writes: string[] = [];
   let version = 1;
-  let config = { rules: [{ id: 'locked-rule', entity: 'contacts', sourceField: 'UF_CRM_LOCKED', targetField: 'attributes.locked', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: [], references: {
+  let config = { rules: [{ id: 'locked-rule', entity: 'contacts', sourceField: 'UF_CRM_LOCKED', targetField: 'attributes.locked', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: [], childResourceBindings: [], references: {
     units: [{ bitrix24Id: 14, bitrix24Code: '1720010507', moyskladId: null, moyskladCode: null, status: 'unmapped' }],
     priceTypes: [], dictionaries: [
       { key: 'service', bitrix24Field: 'UF_CRM_1766085949', bitrix24ListId: '42', moyskladAttributeId: '0ad997c8-8e75-11e3-1ec9-002590a28eca', moyskladDirectoryId: 'f0177126-8e74-11e3-b761-002590a28eca', pairs: [{ bitrix24Id: 42, moyskladId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }] },
@@ -15,6 +15,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode/recovery', (route) => route.fulfill({ json: { status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null } }));
+  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: { status: 'READY', previousLaunchBoundary: null, pairsRestored: true, lostEventsAcknowledged: true } }));
   await page.route('**/api/admin/sync-mode', (route) => route.fulfill({ json: { mode: 'off' } }));
   await page.route('**/api/admin/monitoring/queue**', (route) => route.fulfill({ json: { counts: {}, events: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/incidents**', (route) => route.fulfill({ json: { cases: [], nextCursor: null } }));
@@ -23,6 +24,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.route('**/api/admin/pairs', (route) => route.fulfill({ json: [
     { id: 'contact-pair-42', entityType: 'CONTACT', bitrix24Id: '42', moyskladId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', active: true, source: 'MANUAL', reason: 'ADMIN_ASSIGNED', createdAt: '2026-10-07T00:00:00.000Z' },
     { id: 'contact-pair-43', entityType: 'CONTACT', bitrix24Id: '43', moyskladId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', active: true, source: 'MANUAL', reason: 'ADMIN_ASSIGNED', createdAt: '2026-10-07T00:00:00.000Z' },
+    { id: 'company-pair-44', entityType: 'COMPANY', bitrix24Id: '44', moyskladId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', active: true, source: 'MANUAL', reason: 'ADMIN_ASSIGNED', createdAt: '2026-10-07T00:00:00.000Z' },
   ] }));
   await page.route('**/api/admin/field-settings/catalogs?*', (route) => {
     const query = new URL(route.request().url()).searchParams;
@@ -164,4 +166,42 @@ test('field settings select, save, and reload field pairs while preview stays re
     expect.objectContaining({ sourceField: 'EMAIL', targetField: 'email' }),
   ]));
   expect(config.rules.find((rule: { sourceField: string }) => rule.sourceField === 'EMAIL')).toEqual(expect.objectContaining({ criticality: 'critical' }));
+
+  await page.getByRole('button', { name: '＋ Добавить связь реквизитов' }).click();
+  await page.getByLabel('Пара компании 1').selectOption('company-pair-44');
+  await page.getByLabel('ID реквизита Bitrix24 1').fill('9001');
+  await page.getByRole('button', { name: '＋ Добавить пару полей' }).first().click();
+  await page.getByLabel('Юридическое поле Bitrix24 1 1').selectOption('RQ_INN');
+  await page.getByLabel('Юридическое поле МойСклад 1 1').selectOption('inn');
+  await page.getByLabel('Включить банковские реквизиты 1').check();
+  await expect(page.getByRole('alert').filter({ hasText: 'ID банковских реквизитов Bitrix24' })).toBeVisible();
+  await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
+  await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Настройки реквизитов' })).toBeVisible();
+  expect(writes).toEqual(['PUT']);
+  await page.getByLabel('ID банковских реквизитов Bitrix24 1').fill('9002');
+  await page.getByLabel('UUID счёта МойСклад 1').fill('ffffffff-ffff-4fff-8fff-ffffffffffff');
+  await page.getByRole('button', { name: '＋ Добавить пару полей' }).last().click();
+  await page.getByLabel('Банковское поле Bitrix24 1 1').selectOption('RQ_BIC');
+  await page.getByLabel('Банковское поле МойСклад 1 1').selectOption('bic');
+  await page.getByRole('button', { name: '＋ Добавить связь реквизитов' }).click();
+  await page.getByLabel('Пара компании 2').selectOption('company-pair-44');
+  await expect(page.getByRole('alert').filter({ hasText: 'для компании уже настроена другая связь' })).toBeVisible();
+  await page.getByRole('button', { name: 'Удалить связь реквизитов 2' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Связь заполнена' })).toBeVisible();
+  await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
+  await expect(page.getByRole('alertdialog')).toContainText('Добавлена связь юридических/банковских реквизитов компании 44');
+  await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
+  await expect(page.getByText('Версия 3', { exact: true })).toBeVisible();
+  expect(writes).toEqual(['PUT', 'PUT']);
+  expect(config.childResourceBindings).toEqual([expect.objectContaining({
+    entity: 'companies', bitrix24CompanyId: '44', bitrix24RequisiteId: '9001', moyskladCounterpartyId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }],
+    bankDetail: { bitrix24Id: '9002', moyskladAccountId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', fields: [{ bitrix24Field: 'RQ_BIC', moyskladField: 'bic' }] },
+  })]);
+  await page.reload();
+  await page.getByRole('button', { name: 'Соответствия полей' }).click();
+  await expect(page.getByText('Версия 3', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('ID реквизита Bitrix24 1')).toHaveValue('9001');
+  await expect(page.getByLabel('UUID счёта МойСклад 1')).toHaveValue('ffffffff-ffff-4fff-8fff-ffffffffffff');
 });
