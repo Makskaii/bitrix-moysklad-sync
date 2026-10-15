@@ -31,6 +31,7 @@ export type ClientDependencyResolution =
 export interface ClientDependencyResolver {
   resolveForDocument(input: ClientDependencyInput, lease?: EventWorkerLeaseContext): Promise<ClientDependencyResolution>;
   scheduleOptionalContactRetry(input: ClientDependencyInput, reason: string, retryAfter?: Date): Promise<void>;
+  verifyServiceCounterparty(id: string): Promise<boolean>;
 }
 
 export type { DocumentClientResolution };

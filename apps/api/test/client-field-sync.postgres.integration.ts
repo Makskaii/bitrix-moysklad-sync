@@ -9,14 +9,16 @@ import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { EntityPairService } from '../src/pairs/entity-pair.service';
 import { ProviderFailure } from '../src/provider-failure';
+import { ClientChildResourceSync } from '../src/clients/client-child-resource-sync';
 
 const suffix = randomUUID();
 const sourceId = `client-field-${suffix}`;
 const targetId = randomUUID();
-const parentId = randomUUID();
-const pairId = `client-field-pair-${suffix}`;
-const companySourceId = `client-field-company-${suffix}`;
+const companySourceId = '481';
 const companyTargetId = randomUUID();
+const parentId = companyTargetId;
+const companyAccountId = randomUUID();
+const pairId = `client-field-pair-${suffix}`;
 const companyPairId = `client-field-company-pair-${suffix}`;
 let baseEventId = '';
 let forwardEventId = '';
@@ -36,9 +38,12 @@ let companyB24: Record<string, unknown>;
 let companyMs: Record<string, unknown>;
 
 function event(id: string, source: 'BITRIX24' | 'MOYSKLAD', entityId: string, entityType: string) {
+  const payload = source === 'MOYSKLAD' && entityType === 'contactperson'
+    ? { events: [{ meta: { href: `https://moysklad.fake/api/remap/1.2/entity/counterparty/${parentId}/contactpersons/${entityId}` } }] }
+    : { event: id };
   return settings.saveAcceptedEvent({
     source, deliveryKey: id, eventType: source === 'BITRIX24' ? (entityType === 'company' ? 'ONCRMCOMPANYUPDATE' : 'ONCRMCONTACTUPDATE') : 'UPDATE',
-    externalEntityId: entityId, externalEntityType: entityType, payload: { event: id }, directionDisabled: false,
+    externalEntityId: entityId, externalEntityType: entityType, payload, directionDisabled: false,
   });
 }
 
@@ -86,10 +91,10 @@ before(async () => {
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
     }],
     childResourceBindings: [{
-      id: 'field53-company-legal-bank', entity: 'companies', bitrix24CompanyId: '481', bitrix24RequisiteId: '482',
+        id: 'field53-company-legal-bank', entity: 'companies', bitrix24CompanyId: companySourceId, bitrix24RequisiteId: '482',
       moyskladCounterpartyId: companyTargetId,
       legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }, { bitrix24Field: 'RQ_KPP', moyskladField: 'kpp' }],
-      bankDetail: { bitrix24Id: '483', moyskladAccountId: randomUUID(), fields: [
+      bankDetail: { bitrix24Id: '483', moyskladAccountId: companyAccountId, fields: [
         { bitrix24Field: 'RQ_ACC_NUM', moyskladField: 'accountNumber' }, { bitrix24Field: 'RQ_BIK', moyskladField: 'bic' },
       ] },
     }],
@@ -133,7 +138,15 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = 'https://bitrix.fake/rest/';
   process.env.MOYSKLAD_API_BASE_URL = 'https://moysklad.fake/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-token';
-  processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, { readCompanyInn: async () => '1111111111' } as never);
+  const childAdapter = new ClientChildResourceSync(async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes('crm.requisite.get.json')) return Response.json({ result: { ID: '482', ENTITY_TYPE_ID: 4, ENTITY_ID: companySourceId, RQ_INN: '1234567890', RQ_KPP: '123456789' } });
+    if (url.includes('crm.requisite.bankdetail.get.json')) return Response.json({ result: { ID: '483', ENTITY_ID: '482', RQ_ACC_NUM: '40700000000000000000', RQ_BIK: '044000001' } });
+    if (url.includes(`/counterparty/${companyTargetId}/accounts/${companyAccountId}`)) return Response.json({ id: companyAccountId, accountNumber: '40700000000000000000', bic: '044000001' });
+    if (url.includes(`/counterparty/${companyTargetId}`)) return Response.json({ id: companyTargetId, meta: { type: 'counterparty' }, inn: '1234567890', kpp: '123456789' });
+    throw new Error(`Unexpected fake child-resource read ${url} ${init.method ?? 'GET'}`);
+  }, journal);
+  processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, { readCompanyInn: async () => '1111111111' } as never, undefined, childAdapter);
   const accepted = await event(`client-field-baseline-${suffix}`, 'BITRIX24', sourceId, 'contact');
   baseEventId = accepted.id;
   assert.equal((await settings.eventConfig(baseEventId)).version, version.version);
@@ -197,7 +210,8 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
 
   const companyBaseline = await event(`client-field-company-baseline-${suffix}`, 'BITRIX24', companySourceId, 'company');
   companyBaselineEventId = companyBaseline.id;
-  assert.equal(await processor.process(companyBaselineEventId), 'BASELINE');
+  const companyBaselineResult = await processor.process(companyBaselineEventId);
+  assert.equal(companyBaselineResult, 'BASELINE', JSON.stringify(await database.operationalLog.findMany({ where: { referenceId: companyBaselineEventId }, select: { message: true } })));
   const mismatchLogs = await database.operationalLog.findMany({ where: { referenceId: companyBaselineEventId, message: { contains: 'INN mismatch' } }, select: { message: true } });
   assert.equal(mismatchLogs.length, 1, 'a saved-pair INN discrepancy is logged');
   assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: companyPairId } })).moyskladId, companyTargetId, 'the saved pair remains authoritative');

@@ -11,6 +11,7 @@ import {
 export const CLIENT_CANDIDATE_GATEWAY = Symbol('CLIENT_CANDIDATE_GATEWAY');
 
 export interface WritableClientCandidateGateway extends ClientCandidateGateway {
+  readCounterparty(id: string): Promise<Record<string, unknown>>;
   readCompanyInn(sourceSystem: ClientSystem, id: string): Promise<string | null>;
   unmarkedBitrixCompanyEquivalents(input: { id: string; name: string | null; phone: string | null; inn: string | null }): Promise<ClientCandidate[]>;
   createTarget(input: {
@@ -40,6 +41,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const values = [...new Set(rows.map((row) => stringValue(row.RQ_INN)).filter((value): value is string => Boolean(value)))];
     if (values.length > 1) throw new Error('CLIENT_COMPANY_INN_AMBIGUOUS');
     return values[0] ?? null;
+  }
+
+  async readCounterparty(counterpartyId: string): Promise<Record<string, unknown>> {
+    const record = await this.moyskladRequest(`entity/counterparty/${encodeURIComponent(counterpartyId)}`, 'GET');
+    if (!isRecord(record) || id(record.id) !== counterpartyId) throw new Error('SERVICE_COUNTERPARTY_ID_MISMATCH');
+    return record;
   }
 
   async unmarkedBitrixCompanyEquivalents(input: { id: string; name: string | null; phone: string | null; inn: string | null }): Promise<ClientCandidate[]> {

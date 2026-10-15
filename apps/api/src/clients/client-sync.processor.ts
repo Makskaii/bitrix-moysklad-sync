@@ -11,6 +11,7 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyResolver } from './client-dependency-resolver';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { ClientChildResourceSync, ClientChildResourceSnapshot, syncPinnedClientChildResources } from './client-child-resource-sync';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -36,7 +37,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     @Optional() @Inject(CLIENT_SYNC_GATEWAY) private readonly gateway?: ClientSyncGateway,
     @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) private readonly candidateGateway?: WritableClientCandidateGateway,
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
+    @Optional() private readonly childResources?: ClientChildResourceSync,
   ) {}
+
+  async verifyServiceCounterparty(counterpartyId: string): Promise<boolean> {
+    if (!this.candidateGateway) throw new Error('CLIENT_CANDIDATE_GATEWAY_UNAVAILABLE');
+    const record = await this.candidateGateway.readCounterparty(counterpartyId);
+    return isRecord(record.meta) && record.meta.type === 'counterparty' && idFromMeta(record) === counterpartyId;
+  }
 
   supports(event: { source?: string; eventType?: string | null; externalEntityType?: string | null }): boolean {
     return Boolean(entityForEvent(event));
@@ -372,6 +380,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     let entity = entityForEvent(event)!;
     let fence = workerLease;
     let releaseSourceLease: (() => Promise<void>) | undefined;
+    let releasePairLease: (() => Promise<void>) | undefined;
     this.active.add(eventId);
     try {
       const claimed = await this.database.$transaction(async (tx) => {
@@ -421,11 +430,34 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           return 'UNCHANGED';
         }
       }
+      if (entity === 'CONTACT' && sourceSystem === 'BITRIX24') {
+        const contextPairs = await this.database.entityPair.findMany({
+          where: { entityType: 'CONTACT', active: true, bitrix24Id: event.externalEntityId },
+          orderBy: [{ moyskladParentId: 'asc' }, { id: 'asc' }],
+        });
+        if (contextPairs.length) return await this.processContactPairFanout(event, eventConfig, bitrixSourceRecord!, contextPairs, fence);
+      }
+      if (entity === 'CONTACT' && sourceSystem === 'MOYSKLAD' && event.externalEntityType === 'contactperson' && !parentIdFromEvent(event)) {
+        return await this.hold(event, 'CLIENT_CONTACT_SOURCE_PARENT_MISSING', { sourceId: event.externalEntityId }, fence);
+      }
+      let contactPrimaryCompanySourceId: string | null = null;
+      let contactPrimaryCompanyTargetId: string | null = null;
+      if (entity === 'CONTACT' && sourceSystem === 'BITRIX24') {
+        contactPrimaryCompanySourceId = stringValue(bitrixSourceRecord?.COMPANY_ID);
+        if (contactPrimaryCompanySourceId) {
+          let companyPair = await this.findPersistedPair('COMPANY', contactPrimaryCompanySourceId, 'BITRIX24');
+          if (!companyPair) {
+            const resolved = await this.resolveForDocument({ eventId: event.id, sourceSystem, entity: 'COMPANY', sourceId: contactPrimaryCompanySourceId }, fence);
+            if (resolved.status === 'RETRY') return await this.retry(event, resolved.reason, resolved.retryAfter, fence);
+            if (resolved.status !== 'RESOLVED') return await this.hold(event, 'CLIENT_CONTACT_PRIMARY_COMPANY_UNRESOLVED', { sourceId: event.externalEntityId, companyId: contactPrimaryCompanySourceId }, fence);
+            companyPair = resolved.pair;
+          }
+          contactPrimaryCompanyTargetId = companyPair.moyskladId;
+        }
+      }
       const contactPairParentId = entity === 'CONTACT'
         ? sourceSystem === 'BITRIX24'
-          ? (stringValue(bitrixSourceRecord?.COMPANY_ID)
-            ? (await this.findPersistedPair('COMPANY', stringValue(bitrixSourceRecord?.COMPANY_ID)!, 'BITRIX24'))?.moyskladId ?? null
-            : null)
+          ? contactPrimaryCompanyTargetId
           : parentIdFromEvent(event)
         : undefined;
       let pair = await this.database.entityPair.findFirst({
@@ -436,8 +468,18 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         const record = await this.gateway.readMoysklad('counterparty', event.externalEntityId, null);
         if (stringValue(record.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
       }
-      if (!pair) pair = await this.resolveUnpaired(event, entity, sourceSystem, eventConfig.config, null, fence);
+      if (!pair) pair = await this.resolveUnpaired(event, entity, sourceSystem, eventConfig.config, contactPrimaryCompanySourceId, fence);
       if (!pair) return 'REVIEW';
+      const parentFence = fence;
+      const pairLease = await this.acquireRuntimeLease('BITRIX24', entity, `pair:${pair.id}`, event.id);
+      releasePairLease = () => pairLease.release();
+      fence = {
+        assertOwned: async () => { await parentFence?.assertOwned(); await pairLease.assertOwned(); },
+        assertOwnedIn: async (tx) => {
+          if (parentFence?.assertOwnedIn) await parentFence.assertOwnedIn(tx); else await parentFence?.assertOwned();
+          await pairLease.assertOwnedIn(tx);
+        },
+      };
 
       const config = eventConfig;
       const bitrixEntity = entity === 'COMPANY' ? 'COMPANY' : 'CONTACT';
@@ -470,6 +512,23 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const groups = Array.isArray(config.config.groups) ? config.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
       const prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
       const current = { bitrix24Values: selectFields(bitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(moysklad, applicable, groups, 'MOYSKLAD') };
+      let childResourceState = prior?.childResourceState ?? null;
+      let childResourceFields: string[] = [];
+      let childResourceChanged = false;
+      if (entity === 'COMPANY' && Array.isArray(config.config.childResourceBindings) && config.config.childResourceBindings.length) {
+        if (!this.childResources) return await this.hold(event, 'CLIENT_CHILD_RESOURCE_ADAPTER_UNAVAILABLE', { pairId: pair.id }, fence);
+        const childSync = await syncPinnedClientChildResources({
+          adapter: this.childResources, settings: this.settings, eventId: event.id, direction: event.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : 'MOYSKLAD_TO_BITRIX24',
+          bitrix24CompanyId: pair.bitrix24Id, moyskladCounterpartyId: pair.moyskladId,
+          prior: childResourceState as ClientChildResourceSnapshot | null,
+          fallbackMatch: pair.reason?.includes('exact_name_and_phone') ? 'exact_name_and_phone' : undefined,
+          assertLease: fence.assertOwned,
+        });
+        if (childSync.result.status === 'MANUAL_REVIEW') return await this.hold(event, childSync.result.reason, { pairId: pair.id, bindingId: childSync.result.bindingId ?? null }, fence);
+        childResourceState = childSync.result.state as unknown as Prisma.JsonValue;
+        childResourceFields = childSync.result.fields;
+        childResourceChanged = childSync.result.status === 'SYNCED' || childSync.result.status === 'JOURNALED';
+      }
 
       // First read establishes a comparison point, never a bulk write.
       if (!prior) {
@@ -479,7 +538,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
             pairId: pair.id, eventId: event.id, settingsVersion: config.version,
             bitrix24Values: current.bitrix24Values as Prisma.InputJsonValue, moyskladValues: current.moyskladValues as Prisma.InputJsonValue,
           }, update: {} });
-          await tx.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: config.version, bitrix24Values: current.bitrix24Values as Prisma.InputJsonValue, moyskladValues: current.moyskladValues as Prisma.InputJsonValue } });
+          await tx.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: config.version, bitrix24Values: current.bitrix24Values as Prisma.InputJsonValue, moyskladValues: current.moyskladValues as Prisma.InputJsonValue, ...(childResourceState ? { childResourceState: childResourceState as Prisma.InputJsonValue } : {}) } });
           await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'UNCHANGED', processingStartedAt: null, direction: null, lastSuccessfulAt: new Date(), lastErrorCategory: null } });
           await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Initial client baseline captured; no fields written (pair ${pair.id}).`, referenceId: event.id } });
         });
@@ -506,12 +565,12 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }
       await this.database.$transaction(async (tx) => {
         await assertFenceInTransaction(fence, tx);
-        await tx.entityPairSyncState.update({ where: { pairId: pair.id }, data: { settingsVersion: config.version, bitrix24Values: confirmed.bitrix24Values as Prisma.InputJsonValue, moyskladValues: confirmed.moyskladValues as Prisma.InputJsonValue } });
+        await tx.entityPairSyncState.update({ where: { pairId: pair.id }, data: { settingsVersion: config.version, bitrix24Values: confirmed.bitrix24Values as Prisma.InputJsonValue, moyskladValues: confirmed.moyskladValues as Prisma.InputJsonValue, ...(childResourceState ? { childResourceState: childResourceState as Prisma.InputJsonValue } : {}) } });
         await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'SUCCEEDED', processingStartedAt: null, direction, lastSuccessfulAt: new Date(), lastErrorCategory: null } });
-        const updatedFields = [...Object.keys(writes.moysklad), ...Object.keys(writes.bitrix24)];
+        const updatedFields = [...Object.keys(writes.moysklad), ...Object.keys(writes.bitrix24), ...childResourceFields];
         await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: updatedFields.length ? `Configured fields synchronized (MoySklad wins conflicts): ${updatedFields.join(', ')} (pair ${pair.id}).` : `No configured field changes to synchronize (pair ${pair.id}).`, referenceId: event.id } });
       });
-      return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length ? 'SYNCED' : 'UNCHANGED';
+      return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length || childResourceChanged ? 'SYNCED' : 'UNCHANGED';
     } catch (error) {
       const retryable = isRetryableFailure(error);
       const reason = error instanceof ProviderFailure && !retryable ? 'CLIENT_PROVIDER_REJECTED' : 'CLIENT_SYNC_FAILURE';
@@ -528,9 +587,115 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }).catch(() => undefined);
       return 'RETRY';
     } finally {
+      await releasePairLease?.().catch(() => undefined);
       await releaseSourceLease?.().catch(() => undefined);
       this.active.delete(eventId);
     }
+  }
+
+  private async processContactPairFanout(
+    event: PersistedEvent,
+    eventConfig: Awaited<ReturnType<FieldSettingsService['eventConfig']>>,
+    bitrixSource: ClientRecord,
+    pairs: Array<Prisma.EntityPairGetPayload<Record<string, never>>>,
+    parentFence?: EventWorkerLeaseContext,
+  ): Promise<'REVIEW' | 'BASELINE' | 'UNCHANGED' | 'SYNCED' | 'RETRY'> {
+    if (!this.gateway) return this.hold(event, 'CLIENT_RUNTIME_GATEWAY_UNAVAILABLE', {}, parentFence);
+    const failures: Array<{ pairId: string; reason: string; retryable: boolean; retryAfter?: Date }> = [];
+    let baselines = 0;
+    let syncs = 0;
+    for (const pair of pairs) {
+      let lease: ClientRuntimeLease | undefined;
+      try {
+        if ((await this.syncMode.read()).mode !== 'on') throw new Error('CLIENT_SYNC_MODE_NOT_ON');
+        // A distinct lease per saved relationship prevents one association from
+        // blocking or accidentally standing in for another company's pair.
+        lease = await this.acquireRuntimeLease('BITRIX24', 'CONTACT', `pair:${pair.id}`, event.id);
+        const fence: EventWorkerLeaseContext = {
+          assertOwned: async () => { await parentFence?.assertOwned(); await lease?.assertOwned(); },
+          assertOwnedIn: async (tx) => {
+            if (parentFence?.assertOwnedIn) await parentFence.assertOwnedIn(tx); else await parentFence?.assertOwned();
+            await lease?.assertOwnedIn(tx);
+          },
+        };
+        await fence.assertOwned();
+        if (!pair.moyskladParentId) {
+          if (pair.moyskladType !== 'counterparty') throw new Error('CLIENT_CONTACTPERSON_PARENT_MISSING');
+        } else {
+          const companyPair = await this.database.entityPair.findFirst({ where: {
+            entityType: 'COMPANY', active: true, moyskladId: pair.moyskladParentId, moyskladType: 'counterparty',
+          } });
+          if (!companyPair) throw new Error('CLIENT_CONTACT_PAIR_COMPANY_CONTEXT_UNRESOLVED');
+        }
+        if (pair.moyskladType !== 'counterparty' && pair.moyskladType !== 'contactperson') throw new Error('CLIENT_PERSISTED_PAIR_TYPE_UNKNOWN');
+        const ms = await this.gateway.readMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId);
+        if (pair.moyskladType === 'contactperson') {
+          const actualParent = idFromMeta(ms.company) ?? idFromMeta(ms.agent);
+          if (actualParent && actualParent !== pair.moyskladParentId) throw new Error('CLIENT_CONTACTPERSON_PARENT_MISMATCH');
+        } else if (stringValue(ms.companyType)?.toLowerCase() !== 'individual') {
+          throw new Error('CLIENT_CONTACT_TARGET_NOT_INDIVIDUAL');
+        }
+        const bitrix = await this.gateway.readBitrix('CONTACT', pair.bitrix24Id);
+        const mappingEntity = 'contacts-companies';
+        const rules = Array.isArray(eventConfig.config.rules) ? eventConfig.config.rules : [];
+        const applicable = rules.filter((rule: any) => rule?.entity === mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
+        const groups = Array.isArray(eventConfig.config.groups) ? eventConfig.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
+        const prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+        const current = { bitrix24Values: selectFields(bitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(ms, applicable, groups, 'MOYSKLAD') };
+        if (!prior) {
+          await this.database.$transaction(async (tx) => {
+            await assertFenceInTransaction(fence, tx);
+            await tx.entityPairBaseline.upsert({ where: { pairId: pair.id }, create: {
+              pairId: pair.id, eventId: event.id, settingsVersion: eventConfig.version,
+              bitrix24Values: current.bitrix24Values as Prisma.InputJsonValue, moyskladValues: current.moyskladValues as Prisma.InputJsonValue,
+            }, update: {} });
+            await tx.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: eventConfig.version, bitrix24Values: current.bitrix24Values as Prisma.InputJsonValue, moyskladValues: current.moyskladValues as Prisma.InputJsonValue } });
+          });
+          baselines++;
+          continue;
+        }
+        const direction = event.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : 'MOYSKLAD_TO_BITRIX24';
+        const writes = buildWrites(eventConfig.config, mappingEntity, direction, bitrix, ms, prior, applicable, this.settings);
+        if (writes.ambiguous) throw new Error(writes.ambiguous);
+        if (Object.keys(writes.moysklad).length) { await fence.assertOwned(); await this.gateway.updateMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId, writes.moysklad, event.id); }
+        if (Object.keys(writes.bitrix24).length) { await fence.assertOwned(); await this.gateway.updateBitrix('CONTACT', pair.bitrix24Id, writes.bitrix24, event.id); }
+        const [afterBitrix, afterMoysklad] = await Promise.all([
+          this.gateway.readBitrix('CONTACT', pair.bitrix24Id),
+          this.gateway.readMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId),
+        ]);
+        const confirmed = { bitrix24Values: selectFields(afterBitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(afterMoysklad, applicable, groups, 'MOYSKLAD') };
+        if (!matchesWrittenFields(writes.bitrix24, confirmed.bitrix24Values) || !matchesWrittenFields(writes.moysklad, confirmed.moyskladValues)) throw new ProviderFailure(Object.keys(writes.moysklad).length ? 'MOYSKLAD' : 'BITRIX24', null);
+        await this.database.$transaction(async (tx) => {
+          await assertFenceInTransaction(fence, tx);
+          await tx.entityPairSyncState.update({ where: { pairId: pair.id }, data: { settingsVersion: eventConfig.version, bitrix24Values: confirmed.bitrix24Values as Prisma.InputJsonValue, moyskladValues: confirmed.moyskladValues as Prisma.InputJsonValue } });
+          const updated = [...Object.keys(writes.moysklad), ...Object.keys(writes.bitrix24)];
+          await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: updated.length ? `Configured contact fields synchronized for company context ${pair.moyskladParentId ?? 'standalone'}: ${updated.join(', ')} (pair ${pair.id}).` : `No configured contact field changes for company context ${pair.moyskladParentId ?? 'standalone'} (pair ${pair.id}).`, referenceId: event.id } });
+        });
+        if (Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length) syncs++;
+      } catch (error) {
+        const reason = safeReason(error);
+        failures.push({ pairId: pair.id, reason, retryable: isRetryableFailure(error), retryAfter: isRetryableFailure(error) ? retryAtForFailure(error, event.attempts + 1) : undefined });
+      } finally {
+        await lease?.release().catch(() => undefined);
+      }
+    }
+    if (failures.length) {
+      const retryable = failures.some((failure) => failure.retryable);
+      if (!retryable) return this.hold(event, 'CLIENT_CONTACT_CONTEXT_SYNC_REVIEW', { failures }, parentFence);
+      const retryAfter = failures.filter((failure) => failure.retryable && failure.retryAfter).map((failure) => failure.retryAfter!).sort((a, b) => a.getTime() - b.getTime())[0];
+      await this.database.$transaction(async (tx) => {
+        await assertFenceInTransaction(parentFence, tx);
+        await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'RETRYABLE_FAILURE', processingStartedAt: null, retryAfter: retryAfter ?? retryAtForFailure(new Error('CLIENT_CONTACT_CONTEXT_SYNC_RETRY'), event.attempts + 1), lastErrorCategory: 'CLIENT_CONTACT_CONTEXT_SYNC_RETRY' } });
+        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Some contact company contexts need retry: ${failures.map((failure) => `${failure.pairId}:${failure.reason}`).join('; ')}.`, referenceId: event.id } });
+      });
+      return 'RETRY';
+    }
+    await this.database.$transaction(async (tx) => {
+      await assertFenceInTransaction(parentFence, tx);
+      await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'SUCCEEDED', processingStartedAt: null, direction: 'BITRIX24_TO_MOYSKLAD', lastSuccessfulAt: new Date(), lastErrorCategory: null } });
+    });
+    if (syncs) return 'SYNCED';
+    return baselines ? 'BASELINE' : 'UNCHANGED';
   }
 
   private async resolveUnpaired(event: PersistedEvent, entity: 'COMPANY' | 'CONTACT', sourceSystem: ClientSystem, config: unknown, primaryCompanyOverride: string | null = null, workerLease?: EventWorkerLeaseContext, parentFence?: EventWorkerLeaseContext, optionalRetry = false): Promise<any | null> {
@@ -746,6 +911,18 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client event requires review: ${reason}.`, referenceId: event.id } });
     });
     return 'REVIEW';
+  }
+
+  private async retry(event: PersistedEvent, reason: string, retryAfter?: Date, fence?: EventWorkerLeaseContext): Promise<'RETRY'> {
+    await this.database.$transaction(async (tx) => {
+      await assertFenceInTransaction(fence, tx);
+      await tx.inboundEvent.updateMany({ where: { id: event.id, status: event.status }, data: {
+        status: 'RETRYABLE_FAILURE', processingStartedAt: null, lastErrorCategory: reason,
+        retryAfter: retryAfter ?? retryAtForFailure(new Error(reason), event.attempts + 1),
+      } });
+      await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client dependency held for retry: ${reason}.`, referenceId: event.id } });
+    });
+    return 'RETRY';
   }
 }
 

@@ -303,6 +303,18 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_NOT_CONFIGURED' };
       }
       if (sourceSystem === 'BITRIX24' && !dependencies.some((dependency) => dependency.sourceId) && serviceCounterpartyId) {
+        if (!this.clientDependencies.verifyServiceCounterparty) return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_UNAVAILABLE' };
+        try {
+          if (!await this.clientDependencies.verifyServiceCounterparty(serviceCounterpartyId)) {
+            return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_INVALID' };
+          }
+        } catch (error) {
+          if (error instanceof ProviderFailure && isRetryableFailure(error)) {
+            return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_FAILED', retryAfter: retryAtForFailure(error, attempt) };
+          }
+          if (isRetryableFailure(error)) return { status: 'RETRY' as const, reason: 'SERVICE_COUNTERPARTY_VALIDATION_FAILED', retryAfter: retryAtForFailure(error, attempt) };
+          return { status: 'REVIEW' as const, reason: 'SERVICE_COUNTERPARTY_INVALID' };
+        }
         await writeOperationalLog(this.database, 'EVENT', `Document has no client; configured service counterparty ${serviceCounterpartyId} is available.`, event.id);
       }
       let companyPair: import('@prisma/client').EntityPair | null = null;

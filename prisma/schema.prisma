@@ -324,6 +324,7 @@ model EntityPairSyncState {
   settingsVersion Int
   bitrix24Values  Json
   moyskladValues  Json
+  childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }

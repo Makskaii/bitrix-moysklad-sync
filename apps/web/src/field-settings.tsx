@@ -18,7 +18,7 @@ type FieldGroup = {
   targetField: string;
   sourceFields: string[];
   criticality: 'critical' | 'optional' | 'tbd';
-  transform: { kind: 'join-non-empty'; separator: string };
+  transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
 };
 type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
 type PriceTypePair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladLabel: string | null; status: string };
@@ -182,7 +182,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [mappingEntity, setMappingEntity] = useState('deals-orders');
   const metadataRequest = useRef(0);
   const [saveValidationError, setSaveValidationError] = useState('');
-  const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
+  const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ', transformKind: 'join-non-empty' as FieldGroup['transform']['kind'], valueType: '' });
 
   const headers: Record<string, string> = {
     ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
@@ -326,12 +326,14 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   function addGroup(event: React.FormEvent) {
     event.preventDefault();
-    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim()) return;
+    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
       criticality: 'tbd',
-      transform: { kind: 'join-non-empty', separator: groupForm.separator },
+      transform: groupForm.transformKind === 'split-non-empty'
+        ? { kind: 'split-non-empty', separator: groupForm.separator, valueType: groupForm.valueType }
+        : { kind: 'join-non-empty', separator: groupForm.separator },
     };
     changeDraft((current) => ({ ...current, groups: [...current.groups, group] }));
     setGroupForm((current) => ({ ...current, targetField: '', sourceFields: '' }));
@@ -514,13 +516,18 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
           <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
-          <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD">Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
+          <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD" disabled={groupForm.transformKind === 'split-non-empty'}>Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
+          <label>Преобразование<select aria-label="Преобразование группы" value={groupForm.transformKind} onChange={(event) => {
+            const transformKind = event.target.value as FieldGroup['transform']['kind'];
+            setGroupForm({ ...groupForm, transformKind, ...(transformKind === 'split-non-empty' ? { direction: 'MOYSKLAD_TO_BITRIX24' as const } : {}) });
+          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
           <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
             const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
-            setGroupForm({ ...groupForm, sourceFields: selected.join(',') });
+            setGroupForm({ ...groupForm, sourceFields: (groupForm.transformKind === 'split-non-empty' ? selected.slice(0, 1) : selected).join(',') });
           }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
+          {groupForm.transformKind === 'split-non-empty' && <label>Тип значения Bitrix24<select aria-label="Тип значения Bitrix24" value={groupForm.valueType} onChange={(event) => setGroupForm({ ...groupForm, valueType: event.target.value })}><option value="">Выберите тип</option>{['WORK', 'HOME', 'MOBILE', 'MAILING', 'OTHER', 'FAX', 'PAGER'].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>}
           <button type="submit" className="button-secondary">Добавить составное правило</button>
         </form>
         {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small><label>Критичность<select aria-label={`Критичность группы ${group.targetField}`} value={group.criticality ?? 'tbd'} onChange={(event) => changeDraft((current) => ({ ...current, groups: current.groups.map((item) => item.id === group.id ? { ...item, criticality: event.target.value as FieldGroup['criticality'] } : item) }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
