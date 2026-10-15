@@ -722,7 +722,7 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
 function applyGroupTransform(group: JsonRecord, source: JsonRecord, direction: string): { value: unknown; error?: string; transform: string } {
   const fields = Array.isArray(group.sourceFields) ? group.sourceFields.filter(isString) : [];
   const transform = group.transform;
-  if (!isRecord(transform) || !isString(transform.separator) || transform.separator.length === 0) return { value: null, error: 'transform is not supported', transform: 'unsupported' };
+  if (!isRecord(transform) || typeof transform.separator !== 'string' || transform.separator.length === 0) return { value: null, error: 'transform is not supported', transform: 'unsupported' };
   if (transform.kind === 'join-non-empty') {
     const values: string[] = [];
     for (const field of fields) {

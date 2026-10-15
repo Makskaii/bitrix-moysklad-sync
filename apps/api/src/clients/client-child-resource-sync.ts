@@ -24,7 +24,7 @@ const COUNTERPARTY_FIELDS = new Set(['legalTitle', 'inn', 'kpp', 'ogrn', 'ogrnip
 const BANK_FIELDS = new Set(['RQ_BANK_NAME', 'RQ_BANK_ADDR', 'RQ_BIK', 'RQ_BIC', 'RQ_ACC_NUM', 'RQ_COR_ACC_NUM']);
 const ACCOUNT_FIELDS = new Set(['bankName', 'bankLocation', 'bic', 'accountNumber', 'correspondentAccount']);
 const LEGAL_FIELD_PAIRS = new Set([
-  'RQ_COMPANY_NAME:legalTitle', 'RQ_COMPANY_FULL_NAME:legalTitle', 'RQ_INN:inn', 'RQ_KPP:kpp',
+  'RQ_COMPANY_FULL_NAME:legalTitle', 'RQ_INN:inn', 'RQ_KPP:kpp',
   'RQ_OGRN:ogrn', 'RQ_OGRNIP:ogrnip', 'RQ_OKPO:okpo',
 ]);
 
@@ -276,6 +276,12 @@ export class ClientChildResourceSync {
     if (!testAllowed && (local || reservedFake)) throw new ProviderFailure(provider, 400);
     if (url.protocol !== 'https:' && !(testAllowed && local && url.protocol === 'http:')) throw new ProviderFailure(provider, 400);
     if (provider === 'BITRIX24') {
+      if (!testAllowed) {
+        let allowedPortal: URL;
+        try { allowedPortal = new URL(process.env.BITRIX24_ALLOWED_ORIGIN ?? ''); }
+        catch { throw new ProviderFailure(provider, 400); }
+        if (allowedPortal.protocol !== 'https:' || allowedPortal.username || allowedPortal.password || allowedPortal.pathname !== '/' || allowedPortal.search || allowedPortal.hash || allowedPortal.origin !== url.origin) throw new ProviderFailure(provider, 400);
+      }
       if (!url.pathname.startsWith('/rest/') && !testAllowed) throw new ProviderFailure(provider, 400);
       if (testAllowed && !url.pathname.startsWith('/rest/')) throw new ProviderFailure(provider, 400);
     } else if (!testAllowed) {

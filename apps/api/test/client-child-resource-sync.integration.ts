@@ -91,6 +91,7 @@ after(async () => {
 test('explicit child IDs validate only documented writable requisite, bank-detail and account fields', () => {
   assert.equal(validateChildResourceBindings([binding]), null);
   assert.equal(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'RQ_OGRNIP', moyskladField: 'ogrnip' }] }]), null);
+  assert.equal(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'RQ_COMPANY_NAME', moyskladField: 'legalTitle' }] }]), null, 'field-code shape is valid; company-type compatibility is checked against the live counterparty');
   assert.match(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'ID', moyskladField: 'id' }] }]) ?? '', /Unsupported or read-only requisite mapping/);
   assert.match(validateChildResourceBindings([{ ...binding, bankDetail: { ...binding.bankDetail!, fields: [{ bitrix24Field: 'RQ_COUNTRY_CODE_GUESS', moyskladField: 'country' }] } }]) ?? '', /Unsupported or read-only bank mapping/);
   assert.match(validateChildResourceBindings([{ ...binding, bitrix24RequisiteId: '' }]) ?? '', /explicit company, requisite, and counterparty IDs/);
@@ -191,6 +192,13 @@ test('per-type legal mappings allow supported RU/UZ fields and review incompatib
   process.env.SYNC_MODE = 'apply';
   calls = [];
   const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  counterparty = { ...counterparty, companyType: 'legal' };
+  const shortName = await adapter.syncForPair({ eventId: 'short-name-as-legal-title', direction: 'BITRIX24_TO_MOYSKLAD',
+    bindings: [{ ...binding, bankDetail: undefined, legalFields: [{ bitrix24Field: 'RQ_COMPANY_NAME', moyskladField: 'legalTitle' }] }],
+    bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(shortName, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false, 'short company name must not overwrite a full legal title');
+  calls = [];
   counterparty = { ...counterparty, companyType: 'entrepreneur' };
   const entrepreneurBinding = { ...binding, bankDetail: undefined, legalFields: [
     { bitrix24Field: 'RQ_COMPANY_FULL_NAME', moyskladField: 'legalTitle' }, { bitrix24Field: 'RQ_INN', moyskladField: 'inn' },
@@ -250,10 +258,12 @@ test('APPLY child writes honor database-recovery guard before any provider mutat
 
 test('provider URL validation rejects untrusted hosts and non-provider paths before credentials or requests are sent', async () => {
   const oldB24 = process.env.BITRIX24_REST_BASE_URL;
+  const oldAllowedB24 = process.env.BITRIX24_ALLOWED_ORIGIN;
   const oldMs = process.env.MOYSKLAD_API_BASE_URL;
   const oldMode = process.env.SYNC_MODE;
   process.env.SYNC_MODE = 'apply';
-  process.env.BITRIX24_REST_BASE_URL = 'https://portal.example/not-rest/';
+  process.env.BITRIX24_REST_BASE_URL = 'https://evil.com/rest/webhook/';
+  process.env.BITRIX24_ALLOWED_ORIGIN = 'https://portal.bitrix24.ru';
   process.env.MOYSKLAD_API_BASE_URL = 'https://attacker.example/api/remap/1.2/';
   const requests: string[] = [];
   const adapter = new ClientChildResourceSync(async (input) => {
@@ -273,6 +283,7 @@ test('provider URL validation rejects untrusted hosts and non-provider paths bef
     assert.ok(requests.every((url) => new URL(url).origin === 'https://portal.bitrix24.ru'));
   } finally {
     if (oldB24 === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldB24;
+    if (oldAllowedB24 === undefined) delete process.env.BITRIX24_ALLOWED_ORIGIN; else process.env.BITRIX24_ALLOWED_ORIGIN = oldAllowedB24;
     if (oldMs === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMs;
     if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
   }
