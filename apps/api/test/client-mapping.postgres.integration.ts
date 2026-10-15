@@ -58,6 +58,10 @@ const concurrentDealEventId = `concurrent-deal-event-${suffix}`;
 const concurrentCompanyId = `concurrent-company-${suffix}`;
 const concurrentCompanyTarget = randomUUID();
 const uncertainCompanyId = `uncertain-company-${suffix}`;
+const pagingSourceId = `paging-source-${suffix}`;
+const pagingTargetId = `paging-target-${suffix}`;
+const pagingManualSourceId = `paging-manual-source-${suffix}`;
+const pagingSecondTargetId = `second-${suffix}`;
 let database: DatabaseService;
 
 const fakeApi: ClientInventoryProvider = {
@@ -106,6 +110,8 @@ before(async () => {
 after(async () => {
   if (!database) return;
   await database.entityPair.deleteMany({ where: { bitrix24Id: { in: [companyId, contactId] } } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: { in: [pagingSourceId, pagingManualSourceId] } } });
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [pagingSourceId, pagingTargetId, pagingSecondTargetId] } } });
   await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [companyId, contactId, companyTarget, contactTarget] } } });
   await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeCompanyId } });
@@ -129,6 +135,260 @@ after(async () => {
   await database.pairReviewCase.deleteMany({ where: { sourceEntityId: uncertainCompanyId } });
   await database.inboundEvent.deleteMany({ where: { id: { in: [combinedEventId, uncertainEventId, uncertainRetryEventId, concurrentOrdinaryEventId, concurrentDealEventId, leaseLossEventId, pairWorkerLeaseLossEventId] } } });
   await database.$disconnect();
+});
+
+test('contactperson inventory resumes from the persisted nested offset after interruption', async () => {
+  await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
+  const people = [
+    { id: `resume-person-1-${suffix}` }, { id: `resume-person-2-${suffix}` }, { id: `resume-person-3-${suffix}` },
+  ];
+  const parents = [{ id: `resume-parent-1-${suffix}`, companyType: 'legal' }, { id: `resume-parent-2-${suffix}`, companyType: 'legal' }];
+  let failOnce = true;
+  const calls: Array<{ parentId: string; offset: number }> = [];
+  const provider: ClientInventoryProvider = {
+    async bitrixPage() { return { rows: [], next: null, total: 0 }; },
+    async counterpartyPage(offset) {
+      const rows = parents.slice(offset);
+      return { rows, next: offset + rows.length < parents.length ? offset + rows.length : null, total: parents.length };
+    },
+    async contactpersonPage(parentId, offset) {
+      calls.push({ parentId, offset });
+      if (parentId === parents[0]!.id && offset === 0) return { rows: [people[0]!], next: 1, total: 2 };
+      if (parentId === parents[0]!.id && offset === 1 && failOnce) { failOnce = false; throw new Error('simulated interruption'); }
+      if (parentId === parents[0]!.id && offset === 1) return { rows: [people[1]!], next: null, total: 2 };
+      if (parentId === parents[1]!.id && offset === 0) return { rows: [people[2]!], next: null, total: 1 };
+      return { rows: [], next: null, total: 0 };
+    },
+  };
+  const service = new ClientMappingService(database, provider);
+  await service.start('synthetic-disposable-b24-token');
+  let status: any;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await service.readStatus();
+    if (status.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(status.status, 'failed', JSON.stringify(status));
+  const checkpoint = await database.clientInventoryJob.findUnique({ where: { id: 'client-map' } });
+  assert.equal(checkpoint?.moyskladContactpersonParentOffset, 0);
+  assert.equal(checkpoint?.moyskladContactpersonOffset, 1);
+  assert.equal(checkpoint?.moyskladContactpersonProcessed, 0);
+
+  await service.start('synthetic-disposable-b24-token');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await service.readStatus();
+    if (status.status === 'complete' || status.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(status.status, 'complete', JSON.stringify(status));
+  assert.equal(calls.filter((call) => call.parentId === parents[0]!.id && call.offset === 0).length, 1, 'resume must continue at saved nested offset instead of repeating the parent inventory');
+  assert.ok(calls.some((call) => call.parentId === parents[1]!.id && call.offset === 0), 'resume advances to the next parent after the interrupted parent completes');
+  const saved = await database.clientInventoryObject.findMany({ where: { system: 'MOYSKLAD', nativeType: 'contactperson', externalId: { in: people.map((person) => person.id) } } });
+  assert.equal(saved.length, 3);
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [...people.map((person) => person.id), ...parents.map((parent) => parent.id)] } } });
+  await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
+});
+
+test('incomplete top-level inventory fails before reconciliation and resumes from its checkpoint', async () => {
+  await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [pagingSourceId, pagingTargetId, pagingSecondTargetId] } } });
+  const sourceId = pagingSourceId;
+  const targetId = pagingTargetId;
+  const manualSourceId = pagingManualSourceId;
+  const uuid = targetId;
+  const preserved = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: manualSourceId, moyskladId: randomUUID(), moyskladType: 'counterparty',
+    active: true, source: 'MANUAL', reason: 'ADMIN_CORRECTION',
+  } });
+  let malformed = true;
+  const provider: ClientInventoryProvider = {
+    async bitrixPage(entity) { return entity === 'COMPANY'
+      ? { rows: [{ id: sourceId, uuid }], next: null, total: 1 }
+      : { rows: [], next: null, total: 0 }; },
+    async counterpartyPage(offset) {
+      if (offset === 1 && !malformed) return { rows: [{ id: pagingSecondTargetId, companyType: 'legal' }], next: null, total: 2 };
+      if (offset > 0) return { rows: [], next: null, total: 2 };
+      if (malformed) return { rows: [{ id: targetId, companyType: 'legal' }], next: null, total: 2 };
+      return { rows: [{ id: targetId, companyType: 'legal' }, { id: pagingSecondTargetId, companyType: 'legal' }], next: null, total: 2 };
+    },
+    async contactpersonPage(_parentId, offset) { return { rows: [], next: null, total: offset }; },
+  };
+  const service = new ClientMappingService(database, provider);
+  await service.start('synthetic-disposable-b24-token');
+  let status: any;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await service.readStatus();
+    if (status.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(status.status, 'failed', JSON.stringify(status));
+  assert.equal(status.error, 'CLIENT_INVENTORY_PAGE_INVALID');
+  assert.equal(status.phase, 'MOYSKLAD_COUNTERPARTIES');
+  assert.equal(await database.entityPair.count({ where: { bitrix24Id: sourceId, active: true } }), 0, 'unconfirmed inventory must not create pairs');
+  assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: preserved.id } })).active, true, 'manual pairs remain untouched');
+
+  malformed = false;
+  await service.start('synthetic-disposable-b24-token');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await service.readStatus();
+    if (status.status === 'complete' || status.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(status.status, 'complete', JSON.stringify(status));
+  assert.equal(await database.entityPair.count({ where: { bitrix24Id: sourceId, moyskladId: targetId, active: true } }), 1, 'resume creates the unique pair exactly once');
+  await database.entityPair.deleteMany({ where: { id: preserved.id } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: sourceId } });
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [sourceId, targetId, pagingSecondTargetId] } } });
+  await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
+});
+
+test('unmatched inventory pages all records from both systems and honors filters', async () => {
+  const sourceRows = Array.from({ length: 205 }, (_, index) => ({
+    system: 'BITRIX24', entityType: 'COMPANY', nativeType: 'company', externalId: `page-source-${suffix}-${String(index).padStart(3, '0')}`, status: 'UNMATCHED', reason: 'UUID_MISSING',
+  }));
+  const targetRows = Array.from({ length: 4 }, (_, index) => ({
+    system: 'MOYSKLAD', entityType: 'CONTACT', nativeType: 'contactperson', externalId: `page-target-${suffix}-${index}`, parentId: `parent-${suffix}`, status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH',
+  }));
+  await database.clientInventoryObject.createMany({ data: [...sourceRows, ...targetRows] });
+  const service = new ClientMappingService(database, fakeApi);
+  const collected: Array<{ system: string; entityType: string; externalId: string }> = [];
+  let page = await service.listUnmatched();
+  assert.equal(page.entries.length, 100);
+  while (true) {
+    collected.push(...page.entries.map((entry) => ({ system: entry.system, entityType: entry.entityType, externalId: entry.externalId })));
+    if (!page.nextCursor) break;
+    page = await service.listUnmatched(undefined, undefined, page.nextCursor);
+  }
+  assert.equal(collected.length, sourceRows.length + targetRows.length);
+  assert.equal(new Set(collected.map((row) => `${row.system}:${row.entityType}:${row.externalId}`)).size, collected.length);
+  assert.equal(collected.filter((row) => row.system === 'BITRIX24').length, 205);
+  assert.equal(collected.filter((row) => row.system === 'MOYSKLAD').length, 4);
+  const filtered = await service.listUnmatched('MOYSKLAD', 'CONTACT');
+  assert.equal(filtered.entries.length, 4);
+  assert.ok(filtered.entries.every((row) => row.parentId === `parent-${suffix}`));
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { contains: suffix } } });
+});
+
+test('manual COMPANY and CONTACT assignments update both inventory sides immediately and clear replaced targets safely', async () => {
+  const pairService = new EntityPairService(database);
+  const mapping = new ClientMappingService(database, fakeApi);
+  const companySource = `manual-company-source-${suffix}`;
+  const companyTarget = `manual-company-target-${suffix}`;
+  const contactSource = `manual-contact-source-${suffix}`;
+  const contactTarget = `manual-contact-target-${suffix}`;
+  const replacementSource = `replace-company-source-${suffix}`;
+  const replacementTarget = `replace-company-target-${suffix}`;
+  const replacementNextTarget = `replace-company-next-target-${suffix}`;
+  const sharedContactSource = `shared-contact-source-${suffix}`;
+  const staleSource = `stale-company-source-${suffix}`;
+  const staleTarget = `stale-company-target-${suffix}`;
+  const staleNextTarget = `stale-company-next-target-${suffix}`;
+  const rows = [
+    { system: 'BITRIX24', entityType: 'COMPANY', nativeType: 'company', externalId: companySource, status: 'UNMATCHED', reason: 'UUID_MISSING' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: companyTarget, companyType: 'legal', status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH' },
+    { system: 'BITRIX24', entityType: 'CONTACT', nativeType: 'contact', externalId: contactSource, status: 'UNMATCHED', reason: 'UUID_MISSING' },
+    { system: 'MOYSKLAD', entityType: 'CONTACT', nativeType: 'contactperson', externalId: contactTarget, parentId: `parent-${suffix}`, status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH' },
+    { system: 'BITRIX24', entityType: 'COMPANY', nativeType: 'company', externalId: replacementSource, status: 'UNMATCHED', reason: 'UUID_MISSING' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: replacementTarget, companyType: 'legal', status: 'MATCHED' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: replacementNextTarget, companyType: 'legal', status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH' },
+    { system: 'BITRIX24', entityType: 'CONTACT', nativeType: 'contact', externalId: sharedContactSource, status: 'MATCHED' },
+    { system: 'MOYSKLAD', entityType: 'CONTACT', nativeType: 'counterparty', externalId: replacementTarget, companyType: 'individual', status: 'MATCHED' },
+    { system: 'BITRIX24', entityType: 'COMPANY', nativeType: 'company', externalId: staleSource, status: 'MATCHED' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: staleTarget, companyType: 'legal', status: 'MATCHED' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: staleNextTarget, companyType: 'legal', status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH' },
+  ];
+  await database.clientInventoryObject.createMany({ data: rows });
+  const oldPair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: replacementSource, moyskladId: replacementTarget,
+    moyskladType: 'counterparty', source: 'MANUAL', reason: 'existing fixture',
+  } });
+  const stillValidPair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: sharedContactSource, moyskladId: replacementTarget,
+    moyskladType: 'counterparty', source: 'MANUAL', reason: 'shared target fixture',
+  } });
+  const stalePair = await database.entityPair.create({ data: {
+    entityType: 'COMPANY', bitrix24Id: staleSource, moyskladId: staleTarget,
+    moyskladType: 'counterparty', source: 'MANUAL', reason: 'stale target fixture',
+  } });
+  const companyPair = await pairService.assign({ entityType: 'COMPANY', bitrix24Id: companySource, moyskladId: companyTarget, moyskladType: 'counterparty' });
+  const contactPair = await pairService.assign({ entityType: 'CONTACT', bitrix24Id: contactSource, moyskladId: contactTarget, moyskladType: 'contactperson', moyskladParentId: `parent-${suffix}` });
+  assert.ok(companyPair.id && contactPair.id);
+  const companyRows = await database.clientInventoryObject.findMany({ where: { externalId: { in: [companySource, companyTarget] } } });
+  const contactRows = await database.clientInventoryObject.findMany({ where: { externalId: { in: [contactSource, contactTarget] } } });
+  assert.ok(companyRows.every((row) => row.status === 'MATCHED'));
+  assert.ok(contactRows.every((row) => row.status === 'MATCHED'));
+  assert.deepEqual((await mapping.listUnmatched(undefined, 'COMPANY')).entries.map((row) => row.externalId).filter((id) => [companySource, companyTarget].includes(id)), []);
+  assert.deepEqual((await mapping.listUnmatched(undefined, 'CONTACT')).entries.map((row) => row.externalId).filter((id) => [contactSource, contactTarget].includes(id)), []);
+
+  await pairService.assign({ entityType: 'COMPANY', bitrix24Id: replacementSource, moyskladId: replacementNextTarget, moyskladType: 'counterparty', replaceExisting: true });
+  const [oldTargetRow, newTargetRow, retainedPair] = await Promise.all([
+    database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: replacementTarget } }),
+    database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: replacementNextTarget } }),
+    database.entityPair.findUnique({ where: { id: stillValidPair.id } }),
+  ]);
+  assert.equal(oldTargetRow?.status, 'UNMATCHED');
+  assert.equal(oldTargetRow?.reason, 'ADMIN_REASSIGNED');
+  const otherEntityTargetRow = await database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'CONTACT', externalId: replacementTarget } });
+  assert.equal(otherEntityTargetRow?.status, 'MATCHED', 'replacement must not clobber a distinct inventory row still used by a valid active pair');
+  assert.equal(newTargetRow?.status, 'MATCHED');
+  assert.equal(retainedPair?.active, true);
+  assert.equal((await database.entityPair.findUnique({ where: { id: oldPair.id } }))?.active, false);
+
+  await pairService.assign({ entityType: 'COMPANY', bitrix24Id: staleSource, moyskladId: staleNextTarget, moyskladType: 'counterparty', replaceExisting: true });
+  const [staleTargetRow, staleSourceRow] = await Promise.all([
+    database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: staleTarget } }),
+    database.clientInventoryObject.findFirst({ where: { system: 'BITRIX24', entityType: 'COMPANY', externalId: staleSource } }),
+  ]);
+  assert.equal(staleTargetRow?.status, 'UNMATCHED');
+  assert.equal(staleTargetRow?.reason, 'ADMIN_REASSIGNED');
+  assert.equal(staleSourceRow?.status, 'MATCHED');
+  assert.equal((await database.entityPair.findUnique({ where: { id: stalePair.id } }))?.active, false);
+
+  await database.entityPair.deleteMany({ where: { id: { in: [companyPair.id, contactPair.id, oldPair.id, stillValidPair.id, stalePair.id] } } });
+  await database.entityPair.deleteMany({ where: { bitrix24Id: { in: [replacementSource, staleSource] } } });
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: rows.map((row) => row.externalId) } } });
+});
+
+test('manual assignment rolls back both inventory status changes if the target update fails', async () => {
+  const bitrix24Id = `rollback-company-source-${suffix}`;
+  const moyskladId = `rollback-company-target-${suffix}`;
+  await database.clientInventoryObject.createMany({ data: [
+    { system: 'BITRIX24', entityType: 'COMPANY', nativeType: 'company', externalId: bitrix24Id, status: 'UNMATCHED', reason: 'UUID_MISSING' },
+    { system: 'MOYSKLAD', entityType: 'COMPANY', nativeType: 'counterparty', externalId: moyskladId, companyType: 'legal', status: 'UNMATCHED', reason: 'NO_SOURCE_UUID_MATCH' },
+  ] });
+  const originalTransaction = database.$transaction.bind(database);
+  let updateCalls = 0;
+  (database as any).$transaction = (callback: (transaction: any) => Promise<unknown>, options?: unknown) => originalTransaction(async (transaction: any) => await callback(new Proxy(transaction, {
+    get(target, property, receiver) {
+      if (property !== 'clientInventoryObject') return Reflect.get(target, property, receiver);
+      return new Proxy(target.clientInventoryObject, {
+        get(delegate, method, delegateReceiver) {
+          if (method !== 'updateMany') return Reflect.get(delegate, method, delegateReceiver);
+          return async (...args: unknown[]) => {
+            updateCalls++;
+            if (updateCalls === 2) throw new Error('INJECTED_TARGET_STATUS_FAILURE');
+            return delegate.updateMany(...args);
+          };
+        },
+      });
+    },
+  })), options as never);
+  try {
+    await assert.rejects(() => new EntityPairService(database).assign({
+      entityType: 'COMPANY', bitrix24Id, moyskladId, moyskladType: 'counterparty',
+    }), /INJECTED_TARGET_STATUS_FAILURE/);
+  } finally {
+    (database as any).$transaction = originalTransaction;
+  }
+  const [sourceRow, targetRow, pairCount] = await Promise.all([
+    database.clientInventoryObject.findFirst({ where: { system: 'BITRIX24', entityType: 'COMPANY', externalId: bitrix24Id } }),
+    database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: moyskladId } }),
+    database.entityPair.count({ where: { entityType: 'COMPANY', bitrix24Id, moyskladId, active: true } }),
+  ]);
+  assert.equal(sourceRow?.status, 'UNMATCHED');
+  assert.equal(targetRow?.status, 'UNMATCHED');
+  assert.equal(pairCount, 0);
+  await database.clientInventoryObject.deleteMany({ where: { externalId: { in: [bitrix24Id, moyskladId] } } });
 });
 
 test('unpaired company resolves and creates through fake APIs, then persists the runtime pair in PostgreSQL', async () => {
@@ -196,6 +456,33 @@ test('resumable inventory maps exact company/contact UUIDs to native IDs, includ
   assert.equal(inventoriedCompany?.companyType, 'legal');
   const unmatched = await service.listUnmatched();
   assert.equal(unmatched.entries.some((row) => row.externalId === companyId || row.externalId === contactId), false);
+
+  const correctedTarget = `manual-company-${suffix}`;
+  const corrected = await new EntityPairService(database).assign({ entityType: 'COMPANY', bitrix24Id: companyId, moyskladId: correctedTarget, moyskladType: 'counterparty', replaceExisting: true });
+  await database.clientInventoryJob.update({ where: { id: 'client-map' }, data: {
+    status: 'idle', phase: 'BITRIX24_COMPANIES', bitrix24CompanyStart: 0, bitrix24ContactStart: 0,
+    moyskladCounterpartyOffset: 0, moyskladContactpersonParentOffset: 0, moyskladContactpersonOffset: 0,
+    bitrix24CompanyProcessed: 0, bitrix24ContactProcessed: 0, moyskladCounterpartyProcessed: 0, moyskladContactpersonProcessed: 0,
+    leaseOwner: null, leaseUntil: null,
+  } });
+  await service.start('synthetic-disposable-b24-token');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await service.readStatus();
+    if (status.status === 'complete' || status.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(status.status, 'complete', JSON.stringify(status));
+  const preservedCorrection = await database.entityPair.findFirst({ where: { entityType: 'COMPANY', bitrix24Id: companyId, active: true } });
+  assert.equal(preservedCorrection?.id, corrected.id);
+  assert.equal(preservedCorrection?.moyskladId, correctedTarget);
+  assert.equal(preservedCorrection?.source, 'MANUAL', 'a later UUID inventory pass must preserve the administrator correction');
+  const staleUuidTarget = await database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: companyTarget } });
+  assert.equal(staleUuidTarget?.status, 'UNMATCHED');
+  assert.equal(staleUuidTarget?.reason, 'SOURCE_ALREADY_PAIRED');
+  const originalCompanyPair = pairs.find((pair) => pair.entityType === 'COMPANY');
+  assert.ok(originalCompanyPair);
+  await database.entityPair.update({ where: { id: corrected.id }, data: { active: false } });
+  await database.entityPair.update({ where: { id: originalCompanyPair.id }, data: { active: true } });
 });
 
 test('unpaired contact resolves its primary company and creates a nested MoySklad contactperson through fake APIs', async () => {

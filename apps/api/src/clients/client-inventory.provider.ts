@@ -28,8 +28,19 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
       if (!isRecord(row) || !readId(row.ID)) throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_ROW');
       return { id: readId(row.ID)!, uuid: readOptionalString(row[field]) };
     });
-    const next = isRecord(payload) && Number.isInteger(payload.next) ? Number(payload.next) : null;
-    const total = isRecord(payload) && Number.isInteger(payload.total) ? Number(payload.total) : null;
+    if (!isRecord(payload) || !Number.isInteger(payload.total) || Number(payload.total) < 0) {
+      throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_PAGINATION');
+    }
+    const total = Number(payload.total);
+    const hasNext = Object.prototype.hasOwnProperty.call(payload, 'next');
+    if (hasNext && (!Number.isInteger(payload.next) || Number(payload.next) <= start)) {
+      throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_PAGINATION');
+    }
+    const next = hasNext ? Number(payload.next) : null;
+    const expectedRows = Math.min(50, Math.max(0, total - start));
+    if (rows.length !== expectedRows || (next !== null) !== (start + rows.length < total) || (next !== null && next !== start + 50)) {
+      throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_PAGINATION');
+    }
     return { rows, next, total };
   }
 
@@ -40,7 +51,7 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     // companyType is the minimal native metadata needed to distinguish
     // organization counterparties from individual clients in the UUID map.
     url.searchParams.set('fields', 'id,companyType');
-    return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }));
+    return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }), offset);
   }
 
   async contactpersonPage(counterpartyId: string, offset: number): Promise<ClientPage<MoyskladClientRow>> {
@@ -48,7 +59,7 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     url.searchParams.set('limit', '1000');
     url.searchParams.set('offset', String(offset));
     url.searchParams.set('fields', 'id');
-    return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }), counterpartyId);
+    return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }), offset, counterpartyId);
   }
 
   private moyskladUrl(path: string): URL {
@@ -73,8 +84,13 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
   }
 }
 
-function readMoyskladPage(payload: unknown, parentId?: string): ClientPage<MoyskladClientRow> {
+function readMoyskladPage(payload: unknown, requestedOffset: number, parentId?: string): ClientPage<MoyskladClientRow> {
   if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta)) throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_RESPONSE');
+  const { size, offset, limit } = payload.meta;
+  if (!Number.isInteger(size) || Number(size) < 0 || !Number.isInteger(offset) || Number(offset) !== requestedOffset ||
+      !Number.isInteger(limit) || Number(limit) <= 0 || Number(limit) > 1000) {
+    throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_PAGINATION');
+  }
   const rows = payload.rows.map((row) => {
     if (!isRecord(row) || !readId(row.id)) throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_ROW');
     return {
@@ -82,10 +98,13 @@ function readMoyskladPage(payload: unknown, parentId?: string): ClientPage<Moysk
       ...(parentId === undefined ? { companyType: readOptionalString(row.companyType) } : {}),
     };
   });
-  const size = Number(payload.meta.size);
-  const offset = Number(payload.meta.offset);
-  const next = Number.isInteger(size) && Number.isInteger(offset) && offset + rows.length < size ? offset + rows.length : null;
-  return { rows, next, total: Number.isInteger(size) ? size : null };
+  const total = Number(size);
+  const pageOffset = Number(offset);
+  const pageLimit = Number(limit);
+  const expectedRows = Math.min(pageLimit, Math.max(0, total - pageOffset));
+  if (rows.length !== expectedRows) throw new Error('MOYSKLAD_CLIENT_INVENTORY_INVALID_PAGINATION');
+  const next = pageOffset + rows.length < total ? pageOffset + rows.length : null;
+  return { rows, next, total };
 }
 
 function readId(value: unknown): string | null {

@@ -37,7 +37,9 @@ before(async () => {
   assert.match(databaseUrl.hostname, /^(localhost|127\.0\.0\.1|postgres)$/i, 'refusing to run against a non-local database host');
   assert.match(databaseUrl.pathname, /(test|issue11|verify)/i, 'refusing to run unless the database name identifies an isolated test database');
   process.env.SYNC_MODE = 'dry';
-  process.env.DRY_DATABASE_URL = process.env.DATABASE_URL;
+  const dryUrl = new URL(process.env.DATABASE_URL);
+  dryUrl.searchParams.set('schema', 'dry_pair_resolution_test');
+  process.env.DRY_DATABASE_URL = dryUrl.toString();
   process.env.SYNC_STATE = 'on';
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-b24-event-token';
   process.env.MOYSKLAD_WEBHOOK_SECRET = 'synthetic-ms-webhook-secret';
@@ -155,6 +157,41 @@ test('public webhook invokes first-event resolution and durably holds unresolved
   createdReviewIds.push(review.id);
 });
 
+test('typed manual CONTACT pair resolves on a subsequent event and leaves prior events untouched', async () => {
+  const database = app.get(DatabaseService);
+  const bitrix24Id = `contact-b24-${suffix}`;
+  const moyskladId = `contactperson-ms-${suffix}`;
+  const parentId = `counterparty-parent-${suffix}`;
+  const oldBitrixEvent = await database.inboundEvent.create({ data: {
+    source: 'BITRIX24', deliveryKey: `old-contact-b24-${suffix}`, eventType: 'ONCRMCONTACTUPDATE',
+    externalEntityId: bitrix24Id, externalEntityType: 'deal', payload: {}, status: 'MANUAL_REVIEW', lastErrorCategory: 'PAIR_REVIEW_REQUIRED',
+  } });
+  const oldMoyskladEvent = await database.inboundEvent.create({ data: {
+    source: 'MOYSKLAD', deliveryKey: `old-contact-ms-${suffix}`, eventType: 'UPDATE',
+    externalEntityId: moyskladId, externalEntityType: 'customerorder', payload: {}, status: 'MANUAL_REVIEW', lastErrorCategory: 'PAIR_REVIEW_REQUIRED',
+  } });
+  createdEventIds.push(oldBitrixEvent.id, oldMoyskladEvent.id);
+  const pair = await app.get(EntityPairService).assign({
+    entityType: 'CONTACT', bitrix24Id, moyskladId, moyskladType: 'contactperson', moyskladParentId: parentId,
+  });
+  createdPairIds.push(pair.id);
+  assert.equal(pair.moyskladType, 'contactperson');
+  assert.equal(pair.moyskladParentId, parentId);
+
+  const resolved = await app.get(PairResolutionProvider).resolve({ entityType: 'CONTACT', sourceSystem: 'BITRIX24', externalId: bitrix24Id, eventId: `next-${suffix}` });
+  assert.equal(resolved.status, 'confirmed');
+  if (resolved.status === 'confirmed') {
+    assert.equal(resolved.pair.moyskladType, 'contactperson');
+    assert.equal(resolved.pair.moyskladParentId, parentId);
+  }
+  const [stillOldBitrix, stillOldMoysklad] = await Promise.all([
+    database.inboundEvent.findUnique({ where: { id: oldBitrixEvent.id } }),
+    database.inboundEvent.findUnique({ where: { id: oldMoyskladEvent.id } }),
+  ]);
+  assert.equal(stillOldBitrix?.status, 'MANUAL_REVIEW');
+  assert.equal(stillOldMoysklad?.status, 'MANUAL_REVIEW');
+});
+
 test('confirmed pair lookup reports identity without mutating baseline readiness', async () => {
   const database = app.get(DatabaseService);
   const bitrix24Id = `confirmed-b24-${suffix}`;
@@ -168,8 +205,7 @@ test('confirmed pair lookup reports identity without mutating baseline readiness
   assert.equal(response.status, 200);
   const ack = await response.json() as { eventId: string };
   createdEventIds.push(ack.eventId);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  const event = await database.inboundEvent.findUnique({ where: { id: ack.eventId } });
+  const event = await waitForEventStatus(database, ack.eventId, 'SUCCEEDED');
   assert.equal(event?.status, 'SUCCEEDED');
   assert.equal(event?.lastErrorCategory, null);
 });

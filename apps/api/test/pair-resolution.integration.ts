@@ -5,6 +5,7 @@ import { PairResolutionProvider } from '../src/pairs/pair-resolution.provider';
 
 type Pair = {
   id: string; entityType: string; bitrix24Id: string; moyskladId: string;
+  moyskladType?: string | null; moyskladParentId?: string | null;
   active: boolean; source: string; reason: string | null; createdAt: Date;
 };
 type Review = {
@@ -16,9 +17,11 @@ function createDatabase() {
   const pairs: Pair[] = [];
   const reviews: Review[] = [];
   let nextId = 0;
+  const requeueCalls: unknown[] = [];
   const database = {
     pairs,
     reviews,
+    requeueCalls,
     entityPair: {
       findFirst: async ({ where }: { where: Partial<Pair> }) => pairs.find((pair) =>
         Object.entries(where).every(([key, value]) => pair[key as keyof Pair] === value)) ?? null,
@@ -62,7 +65,8 @@ function createDatabase() {
         return { count: matches.length };
       },
     },
-    inboundEvent: { updateMany: async () => ({ count: 0 }) },
+    clientInventoryObject: { updateMany: async () => ({ count: 0 }) },
+    inboundEvent: { updateMany: async (args: unknown) => { requeueCalls.push(args); return { count: 0 }; } },
     $queryRaw: async () => [],
     $transaction: async <T>(operation: (tx: unknown) => Promise<T>) => operation(database as unknown),
   };
@@ -126,5 +130,16 @@ test('manual reassignment requires an explicit replace flag and keeps prior assi
   assert.equal(database.pairs.find((pair) => pair.id === original.id)?.active, false);
   assert.equal(replacement.active, true);
   assert.equal((await pairs.listActive('DEAL')).length, 1);
+});
+
+test('manual CONTACT pairs require a native MoySklad type and parent ID for nested contacts', async () => {
+  const database = createDatabase();
+  const pairs = new EntityPairService(database as never);
+  await assert.rejects(() => pairs.assign({ entityType: 'CONTACT', bitrix24Id: 'b24-contact', moyskladId: 'ms-contact' }), /moyskladType/);
+  await assert.rejects(() => pairs.assign({ entityType: 'CONTACT', bitrix24Id: 'b24-contact', moyskladId: 'ms-contact', moyskladType: 'contactperson' }), /parent counterparty ID/);
+  const saved = await pairs.assign({ entityType: 'CONTACT', bitrix24Id: 'b24-contact', moyskladId: 'ms-contact', moyskladType: 'contactperson', moyskladParentId: 'ms-parent' });
+  assert.equal(saved.moyskladType, 'contactperson');
+  assert.equal(saved.moyskladParentId, 'ms-parent');
+  assert.equal(database.requeueCalls.length, 0, 'contact-pair correction must not release historical document events in bulk');
 });
 

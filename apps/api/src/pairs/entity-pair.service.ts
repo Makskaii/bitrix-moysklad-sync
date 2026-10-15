@@ -84,6 +84,28 @@ export class EntityPairService {
             where: { id: { in: conflicts.map((pair) => pair.id) }, active: true },
             data: { active: false },
           });
+          for (const conflict of conflicts) {
+            const oldSourceStillPaired = await transaction.entityPair.findFirst({
+              where: { entityType: input.entityType, bitrix24Id: conflict.bitrix24Id, active: true },
+              select: { id: true },
+            });
+            if (!oldSourceStillPaired && conflict.bitrix24Id !== input.bitrix24Id) {
+              await transaction.clientInventoryObject.updateMany({
+                where: { system: 'BITRIX24', entityType: input.entityType, externalId: conflict.bitrix24Id },
+                data: { status: 'UNMATCHED', reason: 'ADMIN_REASSIGNED' },
+              });
+            }
+            const oldTargetStillPaired = await transaction.entityPair.findFirst({
+              where: { entityType: input.entityType, moyskladId: conflict.moyskladId, active: true },
+              select: { id: true },
+            });
+            if (!oldTargetStillPaired && conflict.moyskladId !== input.moyskladId) {
+              await transaction.clientInventoryObject.updateMany({
+                where: { system: 'MOYSKLAD', entityType: input.entityType, externalId: conflict.moyskladId },
+                data: { status: 'UNMATCHED', reason: 'ADMIN_REASSIGNED' },
+              });
+            }
+          }
         }
         const pair = await transaction.entityPair.create({
           data: {
@@ -111,6 +133,13 @@ export class EntityPairService {
             where: { system: 'BITRIX24', entityType: input.entityType, externalId: input.bitrix24Id },
             data: { status: 'MATCHED', reason: null },
           });
+          await transaction.clientInventoryObject.updateMany({
+            where: {
+              system: 'MOYSKLAD', entityType: input.entityType, externalId: input.moyskladId,
+              nativeType: input.moyskladType,
+            },
+            data: { status: 'MATCHED', reason: null },
+          });
         }
         await transaction.pairReviewCase.updateMany({
           where: {
@@ -121,14 +150,14 @@ export class EntityPairService {
           },
           data: { status: 'RESOLVED', resolvedAt: new Date() },
         });
-        await transaction.inboundEvent.updateMany({
+        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
           where: {
             source: 'BITRIX24', externalEntityType: 'deal', externalEntityId: input.bitrix24Id,
             status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
           },
           data: { status: 'RECEIVED', lastErrorCategory: null },
         });
-        await transaction.inboundEvent.updateMany({
+        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
           where: {
             source: 'MOYSKLAD', externalEntityType: 'customerorder', externalEntityId: input.moyskladId,
             status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
@@ -154,6 +183,12 @@ function validate(input: AssignEntityPairInput): void {
   }
   if (input.moyskladType === 'contactperson' && (input.entityType !== 'CONTACT' || !input.moyskladParentId)) {
     throw new BadRequestException('A contactperson pair must be a CONTACT with its parent counterparty ID');
+  }
+  if (input.entityType === 'CONTACT' && input.moyskladType !== 'counterparty' && input.moyskladType !== 'contactperson') {
+    throw new BadRequestException('A CONTACT pair must specify moyskladType as counterparty or contactperson');
+  }
+  if (input.entityType === 'COMPANY' && input.moyskladType !== 'counterparty') {
+    throw new BadRequestException('A COMPANY pair must specify moyskladType as counterparty');
   }
   if (input.moyskladParentId !== undefined && input.moyskladType !== 'contactperson') {
     throw new BadRequestException('Only a contactperson pair may specify moyskladParentId');

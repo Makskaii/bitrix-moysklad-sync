@@ -57,19 +57,22 @@ export class ClientMappingService {
     return this.ensureJob();
   }
 
-  async listUnmatched(entityType?: ClientInventoryEntity, cursor?: string) {
+  async listUnmatched(system?: 'BITRIX24' | 'MOYSKLAD', entityType?: ClientInventoryEntity, cursor?: string) {
+    if (system !== undefined && system !== 'BITRIX24' && system !== 'MOYSKLAD') throw new BadRequestException('system must be BITRIX24 or MOYSKLAD');
     if (entityType !== undefined && entityType !== 'COMPANY' && entityType !== 'CONTACT') throw new BadRequestException('entityType must be COMPANY or CONTACT');
     const after = cursor ? parseCursor(cursor) : null;
     const rows = await this.database.clientInventoryObject.findMany({
       where: {
-        system: 'BITRIX24', status: 'UNMATCHED', ...(entityType ? { entityType } : {}),
-        ...(after ? { OR: [{ entityType: { gt: after.entityType } }, { entityType: after.entityType, externalId: { gt: after.externalId } }] } : {}),
+        ...(system ? { system } : {}), status: 'UNMATCHED', ...(entityType ? { entityType } : {}),
+        ...(after ? { OR: [{ system: { gt: after.system } }, { system: after.system, entityType: { gt: after.entityType } }, { system: after.system, entityType: after.entityType, externalId: { gt: after.externalId } }] } : {}),
       },
-      orderBy: [{ entityType: 'asc' }, { externalId: 'asc' }], take: 100,
-      select: { entityType: true, externalId: true, matchValue: true, reason: true, observedAt: true },
+      orderBy: [{ system: 'asc' }, { entityType: 'asc' }, { externalId: 'asc' }], take: 101,
+      select: { system: true, entityType: true, nativeType: true, externalId: true, matchValue: true, parentId: true, reason: true, observedAt: true },
     });
-    const last = rows[rows.length - 1];
-    return { entries: rows, nextCursor: rows.length === 100 && last ? `${last.entityType}:${last.externalId}` : null };
+    const hasMore = rows.length > 100;
+    const entries = rows.slice(0, 100);
+    const last = entries[entries.length - 1];
+    return { entries, nextCursor: hasMore && last ? encodeCursor({ system: last.system as 'BITRIX24' | 'MOYSKLAD', entityType: last.entityType as ClientInventoryEntity, externalId: last.externalId }) : null };
   }
 
   private async run(owner: string, accessToken: string) {
@@ -110,25 +113,23 @@ export class ClientMappingService {
         if (job.phase === 'MOYSKLAD_CONTACTPERSONS') {
           const parents = await this.provider.counterpartyPage(job.moyskladContactpersonParentOffset);
           assertPage(parents, job.moyskladContactpersonParentOffset);
-          if (!parents.rows.length && parents.next !== null) throw new Error('CLIENT_INVENTORY_EMPTY_PAGE');
-          for (const parent of parents.rows) {
-            if (await this.pauseRequested(owner)) return;
-            let offset = 0;
-            while (true) {
-              const page = await this.provider.contactpersonPage(parent.id, offset);
-              assertPage(page, offset);
-              await this.saveMoyskladPage('contactperson', page.rows.map((row) => ({ ...row, parentId: parent.id })), owner);
-              await this.checkLease(owner);
-              if (page.next === null) break;
-              offset = page.next;
-            }
+          const parent = parents.rows[0];
+          if (!parent) {
+            job = await this.checkpoint(owner, { phase: 'RECONCILE', moyskladContactpersonOffset: 0 });
+            continue;
           }
-          job = await this.checkpoint(owner, {
-            moyskladContactpersonParentOffset: parents.next ?? 0,
-            moyskladContactpersonOffset: 0,
-            moyskladContactpersonProcessed: { increment: parents.rows.length },
-            phase: parents.next === null ? 'RECONCILE' : 'MOYSKLAD_CONTACTPERSONS',
-          });
+          if (await this.pauseRequested(owner)) return;
+          const offset = job.moyskladContactpersonOffset;
+          const page = await this.provider.contactpersonPage(parent.id, offset);
+          assertPage(page, offset);
+          await this.saveMoyskladPage('contactperson', page.rows.map((row) => ({ ...row, parentId: parent.id })), owner);
+          job = page.next === null
+            ? await this.checkpoint(owner, {
+              moyskladContactpersonParentOffset: job.moyskladContactpersonParentOffset + 1,
+              moyskladContactpersonOffset: 0,
+              moyskladContactpersonProcessed: { increment: 1 },
+            })
+            : await this.checkpoint(owner, { moyskladContactpersonOffset: page.next });
           continue;
         }
 
@@ -241,6 +242,34 @@ export class ClientMappingService {
           data: { status, reason: decision.status === 'UNMATCHED' ? decision.reason : null },
         });
       }
+      const pairedTargets = new Set([
+        ...preservedPairs.filter((pair) => pair.entity === entity).map((pair) => pair.moyskladId),
+        ...decisions.filter((decision) => decision.status === 'MATCHED').map((decision) => decision.moyskladId),
+      ]);
+      const sourceUuidById = new Map(sources.map((source) => [source.bitrix24Id, source.uuid]));
+      const unmatchedTargetReasons = new Map<string, string>();
+      for (const decision of decisions) {
+        if (decision.status !== 'UNMATCHED' || !['UUID_REPEATED', 'CONFLICTING_ACTIVE_PAIR', 'MULTIPLE_CANDIDATES'].includes(decision.reason)) continue;
+        const uuid = sourceUuidById.get(decision.bitrix24Id);
+        if (uuid) unmatchedTargetReasons.set(uuid, decision.reason);
+      }
+      const sourceAlreadyPairedUuids = new Set(decisions
+        .filter((decision) => decision.status === 'MATCHED' && decision.source === 'EXISTING')
+        .map((decision) => sourceUuidById.get(decision.bitrix24Id))
+        .filter((uuid): uuid is string => Boolean(uuid)));
+      for (const target of targets) {
+        let reason: string | null = null;
+        if (pairedTargets.has(target.id)) reason = null;
+        else if (unmatchedTargetReasons.has(target.id)) reason = unmatchedTargetReasons.get(target.id)!;
+        else if (sourceAlreadyPairedUuids.has(target.id)) reason = 'SOURCE_ALREADY_PAIRED';
+        else if (target.type === 'counterparty' && !target.companyType) reason = 'INCOMPLETE_VERIFICATION';
+        else if (target.type === 'counterparty' && !targetTypeApplies(entity, target.type, target.companyType)) reason = 'ENTITY_TYPE_MISMATCH';
+        else reason = 'NO_SOURCE_UUID_MATCH';
+        await transaction.clientInventoryObject.update({
+          where: { system_entityType_externalId: { system: 'MOYSKLAD', entityType: entity, externalId: target.id } },
+          data: { status: reason ? 'UNMATCHED' : 'MATCHED', reason },
+        });
+      }
     }, { isolationLevel: 'Serializable', timeout: 60_000 });
     await this.checkLease(owner);
   }
@@ -283,7 +312,15 @@ export class ClientMappingService {
 }
 
 function assertPage<T>(page: ClientPage<T>, requested: number) {
-  if (!Array.isArray(page.rows) || (page.next !== null && (!Number.isInteger(page.next) || page.next <= requested || page.rows.length === 0))) throw new Error('CLIENT_INVENTORY_PAGE_INVALID');
+  if (!Array.isArray(page.rows) || !Number.isInteger(page.total) || page.total === null || page.total < 0 ||
+      !Number.isInteger(requested) || requested < 0 || requested > page.total) {
+    throw new Error('CLIENT_INVENTORY_PAGE_INVALID');
+  }
+  const end = requested + page.rows.length;
+  if (end > page.total || (page.next === null && end < page.total) ||
+      (page.next !== null && (!Number.isInteger(page.next) || page.next !== end || page.next <= requested || page.rows.length === 0 || page.next >= page.total))) {
+    throw new Error('CLIENT_INVENTORY_PAGE_INVALID');
+  }
 }
 
 function targetType(value: string | null): 'counterparty' | 'contactperson' | null {
@@ -292,12 +329,22 @@ function targetType(value: string | null): 'counterparty' | 'contactperson' | nu
   return null;
 }
 
-function parseCursor(value: string): { entityType: ClientInventoryEntity; externalId: string } {
-  const separator = value.indexOf(':');
-  const entityType = value.slice(0, separator);
-  const externalId = value.slice(separator + 1);
-  if (separator < 1 || (entityType !== 'COMPANY' && entityType !== 'CONTACT') || !externalId) throw new BadRequestException('cursor is invalid');
-  return { entityType, externalId };
+function parseCursor(value: string): { system: 'BITRIX24' | 'MOYSKLAD'; entityType: ClientInventoryEntity; externalId: string } {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if ((parsed.system !== 'BITRIX24' && parsed.system !== 'MOYSKLAD') || (parsed.entityType !== 'COMPANY' && parsed.entityType !== 'CONTACT') || typeof parsed.externalId !== 'string' || !parsed.externalId) throw new Error();
+    return { system: parsed.system, entityType: parsed.entityType, externalId: parsed.externalId };
+  } catch { throw new BadRequestException('cursor is invalid'); }
+}
+
+function encodeCursor(cursor: { system: 'BITRIX24' | 'MOYSKLAD'; entityType: ClientInventoryEntity; externalId: string }): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+function targetTypeApplies(entity: ClientInventoryEntity, nativeType: string, companyType?: string | null): boolean {
+  if (nativeType === 'contactperson') return entity === 'CONTACT';
+  const type = companyType?.toLocaleLowerCase('en-US');
+  return entity === 'COMPANY' ? type === 'legal' || type === 'entrepreneur' : type === 'individual';
 }
 
 export function clientMapDecisionSummary(decision: ClientMapDecision): string {

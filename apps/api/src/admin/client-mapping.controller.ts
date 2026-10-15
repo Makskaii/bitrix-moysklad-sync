@@ -28,8 +28,9 @@ export class ClientMappingController {
   }
 
   @Get('unmatched')
-  unmatched(@Query('entityType') entityType?: string, @Query('cursor') cursor?: string) {
+  unmatched(@Query('system') system?: string, @Query('entityType') entityType?: string, @Query('cursor') cursor?: string) {
+    if (system !== undefined && system !== 'BITRIX24' && system !== 'MOYSKLAD') throw new BadRequestException('system must be BITRIX24 or MOYSKLAD');
     if (entityType !== undefined && entityType !== 'COMPANY' && entityType !== 'CONTACT') throw new BadRequestException('entityType must be COMPANY or CONTACT');
-    return this.mapping.listUnmatched(entityType as 'COMPANY' | 'CONTACT' | undefined, cursor);
+    return this.mapping.listUnmatched(system as 'BITRIX24' | 'MOYSKLAD' | undefined, entityType as 'COMPANY' | 'CONTACT' | undefined, cursor);
   }
 }
