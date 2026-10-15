@@ -40,7 +40,7 @@ export class ProductCardRuntimeService {
     // Product cards are deliberately one-way. Persisted legacy direction flags
     // must not reopen the Bitrix24 → MySklad write path.
     if (source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' };
-    if (process.env.SYNC_MODE !== 'apply') return { status: 'SKIPPED_DISABLED', reason: 'APPLY_MODE_REQUIRED' };
+    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return { status: 'SKIPPED_DISABLED', reason: 'SYNC_MODE_REQUIRED' };
     let mode: 'on' | 'pause' | 'off';
     try { mode = (await this.syncMode.read()).mode; }
     catch { return { status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_RUNTIME_MODE_READ_FAILED' }; }
@@ -93,7 +93,7 @@ export class ProductCardRuntimeService {
           SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
         `;
         if (!settings[0]) throw new ProductCardWriteGateError({ status: 'RETRYABLE_FAILURE', reason: 'PRODUCT_RUNTIME_MODE_READ_FAILED' });
-        if (process.env.SYNC_MODE !== 'apply' || settings[0].serviceMode === 'off') {
+        if ((process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || settings[0].serviceMode === 'off') {
           throw new ProductCardWriteGateError({ status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF' });
         }
         if (settings[0].serviceMode === 'pause') {

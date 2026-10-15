@@ -16,6 +16,7 @@ import { WebhookDiagnosticLog } from '../webhook-diagnostic-log';
 import { FieldSettingsController } from './field-settings.controller';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
+import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { EntityPairService } from '../pairs/entity-pair.service';
 import { PairResolutionProvider } from '../pairs/pair-resolution.provider';
 import { PAIR_RESOLVER } from '../pairs/pair-resolver';
@@ -55,13 +56,14 @@ export class LocalAdminPreviewModule {
         EventIntakeService,
         ...(databaseProvider === DatabaseService ? [EventDispatcherService, EventWorkerLeaseService] : []),
         RetentionService,
+        DryRunWriteJournal,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
           FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
           HistoricalInventoryService,
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
-          { provide: HttpClientSyncGateway, useFactory: () => new HttpClientSyncGateway(fetch) }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
-          { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService) => new HttpClientCandidateGateway(database, fetch), inject: [DatabaseService] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
+          { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
+          { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
           ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor,
           { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
           EntityPairService, PairResolutionProvider,

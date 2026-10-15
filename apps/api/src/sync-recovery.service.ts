@@ -112,7 +112,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     const downtimeTouchedWindow =
       (setting.lastInactiveAt !== null && setting.lastInactiveAt >= downtimeCutoff) ||
       (setting.lastActiveAt !== null && setting.lastActiveAt >= downtimeCutoff);
-    const enabled = mode.mode === 'on' && process.env.SYNC_MODE === 'apply' && !downtimeTouchedWindow &&
+    const configuredMode = process.env.SYNC_MODE === 'apply' || process.env.SYNC_MODE === 'dry';
+    const enabled = mode.mode === 'on' && configuredMode && !downtimeTouchedWindow &&
       clientScope?.ready === true && (clientScope.bitrix24ToMoysklad || clientScope.moyskladToBitrix24);
     const windowFrom = enabled ? this.nightlyWindowStart(now) : null;
     const claim = await this.database.syncSetting.updateMany({
@@ -136,8 +137,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         nightlyAttempts: 0,
         nightlyError: enabled ? null : downtimeTouchedWindow
           ? 'Skipped because the previous 24-hour window included OFF or PAUSE downtime.'
-          : mode.mode !== 'on' || process.env.SYNC_MODE !== 'apply'
-            ? 'Skipped because synchronization was not On and in apply mode at the scheduled time.'
+          : mode.mode !== 'on' || !configuredMode
+            ? 'Skipped because synchronization was not On and configured for dry or apply at the scheduled time.'
             : 'Skipped because the contacts-companies entity or both directions are disabled.',
       },
     });
@@ -315,7 +316,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     const downtimeTouchedWindow =
       (setting.lastInactiveAt !== null && setting.lastInactiveAt >= cutoff) ||
       (setting.lastActiveAt !== null && setting.lastActiveAt >= cutoff);
-    return mode.mode !== 'on' || process.env.SYNC_MODE !== 'apply' || downtimeTouchedWindow;
+    return mode.mode !== 'on' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || downtimeTouchedWindow;
   }
 
   private async cancelLegacyOffResumeJob() {

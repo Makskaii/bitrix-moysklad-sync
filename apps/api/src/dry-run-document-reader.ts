@@ -1,9 +1,12 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { DryRunWriteJournal } from './dry-run-write-journal';
 
 const READ_TIMEOUT_MS = 10_000;
 
 @Injectable()
 export class DryRunDocumentReader {
+  constructor(private readonly dryWrites?: DryRunWriteJournal) {}
+
   async readBitrix24Deal(id: string): Promise<Record<string, unknown>> {
     assertDryServerMode();
     return this.readBitrix24DealForBaseline(id);
@@ -27,7 +30,7 @@ export class DryRunDocumentReader {
     if (!isRecord(body) || body.error || !isRecord(body.result) || String(body.result.ID ?? '') !== id) {
       throw new ServiceUnavailableException('Bitrix24 returned an invalid deal record');
     }
-    return body.result;
+    return { ...body.result, ...(await this.dryWrites?.readback('BITRIX24', 'deal', id)) };
   }
 
   async readMoySkladCustomerOrder(id: string): Promise<Record<string, unknown>> {
@@ -53,7 +56,7 @@ export class DryRunDocumentReader {
     if (!isRecord(body) || body.id !== id || !isRecord(body.meta) || body.meta.type !== 'customerorder') {
       throw new ServiceUnavailableException('MoySklad returned an invalid customer-order record');
     }
-    return body;
+    return { ...body, ...(await this.dryWrites?.readback('MOYSKLAD', 'customerorder', id)) };
   }
 }
 

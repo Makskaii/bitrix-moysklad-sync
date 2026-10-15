@@ -1,5 +1,8 @@
 import { Injectable } from '@nestjs/common';
+import { assertApplyExternalWrite } from '../external-write-guard';
 import { DatabaseService } from '../database.service';
+import { DryRunWriteJournal } from '../dry-run-write-journal';
+import { randomUUID } from 'node:crypto';
 import {
   ClientCandidate, ClientCandidateGateway, ClientEntity, ClientSystem, ClientTargetType,
 } from './client-runtime-resolver';
@@ -16,13 +19,14 @@ export interface WritableClientCandidateGateway extends ClientCandidateGateway {
     parentId: string | null;
     source: Record<string, unknown>;
     configuredFields: Record<string, unknown>;
+    eventId?: string;
   }): Promise<string>;
 }
 
 /** Candidate lookup/create adapter used only for webhook-time client resolution. */
 @Injectable()
 export class HttpClientCandidateGateway implements WritableClientCandidateGateway {
-  constructor(private readonly database: DatabaseService, private readonly fetcher: typeof fetch = fetch) {}
+  constructor(private readonly database: DatabaseService, private readonly fetcher: typeof fetch = fetch, private readonly dryWrites?: DryRunWriteJournal) {}
 
   async readCompanyInn(sourceSystem: ClientSystem, companyId: string): Promise<string | null> {
     if (sourceSystem === 'MOYSKLAD') {
@@ -132,7 +136,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
 
   async createTarget(input: {
     entity: ClientEntity; targetSystem: ClientSystem; targetType: ClientTargetType | 'company' | 'contact'; parentId: string | null;
-    source: Record<string, unknown>; configuredFields: Record<string, unknown>;
+    source: Record<string, unknown>; configuredFields: Record<string, unknown>; eventId?: string;
   }): Promise<string> {
     if (input.targetSystem === 'MOYSKLAD') {
       const sourceName = input.entity === 'COMPANY'
@@ -144,6 +148,14 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       const path = input.targetType === 'contactperson'
         ? `entity/counterparty/${encodeURIComponent(required(input.parentId, 'CLIENT_CONTACT_PARENT_REQUIRED'))}/contactpersons`
         : 'entity/counterparty';
+      if (process.env.SYNC_MODE === 'dry' && this.dryWrites) {
+        const targetId = randomUUID();
+        await this.dryWrites.propose({ eventId: input.eventId, provider: 'MOYSKLAD', entityType: input.targetType, entityId: targetId, operation: 'CREATE', fields: {
+          id: targetId, ...body, ...(input.targetType === 'contactperson' ? { company: { id: input.parentId } } : {}),
+        } });
+        return targetId;
+      }
+      assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CREATE');
       const created = await this.moyskladRequest(path, 'POST', body);
       const resultId = isRecord(created) ? id(created.id) : null;
       if (!resultId) throw new Error('CLIENT_CREATE_RESPONSE_INVALID');
@@ -155,6 +167,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const fields = input.entity === 'COMPANY'
       ? { TITLE: sourceName, ...input.configuredFields }
       : { NAME: sourceName, ...input.configuredFields, ...(input.parentId ? { COMPANY_ID: input.parentId } : {}) };
+    if (process.env.SYNC_MODE === 'dry' && this.dryWrites) {
+      const targetId = `${Date.now()}${String(Math.floor(Math.random() * 1_000)).padStart(3, '0')}`;
+      await this.dryWrites.propose({ eventId: input.eventId, provider: 'BITRIX24', entityType: input.entity.toLowerCase(), entityId: targetId, operation: 'CREATE', fields: { ID: targetId, ...fields } });
+      return targetId;
+    }
+    assertApplyExternalWrite('BITRIX24', 'CLIENT_CREATE');
     const result = await this.bitrixRequest(method, { fields });
     const createdId = id(result);
     if (!createdId) throw new Error('CLIENT_CREATE_RESPONSE_INVALID');
@@ -162,6 +180,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   async readRecord(sourceSystem: ClientSystem, entity: ClientEntity, idValue: string, parentId: string | null = null): Promise<Record<string, unknown>> {
+    const provider = sourceSystem === 'MOYSKLAD' ? 'MOYSKLAD' : 'BITRIX24';
+    const type = sourceSystem === 'MOYSKLAD'
+      ? entity === 'CONTACT' && parentId ? 'contactperson' : 'counterparty'
+      : entity.toLowerCase();
+    const created = await this.dryWrites?.createdRecord(provider, type, idValue);
+    if (created) return created;
     if (sourceSystem === 'MOYSKLAD') {
       const path = entity === 'CONTACT' && parentId
         ? `entity/counterparty/${encodeURIComponent(parentId)}/contactpersons/${encodeURIComponent(idValue)}`
@@ -272,6 +296,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   private async bitrixJsonRequest(method: string, parameters: Record<string, unknown>): Promise<unknown> {
+    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CLIENT_CANDIDATE_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
     const form = new URLSearchParams();
@@ -302,6 +327,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   private async moyskladRequestUrl(url: URL, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<unknown> {
+    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CANDIDATE_REQUEST');
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
     const response = await this.fetcher(url, {
