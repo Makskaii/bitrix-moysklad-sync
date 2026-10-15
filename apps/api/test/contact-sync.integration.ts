@@ -28,6 +28,7 @@ type StoredEvent = {
   snapshotRevision: number;
   lastSuccessfulAt: Date | null;
   lastErrorCategory: string | null;
+  retryAfter?: Date | null;
 };
 
 const events = new Map<string, StoredEvent>();
@@ -65,6 +66,10 @@ let externalWrites: string[];
 let failNextMoyskladWrite = false;
 let bitrixHasMultipleEmails = false;
 let moyskladMissingEmail = false;
+let malformedNextBitrixResponse = false;
+let malformedNextMoyskladResponse = false;
+let malformedNextMoyskladWriteResponse = false;
+let malformedNextBitrixWriteResponse = false;
 let serviceMode: 'on' | 'pause' = 'on';
 
 const database = {
@@ -225,6 +230,12 @@ before(async () => {
 
   bitrixMock = await startMock((request, response) => {
     if (request.method === 'POST' && request.url === '/rest/crm.contact.get.json') {
+      if (malformedNextBitrixResponse) {
+        malformedNextBitrixResponse = false;
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end('{');
+        return;
+      }
       return readForm(request).then((form) => {
         assert.equal(form.get('id'), 'contact-42');
         return json(response, 200, { result: {
@@ -245,6 +256,12 @@ before(async () => {
         }
         bitrixState.email = String(form.get('fields[EMAIL][0][VALUE]'));
         externalWrites.push('BITRIX24');
+        if (malformedNextBitrixWriteResponse) {
+          malformedNextBitrixWriteResponse = false;
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end('{');
+          return;
+        }
         return json(response, 200, { result: true });
       });
     }
@@ -252,6 +269,12 @@ before(async () => {
   });
   moyskladMock = await startMock((request, response) => {
     if (request.method === 'GET' && request.url === '/api/entity/counterparty/counterparty-uuid') {
+      if (malformedNextMoyskladResponse) {
+        malformedNextMoyskladResponse = false;
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end('{');
+        return;
+      }
       return json(response, 200, { id: 'counterparty-uuid', email: moyskladMissingEmail ? null : moyskladState.email, updated: moyskladState.updatedAt });
     }
     if (request.method === 'PUT' && request.url === '/api/entity/counterparty/counterparty-uuid') {
@@ -263,6 +286,12 @@ before(async () => {
         moyskladState.email = String(body.email);
         moyskladState.updatedAt = '2026-10-02T10:00:03Z';
         externalWrites.push('MOYSKLAD');
+        if (malformedNextMoyskladWriteResponse) {
+          malformedNextMoyskladWriteResponse = false;
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end('{');
+          return;
+        }
         return json(response, 200, { id: 'counterparty-uuid', email: moyskladState.email, updated: moyskladState.updatedAt });
       });
     }
@@ -295,7 +324,6 @@ beforeEach(() => {
   manualReviewCases.clear();
   pairs.clear();
   snapshots.clear();
-  nextEventId = 0;
   process.env.SYNC_MODE = 'apply';
   process.env.SYNC_STATE = 'on';
   serviceMode = 'on';
@@ -303,6 +331,10 @@ beforeEach(() => {
   failNextMoyskladWrite = false;
   bitrixHasMultipleEmails = false;
   moyskladMissingEmail = false;
+  malformedNextBitrixResponse = false;
+  malformedNextMoyskladResponse = false;
+  malformedNextMoyskladWriteResponse = false;
+  malformedNextBitrixWriteResponse = false;
   pairs.set('contact-42', {
     id: 'pair-1',
     bitrix24ContactId: 'contact-42',
@@ -392,7 +424,7 @@ test('MoySklad reflection of a successful email write does not start a second wr
   });
   assert.equal(response.status, 200);
   const ack = (await response.json()) as { accepted: boolean; eventId: string };
-  assert.deepEqual(ack, { accepted: true, eventId: 'event-1' }, 'MoySklad webhook ACK remains unchanged');
+  assert.deepEqual(ack, { accepted: true, eventId: 'event-2' }, 'MoySklad webhook ACK remains unchanged');
 
   const statusResponse = await waitForStatus(ack.eventId, 'UNCHANGED');
   assert.equal(statusResponse.status, 200);
@@ -540,6 +572,55 @@ test('temporary destination failure keeps the prior snapshot and background retr
   assert.equal(succeeded.snapshotRevision, 2);
   assert.equal(moyskladState.email, 'after@example.test');
   assert.deepEqual(externalWrites, ['MOYSKLAD']);
+});
+
+test('applied contact write with a truncated 2xx body is read back before any repeat write', async () => {
+  malformedNextMoyskladWriteResponse = true;
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMCONTACTUPDATE', data: { FIELDS: { ID: 'contact-42' } }, auth: { application_token: 'synthetic-b24-event-token' } }),
+  });
+  const ack = await response.json() as { eventId: string };
+  const failedResponse = await waitForStatus(ack.eventId, 'RETRYABLE_FAILURE');
+  const failed = await failedResponse.json() as { attempts: number; lastErrorCategory: string | null };
+  assert.equal(failed.attempts, 1);
+  assert.equal(failed.lastErrorCategory, 'EXTERNAL_API_FAILURE');
+  assert.equal(moyskladState.email, 'after@example.test', 'fake provider applies the write before truncating its response');
+  assert.deepEqual(externalWrites, ['MOYSKLAD']);
+
+  const stored = events.get(ack.eventId)!;
+  stored.retryAfter = new Date(0);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  await app.get(ContactSyncProcessor).process(ack.eventId);
+  const succeededResponse = await waitForStatus(ack.eventId, 'SUCCEEDED');
+  const succeeded = await succeededResponse.json() as { attempts: number; snapshotRevision: number };
+  assert.equal(succeeded.attempts, 2);
+  assert.equal(succeeded.snapshotRevision, 2);
+  assert.deepEqual(externalWrites, ['MOYSKLAD'], 'retry reads the applied state and does not repeat the external write');
+});
+
+test('applied Bitrix24 contact write with a truncated 2xx body is read back before any repeat write', async () => {
+  bitrixState.email = 'before@example.test';
+  bitrixState.updatedAt = '2026-10-02T09:00:00Z';
+  moyskladState.email = 'after@example.test';
+  moyskladState.updatedAt = '2026-10-02T10:01:00Z';
+  malformedNextBitrixWriteResponse = true;
+  const response = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-webhook-secret?requestId=truncated-b24-contact-write`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ meta: { href: 'https://example.test/api/remap/1.2/entity/counterparty/counterparty-uuid' }, action: 'UPDATE' }] }),
+  });
+  const ack = await response.json() as { eventId: string };
+  const failed = await (await waitForStatus(ack.eventId, 'RETRYABLE_FAILURE')).json() as { attempts: number };
+  assert.equal(failed.attempts, 1);
+  assert.equal(bitrixState.email, 'after@example.test', 'fake B24 applies the write before truncating its response');
+  assert.deepEqual(externalWrites, ['BITRIX24']);
+
+  events.get(ack.eventId)!.retryAfter = new Date(0);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  await app.get(ContactSyncProcessor).process(ack.eventId);
+  const succeeded = await (await waitForStatus(ack.eventId, 'SUCCEEDED')).json() as { attempts: number };
+  assert.equal(succeeded.attempts, 2);
+  assert.deepEqual(externalWrites, ['BITRIX24'], 'retry verifies the current value without repeating the update');
 });
 
 test('the background recovery scan retries a failed contact event without another webhook delivery', async () => {
@@ -727,6 +808,32 @@ test('a valid counterparty with no email opens a durable manual-review incident'
     bitrixEmailFieldCount: 1,
     snapshotRevision: 1,
   });
+});
+
+test('malformed successful Bitrix24 read bodies retry before any external write', async () => {
+  malformedNextBitrixResponse = true;
+  const bitrixResponse = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMCONTACTUPDATE', data: { FIELDS: { ID: 'contact-42' } }, auth: { application_token: 'synthetic-b24-event-token' } }),
+  });
+  const bitrixAck = await bitrixResponse.json() as { eventId: string };
+  const bitrixStatus = await (await waitForStatus(bitrixAck.eventId, 'SUCCEEDED')).json() as { status: string; attempts: number };
+  assert.equal(bitrixStatus.status, 'SUCCEEDED');
+  assert.equal(bitrixStatus.attempts, 2);
+  assert.deepEqual(externalWrites, ['MOYSKLAD']);
+});
+
+test('malformed successful MoySklad read bodies retry before any external write', async () => {
+  malformedNextMoyskladResponse = true;
+  const moyskladResponse = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMCONTACTUPDATE', data: { FIELDS: { ID: 'contact-42' } }, auth: { application_token: 'synthetic-b24-event-token' } }),
+  });
+  const moyskladAck = await moyskladResponse.json() as { eventId: string };
+  const moyskladStatus = await (await waitForStatus(moyskladAck.eventId, 'SUCCEEDED')).json() as { status: string; attempts: number };
+  assert.equal(moyskladStatus.status, 'SUCCEEDED');
+  assert.equal(moyskladStatus.attempts, 2);
+  assert.deepEqual(externalWrites, ['MOYSKLAD']);
 });
 
 async function waitForStatus(eventId: string, expectedStatus = 'SUCCEEDED'): Promise<Response> {

@@ -10,13 +10,14 @@ import { CLIENT_CANDIDATE_GATEWAY, WritableClientCandidateGateway } from './clie
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyResolver } from './client-dependency-resolver';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
+import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
 
 type PersistedEvent = {
   id: string; source: string; eventType: string | null; externalEntityType: string | null;
-  externalEntityId: string | null; status: string; lastErrorCategory: string | null; processingStartedAt?: Date | null; payload?: unknown;
+  externalEntityId: string | null; status: string; lastErrorCategory: string | null; attempts: number; processingStartedAt?: Date | null; payload?: unknown;
 };
 const CLIENT_EVENT_LEASE_MS = 60_000;
 
@@ -132,7 +133,10 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         if (companyResolution.status !== 'RESOLVED') return { status: 'REVIEW', reason: 'DUPLICATE_CONTACT_COMPANY_UNRESOLVED' };
         const companyPair = companyResolution.pair;
         try { await gateway.readMoysklad('counterparty', companyPair.moyskladId, null); }
-        catch { return await this.dependencyHold(event, 'DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', { companyId, pairId: companyPair.id }, fence); }
+        catch (error) {
+          if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
+          return await this.dependencyHold(event, 'DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', { companyId, pairId: companyPair.id }, fence);
+        }
         await this.logDependencyResolution(event.id, input, companyPair, 'DUPLICATE_CONTACT_OMITTED', fence);
         return { status: 'OMITTED', reason: 'DUPLICATE_CONTACT', companyPair };
       }
@@ -198,7 +202,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           const reason = selectedSourceId === input.sourceId ? 'PERSISTED_PAIR' : 'DUPLICATE_COMPANY_CANONICALIZED';
           await this.logDependencyResolution(event.id, input, pair, reason, fence);
           return { status: 'RESOLVED', pair, selectedSourceId, reason };
-        } catch {
+        } catch (error) {
+          if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'CLIENT_PERSISTED_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
           return await this.dependencyHold(event, 'CLIENT_PERSISTED_TARGET_UNAVAILABLE', { entity: input.entity, selectedSourceId, pairId: pair.id }, fence);
         }
       }
@@ -218,7 +223,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     } catch (error) {
       if (error instanceof Error && error.message === 'CLIENT_ENTITY_LOCK_BUSY') {
         await workerLease?.assertOwned();
-        return { status: 'RETRY', reason: 'CLIENT_ENTITY_LOCK_BUSY' };
+        return { status: 'RETRY', reason: 'CLIENT_ENTITY_LOCK_BUSY', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
       }
       const unresolvedCreate = await this.database.pairReviewCase.findFirst({
         where: { entityType: input.entity, sourceSystem: input.sourceSystem, sourceEntityId: input.sourceId, status: 'OPEN', reason: 'CLIENT_CREATE_IN_PROGRESS' },
@@ -226,12 +231,15 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       if (unresolvedCreate) {
         return await this.dependencyHold(event, 'CLIENT_CREATE_RESPONSE_UNCERTAIN', { entity: input.entity, sourceId: input.sourceId, pairReviewId: unresolvedCreate.id }, fence);
       }
+      if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
+        return await this.dependencyHold(event, 'CLIENT_PROVIDER_REJECTED', { provider: error.provider, status: error.status, entity: input.entity, sourceId: input.sourceId }, fence ?? workerLease);
+      }
       await this.database.$transaction(async (tx) => {
         await assertFenceInTransaction(fence ?? workerLease, tx);
-        if (!workerLease) await tx.inboundEvent.updateMany({ where: { id: event.id, status: expectedStatus }, data: { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'CLIENT_DEPENDENCY_RETRY', retryAfter: new Date(Date.now() + 30_000) } });
+        if (!workerLease) await tx.inboundEvent.updateMany({ where: { id: event.id, status: expectedStatus }, data: { status: 'RETRYABLE_FAILURE', lastErrorCategory: 'CLIENT_DEPENDENCY_RETRY', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) } });
         await tx.operationalLog.create({ data: { category: 'CLIENT_DEPENDENCY', message: `Document client dependency will retry: ${safeReason(error)}.`, referenceId: event.id } });
       });
-      return { status: 'RETRY', reason: safeReason(error) };
+      return { status: 'RETRY', reason: safeReason(error), retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
     } finally {
       await sourceLease?.release().catch(() => undefined);
     }
@@ -408,6 +416,12 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
       ]);
       const confirmed = { bitrix24Values: selectFields(afterBitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(afterMoysklad, applicable, groups, 'MOYSKLAD') };
+      if (!matchesWrittenFields(writes.bitrix24, confirmed.bitrix24Values) || !matchesWrittenFields(writes.moysklad, confirmed.moyskladValues)) {
+        // A successful write response is not enough to advance the durable
+        // baseline. Leave the event retryable; the next attempt starts with
+        // fresh reads and will only reissue a write if the target is still stale.
+        throw new ProviderFailure(Object.keys(writes.moysklad).length ? 'MOYSKLAD' : 'BITRIX24', null);
+      }
       await this.database.$transaction(async (tx) => {
         await assertFenceInTransaction(fence, tx);
         await tx.entityPairSyncState.update({ where: { pairId: pair.id }, data: { settingsVersion: config.version, bitrix24Values: confirmed.bitrix24Values as Prisma.InputJsonValue, moyskladValues: confirmed.moyskladValues as Prisma.InputJsonValue } });
@@ -417,9 +431,17 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       });
       return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length ? 'SYNCED' : 'UNCHANGED';
     } catch (error) {
+      const retryable = isRetryableFailure(error);
+      const reason = error instanceof ProviderFailure && !retryable ? 'CLIENT_PROVIDER_REJECTED' : 'CLIENT_SYNC_FAILURE';
       await this.database.$transaction(async (tx) => {
         await assertFenceInTransaction(fence, tx);
-        await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'RETRYABLE_FAILURE', processingStartedAt: null, lastErrorCategory: 'CLIENT_SYNC_FAILURE', retryAfter: new Date(Date.now() + 30_000) } });
+        if (!retryable) await tx.manualReviewCase.upsert({
+          where: { eventId: event.id },
+          create: { eventId: event.id, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId, externalEntityType: event.externalEntityType, reason },
+          update: { reason },
+        });
+        const dueAt = retryAtForFailure(error, event.attempts + 1);
+        await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: retryable ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: reason, retryAfter: retryable ? dueAt : null } });
         await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client sync held for retry: ${safeReason(error)}.`, referenceId: event.id } });
       }).catch(() => undefined);
       return 'RETRY';
@@ -722,6 +744,9 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
 }
 
 function equal(a: unknown, b: unknown) { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); }
+function matchesWrittenFields(writes: Record<string, unknown>, readback: Record<string, unknown>) {
+  return Object.entries(writes).every(([field, value]) => Object.prototype.hasOwnProperty.call(readback, field) && equal(readback[field], value));
+}
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function safeReason(error: unknown) { return error instanceof Error ? error.message.slice(0, 120) : 'unknown'; }
 function isUniqueConstraintError(error: unknown) { return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'P2002'; }

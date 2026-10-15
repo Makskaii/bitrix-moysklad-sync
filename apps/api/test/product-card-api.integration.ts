@@ -2,11 +2,14 @@ import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
 import { createServer, Server } from 'node:http';
 import { ProductCardHttpApi } from '../src/products/product-card-api';
+import { isRetryableFailure, ProviderFailure } from '../src/provider-failure';
 
 let server: Server;
 let base = '';
 const saved = new Map<string, string | undefined>();
 const requests: Array<{ method: string; path: string; body: string }> = [];
+let malformedNextProductWriteResponse = false;
+let failNextProductWriteRetryAfter: string | null = null;
 const productId = '12345678-1234-1234-1234-123456789abc';
 
 before(async () => {
@@ -29,6 +32,17 @@ before(async () => {
           priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' && request.method === 'GET') return response.end(JSON.stringify({ id: 'abcdefab-cdef-abcd-efab-cdefabcdefad', isoCode: 'RUB' }));
+      if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'PUT' && malformedNextProductWriteResponse) {
+        malformedNextProductWriteResponse = false;
+        response.writeHead(200, { 'content-type': 'application/json' });
+        return response.end('{');
+      }
+      if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'PUT' && failNextProductWriteRetryAfter) {
+        const retryAfter = failNextProductWriteRetryAfter;
+        failNextProductWriteRetryAfter = null;
+        response.writeHead(429, { 'retry-after': retryAfter, 'content-type': 'text/plain' });
+        return response.end('temporarily rate limited');
+      }
       if (request.url === '/rest/catalog.product.update.json' || request.url === '/rest/catalog.price.update.json' || request.url === '/api/remap/1.2/entity/product/' + productId) return response.end(JSON.stringify({ result: true }));
       response.statusCode = 404;
       return response.end(JSON.stringify({ error: 'not found' }));
@@ -72,4 +86,26 @@ test('product API adapter reads only addressed cards and issues partial field an
   assert.equal(b24FieldBody.get('fields[name]'), 'Renamed');
   assert.equal(b24FieldBody.has('fields[previewText]'), false);
   assert.equal(requests.some((request) => request.path.includes('entity/search') || request.method === 'POST' && request.path.includes('/entity/product')), false);
+});
+
+test('truncated successful product response is a retryable uncertain outcome', async () => {
+  const api = new ProductCardHttpApi();
+  malformedNextProductWriteResponse = true;
+  await assert.rejects(
+    api.updateMoysklad(productId, { description: 'applied before truncation' }),
+    (error: unknown) => error instanceof ProviderFailure && isRetryableFailure(error),
+  );
+});
+
+test('malformed 429 product response preserves Retry-After classification', async () => {
+  const api = new ProductCardHttpApi();
+  const retryAfter = new Date(Date.now() + 30_000).toUTCString();
+  failNextProductWriteRetryAfter = retryAfter;
+  await assert.rejects(api.updateMoysklad(productId, { description: 'rate limited' }), (error: unknown) => {
+    assert.ok(error instanceof ProviderFailure);
+    assert.equal(error.status, 429);
+    assert.ok(error.retryAfterAt);
+    assert.ok(Math.abs(error.retryAfterAt.getTime() - Date.parse(retryAfter)) < 1_000);
+    return isRetryableFailure(error);
+  });
 });

@@ -7,6 +7,7 @@ import { ProductCardRuntimeService } from './product-card-runtime.service';
 import { ProductCardSyncResult } from './product-card-sync.service';
 import { InboundEventMetadata } from '../event-dispatcher.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
+import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -134,14 +135,20 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       }
     }
 
-    const supported = await this.resolveProductId(event);
+    const attempt = event.attempts + 1;
+    const supported = await this.resolveProductId(event, attempt);
     if (supported.status === 'not-product-event') return null;
     if (supported.status === 'unsupported-product-kind') {
       await this.finish(event.id, 'SKIPPED_UNSUPPORTED_ENTITY', 'PRODUCT_CARD_ENTITY_KIND_UNSUPPORTED', null, workerLease);
       return null;
     }
     if (supported.status === 'retryable') {
-      const result = { status: 'RETRYABLE_FAILURE' as const, reason: 'PRODUCT_EVENT_ID_RESOLUTION_FAILED', changedFields: [] };
+      if (supported.permanent) {
+        const result = { status: 'MANUAL_REVIEW' as const, reason: 'PRODUCT_PROVIDER_REJECTED', changedFields: [] };
+        await this.applyResult(event.id, event, result, workerLease);
+        return result;
+      }
+      const result = { status: 'RETRYABLE_FAILURE' as const, reason: 'PRODUCT_EVENT_ID_RESOLUTION_FAILED', changedFields: [], ...(supported.retryAfter ? { retryAfter: supported.retryAfter } : {}) };
       await this.applyResult(event.id, event, result, workerLease);
       return result;
     }
@@ -166,6 +173,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         source: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
         settingsVersion: pinned.version,
         eventId: event.id,
+        attempt,
         ...(workerLease ? { assertWorkerLease: workerLease.assertOwned } : {}),
       });
       await this.applyResult(event.id, event, result, workerLease);
@@ -180,7 +188,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
 
   private async resolveProductId(event: {
     source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; payload: Prisma.JsonValue;
-  }): Promise<{ status: 'not-product-event' } | { status: 'unsupported-product-kind' } | { status: 'retryable' } | { status: 'resolved'; productId: string }> {
+  }, attempt: number): Promise<{ status: 'not-product-event' } | { status: 'unsupported-product-kind' } | { status: 'retryable'; retryAfter?: Date; permanent?: boolean } | { status: 'resolved'; productId: string }> {
     if (event.source === 'BITRIX24' && event.eventType === 'CATALOG.PRODUCT.ON.UPDATE') {
       const root = asRecord(event.payload);
       const data = asRecord(root.data);
@@ -197,7 +205,11 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const priceId = readScalar(fields.ID) ?? event.externalEntityId;
       if (!priceId || !/^\d{1,20}$/.test(priceId)) return { status: 'retryable' };
       try { return { status: 'resolved', productId: await this.bitrixApi.readBitrix24PriceProductId(priceId) }; }
-      catch { return { status: 'retryable' }; }
+      catch (error) {
+        return isRetryableFailure(error)
+          ? { status: 'retryable', retryAfter: retryAtForFailure(error, attempt) }
+          : { status: 'retryable', permanent: true };
+      }
     }
     if (event.source === 'MOYSKLAD' && event.eventType === 'UPDATE' && event.externalEntityType === 'product') {
       const id = event.externalEntityId;
@@ -238,7 +250,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
           await finish('MANUAL_REVIEW', 'PRODUCT_RETRY_LIMIT_EXCEEDED');
           return;
         }
-        await finish('RETRYABLE_FAILURE', result.reason, new Date(Date.now() + retryDelayMs(event.attempts + 1)));
+        await finish('RETRYABLE_FAILURE', result.reason, result.retryAfter ?? new Date(Date.now() + retryDelayMs(event.attempts + 1)));
         return;
       case 'SKIPPED_DISABLED':
         await finish('SKIPPED_DISABLED', result.reason);

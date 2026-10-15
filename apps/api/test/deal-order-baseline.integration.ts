@@ -8,6 +8,9 @@ import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
+import { DealOrderHeaderSyncProcessor } from '../src/deals-orders/deal-order-header-sync.processor';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
+import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
 
 let app: INestApplication;
 let apiUrl = '';
@@ -19,6 +22,10 @@ let moyskladId = '';
 const oldEnv = new Map<string, string | undefined>();
 let bitrixComments = 'B24 initial';
 let moyskladDescription = 'MS initial';
+let failNextMoyskladWriteRetryAfter: string | null = null;
+let failNextBitrixWriteRetryAfter: string | null = null;
+let failNextBitrixRead: { status: number; retryAfter: string | null } | null = null;
+let failNextMoyskladRead: { status: number; retryAfter: string | null } | null = null;
 
 before(async () => {
   for (const key of ['SYNC_MODE', 'DATABASE_URL', 'DRY_DATABASE_URL', 'ADMIN_PREVIEW', 'LOCAL_HEADER_EXCHANGE', 'LOCAL_HEADER_EXCHANGE_READY', 'BITRIX24_EVENT_APPLICATION_TOKEN', 'BITRIX24_REST_BASE_URL', 'MOYSKLAD_WEBHOOK_SECRET', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN']) oldEnv.set(key, process.env[key]);
@@ -39,15 +46,20 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = `${fakeBase}/b24/rest/`;
   process.env.MOYSKLAD_API_BASE_URL = `${fakeBase}/ms/api/remap/1.2/`;
 
+  // Clear only the explicitly supplied isolated apply-test schema before
+  // Nest starts recovery scans in onApplicationBootstrap.
+  const setupDatabase = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+  await setupDatabase.inboundEvent.deleteMany({});
+  await setupDatabase.entityPairBaseline.deleteMany({});
+  await setupDatabase.entityPairSyncState.deleteMany({});
+  await setupDatabase.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
+  await setupDatabase.$disconnect();
+
   app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
   const database = app.get(DatabaseService);
   await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
-  await database.inboundEvent.deleteMany({});
-  await database.entityPairBaseline.deleteMany({});
-  await database.entityPairSyncState.deleteMany({});
-  await database.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
 });
 
 after(async () => {
@@ -82,19 +94,23 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   assert.equal(intake.status, 200);
   const { eventId } = await intake.json() as { eventId: string };
 
-  for (let attempt = 0; attempt < 50 && externalRequests.length < 2; attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
+  for (let attempt = 0; attempt < 50 && externalRequests.length < 3; attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
+  await waitForEventStatus(database, eventId, 'SUCCEEDED');
   assert.deepEqual(externalRequests.map(({ method, path }) => [method, path]), [
+    ['POST', '/b24/rest/crm.deal.get.json'], // dependency discovery reads the deal before baseline capture
     ['GET', `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`],
     ['POST', '/b24/rest/crm.deal.get.json'],
   ]);
   assert.equal(externalRequests.filter(isWrite).length, 0, 'baseline capture must not write either system');
   assert.equal(moyskladDescription, 'MS initial');
 
+
   process.env.LOCAL_HEADER_EXCHANGE_READY = '0';
   bitrixComments = 'blocked while entity readiness gate is closed';
   const readinessGated = await postB24(bitrixId, bitrixComments, 'entity-not-ready');
   assert.equal(readinessGated.status, 200);
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  const { eventId: readinessGatedEventId } = await readinessGated.json() as { eventId: string };
+  await waitForEventStatus(database, readinessGatedEventId, 'SKIPPED_DISABLED');
   assert.equal(externalRequests.filter(isWrite).length, 0, 'global mode and mapping alone do not bypass entity readiness');
   process.env.LOCAL_HEADER_EXCHANGE_READY = '1';
 
@@ -104,7 +120,9 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
     body: JSON.stringify({ event: 'ONCRMDEALUPDATE', data: { FIELDS: { ID: bitrixId, COMMENTS: 'B24 changed' }, marker: 'b24-change-1' }, auth: { application_token: 'synthetic-event-token' } }),
   });
   assert.equal(changedB24.status, 200);
+  const { eventId: changedB24EventId } = await changedB24.json() as { eventId: string };
   await waitUntil(() => moyskladDescription === 'B24 changed');
+  await waitForEventStatus(database, changedB24EventId, 'SUCCEEDED');
   const b24UpdateCount = externalRequests.filter((request) => request.path.endsWith('/crm.deal.update.json')).length;
   assert.equal(b24UpdateCount, 0);
   assert.equal(externalRequests.filter((request) => request.method === 'PUT').length, 1);
@@ -112,6 +130,8 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   // Re-delivery of the same value is an echo/no-op, not another write.
   const echoB24 = await postB24(bitrixId, 'B24 changed', 'b24-echo');
   assert.equal(echoB24.status, 200);
+  const { eventId: echoB24EventId } = await echoB24.json() as { eventId: string };
+  await waitForEventStatus(database, echoB24EventId, 'SUCCEEDED');
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(externalRequests.filter((request) => request.method === 'PUT').length, 1);
   assert.equal(externalRequests.filter((request) => request.path.endsWith('/crm.deal.update.json')).length, 0);
@@ -123,7 +143,9 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
     body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }),
   });
   assert.equal(msChange.status, 200);
+  const { eventId: msChangeEventId } = await msChange.json() as { eventId: string };
   await waitUntil(() => bitrixComments === 'MS wins');
+  await waitForEventStatus(database, msChangeEventId, 'SUCCEEDED');
   assert.equal(externalRequests.filter((request) => request.path.endsWith('/crm.deal.update.json')).length, 1);
 
   const writesBeforeEcho = externalRequests.filter(isWrite).length;
@@ -132,32 +154,60 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
     body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }),
   });
   assert.equal(echoMs.status, 200);
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  const { eventId: echoMsEventId } = await echoMs.json() as { eventId: string };
+  await waitForEventStatus(database, echoMsEventId, 'SUCCEEDED');
   assert.equal(externalRequests.filter(isWrite).length, writesBeforeEcho, 'matching bilateral values are not rewritten');
 
+  // Provider throttling leaves the event durable at the supplied HTTP-date due time.
+  const retryAt = new Date(Date.now() + 30_000);
+  failNextMoyskladWriteRetryAfter = retryAt.toUTCString();
+  bitrixComments = 'rate limited update';
+  const rateLimitedEventResponse = await postB24(bitrixId, bitrixComments, 'rate-limited-header-write');
+  assert.equal(rateLimitedEventResponse.status, 200);
+  const { eventId: rateLimitedEventId } = await rateLimitedEventResponse.json() as { eventId: string };
+  const rateLimitedEvent = await waitForEventStatus(database, rateLimitedEventId, 'RETRYABLE_FAILURE');
+  assert.ok(rateLimitedEvent.retryAfter);
+  assert.ok(Math.abs(rateLimitedEvent.retryAfter.getTime() - Date.parse(retryAt.toUTCString())) < 1_000);
+  assert.equal(moyskladDescription, 'MS wins', 'a rejected write does not change the fake provider state');
+
+  const bitrixWriteRetryAt = new Date(Date.now() + 35_000);
+  failNextBitrixWriteRetryAfter = bitrixWriteRetryAt.toUTCString();
+  moyskladDescription = 'MS rate limited B24 update';
+  const bitrixRateLimitedResponse = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-webhook-secret?requestId=rate-limited-b24-header-write`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }),
+  });
+  assert.equal(bitrixRateLimitedResponse.status, 200);
+  const { eventId: bitrixRateLimitedEventId } = await bitrixRateLimitedResponse.json() as { eventId: string };
+  const bitrixRateLimitedEvent = await waitForEventStatus(database, bitrixRateLimitedEventId, 'RETRYABLE_FAILURE');
+  assert.ok(bitrixRateLimitedEvent.retryAfter);
+  assert.ok(Math.abs(bitrixRateLimitedEvent.retryAfter.getTime() - Date.parse(bitrixWriteRetryAt.toUTCString())) < 1_000);
+  assert.equal(bitrixComments, 'rate limited update', 'a malformed rejected B24 write does not change provider state');
+
+  const writesAfterRateLimit = externalRequests.filter(isWrite).length;
   const requestsBeforeGate = externalRequests.length;
   const base24BeforeGate = process.env.BITRIX24_REST_BASE_URL;
   process.env.LOCAL_HEADER_EXCHANGE = '0';
   bitrixComments = 'must not write while disabled';
   const disabled = await postB24(bitrixId, bitrixComments, 'local-gate-off');
   assert.equal(disabled.status, 200);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(externalRequests.filter(isWrite).length, writesBeforeEcho, 'the local exchange gate defaults closed');
+  const { eventId: disabledEventId } = await disabled.json() as { eventId: string };
+  await waitForEventStatus(database, disabledEventId, 'SKIPPED_DISABLED');
+  assert.equal(externalRequests.filter(isWrite).length, writesAfterRateLimit, 'the local exchange gate defaults closed');
 
   process.env.LOCAL_HEADER_EXCHANGE = '1';
+  const pair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId } });
+  const eventConfig = await app.get(FieldSettingsService).eventConfig(disabledEventId);
+  const headerSync = app.get(DealOrderHeaderSyncProcessor);
   process.env.BITRIX24_REST_BASE_URL = 'https://external.example/rest/';
-  const remoteTarget = await postB24(bitrixId, bitrixComments, 'loopback-gate');
-  assert.equal(remoteTarget.status, 200);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(externalRequests.length, requestsBeforeGate, 'non-loopback upstreams are rejected before any HTTP request');
+  assert.equal(await headerSync.process({ eventId: disabledEventId, pair: { id: pair.id, entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, status: 'MANUAL', source: 'PERSISTED' }, eventConfig, baselineId: pair.id }), 'DISABLED');
+  assert.equal(externalRequests.length, requestsBeforeGate + 1, 'the header writer rejects non-loopback B24 before making another HTTP request');
   process.env.BITRIX24_REST_BASE_URL = base24BeforeGate;
 
   const baseMsBeforeGate = process.env.MOYSKLAD_API_BASE_URL;
   process.env.MOYSKLAD_API_BASE_URL = 'http://remote.example/api/';
-  const remoteMoySklad = await postB24(bitrixId, bitrixComments, 'remote-ms-gate');
-  assert.equal(remoteMoySklad.status, 200);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(externalRequests.length, requestsBeforeGate, 'non-loopback MySklad upstreams are rejected before any HTTP request');
+  assert.equal(await headerSync.process({ eventId: disabledEventId, pair: { id: pair.id, entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, status: 'MANUAL', source: 'PERSISTED' }, eventConfig, baselineId: pair.id }), 'DISABLED');
+  assert.equal(externalRequests.length, requestsBeforeGate + 1, 'the header writer rejects non-loopback MySklad before making another HTTP request');
   process.env.MOYSKLAD_API_BASE_URL = baseMsBeforeGate;
 
   const unconfirmedId = String(Number(bitrixId) + 1);
@@ -170,6 +220,112 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   assert.ok(externalRequests.filter(isWrite).every((request) =>
     (request.method === 'PUT' && request.path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`) ||
     (request.method === 'POST' && request.path === '/b24/rest/crm.deal.update.json')));
+});
+
+test('deal/order source read failures persist bounded Retry-After; permanent 4xx is held for review', async () => {
+  const database = app.get(DatabaseService);
+  const writesBefore = externalRequests.filter(isWrite).length;
+
+  bitrixId = String(7_050_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  await createConfirmedPairAndSettings(database, 750_000 + Math.floor(Math.random() * 100_000));
+  const bitrixRetryAt = new Date(Date.now() + 30_000);
+  failNextBitrixRead = { status: 429, retryAfter: bitrixRetryAt.toUTCString() };
+  const bitrixResponse = await postB24(bitrixId, 'B24 source', 'b24-read-rate-limit');
+  const { eventId: bitrixEventId } = await bitrixResponse.json() as { eventId: string };
+  const bitrixEvent = await waitForEventStatus(database, bitrixEventId, 'RETRYABLE_FAILURE');
+  assert.ok(bitrixEvent.retryAfter);
+  assert.ok(Math.abs(bitrixEvent.retryAfter.getTime() - Date.parse(bitrixRetryAt.toUTCString())) < 1_000);
+
+  bitrixId = String(7_060_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  await createConfirmedPairAndSettings(database, 760_000 + Math.floor(Math.random() * 100_000));
+  const moyskladRetryAt = new Date(Date.now() + 30_000);
+  failNextMoyskladRead = { status: 429, retryAfter: moyskladRetryAt.toUTCString() };
+  const moyskladResponse = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-webhook-secret?requestId=ms-read-rate-limit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }),
+  });
+  const { eventId: moyskladEventId } = await moyskladResponse.json() as { eventId: string };
+  const moyskladEvent = await waitForEventStatus(database, moyskladEventId, 'RETRYABLE_FAILURE');
+  assert.ok(moyskladEvent.retryAfter);
+  assert.ok(Math.abs(moyskladEvent.retryAfter.getTime() - Date.parse(moyskladRetryAt.toUTCString())) < 1_000);
+
+  bitrixId = String(7_070_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  await createConfirmedPairAndSettings(database, 770_000 + Math.floor(Math.random() * 100_000));
+  failNextBitrixRead = { status: 400, retryAfter: null };
+  const permanentResponse = await postB24(bitrixId, 'permanent source rejection', 'b24-read-client-error');
+  const { eventId: permanentEventId } = await permanentResponse.json() as { eventId: string };
+  const permanentEvent = await waitForEventStatus(database, permanentEventId, 'MANUAL_REVIEW');
+  assert.equal(permanentEvent.retryAfter, null, 'permanent 4xx failures are not scheduled for retry');
+  assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'source reads must succeed before any external write');
+});
+
+test('baseline database timeout leaves the event recoverable in PROCESSING', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_080_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const pair = await createConfirmedPairAndSettings(database, 780_000 + Math.floor(Math.random() * 100_000));
+  const baselineModel = database.entityPairBaseline;
+  const originalFindUnique = baselineModel.findUnique.bind(baselineModel);
+  let failOnce = true;
+  const injectedFindUnique = async (...args: unknown[]) => {
+    if (failOnce) {
+      failOnce = false;
+      throw new Error('synthetic database timeout');
+    }
+    return originalFindUnique(args[0] as Parameters<typeof baselineModel.findUnique>[0]);
+  };
+  baselineModel.findUnique = injectedFindUnique as unknown as typeof baselineModel.findUnique;
+
+  try {
+    const response = await postB24(bitrixId, 'database retry source', 'baseline-database-timeout');
+    const { eventId } = await response.json() as { eventId: string };
+    await waitForEventStatus(database, eventId, 'PROCESSING');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const held = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+    assert.equal(held.status, 'PROCESSING');
+    assert.equal(held.retryAfter, null);
+    assert.equal(held.lastErrorCategory, null);
+    assert.ok(held.processingStartedAt);
+
+    baselineModel.findUnique = originalFindUnique;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await database.inboundEvent.update({
+      where: { id: eventId },
+      data: { processingStartedAt: new Date(Date.now() - 120_000) },
+    });
+    const retryResult = await app.get(PairFirstEventProcessor).process(eventId);
+    assert.ok(retryResult, 'stale PROCESSING row is eligible for recovery');
+    const recovered = await waitForEventStatus(database, eventId, 'SUCCEEDED');
+    assert.equal(recovered.status, 'SUCCEEDED');
+    assert.ok(await database.entityPairBaseline.findUnique({ where: { pairId: pair.id } }));
+  } finally {
+    baselineModel.findUnique = originalFindUnique;
+  }
+});
+
+test('sequential deal baseline timeouts use increasing bounded fallback backoff', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_090_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  await createConfirmedPairAndSettings(database, 790_000 + Math.floor(Math.random() * 100_000));
+  failNextBitrixRead = { status: 503, retryAfter: null };
+  const response = await postB24(bitrixId, 'retry one', 'baseline-backoff');
+  const { eventId } = await response.json() as { eventId: string };
+  const first = await waitForEventAttempt(database, eventId, 1);
+  assert.ok(first.retryAfter);
+  const firstDelay = first.retryAfter!.getTime() - Date.now();
+  assert.ok(firstDelay > 3_000 && firstDelay <= 5_000, `first fallback should be ~5s, got ${firstDelay}ms`);
+
+  failNextBitrixRead = { status: 503, retryAfter: null };
+  await database.inboundEvent.update({ where: { id: eventId }, data: { retryAfter: new Date(Date.now() - 1_000) } });
+  const second = await waitForEventAttempt(database, eventId, 2);
+  assert.ok(second.retryAfter);
+  const secondDelay = second.retryAfter!.getTime() - Date.now();
+  assert.ok(secondDelay > 8_000 && secondDelay <= 10_000, `second fallback should grow to ~10s, got ${secondDelay}ms`);
+  assert.ok(second.retryAfter!.getTime() > first.retryAfter!.getTime(), 'durable dueAt increases after a repeated timeout');
 });
 
 test('first confirmed event captures baseline with header-writer preview flags disabled', async () => {
@@ -190,16 +346,16 @@ test('first confirmed event captures baseline with header-writer preview flags d
   await waitForBaseline(database, pair.id);
   const baseline = await database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
   assert.ok(baseline, 'Q26.66 baseline capture is not gated by local preview flags');
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
   assert.equal(externalRequests.slice(requestsBefore).filter(isWrite).length, 0);
-  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'RECEIVED');
+  await waitForEventStatus(database, eventId, 'SKIPPED_DISABLED');
 
   process.env.ADMIN_PREVIEW = '1';
   process.env.LOCAL_HEADER_EXCHANGE = '1';
   process.env.LOCAL_HEADER_EXCHANGE_READY = '1';
 });
 
-test('pause accepts and stores event, captures first baseline read-only, and does not run header writes', async () => {
+test('pause stores event without provider reads; resume captures current state once without writes', async () => {
   const database = app.get(DatabaseService);
   bitrixId = String(7_200_000_000 + Math.floor(Math.random() * 1_000_000));
   moyskladId = randomUUID();
@@ -212,12 +368,18 @@ test('pause accepts and stores event, captures first baseline read-only, and doe
   const response = await postB24(bitrixId, 'paused first event', 'paused-baseline-only');
   assert.equal(response.status, 200);
   const { eventId } = await response.json() as { eventId: string };
-  await waitForBaseline(database, pair.id);
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
-  assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'pause permits baseline source reads but no sync writes');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(externalRequests.length, requestsBefore, 'pause does not perform provider reads');
   assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'RECEIVED');
-
+  bitrixComments = 'current state on resume';
   await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  await waitForBaseline(database, pair.id);
+  await waitForEventStatus(database, eventId, 'SUCCEEDED');
+  const baseline = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.equal((baseline.bitrix24Values as { 'rule:deal-comments'?: string })['rule:deal-comments'], 'current state on resume');
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
+  assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'pause permits baseline source reads but no sync writes');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'SUCCEEDED');
 });
 
 test('global off rejects intake before persistence, pair resolution, or upstream reads', async () => {
@@ -240,6 +402,12 @@ test('dry first-event baseline uses the isolated dry database and performs reads
   await app.close();
   process.env.SYNC_MODE = 'dry';
   process.env.DRY_DATABASE_URL = process.env.BASELINE_DRY_TEST_DATABASE_URL ?? 'postgresql://sync:local-only@127.0.0.1:55414/sync?schema=issue14_test';
+  const drySetupDatabase = new PrismaClient({ datasources: { db: { url: process.env.DRY_DATABASE_URL } } });
+  await drySetupDatabase.inboundEvent.deleteMany({});
+  await drySetupDatabase.entityPairBaseline.deleteMany({});
+  await drySetupDatabase.entityPairSyncState.deleteMany({});
+  await drySetupDatabase.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
+  await drySetupDatabase.$disconnect();
   app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
@@ -258,7 +426,7 @@ test('dry first-event baseline uses the isolated dry database and performs reads
   const applyDatabase = new PrismaClient({ datasources: { db: { url: applyDatabaseUrl } } });
   assert.equal(await applyDatabase.entityPairBaseline.findUnique({ where: { pairId: pair.id } }), null);
   await applyDatabase.$disconnect();
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['GET', 'POST']);
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
   assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'dry mode performs no external synchronization writes');
 });
 
@@ -283,14 +451,42 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   externalRequests.push({ method: request.method ?? '', path });
   response.setHeader('content-type', 'application/json');
   if (path === '/b24/rest/crm.deal.get.json' && request.method === 'POST') {
+    if (failNextBitrixRead) {
+      const failure = failNextBitrixRead;
+      failNextBitrixRead = null;
+      if (failure.retryAfter) response.setHeader('retry-after', failure.retryAfter);
+      response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
+      return;
+    }
     response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMMENTS: bitrixComments, DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
   } else if (path === '/b24/rest/crm.deal.update.json' && request.method === 'POST') {
+    if (failNextBitrixWriteRetryAfter) {
+      const retryAfter = failNextBitrixWriteRetryAfter;
+      failNextBitrixWriteRetryAfter = null;
+      response.setHeader('retry-after', retryAfter);
+      response.writeHead(429, { 'content-type': 'text/plain' }); response.end('temporarily rate limited');
+      return;
+    }
     const form = new URLSearchParams(body);
     bitrixComments = form.get('fields[COMMENTS]') ?? bitrixComments;
     response.writeHead(200); response.end(JSON.stringify({ result: true }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}` && request.method === 'GET') {
+    if (failNextMoyskladRead) {
+      const failure = failNextMoyskladRead;
+      failNextMoyskladRead = null;
+      if (failure.retryAfter) response.setHeader('retry-after', failure.retryAfter);
+      response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
+      return;
+    }
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, updated: '2026-10-07T10:00:00+00:00' }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}` && request.method === 'PUT') {
+    if (failNextMoyskladWriteRetryAfter) {
+      const retryAfter = failNextMoyskladWriteRetryAfter;
+      failNextMoyskladWriteRetryAfter = null;
+      response.setHeader('retry-after', retryAfter);
+      response.writeHead(429, { 'content-type': 'text/plain' }); response.end('temporarily rate limited');
+      return;
+    }
     const payload = JSON.parse(body) as { description?: string };
     if (typeof payload.description === 'string') moyskladDescription = payload.description;
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription }));
@@ -309,6 +505,39 @@ async function postB24(id: string, comments: string, marker: string) {
 async function waitUntil(condition: () => boolean) {
   for (let attempt = 0; attempt < 100 && !condition(); attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.ok(condition(), `timed out waiting for event processor; fake requests: ${JSON.stringify(externalRequests)}; fake values: ${bitrixComments}/${moyskladDescription}`);
+}
+
+async function waitForEventStatus(database: DatabaseService, id: string, status: string) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const event = await database.inboundEvent.findUnique({ where: { id }, select: { status: true, retryAfter: true } });
+    if (event?.status === status) {
+      await waitForWorkersIdle(database);
+      return event;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for event ${id} to reach ${status}`);
+}
+
+async function waitForEventAttempt(database: DatabaseService, id: string, attempts: number) {
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const event = await database.inboundEvent.findUnique({ where: { id }, select: { status: true, attempts: true, retryAfter: true } });
+    if (event?.status === 'RETRYABLE_FAILURE' && event.attempts === attempts) {
+      await waitForWorkersIdle(database);
+      return event;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for event ${id} at attempt ${attempts}`);
+}
+
+async function waitForWorkersIdle(database: DatabaseService) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const active = await database.eventWorkerLease.count({ where: { ownerToken: { not: '' } } });
+    if (active === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail('timed out waiting for background event worker leases to be released');
 }
 
 async function waitForBaseline(database: DatabaseService, pairId: string) {

@@ -4,10 +4,13 @@ import { DatabaseService } from '../database.service';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { PairResolutionResult } from '../pairs/pair-resolver';
+import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
   | { status: 'READY'; baselineId: string; created: boolean; settingsVersion: number; capturedAt: string; bitrix24UpdatedAt: string | null; moyskladUpdatedAt: string | null }
+  | { status: 'RETRYABLE_FAILURE'; reason: 'SOURCE_READ_FAILED'; retryAfter: Date }
+  | { status: 'DATABASE_FAILURE' }
   | { status: 'MANUAL_REVIEW'; reason: 'SOURCE_READ_FAILED' | 'BASELINE_STORE_FAILED' | 'UNSUPPORTED_ENTITY' | 'PAIR_NOT_ACTIVE' | 'SETTINGS_VERSION_MISMATCH' };
 
 /**
@@ -23,6 +26,7 @@ export class DealOrderBaselineService {
     pair: ConfirmedPair;
     eventId: string;
     eventConfig: VersionedFieldSettingsDto;
+    attempt?: number;
   }): Promise<DealOrderBaselineResult> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
     if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') {
@@ -39,7 +43,7 @@ export class DealOrderBaselineService {
         select: { id: true },
       });
     } catch {
-      return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
+      return { status: 'DATABASE_FAILURE' };
     }
     if (!pair) return { status: 'MANUAL_REVIEW', reason: 'PAIR_NOT_ACTIVE' };
 
@@ -47,7 +51,7 @@ export class DealOrderBaselineService {
     try {
       existing = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
     } catch {
-      return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
+      return { status: 'DATABASE_FAILURE' };
     }
     if (existing) {
       if (existing.settingsVersion !== input.eventConfig.version) {
@@ -63,7 +67,10 @@ export class DealOrderBaselineService {
       // disagreements without writing either system.
       moysklad = await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId);
       bitrix24 = await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderFailure && isRetryableFailure(error)) {
+        return { status: 'RETRYABLE_FAILURE', reason: 'SOURCE_READ_FAILED', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
+      }
       return { status: 'MANUAL_REVIEW', reason: 'SOURCE_READ_FAILED' };
     }
     const bitrix24Values = projectApprovedValues(input.eventConfig.config, bitrix24, 'bitrix24');
@@ -85,13 +92,13 @@ export class DealOrderBaselineService {
         skipDuplicates: true,
       });
       const saved = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
-      if (!saved) return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
+      if (!saved) return { status: 'DATABASE_FAILURE' };
       if (saved.settingsVersion !== input.eventConfig.version) {
         return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
       }
       return result(saved, saved.eventId === input.eventId && saved.capturedAt.getTime() === capturedAt.getTime());
     } catch {
-      return { status: 'MANUAL_REVIEW', reason: 'BASELINE_STORE_FAILED' };
+      return { status: 'DATABASE_FAILURE' };
     }
   }
 }

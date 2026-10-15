@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { DatabaseService } from '../database.service';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { randomUUID } from 'node:crypto';
@@ -304,10 +305,10 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const response = await this.fetcher(new URL(method, withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
       redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => null);
-    if (!response?.ok) throw httpFailure(response?.status);
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
     const payload: unknown = await response.json().catch(() => null);
-    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new Error('BITRIX24_CLIENT_CANDIDATE_FAILURE');
+    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
     return payload;
   }
 
@@ -333,8 +334,8 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const response = await this.fetcher(url, {
       method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => null);
-    if (!response?.ok) throw httpFailure(response?.status);
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
     return response.json().catch(() => ({}));
   }
 }
@@ -372,7 +373,10 @@ function normName(value: string) { return value.normalize('NFKC').replace(/\s+/g
 function phone(value: unknown) { if (typeof value !== 'string') return ''; let digits = value.replace(/\D/g, ''); if (digits.length === 11 && digits.startsWith('8')) digits = `7${digits.slice(1)}`; return digits.length >= 10 ? digits : ''; }
 function countFilled(row: Record<string, unknown>) { return Object.entries(row).filter(([key, value]) => key !== 'id' && key !== 'ID' && key !== 'meta' && key !== 'created' && key !== 'DATE_CREATE' && value !== null && value !== undefined && value !== '').length; }
 function httpFailure(status: number | undefined) { const error = new Error('CLIENT_CANDIDATE_HTTP_FAILURE') as Error & { status?: number }; error.name = 'ClientCandidateHttpError'; error.status = status; return error; }
-function isSystemwideMetricUnavailable(error: unknown) { return error instanceof Error && error.name === 'ClientCandidateHttpError' && [404, 405, 501].includes((error as Error & { status?: number }).status ?? 0); }
+function isSystemwideMetricUnavailable(error: unknown) {
+  if (error instanceof ProviderFailure) return [404, 405, 501].includes(error.status ?? 0);
+  return error instanceof Error && error.name === 'ClientCandidateHttpError' && [404, 405, 501].includes((error as Error & { status?: number }).status ?? 0);
+}
 function required(value: string | null, reason: string) { if (!value) throw new Error(reason); return value; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function withSlash(value: string) { return value.endsWith('/') ? value : `${value}/`; }

@@ -5,6 +5,7 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http
 import { randomUUID } from 'node:crypto';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { PrismaClient } from '@prisma/client';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
 import { AdminController } from '../src/admin/admin.controller';
 import { ContactSyncStatusController } from '../src/admin/contact-sync-status.controller';
@@ -59,6 +60,23 @@ before(async () => {
   process.env.MOYSKLAD_WEBHOOK_SECRET = 'synthetic-ms-webhook-secret';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-ms-api-token';
 
+  // The suite reuses a disposable UTF8 database. Reset its durable event and
+  // scheduler state before Nest starts recovery scans during bootstrap.
+  const setupDatabase = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+  await setupDatabase.inboundEvent.deleteMany({});
+  await setupDatabase.syncSetting.upsert({
+    where: { id: 'global' }, create: { serviceMode: 'pause' },
+    update: {
+      serviceMode: 'pause', lastInactiveAt: null, lastActiveAt: null,
+      nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+      nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3,
+      nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyBitrixStatus: 'skipped',
+      nightlyMoyskladStatus: 'skipped', nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+      nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
+    },
+  });
+  await setupDatabase.$disconnect();
+
   mockServer = createServer((request, response) => { void handleExternalRequest(request, response); });
   await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
   const address = mockServer.address();
@@ -83,8 +101,18 @@ before(async () => {
   app = await NestFactory.create(RealDatabaseContactSyncModule, { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
+  const encoding = await app.get(DatabaseService).$queryRaw<Array<{ encoding: string }>>`SELECT current_setting('server_encoding') AS encoding`;
+  assert.equal(encoding[0]?.encoding, 'UTF8', 'isolated PostgreSQL tests require UTF8 server encoding');
+  await new Promise((resolve) => setTimeout(resolve, 50));
   await app.get(DatabaseService).syncSetting.upsert({
-    where: { id: 'global' }, create: { serviceMode: 'on' }, update: { serviceMode: 'on', offSince: null },
+    where: { id: 'global' }, create: { serviceMode: 'on' }, update: {
+      serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null,
+      nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+      nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3,
+      nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyBitrixStatus: 'pending',
+      nightlyMoyskladStatus: 'pending', nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+      nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
+    },
   });
 });
 
@@ -408,7 +436,8 @@ test('a temporary external failure stays durable and retries the same stored eve
     },
   });
   failNextWrite = true;
-  failNextWriteRetryAfter = '2';
+  const retryAt = new NativeDate(NativeDate.now() + 3_000);
+  failNextWriteRetryAfter = retryAt.toUTCString();
   const previousWrites = writeCount;
   const body = JSON.stringify({
     event: 'ONCRMCONTACTUPDATE',
@@ -423,7 +452,8 @@ test('a temporary external failure stays durable and retries the same stored eve
   const failed = await waitForStatus(apiUrl, firstAck.eventId, 'RETRYABLE_FAILURE');
   assert.equal(failed.attempts, 1);
   const savedFailure = await database.inboundEvent.findUnique({ where: { id: firstAck.eventId }, select: { retryAfter: true } });
-  assert.ok(savedFailure?.retryAfter && savedFailure.retryAfter.getTime() >= NativeDate.now() + 1_000);
+  assert.ok(savedFailure?.retryAfter);
+  assert.ok(Math.abs(savedFailure.retryAfter.getTime() - Date.parse(retryAt.toUTCString())) < 1_000, 'HTTP-date Retry-After must survive in PostgreSQL as the durable due time');
   assert.equal(destinationEmail, 'before@example.test');
 
   assert.equal(await database.inboundEvent.count({ where: { externalEntityId: contactId } }), 1);
