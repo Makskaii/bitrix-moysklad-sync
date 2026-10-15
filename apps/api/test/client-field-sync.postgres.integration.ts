@@ -123,7 +123,7 @@ before(async () => {
   b24 = { ID: sourceId, NAME: 'Ada', LAST_NAME: 'Lovelace', SECOND_NAME: '', PHONE: [{ VALUE: '+7 111', VALUE_TYPE: 'WORK' }, { VALUE: '+7 222', VALUE_TYPE: 'MOBILE' }], EMAIL: [{ VALUE: 'ada@example.test', VALUE_TYPE: 'WORK' }], UF_READONLY: 'must-not-write' };
   moysklad = { id: targetId, name: 'Old Name', phone: '+7 000', email: 'old@example.test', calculated: 'server-owned', unmapped: 'leave' };
   companyB24 = { ID: companySourceId, TITLE: 'Old Co', PHONE: [{ VALUE: '+7 100' }], EMAIL: [] };
-  companyMs = { id: companyTargetId, name: 'Old Co', phone: '+7 000', email: 'old@example.test', inn: '2222222222' };
+  companyMs = { id: companyTargetId, companyType: 'legal', name: 'Old Co', phone: '+7 000', email: 'old@example.test', inn: '2222222222' };
   const journal = new DryRunWriteJournal(database);
   const gateway = new HttpClientSyncGateway(async (input, init = {}) => {
     const url = String(input);
@@ -143,7 +143,7 @@ before(async () => {
     if (url.includes('crm.requisite.get.json')) return Response.json({ result: { ID: '482', ENTITY_TYPE_ID: 4, ENTITY_ID: companySourceId, RQ_INN: '1234567890', RQ_KPP: '123456789' } });
     if (url.includes('crm.requisite.bankdetail.get.json')) return Response.json({ result: { ID: '483', ENTITY_ID: '482', RQ_ACC_NUM: '40700000000000000000', RQ_BIK: '044000001' } });
     if (url.includes(`/counterparty/${companyTargetId}/accounts/${companyAccountId}`)) return Response.json({ id: companyAccountId, accountNumber: '40700000000000000000', bic: '044000001' });
-    if (url.includes(`/counterparty/${companyTargetId}`)) return Response.json({ id: companyTargetId, meta: { type: 'counterparty' }, inn: '1234567890', kpp: '123456789' });
+    if (url.includes(`/counterparty/${companyTargetId}`)) return Response.json({ id: companyTargetId, companyType: 'legal', meta: { type: 'counterparty' }, inn: '1234567890', kpp: '123456789' });
     throw new Error(`Unexpected fake child-resource read ${url} ${init.method ?? 'GET'}`);
   }, journal);
   processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, { readCompanyInn: async () => '1111111111' } as never, undefined, childAdapter);

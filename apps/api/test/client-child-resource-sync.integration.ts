@@ -42,7 +42,7 @@ const binding: ClientChildResourceBindingDto = {
 before(async () => {
   requisite = { ID: requisiteId, ENTITY_TYPE_ID: '4', ENTITY_ID: companyId, RQ_INN: '111', RQ_KPP: 'old-kpp', RQ_COMPANY_FULL_NAME: 'Old legal name', RQ_OGRN: 'old-ogrn', RQ_OKPO: 'old-okpo' };
   bankDetail = { ID: bankDetailId, ENTITY_ID: requisiteId, RQ_ACC_NUM: 'old-account', RQ_BANK_NAME: 'Old Bank', RQ_BIC: 'old-bic', RQ_BANK_ADDR: 'Old bank address', RQ_COR_ACC_NUM: 'old-correspondent' };
-  counterparty = { id: counterpartyId, inn: '222', kpp: 'old-kpp', legalTitle: 'Old legal name', ogrn: 'old-ogrn', okpo: 'old-okpo' };
+  counterparty = { id: counterpartyId, companyType: 'legal', inn: '222', kpp: 'old-kpp', legalTitle: 'Old legal name', ogrn: 'old-ogrn', okpo: 'old-okpo' };
   account = { id: accountId, accountNumber: 'old-account', bankName: 'Old Bank', bic: 'old-bic', bankLocation: 'Old bank address', correspondentAccount: 'old-correspondent' };
   server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -169,6 +169,61 @@ test('APPLY maps requisite/bank-detail through their official update methods and
   const echo = await adapter.syncForPair({ eventId: 'apply-echo', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: result.state });
   assert.equal(echo.status, 'UNCHANGED');
   assert.equal(calls.filter((call) => call.method === 'PUT').length, writeCount, 'echo uses reconciled snapshot and does not repeat writes');
+});
+
+test('bank-only binding verifies requisite ownership before reading or writing the bank detail', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const originalRequisite = requisite;
+  requisite = { ...requisite, ENTITY_ID: '999' };
+  const bankOnly = { ...binding, legalFields: [] };
+  const adapter = new ClientChildResourceSync();
+  const prior = { bitrix24: { requisite: { RQ_BIK: 'baseline' }, bankDetail: { RQ_BIK: 'baseline' } }, moysklad: { counterparty: {}, account: { bic: 'baseline' } } };
+  await assert.rejects(adapter.syncForPair({ eventId: 'foreign-bank-requisite', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [bankOnly], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior }), (error: unknown) => error instanceof Error && error.message === 'BITRIX24_API_FAILURE' && (error as { status?: number }).status === 404);
+  assert.equal(calls.some((call) => call.path.endsWith('/crm.requisite.bankdetail.get.json') || call.method === 'PUT'), false, 'a foreign requisite prevents bank-detail reads and all writes');
+  assert.deepEqual(prior.bitrix24.requisite, { RQ_BIK: 'baseline' }, 'failure cannot advance the caller-owned snapshot');
+  requisite = originalRequisite;
+});
+
+test('explicit legal mappings allow legal and entrepreneur counterparties but review individual or unknown targets', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync();
+  counterparty = { ...counterparty, companyType: 'entrepreneur' };
+  const entrepreneur = await adapter.syncForPair({ eventId: 'entrepreneur-binding', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(entrepreneur.status, 'BASELINE', 'valid entrepreneur company type remains supported');
+  counterparty = { ...counterparty, companyType: 'legalUZ' };
+  const uzBankOnly = await adapter.syncForPair({ eventId: 'uz-bank-only', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, legalFields: [] }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(uzBankOnly.status, 'BASELINE', 'UZ company types remain valid for their bank-account resource');
+  const uzRussianLegalFields = await adapter.syncForPair({ eventId: 'uz-ru-legal-fields', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(uzRussianLegalFields.status, 'MANUAL_REVIEW', 'RU-only standard legal fields are not written to UZ counterparties');
+  counterparty = { ...counterparty, companyType: 'individual' };
+  calls = [];
+  const individual = await adapter.syncForPair({ eventId: 'individual-binding', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(individual, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false);
+  counterparty = { ...counterparty, companyType: 'legal' };
+});
+
+test('APPLY child writes honor database-recovery guard before any provider mutation', async () => {
+  const { setDatabaseRecoveryReady } = await import('../src/external-write-guard');
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync();
+  const baseline = await adapter.syncForPair({ eventId: 'recovery-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  const priorInn = baseline.state.bitrix24.requisite.RQ_INN;
+  requisite = { ...requisite, RQ_INN: 'blocked-write' };
+  setDatabaseRecoveryReady(false);
+  try {
+    await assert.rejects(adapter.syncForPair({ eventId: 'recovery-blocked', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state }), /BLOCKED_DATABASE_RECOVERY_REQUIRED/);
+    assert.equal(calls.some((call) => call.method === 'PUT' || call.path.endsWith('/crm.requisite.update.json') || call.path.endsWith('/crm.requisite.bankdetail.update.json')), false);
+    assert.equal(baseline.state.bitrix24.requisite.RQ_INN, priorInn, 'blocked write leaves the saved snapshot untouched');
+  } finally {
+    setDatabaseRecoveryReady(true);
+    if (previousMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = previousMode;
+  }
 });
 
 test('lease loss aborts child transfer before provider write', async () => {

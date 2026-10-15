@@ -17,6 +17,7 @@ import { ProviderFailure } from '../src/provider-failure';
 import { toMoySkladCustomerOrderClientFields } from '../src/clients/document-client-contract';
 import { ClientChildResourceSync } from '../src/clients/client-child-resource-sync';
 import { DryRunWriteJournal } from '../src/dry-run-write-journal';
+import { setDatabaseRecoveryReady } from '../src/external-write-guard';
 
 const suffix = randomUUID();
 const companyId = `client53-${suffix}`;
@@ -1222,7 +1223,7 @@ test('ordinary company processor pins requisite and bank child IDs, baselines th
     if (url.includes('crm.requisite.get.json')) return Response.json({ result: { ID: requisiteId, ENTITY_TYPE_ID: 4, ENTITY_ID: sourceId, RQ_INN: requisiteInn } });
     if (url.includes('crm.requisite.bankdetail.get.json')) return Response.json({ result: { ID: bankDetailId, ENTITY_ID: requisiteId, RQ_BIK: bankBic } });
     if (url.includes(`/entity/counterparty/${targetId}/accounts/${accountId}`)) return Response.json({ id: accountId, bic: null });
-    if (url.includes(`/entity/counterparty/${targetId}`)) return Response.json({ id: targetId, inn: null });
+    if (url.includes(`/entity/counterparty/${targetId}`)) return Response.json({ id: targetId, companyType: 'legal', inn: null });
     throw new Error(`Unexpected fake provider request: ${method} ${url}`);
   };
   const gateway: ClientSyncGateway = {
@@ -1254,6 +1255,69 @@ test('ordinary company processor pins requisite and bank child IDs, baselines th
     await database.dryRunWriteProposal.deleteMany({ where: { eventId: { in: eventIds } } });
     await database.entityPair.delete({ where: { id: pair.id } });
     await database.inboundEvent.deleteMany({ where: { id: { in: eventIds } } });
+  }
+});
+
+test('processor keeps child snapshot and event retryable when APPLY writes are blocked during database recovery', async () => {
+  const oldMode = process.env.SYNC_MODE;
+  const oldB24Base = process.env.BITRIX24_REST_BASE_URL;
+  const oldMsBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldToken = process.env.MOYSKLAD_API_TOKEN;
+  process.env.SYNC_MODE = 'apply';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://moysklad.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-token';
+  process.env.BITRIX24_REST_BASE_URL = 'https://bitrix.fake/rest/';
+  const sourceId = String(Date.now() + 11);
+  const targetId = randomUUID();
+  const requisiteId = String(Date.now() + 12);
+  const bankDetailId = String(Date.now() + 13);
+  const accountId = randomUUID();
+  const eventId = `child-recovery-${suffix}`;
+  const pair = await database.entityPair.create({ data: { entityType: 'COMPANY', bitrix24Id: sourceId, moyskladId: targetId, moyskladType: 'counterparty', active: true, source: 'TEST' } });
+  const originalSnapshot = {
+    bitrix24: { requisite: { RQ_INN: 'old-inn' }, bankDetail: { RQ_BIK: 'old-bic' } },
+    moysklad: { counterparty: { inn: 'old-inn' }, account: { bic: 'old-bic' } },
+  };
+  await database.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: 7, bitrix24Values: {}, moyskladValues: {}, childResourceState: originalSnapshot } });
+  await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: eventId, eventType: 'ONCRMCOMPANYUPDATE', externalEntityId: sourceId, externalEntityType: 'company', payload: { event: eventId }, status: 'RECEIVED' } });
+  const binding = { id: 'recovery-child-binding', entity: 'companies' as const, bitrix24CompanyId: sourceId, bitrix24RequisiteId: requisiteId,
+    moyskladCounterpartyId: targetId, legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }],
+    bankDetail: { bitrix24Id: bankDetailId, moyskladAccountId: accountId, fields: [{ bitrix24Field: 'RQ_BIK', moyskladField: 'bic' }] } };
+  const settings = { eventConfig: async () => ({ version: 7, config: { rules: [], groups: [], childResourceBindings: [binding] } }), transformField: () => null };
+  const calls: Array<{ method: string; path: string }> = [];
+  const fakeFetch: typeof fetch = async (input, init = {}) => {
+    const url = String(input); const method = init.method ?? 'GET'; const path = new URL(url).pathname;
+    calls.push({ method, path });
+    if (path.endsWith('crm.requisite.get.json')) return Response.json({ result: { ID: requisiteId, ENTITY_TYPE_ID: 4, ENTITY_ID: sourceId, RQ_INN: 'new-inn' } });
+    if (path.endsWith('crm.requisite.bankdetail.get.json')) return Response.json({ result: { ID: bankDetailId, ENTITY_ID: requisiteId, RQ_BIK: 'new-bic' } });
+    if (path === `/api/remap/1.2/entity/counterparty/${targetId}`) return Response.json({ id: targetId, companyType: 'legal', inn: 'old-inn' });
+    if (path.endsWith(`/accounts/${accountId}`)) return Response.json({ id: accountId, bic: 'old-bic' });
+    throw new Error(`Unexpected fake request ${method} ${url}`);
+  };
+  const gateway: ClientSyncGateway = {
+    async readBitrix() { return { ID: sourceId, TITLE: 'Recovery guard company' }; },
+    async readMoysklad() { return { id: targetId, name: 'Recovery guard company' }; },
+    async updateBitrix() { assert.fail('child writes are blocked before scalar writes'); },
+    async updateMoysklad() { assert.fail('child writes are blocked before scalar writes'); },
+  };
+  const processor = new ClientSyncProcessor(database, settings as never, { read: async () => ({ mode: 'on' }) } as never, gateway,
+    new HttpClientCandidateGateway(database, fakeFetch), undefined, new ClientChildResourceSync(fakeFetch, new DryRunWriteJournal(database)));
+  setDatabaseRecoveryReady(false);
+  try {
+    assert.equal(await processor.process(eventId), 'RETRY');
+    const savedEvent = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+    assert.equal(savedEvent.status, 'RETRYABLE_FAILURE');
+    const savedState = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
+    assert.deepEqual(savedState.childResourceState, originalSnapshot, 'blocked child write cannot advance the persisted snapshot');
+    assert.equal(calls.some((call) => call.method === 'PUT' || call.path.endsWith('crm.requisite.update.json') || call.path.endsWith('crm.requisite.bankdetail.update.json')), false);
+  } finally {
+    setDatabaseRecoveryReady(true);
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+    if (oldB24Base === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldB24Base;
+    if (oldMsBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMsBase;
+    if (oldToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldToken;
+    await database.entityPair.delete({ where: { id: pair.id } });
+    await database.inboundEvent.delete({ where: { id: eventId } });
   }
 });
 

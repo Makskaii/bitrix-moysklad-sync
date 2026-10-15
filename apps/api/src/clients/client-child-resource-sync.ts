@@ -1,12 +1,13 @@
 import { BadRequestException } from '@nestjs/common';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { ClientChildResourceBindingDto } from '../field-settings/field-settings.dto';
+import { assertApplyExternalWrite } from '../external-write-guard';
 
 export type ClientChildSyncDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
 export type AssertClientChildSyncLease = () => Promise<void>;
 export type ClientChildSyncResult =
   | { status: 'BASELINE' | 'SYNCED' | 'JOURNALED' | 'UNCHANGED'; bindingId: string; fields: string[]; state: ClientChildResourceSnapshot }
-  | { status: 'MANUAL_REVIEW'; reason: 'CHILD_RESOURCE_BINDING_MISSING' | 'CHILD_RESOURCE_BINDING_AMBIGUOUS' | 'CHILD_RESOURCE_ID_MISSING'; bindingId?: string };
+  | { status: 'MANUAL_REVIEW'; reason: 'CHILD_RESOURCE_BINDING_MISSING' | 'CHILD_RESOURCE_BINDING_AMBIGUOUS' | 'CHILD_RESOURCE_ID_MISSING' | 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED'; bindingId?: string };
 
 export type ClientChildResourceSnapshot = { bitrix24: { requisite: RecordValue; bankDetail: RecordValue }; moysklad: { counterparty: RecordValue; account: RecordValue } };
 
@@ -73,15 +74,24 @@ export class ClientChildResourceSync {
     let currentBankDetail: RecordValue = {};
     let currentCounterparty: RecordValue = {};
     let currentAccount: RecordValue = {};
+    const requisite = await this.bitrixRead('crm.requisite.get.json', { id: binding.bitrix24RequisiteId });
+    assertRecordId(requisite, 'ID', binding.bitrix24RequisiteId, 'BITRIX24_REQUISITE_ID_MISMATCH');
+    if (String(requisite.ENTITY_TYPE_ID ?? '') !== '4') throw new ProviderFailure('BITRIX24', 404);
+    assertParent(requisite, 'ENTITY_ID', input.bitrix24CompanyId, 'BITRIX24_REQUISITE_PARENT_MISMATCH');
+    const counterparty = await this.msRead(`entity/counterparty/${encodeURIComponent(binding.moyskladCounterpartyId)}`);
+    assertRecordId(counterparty, 'id', input.moyskladCounterpartyId, 'MOYSKLAD_COUNTERPARTY_ID_MISMATCH');
+    const companyType = typeof counterparty.companyType === 'string' ? counterparty.companyType.toLowerCase() : '';
+    if (!['legal', 'entrepreneur', 'legaluz', 'entrepreneuruz'].includes(companyType)) {
+      return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id };
+    }
+    // The official counterparty schema marks the standard inn/kpp/ogrn/okpo
+    // fields RU-only and exposes a distinct UZ requisites group. Do not send
+    // Russian requisite mappings to UZ counterparties; bank-account mappings
+    // remain valid for company counterparties in either region.
+    if (legalEnabled && companyType.endsWith('uz')) {
+      return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id };
+    }
     if (legalEnabled) {
-      const [requisite, counterparty] = await Promise.all([
-        this.bitrixRead('crm.requisite.get.json', { id: binding.bitrix24RequisiteId }),
-        this.msRead(`entity/counterparty/${encodeURIComponent(binding.moyskladCounterpartyId)}`),
-      ]);
-      assertRecordId(requisite, 'ID', binding.bitrix24RequisiteId, 'BITRIX24_REQUISITE_ID_MISMATCH');
-      assertRecordId(counterparty, 'id', input.moyskladCounterpartyId, 'MOYSKLAD_COUNTERPARTY_ID_MISMATCH');
-      if (String(requisite.ENTITY_TYPE_ID ?? '') !== '4') throw new ProviderFailure('BITRIX24', 404);
-      assertParent(requisite, 'ENTITY_ID', input.bitrix24CompanyId, 'BITRIX24_REQUISITE_PARENT_MISMATCH');
       currentRequisite = requisite; currentCounterparty = counterparty;
       if (input.prior) {
       const result = await this.transfer({
@@ -100,6 +110,7 @@ export class ClientChildResourceSync {
       }
     }
     if (bankEnabled && binding.bankDetail) {
+      currentRequisite = requisite;
       const [bankDetail, account] = await Promise.all([
         this.bitrixRead('crm.requisite.bankdetail.get.json', { id: binding.bankDetail.bitrix24Id }),
         this.msRead(`entity/counterparty/${encodeURIComponent(binding.moyskladCounterpartyId)}/accounts/${encodeURIComponent(binding.bankDetail.moyskladAccountId)}`),
@@ -172,7 +183,7 @@ export class ClientChildResourceSync {
         ? `entity/counterparty/${encodeURIComponent(input.parentId)}/accounts/${encodeURIComponent(input.childId)}`
         : `entity/counterparty/${encodeURIComponent(input.parentId)}`;
       await input.assertLease?.();
-      try { await this.msWrite(path, output); }
+      try { assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE'); await this.msWrite(path, output); }
       catch (error) {
         await input.assertLease?.();
         const readback = await this.msRead(path).catch(() => null);
@@ -188,7 +199,7 @@ export class ClientChildResourceSync {
       const endpoint = input.targetResource === 'BITRIX24_BANK_DETAIL' ? 'crm.requisite.bankdetail.get.json' : 'crm.requisite.get.json';
       const id = input.childId;
       await input.assertLease?.();
-      try { await this.bitrixUpdate(method, id, output); }
+      try { assertApplyExternalWrite('BITRIX24', 'CLIENT_CHILD_RESOURCE_UPDATE'); await this.bitrixUpdate(method, id, output); }
       catch (error) {
         await input.assertLease?.();
         const readback = await this.bitrixRead(endpoint, { id }).catch(() => null);
