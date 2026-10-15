@@ -38,6 +38,7 @@ export type FieldRuleDto = {
   entity: string;
   sourceField: string;
   targetField: string;
+  criticality: 'critical' | 'optional' | 'tbd';
   bitrix24ToMoysklad: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
   moyskladToBitrix24: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
 };
@@ -48,6 +49,7 @@ export type FieldGroupDto = {
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
   targetField: string;
   sourceFields: string[];
+  criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string };
 };
 
