@@ -26,13 +26,21 @@ import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
+import { ClientMappingController } from './client-mapping.controller';
+import { ClientMappingService } from '../clients/client-mapping.service';
+import { HttpClientInventoryProvider } from '../clients/client-inventory.provider';
+import { CLIENT_INVENTORY_PROVIDER } from '../clients/client-mapping.service';
+import { CLIENT_SYNC_GATEWAY, ClientSyncProcessor } from '../clients/client-sync.processor';
+import { HttpClientSyncGateway } from '../clients/client-sync.gateway';
+import { CLIENT_CANDIDATE_GATEWAY, HttpClientCandidateGateway } from '../clients/client-candidate.gateway';
+import { CLIENT_DEPENDENCY_RESOLVER } from '../clients/client-dependency-resolver';
 
 @Module({})
 export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController] : [])],
       providers: [
         databaseProvider,
         SyncModeService,
@@ -45,6 +53,9 @@ export class LocalAdminPreviewModule {
         ...(databaseProvider === DatabaseService ? [
           FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
           HistoricalInventoryService,
+          HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
+          HttpClientSyncGateway, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
+          HttpClientCandidateGateway, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,

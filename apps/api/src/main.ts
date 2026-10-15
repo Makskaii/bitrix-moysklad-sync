@@ -32,6 +32,14 @@ import { HistoricalInventoryController } from './admin/historical-inventory.cont
 import { HistoricalInventoryService } from './historical-inventory.service';
 import { HistoricalDealOrderMatchingController } from './admin/historical-deal-order-matching.controller';
 import { HistoricalDealOrderMatchingService } from './historical-deal-order-matching.service';
+import { ClientMappingController } from './admin/client-mapping.controller';
+import { ClientMappingService } from './clients/client-mapping.service';
+import { HttpClientInventoryProvider } from './clients/client-inventory.provider';
+import { CLIENT_INVENTORY_PROVIDER } from './clients/client-mapping.service';
+import { CLIENT_SYNC_GATEWAY, ClientSyncProcessor } from './clients/client-sync.processor';
+import { HttpClientSyncGateway } from './clients/client-sync.gateway';
+import { CLIENT_CANDIDATE_GATEWAY, HttpClientCandidateGateway } from './clients/client-candidate.gateway';
+import { CLIENT_DEPENDENCY_RESOLVER } from './clients/client-dependency-resolver';
 
 @Controller()
 class AppController {
@@ -46,8 +54,8 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController],
-  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
+  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
+  providers: [DatabaseService, AdminAccessGuard, EventIntakeService, WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService, FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService, HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService, HttpClientSyncGateway, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway }, HttpClientCandidateGateway, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}
 

@@ -27,6 +27,8 @@ export type PairResolutionResult =
         entityType: EntityType;
         bitrix24Id: string;
         moyskladId: string;
+        moyskladType?: string | null;
+        moyskladParentId?: string | null;
         status: 'CONFIRMED' | 'MANUAL';
       source: 'PERSISTED';
       };

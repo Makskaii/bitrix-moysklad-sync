@@ -74,7 +74,7 @@ export class PairResolutionProvider implements PairResolver {
   }
 }
 
-function confirmedPairResult(pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string; source: string }): PairResolutionResult {
+function confirmedPairResult(pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string; moyskladType?: string | null; moyskladParentId?: string | null; source: string }): PairResolutionResult {
   return {
     status: 'confirmed',
     pair: {
@@ -82,6 +82,8 @@ function confirmedPairResult(pair: { id: string; entityType: string; bitrix24Id:
       entityType: pair.entityType as EntityType,
       bitrix24Id: pair.bitrix24Id,
       moyskladId: pair.moyskladId,
+      moyskladType: pair.moyskladType,
+      moyskladParentId: pair.moyskladParentId,
       status: pair.source === 'MANUAL' ? 'MANUAL' : 'CONFIRMED',
       // No automatic match key is approved for v1; every pair here was persisted.
       source: 'PERSISTED',
