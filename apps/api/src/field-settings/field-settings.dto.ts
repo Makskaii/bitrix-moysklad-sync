@@ -50,7 +50,18 @@ export type FieldGroupDto = {
   targetField: string;
   sourceFields: string[];
   criticality: 'critical' | 'optional' | 'tbd';
-  transform: { kind: 'join-non-empty'; separator: string };
+  transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
+};
+
+/** Explicit binding for child endpoints. IDs are selected by an operator and are never discovered/guessed by runtime. */
+export type ClientChildResourceBindingDto = {
+  id: string;
+  entity: 'companies';
+  bitrix24CompanyId: string;
+  bitrix24RequisiteId: string;
+  moyskladCounterpartyId: string;
+  legalFields: Array<{ bitrix24Field: string; moyskladField: string }>;
+  bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: Array<{ bitrix24Field: string; moyskladField: string }> };
 };
 
 export type FieldSettingsConfigDto = {
@@ -59,6 +70,7 @@ export type FieldSettingsConfigDto = {
   serviceCounterpartyId?: string | null;
   rules: FieldRuleDto[];
   groups: FieldGroupDto[];
+  childResourceBindings?: ClientChildResourceBindingDto[];
   references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };
 } & Record<string, unknown>;
 
