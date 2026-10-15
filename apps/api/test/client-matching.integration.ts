@@ -17,9 +17,9 @@ test('primary map uses only unique UUIDs, accepts both contact target types, and
       { entity: 'COMPANY', bitrix24Id: 'c-old', uuid: 'changed-uuid' },
     ],
     targets: [
-      { id: 'company-ms', type: 'counterparty' },
+      { id: 'company-ms', type: 'counterparty', companyType: 'legal' },
       { id: 'person-ms', type: 'contactperson' },
-      { id: 'conflict-ms', type: 'counterparty' },
+      { id: 'conflict-ms', type: 'counterparty', companyType: 'individual' },
     ],
     activePairs: [
       { entity: 'CONTACT', bitrix24Id: 'p3', moyskladId: 'another-ms' },
@@ -30,6 +30,27 @@ test('primary map uses only unique UUIDs, accepts both contact target types, and
   assert.deepEqual(decisions.map((decision) => decision.status === 'UNMATCHED' ? decision.reason : `${decision.source}:${decision.moyskladId}`), [
     'UUID:company-ms', 'UUID_REPEATED', 'UUID_REPEATED', 'UUID:person-ms',
     'NO_CANDIDATE', 'EXISTING:another-ms', 'UUID_MISSING', 'EXISTING:old-ms',
+  ]);
+});
+
+test('primary map requires confirmed counterparty type and separates companies from standalone people', () => {
+  const decisions = planInitialClientMap({
+    inventoryComplete: true,
+    sources: [
+      { entity: 'COMPANY', bitrix24Id: 'company-individual', uuid: 'individual' },
+      { entity: 'CONTACT', bitrix24Id: 'contact-organization', uuid: 'legal' },
+      { entity: 'CONTACT', bitrix24Id: 'contact-individual', uuid: 'individual' },
+      { entity: 'COMPANY', bitrix24Id: 'company-missing-type', uuid: 'missing-type' },
+    ],
+    targets: [
+      { id: 'individual', type: 'counterparty', companyType: 'individual' },
+      { id: 'legal', type: 'counterparty', companyType: 'legal' },
+      { id: 'missing-type', type: 'counterparty' },
+    ],
+    activePairs: [],
+  });
+  assert.deepEqual(decisions.map((decision) => decision.status === 'UNMATCHED' ? decision.reason : decision.moyskladId), [
+    'NO_CANDIDATE', 'NO_CANDIDATE', 'individual', 'INCOMPLETE_VERIFICATION',
   ]);
 });
 
@@ -95,6 +116,25 @@ test('company lookup prefers INN and never fills an empty target INN from the Bi
   const result = await resolver.resolve({ id: 'b24', entity: 'COMPANY', inn: '123', name: 'Exact', phone: '555' });
   assert.equal(result.action, 'USE_CANDIDATE');
   assert.deepEqual(calls, ['inn']);
+});
+
+test('company lookup prefers eligible unmarked Bitrix24 matches and falls back to a unique marked match', async () => {
+  let matches = [
+    candidate('marked', { inn: '123', duplicateMarked: true, usageCount: 20 }),
+    candidate('unmarked', { inn: '123', duplicateMarked: false, usageCount: 1 }),
+  ];
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null,
+    companyByInn: async () => matches,
+    companyByExactNameAndPhone: async () => [],
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const preferred = await resolver.resolve({ id: 'ms', sourceSystem: 'MOYSKLAD', entity: 'COMPANY', inn: '123', name: 'Exact' });
+  assert.equal(preferred.action === 'USE_CANDIDATE' && preferred.targetId, 'unmarked');
+  matches = [candidate('original-marked', { inn: '123', duplicateMarked: true })];
+  const fallback = await resolver.resolve({ id: 'ms', sourceSystem: 'MOYSKLAD', entity: 'COMPANY', inn: '123', name: 'Exact' });
+  assert.equal(fallback.action === 'USE_CANDIDATE' && fallback.targetId, 'original-marked');
 });
 
 test('client processor support is restricted to client entity events', async () => {

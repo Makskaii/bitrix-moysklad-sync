@@ -7,6 +7,7 @@ type FieldRule = {
   entity: string;
   sourceField: string;
   targetField: string;
+  criticality: 'critical' | 'optional' | 'tbd';
   bitrix24ToMoysklad: RuleDirection;
   moyskladToBitrix24: RuleDirection;
 };
@@ -16,6 +17,7 @@ type FieldGroup = {
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
   targetField: string;
   sourceFields: string[];
+  criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string };
 };
 type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
@@ -28,18 +30,24 @@ type DictionaryMap = {
   moyskladDirectoryId: string;
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
+type ReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages';
+type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: 'suggested' | 'confirmed' | 'unmapped' };
 type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   priceTypes: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string; values?: { bitrix24: DictionaryOption[]; moysklad: DictionaryOption[] } }>;
+  namedReferences: Partial<Record<ReferenceKind, { sources: Array<{ source: { id: string; code: string; label: string; group?: string }; targetId: string | null; targetLabel: string | null; status: string; suggestion: { id: string; code: string; label: string } | null; ambiguousSuggestions: Array<{ id: string; code: string; label: string }> }>; targets: Array<{ id: string; code: string; label: string }> }>>;
 };
-const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
+const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
+const referenceKinds: Array<[ReferenceKind, string]> = [
+  ['employees', 'Сотрудники'], ['currencies', 'Валюты'], ['organizations', 'Организации'], ['warehouses', 'Склады'], ['projects', 'Проекты'], ['dealStages', 'Стадии сделок ↔ статусы заказов'],
+];
 type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 type AutoMatch = { source: FieldCandidate; target: FieldCandidate; canBitrix24ToMoysklad: boolean; canMoyskladToBitrix24: boolean };
 type AutoMatchBlock = { matches: AutoMatch[]; unmatched: number; conflicts: number };
@@ -209,7 +217,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         void loadCatalogPages(headers, (response) => { if (response.status === 403) onForbidden(); }).then((nextCatalogs) => {
           if (cancelled) return;
           setCatalogs(nextCatalogs);
-          setDraft((current) => current ? includeCurrentCatalogSources(current, nextCatalogs) : current);
+          setDraft((current) => current ? includeCurrentNamedSources(includeCurrentCatalogSources(current, nextCatalogs), nextCatalogs) : current);
           setCatalogError('');
         }).catch((cause) => {
           if (!cancelled) setCatalogError(cause instanceof Error ? cause.message : 'Не удалось загрузить справочники');
@@ -270,6 +278,15 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     }));
   }
 
+  function updateNamedPair(kind: ReferenceKind, source: { id: string; label: string }, targetId: string, status: NamedReferencePair['status']) {
+    changeDraft((current) => {
+      const pairs = current.references.namedPairs ?? [];
+      const target = catalogs.namedReferences[kind]?.targets.find((item) => item.id === targetId);
+      const next: NamedReferencePair = { kind, bitrix24Id: source.id, bitrix24Label: source.label, moyskladId: targetId || null, moyskladLabel: target?.label ?? null, status: targetId ? status : 'unmapped' };
+      return { ...current, references: { ...current.references, namedPairs: [...pairs.filter((pair) => pair.kind !== kind || pair.bitrix24Id !== source.id), next] } };
+    });
+  }
+
   async function loadFieldMetadata(entity = mappingEntity) {
     const requestId = ++metadataRequest.current;
     setMetadataLoading(true);
@@ -301,6 +318,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     setSaveValidationError('');
     changeDraft((current) => ({ ...current, rules: [...current.rules, {
       id: newLocalId(), entity: mappingEntity, sourceField: '', targetField: '',
+      criticality: 'tbd',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
     }] }));
@@ -312,6 +330,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
+      criticality: 'tbd',
       transform: { kind: 'join-non-empty', separator: groupForm.separator },
     };
     changeDraft((current) => ({ ...current, groups: [...current.groups, group] }));
@@ -333,6 +352,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         ...current,
         rules: [...current.rules, ...suggestions.map(({ source, target }) => ({
           id: newLocalId(), entity: mappingEntity, sourceField: source.code, targetField: target.code,
+          criticality: 'tbd' as const,
           // Matching proposes field identity only. Direction and transformation need explicit review.
           bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' as const } },
           moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' as const } },
@@ -347,7 +367,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     const saved = document?.config.rules.find((candidate) => candidate.id === rule.id);
     return Boolean(saved && saved.entity === rule.entity && saved.sourceField === rule.sourceField && saved.targetField === rule.targetField &&
       saved.bitrix24ToMoysklad.enabled === rule.bitrix24ToMoysklad.enabled && saved.bitrix24ToMoysklad.transform.kind === rule.bitrix24ToMoysklad.transform.kind &&
-      saved.moyskladToBitrix24.enabled === rule.moyskladToBitrix24.enabled && saved.moyskladToBitrix24.transform.kind === rule.moyskladToBitrix24.transform.kind);
+      saved.moyskladToBitrix24.enabled === rule.moyskladToBitrix24.enabled && saved.moyskladToBitrix24.transform.kind === rule.moyskladToBitrix24.transform.kind &&
+      (saved.criticality ?? 'tbd') === rule.criticality);
   }
 
   async function preview() {
@@ -390,7 +411,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       if (!response.ok) throw new Error(body || 'Не удалось сохранить новую версию настроек');
       const nextDocument = JSON.parse(body) as SettingsDocument;
       setDocument(nextDocument);
-      setDraft(catalogs ? includeCurrentCatalogSources(nextDocument.config, catalogs) : structuredClone(nextDocument.config));
+      setDraft(catalogs ? includeCurrentNamedSources(includeCurrentCatalogSources(nextDocument.config, catalogs), catalogs) : structuredClone(nextDocument.config));
       setShowSaveWarning(false);
       setPreviewResults([]);
       setAutoMatchSummary(null);
@@ -465,6 +486,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <span className={saved ? 'mapping-status is-saved' : 'mapping-status is-unsaved'} role="cell" aria-label={saved ? 'Сохранено' : 'Не сохранено'} title={saved ? 'Сохранено в активную версию' : 'Есть несохранённые изменения'}>{saved ? '✓ Сохранено' : '• Не сохранено'}</span>
               <details className="mapping-row-advanced"><summary>Направления и коды</summary>
                 <div className="mapping-advanced-content">
+                  <label>Критичность<select aria-label={`Критичность ${rule.sourceField || 'поля'} → ${rule.targetField || 'поля'}`} value={rule.criticality ?? 'tbd'} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, criticality: event.target.value as FieldRule['criticality'] }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label>
                   <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
                   <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
                   <details className="mapping-codes"><summary>Технические коды</summary><code>{rule.sourceField || '—'} → {rule.targetField || '—'}</code><small>{source?.type ?? 'тип недоступен'} → {target?.type ?? 'тип недоступен'}</small></details>
@@ -492,7 +514,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           <button type="submit" className="button-secondary">Добавить составное правило</button>
         </form>
-        {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
+        {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small><label>Критичность<select aria-label={`Критичность группы ${group.targetField}`} value={group.criticality ?? 'tbd'} onChange={(event) => changeDraft((current) => ({ ...current, groups: current.groups.map((item) => item.id === group.id ? { ...item, criticality: event.target.value as FieldGroup['criticality'] } : item) }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
       </section>
 
       <section className="field-editor-section" aria-label="Предпросмотр настройки">
@@ -552,12 +574,52 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         </article>;
         })}
       </section>
+      <section className="field-editor-section" aria-label="Сотрудники, стадии и справочные значения">
+        <div className="panel-heading"><div><p className="eyebrow">СВЯЗИ И СТАТУСЫ</p><h3>Сотрудники, организации и справочники</h3></div></div>
+        <p className="panel-description">Автопоиск предлагает совпадения по названию, но не подтверждает их автоматически. Выберите значение МойСклад и подтвердите каждую пару отдельно.</p>
+        {(() => {
+          const employees = draft.references.namedPairs ?? [];
+          const duplicateEmployees = new Map<string, NamedReferencePair[]>();
+          for (const pair of employees.filter((candidate) => candidate.kind === 'employees' && candidate.status === 'confirmed' && candidate.moyskladId)) {
+            duplicateEmployees.set(pair.moyskladId!, [...(duplicateEmployees.get(pair.moyskladId!) ?? []), pair]);
+          }
+          const conflicts = [...duplicateEmployees.entries()].filter(([, pairs]) => pairs.length > 1);
+          return conflicts.length ? <p role="alert" className="inline-error">Один сотрудник МойСклад сопоставлен с несколькими сотрудниками Bitrix24 ({conflicts.length} конфликтов). Проверьте назначения перед включением обмена.</p> : null;
+        })()}
+        {referenceKinds.map(([kind, title]) => {
+          const catalog = catalogs.namedReferences[kind];
+          const savedPairs = draft.references.namedPairs ?? [];
+          return <details key={kind} className="field-reference-group">
+            <summary>{title} · {savedPairs.filter((pair) => pair.kind === kind && pair.status === 'confirmed').length} подтверждено</summary>
+            {!catalog ? <p role="alert">Каталог недоступен.</p> : <div className="reference-map-list">{catalog.sources.map(({ source, targetId, targetLabel, status, suggestion, ambiguousSuggestions }) => {
+              const saved = savedPairs.find((pair) => pair.kind === kind && pair.bitrix24Id === source.id);
+              const selectedId = saved?.moyskladId ?? targetId ?? '';
+              return <article key={source.id} className="reference-map-row">
+                <div><strong>{source.label || source.id}</strong><small>Bitrix24{source.group ? ` · Воронка: ${source.group}` : ''} · {source.code || source.id} · {saved?.status ?? status}</small>
+                  {suggestion && <small>Предложение: {suggestion.label}</small>}
+                  {ambiguousSuggestions.length > 0 && <small role="alert">Несколько кандидатов: {ambiguousSuggestions.map((item) => item.label).join(', ')}</small>}
+                  {saved?.status === 'confirmed' && targetLabel && <small>Подтверждено: {targetLabel}</small>}
+                </div>
+                <label>МойСклад<select aria-label={`${title}: значение МойСклад для ${source.label}`} value={selectedId} onChange={(event) => updateNamedPair(kind, source, event.target.value, 'suggested')}>
+                  <option value="">Не сопоставлять</option>
+                  {selectedId && !catalog.targets.some((target) => target.id === selectedId) && <option value={selectedId}>{targetLabel ?? 'Сохранённое, отсутствующее в каталоге'} · {selectedId}</option>}
+                  {catalog.targets.map((target) => <option key={target.id} value={target.id}>{target.label} · {target.code || target.id}</option>)}
+                </select></label>
+                {suggestion && !selectedId && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, suggestion.id, 'suggested')}>Использовать предложение</button>}
+                {selectedId && saved?.status !== 'confirmed' && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, selectedId, 'confirmed')}>Подтвердить пару</button>}
+                {saved?.status === 'confirmed' && <button type="button" className="button-secondary" onClick={() => updateNamedPair(kind, source, '', 'unmapped')}>Снять пару</button>}
+              </article>;
+            })}</div>}
+          </details>;
+        })}
+      </section>
       </details>
 
       <div className="field-save-bar"><p>Сохранение создаёт версию {document.version + 1} и сразу применяется к новым событиям.</p><button type="button" onClick={() => setShowSaveWarning(true)} disabled={saving}>Сохранить новую версию</button></div>
       {showSaveWarning && <div className="field-save-warning" role="alertdialog" aria-label="Предупреждение о настройках">
         <h3>Подтвердите изменение настроек</h3>
         <p>Новая версия начнёт действовать для новых событий. Уже принятые события сохранят прежние правила; обычный повтор не переключает версию. Массового пересчёта не будет.</p>
+        {document && draft && fieldRuleRiskChanges(document.config, draft).length > 0 && <div role="alert"><strong>Рискованные изменения ключей или направлений:</strong><ul>{fieldRuleRiskChanges(document.config, draft).map((change) => <li key={change}>{change}</li>)}</ul><p>После подтверждения эти изменения будут записаны в журнал администрирования.</p></div>}
         <button type="button" onClick={() => void save()} disabled={saving}>{saving ? 'Сохраняем…' : 'Подтвердить и сохранить'}</button>
         <button type="button" className="button-secondary" onClick={() => setShowSaveWarning(false)} disabled={saving}>Отмена</button>
       </div>}
@@ -567,6 +629,41 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
 function newLocalId() {
   return globalThis.crypto?.randomUUID?.() ?? `field-rule-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function fieldRuleRiskChanges(previous: SettingsConfig, next: SettingsConfig): string[] {
+  const oldRules = new Map(previous.rules.map((rule) => [rule.id, rule]));
+  const newRules = new Map(next.rules.map((rule) => [rule.id, rule]));
+  const changes: string[] = [];
+  for (const [id, oldRule] of oldRules) {
+    const newRule = newRules.get(id);
+    if (!newRule) {
+      changes.push(`Удалено: ${oldRule.entity} ${oldRule.sourceField} → ${oldRule.targetField}`);
+      continue;
+    }
+    if (oldRule.entity !== newRule.entity || oldRule.sourceField !== newRule.sourceField || oldRule.targetField !== newRule.targetField) {
+      changes.push(`Изменён ключ: ${oldRule.entity} ${oldRule.sourceField} → ${oldRule.targetField}`);
+    }
+    if (oldRule.bitrix24ToMoysklad.enabled !== newRule.bitrix24ToMoysklad.enabled || oldRule.moyskladToBitrix24.enabled !== newRule.moyskladToBitrix24.enabled) {
+      changes.push(`Изменено направление: ${newRule.entity} ${newRule.sourceField} → ${newRule.targetField}`);
+    }
+  }
+  for (const [id, newRule] of newRules) if (!oldRules.has(id)) changes.push(`Добавлен ключ: ${newRule.entity} ${newRule.sourceField} → ${newRule.targetField}`);
+  const oldGroups = new Map(previous.groups.map((group) => [group.id, group]));
+  const newGroups = new Map(next.groups.map((group) => [group.id, group]));
+  for (const [id, oldGroup] of oldGroups) {
+    const newGroup = newGroups.get(id);
+    if (!newGroup) {
+      changes.push(`Удалена группа: ${oldGroup.entity} ${oldGroup.sourceFields.join(' + ')} → ${oldGroup.targetField}`);
+      continue;
+    }
+    if (oldGroup.entity !== newGroup.entity || oldGroup.targetField !== newGroup.targetField || oldGroup.sourceFields.join('\0') !== newGroup.sourceFields.join('\0')) {
+      changes.push(`Изменён ключ группы: ${oldGroup.entity} ${oldGroup.sourceFields.join(' + ')} → ${oldGroup.targetField}`);
+    }
+    if (oldGroup.direction !== newGroup.direction) changes.push(`Изменено направление группы: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
+  }
+  for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`Добавлена группа: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
+  return changes;
 }
 
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {
@@ -586,8 +683,29 @@ function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs
   return next;
 }
 
+function includeCurrentNamedSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {
+  const next = structuredClone(config);
+  const pairs = next.references.namedPairs ?? [];
+  const result = [...pairs];
+  for (const [kind] of referenceKinds) {
+    for (const item of catalogs.namedReferences[kind]?.sources ?? []) {
+      if (result.some((pair) => pair.kind === kind && pair.bitrix24Id === item.source.id)) continue;
+      result.push({
+        kind,
+        bitrix24Id: item.source.id,
+        bitrix24Label: item.source.label,
+        moyskladId: item.suggestion?.id ?? null,
+        moyskladLabel: item.suggestion?.label ?? null,
+        status: item.suggestion ? 'suggested' : 'unmapped',
+      });
+    }
+  }
+  next.references.namedPairs = result;
+  return next;
+}
+
 async function loadCatalogPages(headers: Record<string, string>, inspect: (response: Response) => void): Promise<Catalogs> {
-  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [] };
+  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
   for (const kind of ['units', 'priceTypes'] as const) {
     for (const system of ['bitrix24', 'moysklad'] as const) {
       let cursor: string | null = null;
@@ -605,6 +723,8 @@ async function loadCatalogPages(headers: Record<string, string>, inspect: (respo
   const metaResponse = await fetch(`${endpoint}/catalogs`, { headers });
   inspect(metaResponse);
   if (!metaResponse.ok) throw new Error('Не удалось загрузить метаданные справочников');
-  result.dictionaries = (await metaResponse.json() as Catalogs).dictionaries;
+  const metadata = await metaResponse.json() as Catalogs;
+  result.dictionaries = metadata.dictionaries;
+  result.namedReferences = metadata.namedReferences;
   return result;
 }

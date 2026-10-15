@@ -66,7 +66,7 @@ const fakeApi: ClientInventoryProvider = {
     return { rows: entity === 'COMPANY' ? [{ id: companyId, uuid: companyUuid }] : [{ id: contactId, uuid: contactUuid }], next: null, total: 1 };
   },
   async counterpartyPage(offset) {
-    return offset === 0 ? { rows: [{ id: companyTarget }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
+    return offset === 0 ? { rows: [{ id: companyTarget, companyType: 'legal' }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
   },
   async contactpersonPage(parentId, offset) {
     return offset === 0 ? { rows: [{ id: contactTarget, parentId }], next: null, total: 1 } : { rows: [], next: null, total: 1 };
@@ -192,6 +192,8 @@ test('resumable inventory maps exact company/contact UUIDs to native IDs, includ
   assert.deepEqual(pairs.map((pair) => [pair.entityType, pair.moyskladId, pair.moyskladType, pair.moyskladParentId]), [
     ['COMPANY', companyTarget, 'counterparty', null], ['CONTACT', contactTarget, 'contactperson', companyTarget],
   ], JSON.stringify({ status, objects: await database.clientInventoryObject.findMany({ where: { externalId: { in: [companyId, contactId, companyTarget, contactTarget] } } }) }));
+  const inventoriedCompany = await database.clientInventoryObject.findFirst({ where: { system: 'MOYSKLAD', entityType: 'COMPANY', externalId: companyTarget } });
+  assert.equal(inventoriedCompany?.companyType, 'legal');
   const unmatched = await service.listUnmatched();
   assert.equal(unmatched.entries.some((row) => row.externalId === companyId || row.externalId === contactId), false);
 });
@@ -255,7 +257,7 @@ test('document dependency canonicalizes a duplicate company to an unmarked equiv
     async readBitrix(entity, id) {
       assert.equal(entity, 'COMPANY');
       assert.ok([duplicateCompanyId, canonicalCompanyId].includes(id));
-      return { ID: id, TITLE: 'Canonical LLC', PHONE: '+7 999 222-33-44', UF_CRM_1789126724375: id === duplicateCompanyId ? '1' : '0' };
+      return { ID: id, TITLE: 'Canonical LLC', PHONE: '+7 999 222-33-44', UF_CRM_1789126724375: id === duplicateCompanyId ? 'Дубль' : '' };
     },
     async readMoysklad(type, id) { assert.equal(type, 'counterparty'); return { id, name: 'Canonical LLC' }; },
     async updateBitrix() { assert.fail('dependency mapping must not write fields'); },
@@ -620,7 +622,7 @@ test('ordinary client sync excludes a duplicate-marked company without searching
   } });
   await settings.pinEvent(duplicateOrdinaryEventId);
   const syncGateway: ClientSyncGateway = {
-    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, duplicateCompanyId); return { ID: id, TITLE: 'Duplicate', UF_CRM_1789126724375: '1' }; },
+    async readBitrix(entity, id) { assert.equal(entity, 'COMPANY'); assert.equal(id, duplicateCompanyId); return { ID: id, TITLE: 'Duplicate', UF_CRM_1789126724375: 'Дубль' }; },
     async readMoysklad() { assert.fail('duplicate-marked company must not access the target'); },
     async updateBitrix() { assert.fail('duplicate-marked company must not sync'); },
     async updateMoysklad() { assert.fail('duplicate-marked company must not sync'); },

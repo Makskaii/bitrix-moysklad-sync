@@ -167,8 +167,8 @@ export class ClientMappingService {
       for (const entityType of entityTypes) {
         await this.database.clientInventoryObject.upsert({
           where: { system_entityType_externalId: { system: 'MOYSKLAD', entityType, externalId: row.id } },
-          create: { system: 'MOYSKLAD', entityType, nativeType, externalId: row.id, parentId: row.parentId ?? null, status: 'INVENTORIED' },
-          update: { nativeType, parentId: row.parentId ?? null, status: 'INVENTORIED', reason: null, observedAt: new Date() },
+          create: { system: 'MOYSKLAD', entityType, nativeType, externalId: row.id, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, status: 'INVENTORIED' },
+          update: { nativeType, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, status: 'INVENTORIED', reason: null, observedAt: new Date() },
         });
       }
       await this.checkLease(owner);
@@ -180,11 +180,11 @@ export class ClientMappingService {
       where: { system: 'BITRIX24' }, select: { entityType: true, externalId: true, matchValue: true },
     });
     const moyskladTargets = await this.database.clientInventoryObject.findMany({
-      where: { system: 'MOYSKLAD' }, select: { entityType: true, nativeType: true, externalId: true, parentId: true },
+      where: { system: 'MOYSKLAD' }, select: { entityType: true, nativeType: true, externalId: true, parentId: true, companyType: true },
     });
     for (const entity of ['COMPANY', 'CONTACT'] as const) {
       const sources = bitrixSources.filter((row) => row.entityType === entity).map((row) => ({ entity, bitrix24Id: row.externalId, uuid: row.matchValue }));
-      const targets = moyskladTargets.filter((row) => row.entityType === entity).map((row) => ({ id: row.externalId, type: row.nativeType as 'counterparty' | 'contactperson', parentId: row.parentId }));
+      const targets = moyskladTargets.filter((row) => row.entityType === entity).map((row) => ({ id: row.externalId, type: row.nativeType as 'counterparty' | 'contactperson', parentId: row.parentId, companyType: row.companyType }));
       await this.reconcileEntity(entity, sources, targets, owner);
     }
   }
@@ -192,7 +192,7 @@ export class ClientMappingService {
   private async reconcileEntity(
     entity: ClientInventoryEntity,
     sources: Array<{ entity: ClientInventoryEntity; bitrix24Id: string; uuid: string | null }>,
-    targets: Array<{ id: string; type: 'counterparty' | 'contactperson' }>,
+    targets: Array<{ id: string; type: 'counterparty' | 'contactperson'; parentId?: string | null; companyType?: string | null }>,
     owner: string,
   ) {
     await this.database.$transaction(async (transaction) => {

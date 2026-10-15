@@ -3,6 +3,19 @@ import { FieldCandidate, LiveFieldCatalogs, PairSnapshot, ReadOnlyFieldDataProvi
 
 /** Synthetic catalogs used only by the isolated local admin preview. */
 export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvider {
+  override async referenceCatalogs(_bitrixAccessToken: string) {
+    const sample = (id: string, label: string) => ({ id, code: id, label });
+    const refs = {
+      employees: { bitrix24: [sample('1', 'Демо сотрудник')], moysklad: [sample('demo-employee', 'Демо сотрудник')] },
+      currencies: { bitrix24: [sample('RUB', 'Российский рубль')], moysklad: [sample('demo-rub', 'Российский рубль')] },
+      organizations: { bitrix24: [sample('87402', 'Демо организация')], moysklad: [sample('demo-org', 'Демо организация')] },
+      warehouses: { bitrix24: [sample('87404', 'Демо склад')], moysklad: [sample('demo-store', 'Демо склад')] },
+      projects: { bitrix24: [sample('87406', 'Демо проект')], moysklad: [sample('demo-project', 'Демо проект')] },
+      dealStages: { bitrix24: [sample('0:NEW', 'Новая сделка')], moysklad: [sample('demo-state', 'Новая сделка')] },
+    };
+    return refs;
+  }
+
   override async catalogs(_bitrixAccessToken: string): Promise<LiveFieldCatalogs> {
     return {
       units: {

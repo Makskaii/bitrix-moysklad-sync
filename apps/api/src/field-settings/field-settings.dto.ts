@@ -23,11 +23,22 @@ export type DictionaryReference = {
   pairs: Array<{ bitrix24Id: number; moyskladId: string }>;
 };
 
+export type NamedReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages';
+export type NamedReferencePair = {
+  kind: NamedReferenceKind;
+  bitrix24Id: string;
+  bitrix24Label: string;
+  moyskladId: string | null;
+  moyskladLabel: string | null;
+  status: 'suggested' | 'confirmed' | 'unmapped';
+};
+
 export type FieldRuleDto = {
   id: string;
   entity: string;
   sourceField: string;
   targetField: string;
+  criticality: 'critical' | 'optional' | 'tbd';
   bitrix24ToMoysklad: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
   moyskladToBitrix24: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
 };
@@ -38,6 +49,7 @@ export type FieldGroupDto = {
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
   targetField: string;
   sourceFields: string[];
+  criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string };
 };
 
@@ -45,7 +57,7 @@ export type FieldSettingsConfigDto = {
   schemaVersion: 1;
   rules: FieldRuleDto[];
   groups: FieldGroupDto[];
-  references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[] };
+  references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };
 } & Record<string, unknown>;
 
 export type VersionedFieldSettingsDto = {

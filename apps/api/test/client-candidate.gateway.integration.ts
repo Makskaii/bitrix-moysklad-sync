@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
+import { HttpClientInventoryProvider } from '../src/clients/client-inventory.provider';
 import { chooseCandidate, ClientRuntimeResolver } from '../src/clients/client-runtime-resolver';
 
 const fakeDb = {
@@ -126,4 +127,59 @@ test('company searches exclude MoySklad individual counterparties', async () => 
   };
   const rows = await new HttpClientCandidateGateway(fakeDb, fetcher).companyByInn('7700000000');
   assert.deepEqual(rows.map((row) => row.id), ['legal']);
+});
+
+test('initial inventory requests and preserves only native company type metadata', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://inventory.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-inventory-token';
+  const requests: URL[] = [];
+  const fetcher: typeof fetch = async (input) => {
+    const url = new URL(String(input)); requests.push(url);
+    return response({ rows: [{ id: 'counterparty-id', companyType: 'individual', unexpected: 'ignored' }], meta: { size: 1, limit: 1000, offset: 0 } });
+  };
+  const provider = new HttpClientInventoryProvider(fetcher);
+  const counterparty = await provider.counterpartyPage(0);
+  const contactpersons = await provider.contactpersonPage('parent-id', 0);
+  assert.equal(requests[0]?.searchParams.get('fields'), 'id,companyType');
+  assert.equal(requests[1]?.searchParams.get('fields'), 'id');
+  assert.deepEqual(counterparty.rows, [{ id: 'counterparty-id', parentId: null, companyType: 'individual' }]);
+  assert.deepEqual(contactpersons.rows, [{ id: 'counterparty-id', parentId: 'parent-id' }]);
+});
+
+test('Bitrix24 company searches request and retain the duplicate marker', async () => {
+  process.env.BITRIX24_REST_BASE_URL = 'https://bitrix-candidate.fake/rest/';
+  const calls: Array<{ method: string; body: string }> = [];
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const form = new URLSearchParams(String(init?.body));
+    const method = url.pathname.split('/').at(-1) ?? '';
+    calls.push({ method, body: String(init?.body) });
+    if (method === 'crm.requisite.list') return response({ result: [{ ENTITY_ID: 'marked', RQ_INN: '7700000000' }, { ENTITY_ID: 'unmarked', RQ_INN: '7700000000' }] });
+    if (method === 'crm.company.list') return response({ result: [
+      { ID: 'marked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: 'Дубль' },
+      { ID: 'unmarked', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22', UF_CRM_1789126724375: '' },
+    ] });
+    if (method === 'crm.deal.list') return response({ result: [], total: 0 });
+    throw new Error(`Unexpected fake API request ${method}`);
+  };
+  const gateway = new HttpClientCandidateGateway(fakeDb, fetcher);
+  const byInn = await gateway.companyByInn('7700000000', 'BITRIX24');
+  const exact = await gateway.companyByExactNameAndPhone('Example LLC', '+7 999 000-11-22', 'BITRIX24');
+  assert.deepEqual(byInn.map((row) => [row.id, row.duplicateMarked]), [['marked', true], ['unmarked', false]]);
+  assert.deepEqual(exact.map((row) => [row.id, row.duplicateMarked]), [['marked', true], ['unmarked', false]]);
+  const companyRequests = calls.filter((call) => call.method === 'crm.company.list').map((call) => call.body);
+  assert.ok(companyRequests.every((body) => body.includes('UF_CRM_1789126724375')));
+});
+
+test('Bitrix24 company search fails closed when the requested duplicate marker is absent', async () => {
+  process.env.BITRIX24_REST_BASE_URL = 'https://bitrix-candidate.fake/rest/';
+  const fetcher: typeof fetch = async (input) => {
+    const method = new URL(String(input)).pathname.split('/').at(-1);
+    if (method === 'crm.company.list') return response({ result: [{ ID: 'unknown-marker', TITLE: 'Example LLC', PHONE: '+7 999 000-11-22' }] });
+    throw new Error(`Unexpected fake API request ${method}`);
+  };
+  await assert.rejects(
+    new HttpClientCandidateGateway(fakeDb, fetcher).companyByExactNameAndPhone('Example LLC', '+7 999 000-11-22', 'BITRIX24'),
+    /CLIENT_COMPANY_DUPLICATE_MARKER_UNVERIFIED/,
+  );
 });

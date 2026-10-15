@@ -269,17 +269,18 @@ model ClientInventoryJob {
 }
 
 model ClientInventoryObject {
-  id         String   @id @default(cuid())
-  system     String
-  entityType String
-  nativeType String
-  externalId String
-  matchValue String?
-  parentId   String?
-  status     String   @default("PENDING")
-  reason     String?
-  observedAt DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id          String   @id @default(cuid())
+  system      String
+  entityType  String
+  nativeType  String
+  externalId  String
+  matchValue  String?
+  parentId    String?
+  companyType String?
+  status      String   @default("PENDING")
+  reason      String?
+  observedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@unique([system, entityType, externalId])
   @@index([system, entityType, matchValue])
