@@ -74,7 +74,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         where: {
           AND: [
             { OR: [
-              { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRICE.ON.UPDATE'] } },
+              { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.ADD', 'CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRICE.ON.UPDATE'] } },
               { source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'product' },
             ] },
             { OR: [
@@ -290,7 +290,7 @@ async function assertWorkerLeaseInTransaction(
 function retryDelayMs(attempt: number): number { return Math.min(60_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 6), 3_600_000); }
 function isProductEvent(source: string, eventType: string | null, externalEntityType: string | null): boolean {
   return source === 'BITRIX24'
-    ? eventType === 'CATALOG.PRODUCT.ON.UPDATE' || eventType === 'CATALOG.PRICE.ON.UPDATE'
+    ? eventType === 'CATALOG.PRODUCT.ON.ADD' || eventType === 'CATALOG.PRODUCT.ON.UPDATE' || eventType === 'CATALOG.PRICE.ON.UPDATE'
     : source === 'MOYSKLAD' && eventType === 'UPDATE' && externalEntityType === 'product';
 }
 function isDue(status: string, retryAfter: Date | null, processingStartedAt: Date | null): boolean {
