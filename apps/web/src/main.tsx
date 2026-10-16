@@ -646,22 +646,36 @@ const pairReviewReasonLabels: Record<string, string> = {
 };
 type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; bitrix24Label?: string | null; moyskladLabel?: string | null; labelStatus?: string; moyskladType: string | null; moyskladParentId: string | null; source: string; reason: string | null; createdAt: string };
 type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; sourceLabel?: string | null; labelStatus?: string; eventId: string | null; reason: string; openedAt: string };
-type ClientLifecycleRow = { id: string; entityType: 'COMPANY' | 'CONTACT'; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; lifecycleStatus: string; tombstonedAt: string | null; tombstoneSource: string | null; tombstoneReason: string | null; deletionMarkerStatus: string; deletionTimelineStatus: string };
+type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT';
+type LifecycleMarkerFields = Partial<Record<LifecycleEntityType, string>>;
+type ClientLifecycleRow = { id: string; entityType: LifecycleEntityType; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; lifecycleStatus: string; tombstonedAt: string | null; tombstoneSource: string | null; tombstoneReason: string | null; deletionMarkerStatus: string; deletionTimelineStatus: string };
+const lifecycleEntityLabels: Record<LifecycleEntityType, string> = { COMPANY: 'Компания', CONTACT: 'Контакт', DEAL: 'Сделка', PRODUCT: 'Товар' };
+const lifecycleMarkerStatusLabels: Record<string, string> = {
+  NOT_REQUIRED: 'Метка не требуется для этого типа записи', PENDING: 'Ожидает записи метки', WRITING: 'Метка записывается',
+  MARKED: 'Метка удаления записана', NOT_CONFIGURED: 'Поле метки не настроено', FAILED: 'Не удалось записать метку',
+  CLEARING: 'Метка очищается', CLEARED: 'Метка очищена', CLEAR_FAILED: 'Не удалось очистить метку',
+};
+const lifecycleRestoreEligible = new Set(['NOT_REQUIRED', 'NOT_CONFIGURED', 'MARKED', 'FAILED', 'PENDING', 'CLEAR_FAILED']);
 
 function PairManager({ accessToken, onError, onForbidden }: { accessToken: string; onError: (message: string) => void; onForbidden: () => void }) {
   const [pairs, setPairs] = useState<PairRow[]>([]);
   const [reviews, setReviews] = useState<PairReviewRow[]>([]);
   const [lifecycleRows, setLifecycleRows] = useState<ClientLifecycleRow[]>([]);
   const [lifecycleError, setLifecycleError] = useState('');
+  const [markerFields, setMarkerFields] = useState<LifecycleMarkerFields>({});
+  const [markerFieldsAvailable, setMarkerFieldsAvailable] = useState(false);
+  const [markerFieldsError, setMarkerFieldsError] = useState('');
+  const [markerFieldsNotice, setMarkerFieldsNotice] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
   async function refresh() {
     const headers: Record<string, string> = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
-    const [pairsResponse, reviewsResponse, lifecycleResponse] = await Promise.all([
+    const [pairsResponse, reviewsResponse, lifecycleResponse, markerFieldsResponse] = await Promise.all([
       fetch('/api/admin/pairs', { headers }),
       fetch('/api/admin/pairs/reviews', { headers }),
       fetch('/api/admin/clients/lifecycle', { headers }),
+      fetch('/api/admin/clients/lifecycle/marker-fields', { headers }),
     ]);
     if (pairsResponse.status === 403 || reviewsResponse.status === 403) {
       onForbidden();
@@ -680,6 +694,19 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
     } else {
       setLifecycleRows(await lifecycleResponse.json() as ClientLifecycleRow[]);
       setLifecycleError('');
+    }
+    if (markerFieldsResponse.status === 403) {
+      onForbidden();
+      throw new Error('Доступ только для администратора Bitrix24');
+    }
+    if (!markerFieldsResponse.ok) {
+      setMarkerFieldsAvailable(false);
+      setMarkerFieldsError('Настройки меток удаления пока недоступны; сохранённые ID обеих систем не изменены.');
+    } else {
+      const result = await markerFieldsResponse.json() as { fields?: LifecycleMarkerFields };
+      setMarkerFields(result.fields ?? {});
+      setMarkerFieldsAvailable(true);
+      setMarkerFieldsError('');
     }
   }
 
@@ -726,6 +753,26 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
     } finally { setSaving(false); }
   }
 
+  async function saveMarkerFields(event: React.FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setMarkerFieldsError('');
+    setMarkerFieldsNotice('');
+    try {
+      const response = await fetch('/api/admin/clients/lifecycle/marker-fields', {
+        method: 'PUT', headers: { 'content-type': 'application/json', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+        body: JSON.stringify({ fields: markerFields }),
+      });
+      if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
+      const result = await response.json().catch(() => null) as { fields?: LifecycleMarkerFields; status?: string } | null;
+      if (!response.ok) throw new Error(result?.status ? `Не удалось сохранить поля меток: ${result.status}` : 'Не удалось сохранить поля меток. Проверьте коды UF-полей.');
+      setMarkerFields(result?.fields ?? markerFields);
+      setMarkerFieldsNotice('Поля меток сохранены на сервере. Новые метки будут записываться при следующих событиях.');
+    } catch (cause) {
+      setMarkerFieldsError(cause instanceof Error ? cause.message : String(cause));
+    } finally { setSaving(false); }
+  }
+
   return <>
     <PageHeading eyebrow="СВЯЗИ ЗАПИСЕЙ" title="Пары Bitrix24 и МойСклад" subtitle="Подтверждённая пара хранится по ID обеих записей. Непроверенное совпадение всегда остаётся на ручной проверке." />
     <section className="panel pair-manager">
@@ -739,11 +786,20 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
     <section className="panel pair-manager" aria-label="Удалённые клиентские пары">
       <p className="eyebrow">ЖИЗНЕННЫЙ ЦИКЛ КЛИЕНТА</p><h3>Приостановленные пары · {lifecycleRows.length}</h3>
       <p className="pair-safety-note">Удалённая запись не считается несопоставленной и не удаляет запись партнёра. Восстановление проверяет, что обе исходные записи по тем же ID всё ещё существуют.</p>
+      <form className="manual-pair-form" onSubmit={(event) => void saveMarkerFields(event)} aria-label="Поля меток удаления">
+        <div className="records-head"><div><h4>Поля меток удаления</h4><p className="panel-description">Точные коды пользовательских полей Bitrix24. Код должен быть настроен на сервере; догадки не применяются.</p></div></div>
+        {markerFieldsAvailable && (['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'] as const).map((entityType) => <label key={entityType}>{lifecycleEntityLabels[entityType]} · код UF-поля<input maxLength={100} value={markerFields[entityType] ?? ''} onChange={(change) => setMarkerFields((current) => ({ ...current, [entityType]: change.target.value }))} placeholder="UF_CRM_…" /></label>)}
+        {markerFieldsError && <p role="alert" className="inline-error">{markerFieldsError}</p>}
+        {markerFieldsNotice && <p role="status" className="pair-safety-note">{markerFieldsNotice}</p>}
+        {markerFieldsAvailable && <button type="submit" disabled={saving}>Сохранить настройки меток</button>}
+      </form>
       {lifecycleError ? <p role="alert" className="inline-error">{lifecycleError}</p> : lifecycleRows.length ? <div className="pair-list">{lifecycleRows.map((row) => <article className="pair-card" key={row.id}>
-        <div><span className="pair-entity">{row.entityType === 'COMPANY' ? 'Компания' : 'Контакт'}</span><span className="pair-state">Удалена в {row.tombstoneSource ?? 'неизвестной системе'} · {row.tombstonedAt ? new Date(row.tombstonedAt).toLocaleString('ru-RU') : 'время неизвестно'}</span></div>
+        <div><span className="pair-entity">{lifecycleEntityLabels[row.entityType] ?? row.entityType}</span><span className="pair-state">Удалена в {row.tombstoneSource ?? 'неизвестной системе'} · {row.tombstonedAt ? new Date(row.tombstonedAt).toLocaleString('ru-RU') : 'время неизвестно'}</span></div>
         <div className="pair-sides"><p><small>Bitrix24 · ID</small><code>{row.bitrix24Id}</code></p><b aria-hidden="true">↔</b><p><small>МойСклад · {row.moyskladType ?? 'ID'}</small><code>{row.moyskladId}</code>{row.moyskladParentId && <small>Родительский ID · {row.moyskladParentId}</small>}</p></div>
-        <small>Причина: {row.tombstoneReason ?? 'не указана'} · Метка удаления: {row.deletionMarkerStatus} · Запись в истории Bitrix24: {row.deletionTimelineStatus}</small>
-        {row.deletionMarkerStatus === 'NOT_CONFIGURED' && <button type="button" disabled={saving} onClick={() => void restore(row.id).catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Проверить и восстановить</button>}
+        <small>Причина: {row.tombstoneReason ?? 'не указана'} · Метка удаления: {lifecycleMarkerStatusLabels[row.deletionMarkerStatus] ?? row.deletionMarkerStatus} · Запись в истории Bitrix24: {row.deletionTimelineStatus}</small>
+        {lifecycleRestoreEligible.has(row.deletionMarkerStatus)
+          ? <button type="button" disabled={saving} onClick={() => void restore(row.id).catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Проверить ID и очистить метку, если настроена; затем восстановить</button>
+          : <small>Восстановление ожидает завершения операции с меткой удаления.</small>}
       </article>)}</div> : <p className="empty-state">Удалённых связанных клиентских пар нет.</p>}
     </section>
     <section className="panel pair-manager">

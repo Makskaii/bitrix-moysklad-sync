@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/admin/overview', (route) => route.fulfill({ json: { queue: {}, openManualReviews: 0, openPairReviews: 0, activePairs: 0, lastEventAt: null } }));
+  await page.route('**/api/admin/audit**', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));
   await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: {
     status: 'READY', previousLaunchBoundary: '2026-10-07T00:00:00.000Z', pairsRestored: true, lostEventsAcknowledged: true,
   } }));
@@ -53,7 +55,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
   await page.goto('/');
   await expect(page.getByRole('navigation', { name: 'Разделы админки' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Обзор' })).toBeVisible();
-  await expect(page.getByText('Нет достоверных данных', { exact: false }).first()).toBeVisible();
+  await expect(page.getByText('Нет событий', { exact: true })).toBeVisible();
 
   const sections = [
     ['Очередь и попытки', 'Очередь и попытки'],

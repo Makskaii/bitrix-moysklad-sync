@@ -9,6 +9,8 @@ test('historical inventory browses each provider independently and resets pages 
   const staleB24Gate = new Promise<void>((resolve) => { releaseStaleB24Page = resolve; });
   const staleB24Started = new Promise<void>((resolve) => { staleB24PageStarted = resolve; });
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
+  await page.route('**/api/admin/overview', (route) => route.fulfill({ json: { queue: {}, openManualReviews: 0, openPairReviews: 0, activePairs: 0, lastEventAt: null } }));
+  await page.route('**/api/admin/audit**', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode', (route) => route.fulfill({ json: { mode: 'off' } }));
   await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [] }));
