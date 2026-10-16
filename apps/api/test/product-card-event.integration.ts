@@ -61,6 +61,22 @@ test('Bitrix24 product update is skipped before pair lookup or reconciliation', 
   assert.equal(runtimeCalls.length, 0);
 });
 
+test('Bitrix24 catalog create events are accepted only to record the disabled reverse direction', async () => {
+  const { processor, storedEvent, runtimeCalls } = harness({
+    eventType: 'CATALOG.PRODUCT.ON.ADD', externalEntityType: 'product', externalEntityId: '101',
+    payload: { event: 'CATALOG.PRODUCT.ON.ADD', data: { FIELDS: { ID: 101, TYPE: 1 } } },
+  }, [], { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' });
+
+  assert.equal(processor.supports({
+    id: 'event-1', source: 'BITRIX24', eventType: 'CATALOG.PRODUCT.ON.ADD', externalEntityType: 'product', externalEntityId: '101',
+  }), true);
+  assert.deepEqual(await processor.process('event-1'), {
+    status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [],
+  });
+  assert.equal(storedEvent.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(runtimeCalls.length, 0);
+});
+
 test('due retryable product events are claimed and reprocessed', async () => {
   const { processor, storedEvent, runtimeCalls } = harness({
     eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
