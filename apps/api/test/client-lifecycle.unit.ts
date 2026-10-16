@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
+import { EventIntakeService } from '../src/events.controller';
 
 test('delete processor supports each enabled durable pair entity and only explicit deletion events', () => {
   const service = new ClientLifecycleService({} as never);
@@ -17,6 +18,35 @@ test('delete processor supports each enabled durable pair entity and only explic
     assert.equal(service.supports({ id: 'event', source, eventType, externalEntityType, externalEntityId: 'native-id' }), true);
   }
   assert.equal(service.supports({ id: 'event', source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'product', externalEntityId: 'native-id' }), false);
+});
+
+test('Bitrix catalog deletion webhook persists the exact product event identity', async () => {
+  const oldToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
+  const oldMode = process.env.SYNC_MODE;
+  process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'fixture-app-token';
+  process.env.SYNC_MODE = 'apply';
+  let persisted: Record<string, unknown> | undefined;
+  const intake = new EventIntakeService(
+    {} as never,
+    { read: async () => ({ mode: 'on' }), isDirectionEnabled: async () => true } as never,
+    undefined,
+    { saveAcceptedEvent: async (input: Record<string, unknown>) => { persisted = input; return { id: 'event-product-delete' }; } } as never,
+  );
+  try {
+    const acknowledgement = await intake.receiveBitrix24({
+      event: 'CATALOG.PRODUCT.ON.DELETE',
+      auth: { application_token: 'fixture-app-token' },
+      data: { FIELDS: { ID: 123, TYPE: 1 } },
+    });
+    assert.deepEqual(acknowledgement, { accepted: true, eventId: 'event-product-delete' });
+    assert.equal(persisted?.source, 'BITRIX24');
+    assert.equal(persisted?.eventType, 'CATALOG.PRODUCT.ON.DELETE');
+    assert.equal(persisted?.externalEntityType, 'product');
+    assert.equal(persisted?.externalEntityId, '123');
+  } finally {
+    if (oldToken === undefined) delete process.env.BITRIX24_EVENT_APPLICATION_TOKEN; else process.env.BITRIX24_EVENT_APPLICATION_TOKEN = oldToken;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+  }
 });
 
 test('tombstone targets one entity-type/native-ID pair and repeats idempotently', async () => {
