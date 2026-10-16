@@ -37,7 +37,8 @@ export class DealOrderTotalReconciliationHandler {
   async process(input: {
     pairId: string;
     eventId: string;
-    pinnedConfig: { version: number; totalsEnabled: boolean };
+    /** Immutable settings version attached to this event; total policy is Q26.37/.51, not a user toggle. */
+    pinnedConfig: { version: number };
     bitrix24Current: DealOrderTotalSnapshot['bitrix24'];
     moyskladCurrent: DealOrderTotalSnapshot['moysklad'];
     priorBaseline: DealOrderTotalState | null;
@@ -47,7 +48,6 @@ export class DealOrderTotalReconciliationHandler {
     adapter: DealOrderTotalAdapter;
     assertLease: () => Promise<boolean>;
   }): Promise<DealOrderTotalResult> {
-    if (!input.pinnedConfig.totalsEnabled) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_MAPPING_DISABLED' };
     if (!input.completeRows) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_ROWS_INCOMPLETE' };
     if (!input.priorBaseline) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_BASELINE_MISSING' };
     if (input.priorBaseline.settingsVersion !== input.pinnedConfig.version) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_SETTINGS_VERSION_MISMATCH' };

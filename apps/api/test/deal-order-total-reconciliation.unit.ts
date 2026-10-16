@@ -42,7 +42,6 @@ async function run(input: {
   current: DealOrderTotalSnapshot;
   baseline: DealOrderTotalState;
   completeRows?: boolean;
-  totalsEnabled?: boolean;
   rowValuesChanged?: boolean;
   dry?: boolean;
   lease?: () => Promise<boolean>;
@@ -50,7 +49,7 @@ async function run(input: {
 }) {
   const fake = fakeAdapter(input.current, input);
   const result = await handler.process({
-    pairId, eventId, pinnedConfig: { version, totalsEnabled: input.totalsEnabled ?? true },
+    pairId, eventId, pinnedConfig: { version },
     bitrix24Current: input.current.bitrix24, moyskladCurrent: input.current.moysklad,
     priorBaseline: input.baseline, completeRows: input.completeRows ?? true,
     adapter: fake.adapter, assertLease: input.lease ?? (async () => true), rowValuesChanged: input.rowValuesChanged,
@@ -124,11 +123,9 @@ test('missing currency or differing currencies are held for review', async () =>
   assert.deepEqual(mismatch.result, { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_CURRENCY_MISMATCH' });
 });
 
-test('disabled mapping and absent baseline do not write', async () => {
+test('absent baseline does not write', async () => {
   const current = same(100);
-  const disabled = await handler.process({ pairId, eventId, pinnedConfig: { version, totalsEnabled: false }, bitrix24Current: current.bitrix24, moyskladCurrent: current.moysklad, priorBaseline: state(current), completeRows: true, adapter: fakeAdapter(current).adapter, assertLease: async () => true });
-  assert.deepEqual(disabled, { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_MAPPING_DISABLED' });
-  const missing = await handler.process({ pairId, eventId, pinnedConfig: { version, totalsEnabled: true }, bitrix24Current: current.bitrix24, moyskladCurrent: current.moysklad, priorBaseline: null, completeRows: true, adapter: fakeAdapter(current).adapter, assertLease: async () => true });
+  const missing = await handler.process({ pairId, eventId, pinnedConfig: { version }, bitrix24Current: current.bitrix24, moyskladCurrent: current.moysklad, priorBaseline: null, completeRows: true, adapter: fakeAdapter(current).adapter, assertLease: async () => true });
   assert.deepEqual(missing, { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_BASELINE_MISSING' });
 });
 
@@ -154,7 +151,7 @@ test('provider state changing between initial read and write yields retry withou
   const current = mismatch(100.02, 100);
   const fake = fakeAdapter(current, { readInterference: true });
   const result = await handler.process({
-    pairId, eventId, pinnedConfig: { version, totalsEnabled: true }, bitrix24Current: current.bitrix24,
+    pairId, eventId, pinnedConfig: { version }, bitrix24Current: current.bitrix24,
     moyskladCurrent: current.moysklad, priorBaseline: state(same(100)), completeRows: true,
     adapter: fake.adapter, assertLease: async () => true,
   });
