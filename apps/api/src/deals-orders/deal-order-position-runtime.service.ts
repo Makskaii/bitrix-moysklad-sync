@@ -360,9 +360,22 @@ export class DealOrderPositionRuntimeService {
       }
       const candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
       if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) { await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED'); continue; }
-      const product = await requestJson(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() }).catch(() => null);
-      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== unit.moyskladId) {
-        await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
+      let product: unknown;
+      try {
+        product = await requestJson(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+      } catch (error) {
+        if (error instanceof PositionProviderRequestError && error.status === 404) {
+          await skipRow('BITRIX24', rowId, 'DEAL_ORDER_PRODUCT_NOT_FOUND');
+          continue;
+        }
+        if (isTransientProductLookupFailure(error)) return { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_RETRYABLE' };
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_REJECTED' };
+      }
+      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || typeof product.uom.id !== 'string') {
+        return { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_INVALID' };
+      }
+      if (product.uom.id !== unit.moyskladId) {
+        await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_UNIT_MISMATCH');
         continue;
       }
       const payload = {
@@ -571,12 +584,20 @@ async function deleteBitrixRow(rowId: unknown): Promise<void> {
   });
 }
 
+class PositionProviderRequestError extends Error {
+  constructor(readonly status: number | null, readonly failure: 'NETWORK' | 'HTTP' | 'INVALID_BODY') { super(`POSITION_PROVIDER_${failure}`); }
+}
+function isTransientProductLookupFailure(error: unknown): boolean {
+  if (!(error instanceof PositionProviderRequestError)) return false;
+  if (error.failure === 'NETWORK' || error.failure === 'INVALID_BODY') return true;
+  return error.status === 408 || error.status === 425 || error.status === 429 || (error.status !== null && error.status >= 500);
+}
 function safeNextHref(href: string, base: URL): URL { const next = new URL(href); if (next.origin !== base.origin || !next.pathname.includes('/entity/customerorder/')) throw new Error(); return next; }
 async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
-  const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new Error(); });
-  if (!response.ok) throw new Error();
+  const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new PositionProviderRequestError(null, 'NETWORK'); });
+  if (!response.ok) throw new PositionProviderRequestError(response.status, 'HTTP');
   if (init.method === 'DELETE') return null;
-  return response.json().catch(() => { throw new Error(); });
+  return response.json().catch(() => { throw new PositionProviderRequestError(response.status, 'INVALID_BODY'); });
 }
 function bitrixBase(): URL { return configuredBase('BITRIX24_REST_BASE_URL'); }
 function moyskladBase(): URL { return configuredBase('MOYSKLAD_API_BASE_URL'); }

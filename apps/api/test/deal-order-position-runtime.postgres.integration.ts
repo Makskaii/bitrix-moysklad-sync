@@ -25,6 +25,8 @@ let calls: Array<{ method: string; path: string }> = [];
 let positionAdds = 0;
 let failPositionReadId: string | null = null;
 let pauseAfterNextMsPositionUpdate = false;
+let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' = 'NORMAL';
+let productReadCalls = 0;
 
 before(async () => {
   const target = new URL(process.env.DATABASE_URL ?? '');
@@ -46,6 +48,7 @@ before(async () => {
 });
 
 after(async () => {
+  productReadBehavior = 'NORMAL';
   await db.entityPair.deleteMany({ where: { entityType: 'DEAL', bitrix24Id: { startsWith: '98' } } });
   await db.entityPair.deleteMany({ where: { id: productPairId } });
   await db.$disconnect(); await database.$disconnect();
@@ -191,6 +194,54 @@ test('new MySklad position ID is journaled before readback and retry resumes wit
   assert.equal((await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { id: operation.id } })).status, 'SUCCEEDED');
 });
 
+test('confirmed missing MySklad product skips only its row and records the reason', async () => {
+  const one = await seed(uniqueDealId());
+  b24Rows = [b24Rows[0], { id: '303', productId: 904, measureCode: 796, quantity: 1, price: 7, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
+  positionAdds = 0;
+  productReadBehavior = 'NOT_FOUND';
+  productReadCalls = 0;
+  try {
+    const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-add-missing-product', eventConfig: config() });
+    assert.equal(result.status, 'PARTIAL');
+    assert.deepEqual(result.skippedRows, [{ sourceSystem: 'BITRIX24', sourceRowId: '303', reason: 'DEAL_ORDER_PRODUCT_NOT_FOUND' }]);
+    assert.equal(positionAdds, 0);
+  } finally { productReadBehavior = 'NORMAL'; }
+});
+
+test('transient MySklad product lookup failures retry without skipping, then add the same row on repeat', async () => {
+  const cases: Array<{ behavior: 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT'; dealId: string }> = [
+    { behavior: 'SERVER_ERROR', dealId: uniqueDealId() },
+    { behavior: 'NETWORK_ERROR', dealId: uniqueDealId() },
+    { behavior: 'TIMEOUT', dealId: uniqueDealId() },
+  ];
+  for (const { behavior, dealId } of cases) {
+    const one = await seed(dealId);
+    const addedRow = { id: '304', productId: 904, measureCode: 796, quantity: 1, price: 7, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null };
+    b24Rows = [b24Rows[0], addedRow];
+    positionAdds = 0;
+    productReadBehavior = behavior;
+    productReadCalls = 0;
+    const eventId = `event-add-product-${behavior.toLowerCase()}-${dealId}`;
+    const first = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+    assert.deepEqual(first, { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_RETRYABLE' }, behavior);
+    assert.equal(positionAdds, 0, `${behavior} must not attempt a row add`);
+    assert.equal((await db.dealOrderPositionAddOperation.findUnique({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '304' } } })), null,
+      `${behavior} must not persist a skipped or successful row operation`);
+    const retryJournal = await db.operationalLog.findMany({ where: { referenceId: eventId } });
+    assert.equal(retryJournal.some((entry) => entry.message.includes('DEAL_ORDER_POSITION_ROW_SKIPPED')), false,
+      `${behavior} must not journal a transient lookup as an unsupported row`);
+
+    productReadBehavior = 'NORMAL';
+    const retry = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+    assert.deepEqual(retry, { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN' }, `${behavior} retry may safely journal a response-loss outcome`);
+    assert.equal(positionAdds, 1, `${behavior} retry should add exactly one row`);
+    const resumed = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+    assert.deepEqual(resumed, { status: 'SYNCED', rowValuesChanged: true }, `${behavior} repeated recovery`);
+    assert.equal(positionAdds, 1, `${behavior} repeat must not duplicate the row`);
+    assert.ok(await db.dealOrderPositionPair.findUnique({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '304' } } }));
+  }
+});
+
 async function seed(dealId: string) {
   await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
   const orderId = randomUUID();
@@ -205,6 +256,7 @@ async function seed(dealId: string) {
 function config(): any { return { version: 2, createdAt: new Date(0).toISOString(), config: { schemaVersion: 1, rules: [], groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: unitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] } }, references: { units: [], priceTypes: [], dictionaries: [] } }; }
 function msPosition(id: string, quantity: number, price: number) { return { id, assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${productId}` } }, quantity, price, discount: 0, vat: 0, vatEnabled: false }; }
 function confirmed(pair: any): any { return { id: pair.id, entityType: 'DEAL', bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, status: 'CONFIRMED', source: 'PERSISTED' }; }
+function uniqueDealId(): string { return String(980_000_000 + Math.floor(Math.random() * 19_000_000)); }
 function sourceValues(row: Record<string, unknown>): any { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
 function targetValues(row: Record<string, unknown>): any { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
 
@@ -228,7 +280,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { result: true });
   }
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}` && request.method === 'GET') return send(response, { id: activeOrderId, vatIncluded });
-  if (url.pathname === '/api/remap/1.2/entity/product/' + productId) return send(response, { id: productId, meta: { type: 'product' }, uom: { id: unitId } });
+  if (url.pathname === '/api/remap/1.2/entity/product/' + productId) {
+    productReadCalls += 1;
+    if (productReadCalls > 1 && productReadBehavior === 'NOT_FOUND') return send(response, {}, 404);
+    if (productReadCalls > 1 && productReadBehavior === 'SERVER_ERROR') return send(response, {}, 500);
+    if (productReadCalls > 1 && productReadBehavior === 'NETWORK_ERROR') { request.socket.destroy(); return; }
+    if (productReadCalls > 1 && productReadBehavior === 'TIMEOUT') return;
+    return send(response, { id: productId, meta: { type: 'product' }, uom: { id: unitId } });
+  }
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);
     if (request.method === 'GET' && failPositionReadId === id) { failPositionReadId = null; response.writeHead(500); response.end('{}'); return; }
