@@ -41,6 +41,7 @@ function fakeAdapter(initial: DealOrderTotalSnapshot, options: { dry?: boolean; 
 async function run(input: {
   current: DealOrderTotalSnapshot;
   baseline: DealOrderTotalState;
+  eventSource?: 'BITRIX24' | 'MOYSKLAD';
   completeRows?: boolean;
   rowValuesChanged?: boolean;
   dry?: boolean;
@@ -49,7 +50,7 @@ async function run(input: {
 }) {
   const fake = fakeAdapter(input.current, input);
   const result = await handler.process({
-    pairId, eventId, pinnedConfig: { version },
+    pairId, eventId, eventSource: input.eventSource ?? 'BITRIX24', pinnedConfig: { version },
     bitrix24Current: input.current.bitrix24, moyskladCurrent: input.current.moysklad,
     priorBaseline: input.baseline, completeRows: input.completeRows ?? true,
     adapter: fake.adapter, assertLease: input.lease ?? (async () => true), rowValuesChanged: input.rowValuesChanged,
@@ -79,6 +80,15 @@ test('a B24-origin one-kopeck difference is retained without a conflict or write
   assert.deepEqual(result.result, { status: 'SYNCED', state: state(current), conflict: false, reason: 'B24_ONE_KOPECK_RETAINED' });
   assert.deepEqual(result.writes, []);
   assert.deepEqual(result.history[0]?.raw, current);
+});
+
+test('the same one-kopeck RUB difference on an MS event restores B24 from the MS total', async () => {
+  const current = mismatch(100.01, 100);
+  const result = await run({ current, baseline: state(same(100)), eventSource: 'MOYSKLAD' });
+  assert.equal(result.result.status, 'SYNCED');
+  assert.equal(result.result.conflict, true);
+  assert.equal(result.result.reason, 'B24_TOTAL_RESTORED_FROM_MOYSKLAD');
+  assert.deepEqual(result.writes, [100]);
 });
 
 test('two kopecks or more restores B24 OPPORTUNITY from the read-only MS sum', async () => {
@@ -125,7 +135,7 @@ test('missing currency or differing currencies are held for review', async () =>
 
 test('absent baseline does not write', async () => {
   const current = same(100);
-  const missing = await handler.process({ pairId, eventId, pinnedConfig: { version }, bitrix24Current: current.bitrix24, moyskladCurrent: current.moysklad, priorBaseline: null, completeRows: true, adapter: fakeAdapter(current).adapter, assertLease: async () => true });
+  const missing = await handler.process({ pairId, eventId, eventSource: 'BITRIX24', pinnedConfig: { version }, bitrix24Current: current.bitrix24, moyskladCurrent: current.moysklad, priorBaseline: null, completeRows: true, adapter: fakeAdapter(current).adapter, assertLease: async () => true });
   assert.deepEqual(missing, { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_BASELINE_MISSING' });
 });
 
@@ -151,7 +161,7 @@ test('provider state changing between initial read and write yields retry withou
   const current = mismatch(100.02, 100);
   const fake = fakeAdapter(current, { readInterference: true });
   const result = await handler.process({
-    pairId, eventId, pinnedConfig: { version }, bitrix24Current: current.bitrix24,
+    pairId, eventId, eventSource: 'BITRIX24', pinnedConfig: { version }, bitrix24Current: current.bitrix24,
     moyskladCurrent: current.moysklad, priorBaseline: state(same(100)), completeRows: true,
     adapter: fake.adapter, assertLease: async () => true,
   });

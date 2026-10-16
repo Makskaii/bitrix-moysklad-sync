@@ -29,6 +29,7 @@ import { DealOrderCreateOperationService } from '../deals-orders/deal-order-crea
 import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
 import { DealOrderReverseCreateService } from '../deals-orders/deal-order-reverse-create.service';
+import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-total-reconciliation';
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
@@ -65,7 +66,7 @@ export class LocalAdminPreviewModule {
         DryRunWriteJournal,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
-          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService,
+          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
           HistoricalInventoryService,
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
           { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },

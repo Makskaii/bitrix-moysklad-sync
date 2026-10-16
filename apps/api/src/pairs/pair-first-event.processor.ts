@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { PairResolutionInput, PairResolutionResult, PairResolver, PAIR_RESOLVER } from './pair-resolver';
 import { lockEntityPairState } from './pair-db-lock';
@@ -18,6 +19,10 @@ import { DealOrderCreateOperationService } from '../deals-orders/deal-order-crea
 import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../deals-orders/deal-order-reverse-create.service';
+import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-total-reconciliation';
+import { withDealOrderPairLock } from '../deals-orders/deal-order-pair-lock';
+import { DryRunWriteJournal } from '../dry-run-write-journal';
+import { assertApplyExternalWrite } from '../external-write-guard';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -57,6 +62,8 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly positionRuntime?: DealOrderPositionRuntimeService,
     @Optional() private readonly fieldRuntime?: DealOrderFieldRuntimeService,
     @Optional() private readonly reverseCreate?: DealOrderReverseCreateService,
+    @Optional() private readonly totalRuntime?: DealOrderTotalReconciliationHandler,
+    @Optional() private readonly dryWrites?: DryRunWriteJournal,
   ) {}
 
   onApplicationBootstrap() {
@@ -116,14 +123,16 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
   }
 
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairFirstResult | null> {
-    // Pairing and synchronization are both deferred while paused or Off. The
-    // durable RECEIVED event remains eligible when the service returns On.
-    if (this.syncMode && (await this.syncMode.read()).mode !== 'on') return null;
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
       select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true },
     });
     if (!event || !event.externalEntityId || !isDealOrderEvent(event) || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
+    if (this.syncMode) {
+      const currentMode = (await this.syncMode.read()).mode;
+      if (currentMode === 'pause') return null;
+      if (currentMode === 'off') { await this.finishBeforeClaim(event, 'SKIPPED_DISABLED', 'SERVICE_MODE_OFF'); return null; }
+    }
 
     if (this.databaseRecovery) {
       const boundary = await this.databaseRecovery.launchBoundary().catch(() => null);
@@ -212,6 +221,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         partialDealOrderCreation = creation.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
+        if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
         const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
         await this.finish(event.id, 'RETRYABLE_FAILURE', 'CUSTOMER_ORDER_CREATE_RETRY', workerLease,
           retryAtForFailure(error, event.attempts + 1));
@@ -226,10 +236,11 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        const reverseResult = await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig });
+        const reverseResult = await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined });
         partialDealOrderCreation = reverseResult.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
+        if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
         const reason = error instanceof Error ? error.message : 'REVERSE_DEAL_CREATE_FAILED';
         if (error instanceof DealOrderReverseManualReviewError) {
           await this.finish(event.id, 'MANUAL_REVIEW', 'REVERSE_DEAL_CREATE_REVIEW', workerLease);
@@ -308,32 +319,46 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           } else {
             await this.finish(event.id, 'MANUAL_REVIEW', `BASELINE_${baseline.reason}`, workerLease);
           }
-        } else if (this.headerSync) {
+        } else if (this.headerSync || this.positionRuntime || this.fieldRuntime) {
           if (this.syncMode && (await this.syncMode.read()).mode !== 'on') {
             await this.deferWhileInactive(event.id, workerLease);
             return result;
           }
-          const headerResult = await this.headerSync.process({ eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId, attempt, assertWorkerLease: workerLease?.assertOwned });
-          if (typeof headerResult !== 'string' && headerResult.status === 'RETRYABLE_FAILURE') {
-            await this.finish(event.id, 'RETRYABLE_FAILURE', 'DEAL_ORDER_HEADER_RETRY', workerLease, headerResult.retryAfter);
+          const runtimeInput = { eventId: event.id, pair: result.pair, eventConfig, baselineId: baseline.baselineId, attempt, assertWorkerLease: workerLease?.assertOwned };
+          const clientResult = this.headerSync ? await this.headerSync.processClient(runtimeInput) : 'UNSUPPORTED';
+          const headerResult = this.headerSync ? await this.headerSync.process(runtimeInput) : 'DISABLED';
+          const retryResult = [clientResult, headerResult].find((item) => typeof item !== 'string' && item.status === 'RETRYABLE_FAILURE');
+          if (retryResult && typeof retryResult !== 'string') {
+            await this.finish(event.id, 'RETRYABLE_FAILURE', 'DEAL_ORDER_RUNTIME_RETRY', workerLease, retryResult.retryAfter);
           } else {
             const holdReason = headerHoldReason(headerResult as string);
-            const positions = headerResult !== 'DISABLED' && process.env.SYNC_MODE === 'apply' && this.positionRuntime
+            const clientHoldReason = clientHoldReasonFor(clientResult as string);
+            const positions = process.env.SYNC_MODE === 'apply' && this.positionRuntime
               ? await this.positionRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
               : { status: 'SYNCED' as const };
+            const partialPositionRows = positions.status === 'PARTIAL';
             const fields = process.env.SYNC_MODE === 'apply' && this.fieldRuntime
               ? await this.fieldRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
               : { status: 'SYNCED' as const, heldRules: 0 };
-            const runtimeHold = [positions, fields].find((item) => item.status === 'MANUAL_REVIEW') as { status: 'MANUAL_REVIEW'; reason: string } | undefined;
-            const runtimeRetry = [positions, fields].find((item) => item.status === 'RETRY') as { status: 'RETRY'; reason: string } | undefined;
-            if (runtimeRetry) await this.finish(event.id, 'RETRYABLE_FAILURE', runtimeRetry.reason, workerLease, retryAtForFailure(new Error(runtimeRetry.reason), attempt));
-            else if (holdReason || runtimeHold || partialDealOrderCreation) await this.finish(event.id, 'MANUAL_REVIEW', holdReason ?? runtimeHold?.reason ?? 'DEAL_ORDER_PARTIAL_ROWS', workerLease);
-            else await this.finish(event.id, headerResult === 'DISABLED' ? 'SKIPPED_DISABLED' : 'SUCCEEDED', headerResult === 'DISABLED' ? 'DEAL_ORDER_HEADER_DISABLED' : null, workerLease);
+            const totals = positions.status === 'SYNCED' && !partialDealOrderCreation && process.env.SYNC_MODE === 'apply' && this.totalRuntime
+              ? await this.reconcileDealOrderTotal({ pair: result.pair, eventId: event.id, eventSource: event.source as 'BITRIX24' | 'MOYSKLAD', eventConfig, rowValuesChanged: positions.rowValuesChanged === true, assertWorkerLease: workerLease?.assertOwned })
+              : { status: 'SYNCED' as const };
+            const runtimeHold = [positions, fields, totals].find((item) => item.status === 'MANUAL_REVIEW') as { status: 'MANUAL_REVIEW'; reason: string } | undefined;
+            const runtimeRetry = [positions, fields, totals].find((item) => item.status === 'RETRY') as { status: 'RETRY'; reason: string } | undefined;
+            const writeGate = runtimeRetry?.reason.match(/^DEAL_ORDER_WRITE_BLOCKED_(PAUSE|OFF|RECOVERY|DIRECTION|LEASE|NOT_APPLY)$/)?.[1];
+            if (writeGate === 'PAUSE') await this.deferWhileInactive(event.id, workerLease);
+            else if (writeGate === 'OFF') await this.finish(event.id, 'SKIPPED_DISABLED', runtimeRetry!.reason, workerLease);
+            else if (writeGate === 'RECOVERY') await this.finish(event.id, 'RETRYABLE_FAILURE', runtimeRetry!.reason, workerLease, retryAtForFailure(new Error(runtimeRetry!.reason), attempt));
+            else if (writeGate === 'DIRECTION') await this.finish(event.id, 'MANUAL_REVIEW', runtimeRetry!.reason, workerLease);
+            else if (runtimeRetry) await this.finish(event.id, 'RETRYABLE_FAILURE', runtimeRetry.reason, workerLease, retryAtForFailure(new Error(runtimeRetry.reason), attempt));
+            else if (clientHoldReason || holdReason || runtimeHold || partialDealOrderCreation || partialPositionRows) await this.finish(event.id, 'MANUAL_REVIEW', clientHoldReason ?? holdReason ?? runtimeHold?.reason ?? (partialPositionRows ? positions.reason : 'DEAL_ORDER_PARTIAL_ROWS'), workerLease);
+            else await this.finish(event.id, 'SUCCEEDED', null, workerLease);
           }
         } else {
           await this.finish(event.id, 'SUCCEEDED', null, workerLease);
         }
-      } catch {
+      } catch (error) {
+        if (await this.finishForWriteGateError(event.id, error, workerLease)) return result;
         await this.database.$transaction(async (transaction) => {
           await assertWorkerFenceInTransaction(workerLease, transaction);
           await transaction.inboundEvent.updateMany({
@@ -348,6 +373,75 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
 
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));
     return documentClient && result.status === 'confirmed' ? { ...result, documentClient } : result;
+  }
+
+  private async reconcileDealOrderTotal(input: {
+    pair: Extract<PairResolutionResult, { status: 'confirmed' }>['pair']; eventId: string; eventSource: 'BITRIX24' | 'MOYSKLAD';
+    eventConfig: Awaited<ReturnType<FieldSettingsService['eventConfig']>>; rowValuesChanged: boolean;
+    assertWorkerLease?: () => Promise<void>;
+  }): Promise<{ status: 'SYNCED' } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string }> {
+    if (!this.totalRuntime || !this.documentReader || input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_TOTAL_RUNTIME_UNAVAILABLE' };
+    const outcome = await withDealOrderPairLock(this.database, input.pair.id, input.eventId, async (lease) => {
+      const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId: input.pair.id } });
+      if (!baseline || baseline.settingsVersion !== input.eventConfig.version) return { status: 'MANUAL_REVIEW' as const, reason: 'DEAL_ORDER_TOTAL_BASELINE_MISSING' };
+      const syncState = await this.database.entityPairSyncState.findUnique({ where: { pairId: input.pair.id } });
+      const baselineB24 = jsonRecord(baseline.bitrix24Values)['deal-order-total'];
+      const baselineMs = jsonRecord(baseline.moyskladValues)['deal-order-total'];
+      const stateB24 = jsonRecord(syncState?.bitrix24Values)['deal-order-total'];
+      const stateMs = jsonRecord(syncState?.moyskladValues)['deal-order-total'];
+      const stateB24Total = totalValue(stateB24); const stateMsTotal = totalValue(stateMs);
+      const baselineB24Total = totalValue(baselineB24); const baselineMsTotal = totalValue(baselineMs);
+      const prior = stateB24Total && stateMsTotal ? { settingsVersion: syncState!.settingsVersion, bitrix24: stateB24Total, moysklad: stateMsTotal }
+        : baselineB24Total && baselineMsTotal ? { settingsVersion: baseline.settingsVersion, bitrix24: baselineB24Total, moysklad: baselineMsTotal } : null;
+      const readCurrent = async () => {
+        await input.assertWorkerLease?.();
+        const [b24, ms] = await Promise.all([
+          this.documentReader!.readBitrix24DealForBaseline(input.pair.bitrix24Id),
+          this.documentReader!.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
+        ]);
+        return {
+          bitrix24: { amount: b24.OPPORTUNITY, currencyCode: b24.CURRENCY_ID },
+          moysklad: { amount: ms.sum, currencyCode: currencyCodeFromOrder(ms) },
+        };
+      };
+      const initial = await readCurrent();
+      const result = await this.totalRuntime!.process({
+        pairId: input.pair.id, eventId: input.eventId, eventSource: input.eventSource, pinnedConfig: { version: input.eventConfig.version },
+        bitrix24Current: initial.bitrix24, moyskladCurrent: initial.moysklad, priorBaseline: prior,
+        completeRows: true, rowValuesChanged: input.rowValuesChanged,
+        adapter: {
+          readCurrent,
+          writeBitrix24Opportunity: async (amount) => {
+            await this.syncMode?.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => {
+              await input.assertWorkerLease?.(); return lease.assertOwner();
+            });
+            assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_TOTAL_UPDATE');
+            const base = providerBase(process.env.BITRIX24_REST_BASE_URL);
+            if (!base || !/^\d{1,20}$/.test(input.pair.bitrix24Id)) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_NOT_CONFIGURED');
+            const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ id: input.pair.bitrix24Id, 'fields[OPPORTUNITY]': String(amount) }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
+            if (!response.ok) throw new Error(`DEAL_ORDER_TOTAL_PROVIDER_HTTP_${response.status}`);
+            const body: unknown = await response.json().catch(() => null);
+            if (!isRecord(body) || body.error || body.result !== true) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_REJECTED');
+          },
+          persistState: async (state) => {
+            const saved = await lease.commit(async (transaction) => {
+              const existing = await transaction.entityPairSyncState.findUnique({ where: { pairId: input.pair.id } });
+              await transaction.entityPairSyncState.upsert({ where: { pairId: input.pair.id },
+                create: { pairId: input.pair.id, settingsVersion: state.settingsVersion, bitrix24Values: { 'deal-order-total': state.bitrix24 } as Prisma.InputJsonValue, moyskladValues: { 'deal-order-total': state.moysklad } as Prisma.InputJsonValue },
+                update: { settingsVersion: state.settingsVersion,
+                  bitrix24Values: { ...jsonRecord(existing?.bitrix24Values), 'deal-order-total': state.bitrix24 } as Prisma.InputJsonValue,
+                  moyskladValues: { ...jsonRecord(existing?.moyskladValues), 'deal-order-total': state.moysklad } as Prisma.InputJsonValue } });
+            });
+            if (!saved.committed) throw new Error('DEAL_ORDER_TOTAL_PAIR_LOCK_LOST');
+          },
+          recordHistory: async (history) => writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'DEAL_ORDER_TOTAL', ...history }), input.eventId),
+        },
+        assertLease: async () => { await input.assertWorkerLease?.(); return lease.assertOwner(); },
+      });
+      return result.status === 'SYNCED' ? { status: 'SYNCED' as const } : result;
+    });
+    return outcome ?? { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_BUSY' };
   }
 
   private async resolveDocumentDependencies(
@@ -469,6 +563,17 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       });
     });
   }
+
+  private async finishForWriteGateError(eventId: string, error: unknown, workerLease?: EventWorkerLeaseContext): Promise<boolean> {
+    const reason = error instanceof Error ? error.message : '';
+    const mode = reason.match(/^DEAL_ORDER_WRITE_BLOCKED_(PAUSE|OFF|RECOVERY|DIRECTION|LEASE|NOT_APPLY)$/)?.[1];
+    if (!mode) return false;
+    if (mode === 'PAUSE') await this.deferWhileInactive(eventId, workerLease);
+    else if (mode === 'OFF') await this.finish(eventId, 'SKIPPED_DISABLED', reason, workerLease);
+    else if (mode === 'DIRECTION') await this.finish(eventId, 'MANUAL_REVIEW', reason, workerLease);
+    else await this.finish(eventId, 'RETRYABLE_FAILURE', reason, workerLease, retryAtForFailure(new Error(reason), 1));
+    return true;
+  }
 }
 
 function headerHoldReason(result: string): string | null {
@@ -479,6 +584,17 @@ function headerHoldReason(result: string): string | null {
     case 'HOLD_READ_FAILED': return 'DEAL_ORDER_HEADER_READ_FAILED';
     case 'HOLD_WRITE_FAILED': return 'DEAL_ORDER_HEADER_WRITE_FAILED';
     default: return null;
+  }
+}
+
+function clientHoldReasonFor(result: string): string | null {
+  switch (result) {
+    case 'BASELINE_INITIALIZED': case 'NOOP': case 'UPDATED': case 'DISABLED': case 'UNSUPPORTED': return null;
+    case 'BASELINE_MISSING': return 'DEAL_ORDER_CLIENT_BASELINE_MISSING';
+    case 'HOLD_CONFLICT': return 'DEAL_ORDER_CLIENT_CONFLICT';
+    case 'HOLD_READ_FAILED': return 'DEAL_ORDER_CLIENT_READ_FAILED';
+    case 'HOLD_WRITE_FAILED': return 'DEAL_ORDER_CLIENT_WRITE_FAILED';
+    default: return result.startsWith('HOLD_') ? `DEAL_ORDER_CLIENT_${result.slice(5)}` : null;
   }
 }
 
@@ -495,7 +611,7 @@ function isDue(status: string, retryAfter: Date | null, processingStartedAt: Dat
 }
 
 function idValue(value: unknown): string | null {
-  if (typeof value === 'string' && value.trim() && value.length <= 200) return value.trim();
+  if (typeof value === 'string' && value.trim() && value.trim() !== '0' && value.length <= 200) return value.trim();
   if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value);
   return null;
 }
@@ -510,6 +626,22 @@ function referenceId(value: unknown, expectedType: string): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> { return isRecord(value) ? value : {}; }
+function totalValue(value: unknown): { amount: unknown; currencyCode: unknown } | null {
+  return isRecord(value) && 'amount' in value && 'currencyCode' in value ? { amount: value.amount, currencyCode: value.currencyCode } : null;
+}
+function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
+function providerBase(value?: string): URL | null {
+  try {
+    const url = new URL(value ?? '');
+    return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password && !url.hash ? url : null;
+  } catch { return null; }
+}
+function currencyCodeFromOrder(order: Record<string, unknown>): unknown {
+  const currency = isRecord(order.currency) ? order.currency : isRecord(order.rate) && isRecord(order.rate.currency) ? order.rate.currency : null;
+  return currency?.isoCode ?? currency?.code ?? order.currencyCode ?? null;
 }
 
 async function assertWorkerFenceInTransaction(

@@ -37,6 +37,7 @@ export class DealOrderTotalReconciliationHandler {
   async process(input: {
     pairId: string;
     eventId: string;
+    eventSource: 'BITRIX24' | 'MOYSKLAD';
     /** Immutable settings version attached to this event; total policy is Q26.37/.51, not a user toggle. */
     pinnedConfig: { version: number };
     bitrix24Current: DealOrderTotalSnapshot['bitrix24'];
@@ -75,7 +76,7 @@ export class DealOrderTotalReconciliationHandler {
     if (b24Minor !== msMinor) {
       // The exception is specific to a B24-origin change, RUB totals, and at
       // most one minor unit. A simultaneous change remains an MS-wins conflict.
-      if (!input.rowValuesChanged && b24Changed && !msChanged && b24Currency === 'RUB' && abs(b24Minor! - msMinor!) <= 1n) {
+      if (input.eventSource === 'BITRIX24' && !input.rowValuesChanged && b24Changed && !msChanged && b24Currency === 'RUB' && abs(b24Minor! - msMinor!) <= 1n) {
         retainedB24 = true;
         outcome = 'B24_ONE_KOPECK_RETAINED';
       } else {
@@ -96,7 +97,8 @@ export class DealOrderTotalReconciliationHandler {
         if (finalB24 === null || finalMs === null || finalB24 !== finalMs || currency(final.bitrix24.currencyCode) !== b24Currency || currency(final.moysklad.currencyCode) !== msCurrency) {
           return { status: 'RETRY', reason: 'DEAL_ORDER_TOTAL_READBACK_MISMATCH' };
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof Error && /^DEAL_ORDER_WRITE_BLOCKED_/.test(error.message)) return { status: 'RETRY', reason: error.message };
         return { status: 'RETRY', reason: 'DEAL_ORDER_TOTAL_PROVIDER_FAILURE' };
       }
     }

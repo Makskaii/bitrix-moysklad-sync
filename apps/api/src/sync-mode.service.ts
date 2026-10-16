@@ -1,8 +1,13 @@
 import { ConflictException, Inject, Injectable, Optional } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { DatabaseRecoveryService } from './database-recovery.service';
+import { assertApplyExternalWrite } from './external-write-guard';
 
 export type ServiceMode = 'on' | 'pause' | 'off';
+export type DealOrderWriteDirection = 'bitrix24ToMoysklad' | 'moyskladToBitrix24';
+export class DealOrderWriteGateError extends Error {
+  constructor(readonly reason: 'PAUSE' | 'OFF' | 'RECOVERY' | 'DIRECTION' | 'LEASE' | 'NOT_APPLY') { super(`DEAL_ORDER_WRITE_BLOCKED_${reason}`); }
+}
 
 const entityControls = [
   {
@@ -172,6 +177,20 @@ export class SyncModeService {
   ): Promise<boolean> {
     const setting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey } });
     return setting?.[direction] ?? true;
+  }
+
+  /** Re-read durable global/direction/recovery state immediately before each
+   * provider mutation; callers supply their current worker/pair lease check. */
+  async assertDealOrderExternalWriteAllowed(direction: DealOrderWriteDirection, assertLease?: () => Promise<boolean>): Promise<void> {
+    const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { serviceMode: true } });
+    if (!setting) throw new DealOrderWriteGateError('RECOVERY');
+    if (setting.serviceMode !== 'on') throw new DealOrderWriteGateError(setting.serviceMode === 'off' ? 'OFF' : 'PAUSE');
+    if (this.databaseRecovery && !await this.databaseRecovery.assertReady()) throw new DealOrderWriteGateError('RECOVERY');
+    const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' } });
+    if (directions?.[direction] === false) throw new DealOrderWriteGateError('DIRECTION');
+    if (assertLease && !await assertLease()) throw new DealOrderWriteGateError('LEASE');
+    if (process.env.SYNC_MODE !== 'apply') throw new DealOrderWriteGateError('NOT_APPLY');
+    assertApplyExternalWrite('DEAL_ORDER', 'PROVIDER_MUTATION');
   }
 
 }

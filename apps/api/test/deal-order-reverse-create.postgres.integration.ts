@@ -35,6 +35,7 @@ let activeOrderId = ids.order;
 let sourceProductName = 'MS product name';
 let productAdds = 0;
 let msProductWrites = 0;
+let pauseAfterFirstRowAdd = false;
 const suffix = randomUUID();
 let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
@@ -157,6 +158,110 @@ test('concurrent retries create one missing B24 product and durably pair it befo
   assert.ok(dealOperation.positions[0].bitrix24ProductRowId);
 });
 
+test('existing paired order receives addressed MS-only positions without replacing its document or conflating identical products', async () => {
+  const orderId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  activeOrderId = orderId;
+  rows = [{ id: 700, ownerId: 880, ownerType: 'D', productId: 903, price: 100, quantity: 1, measureCode: 796, sort: 1 }];
+  rowAdds = 0; dealAdds = 0; productAdds = 0; loseSecondRowResponse = true; loseProductCreateResponse = false;
+  orderPositions = [position('same-sku-1', 2), position('same-sku-2', 3)];
+  const productPair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } });
+  const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '880', moyskladId: orderId, source: 'MANUAL' } });
+  pairIds.push(dealPair.id);
+  try {
+    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true };
+    await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    assert.equal(rows.length, 3, 'provider applied the row before its response was lost');
+    const first = await service.addPositionsToExistingPair(input);
+    assert.deepEqual(first, { status: 'ROWS_ADDED' });
+    assert.equal(dealAdds, 0, 'existing Bitrix24 deal is never recreated');
+    assert.equal(productAdds, 0, 'confirmed product pair is reused');
+    assert.equal(rows.length, 3);
+    assert.deepEqual(rows.map((row) => row.sort), [1, 2, 3], 'new rows receive new addressed sort slots');
+    const links = await db.dealOrderPositionPair.findMany({ where: { pairId: dealPair.id }, orderBy: { moyskladPositionId: 'asc' } });
+    assert.deepEqual(links.map((link) => link.moyskladPositionId), ['same-sku-1', 'same-sku-2']);
+    assert.equal(new Set(links.map((link) => link.bitrix24ProductRowId)).size, 2, 'same SKU positions retain distinct row identities');
+    assert.deepEqual(await service.addPositionsToExistingPair(input), { status: 'ROWS_ADDED' });
+    assert.equal(rows.length, 3, 'repeat is idempotent');
+    assert.equal(rowAdds, 2);
+  } finally {
+    await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
+    await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { id: dealPair.id } });
+    activeOrderId = ids.order;
+  }
+});
+
+test('existing paired order resumes a lost product-prerequisite response before adding the missing row', async () => {
+  const orderId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const newProductId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  activeOrderId = orderId;
+  rows = [];
+  rowAdds = 0; dealAdds = 0; productAdds = 0; loseProductCreateResponse = true; loseSecondRowResponse = false;
+  orderPositions = [{ ...position('new-product-position', 4), assortment: { id: newProductId, uom: { id: ids.unit } } }];
+  const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '881', moyskladId: orderId, source: 'MANUAL' } });
+  pairIds.push(dealPair.id);
+  const input = { pairId: dealPair.id, bitrix24DealId: '881', moyskladOrderId: orderId, eventId: `event-${suffix}-product-recovery`, eventConfig: config(), positionIds: ['new-product-position'], assertPairLease: async () => true };
+  try {
+    await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    assert.equal(productAdds, 1, 'uncertain B24 product create is durably fenced');
+    assert.equal(rows.length, 0);
+    assert.equal(dealAdds, 0, 'prerequisite recovery never creates a replacement deal');
+    const recovered = await service.addPositionsToExistingPair(input);
+    assert.deepEqual(recovered, { status: 'ROWS_ADDED' });
+    assert.equal(productAdds, 1, 'recovery confirms and reuses the created product card');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].ownerId, 881);
+    assert.equal(rows[0].productId, 944);
+    const link = await db.dealOrderPositionPair.findFirstOrThrow({ where: { pairId: dealPair.id } });
+    assert.equal(link.moyskladPositionId, 'new-product-position');
+    assert.equal(link.bitrix24ProductRowId, '1001');
+    assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: newProductId } })).bitrix24Id, '944');
+  } finally {
+    await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
+    await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: newProductId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: newProductId } });
+    await db.entityPair.deleteMany({ where: { id: dealPair.id } });
+    activeOrderId = ids.order;
+  }
+});
+
+test('persisted pause between existing-order row adds preserves the first ID and resumes without duplication', async () => {
+  const orderId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  activeOrderId = orderId;
+  rows = []; rowAdds = 0; dealAdds = 0; productAdds = 0; loseSecondRowResponse = false; loseProductCreateResponse = false;
+  orderPositions = [position('pause-row-1', 2), position('pause-row-2', 3)];
+  const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '882', moyskladId: orderId, source: 'MANUAL' } });
+  pairIds.push(dealPair.id);
+  const input = { pairId: dealPair.id, bitrix24DealId: '882', moyskladOrderId: orderId, eventId: `event-${suffix}-pause`, eventConfig: config(), positionIds: ['pause-row-1', 'pause-row-2'], assertPairLease: async () => true };
+  try {
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+    pauseAfterFirstRowAdd = true;
+    await assert.rejects(service.addPositionsToExistingPair(input), /DEAL_ORDER_WRITE_BLOCKED_PAUSE/);
+    assert.equal(rows.length, 1);
+    const partial = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: orderId }, include: { positions: true } });
+    assert.equal(partial.status, 'PENDING');
+    assert.equal(partial.positions.filter((row) => row.status === 'SUCCEEDED' && row.bitrix24ProductRowId).length, 1);
+    assert.equal(partial.positions.filter((row) => row.status === 'PENDING').length, 1);
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+    assert.deepEqual(await service.addPositionsToExistingPair(input), { status: 'ROWS_ADDED' });
+    assert.equal(rows.length, 2);
+    assert.equal(rowAdds, 2, 'resume adds only the still-missing row');
+    assert.equal((await db.dealOrderPositionPair.count({ where: { pairId: dealPair.id } })), 2);
+    assert.deepEqual(rows.map((row) => row.sort), [1, 2], 'the resumed row-add reuses its journaled sort slot');
+  } finally {
+    pauseAfterFirstRowAdd = false;
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+    await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
+    await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { id: dealPair.id } });
+    activeOrderId = ids.order;
+  }
+});
+
 test('an existing product pair is preserved when the MySklad product name changes', async () => {
   const orderId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
   activeOrderId = orderId;
@@ -253,7 +358,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const bodyText = Buffer.concat(chunks).toString('utf8');
   const body = bodyText ? JSON.parse(bodyText) as Record<string, any> : {};
   const pathname = new URL(request.url ?? '/', base).pathname;
-  if (pathname === '/api/remap/1.2/entity/product/' + ids.product) return send(response, { id: ids.product, meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { id: ids.unit } });
+  const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/product\/([0-9a-f-]+)$/i);
+  if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { id: ids.unit } });
   if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: ids.state }, rate: { currency: { id: ids.currency } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
@@ -275,6 +381,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     rowAdds++;
     const added = { ...body.fields, id: 1000 + rowAdds };
     rows.push(added);
+    if (pauseAfterFirstRowAdd) {
+      pauseAfterFirstRowAdd = false;
+      await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } });
+    }
     if (rowAdds === 2 && loseSecondRowResponse) {
       loseSecondRowResponse = false;
       response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic response loss after provider success' })); return;
@@ -287,7 +397,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (pathname === '/rest/catalog.product.add') {
     productAdds++;
-    const created = { ...body.fields, id: 903 };
+    const created = { ...body.fields, id: String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
     products.push(created);
     if (loseProductCreateResponse) { loseProductCreateResponse = false; response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic product create response loss' })); return; }
     return send(response, { result: { element: created } });

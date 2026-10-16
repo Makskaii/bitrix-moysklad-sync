@@ -94,7 +94,12 @@ function fixture(input: { b24: string | null; ms: string; oldB24: string | null;
     async readBitrix24DealForBaseline() { return { ID: 'deal-id', COMPANY_ID: companyId }; },
     async readMoySkladCustomerOrderForBaseline() { return { id: 'order-id', agent: { id: agentId } }; },
   } as never;
-  const mode = { async isDirectionEnabled() { return true; } } as never;
+  const mode = {
+    async isDirectionEnabled() { return true; },
+    async assertDealOrderExternalWriteAllowed(_direction: string, assertLease?: () => Promise<boolean>) {
+      if (assertLease && !await assertLease()) throw new Error('test lease lost');
+    },
+  } as never;
   const processor = new DealOrderHeaderSyncProcessor(database, reader, mode);
   return { processor, tx, state };
 }

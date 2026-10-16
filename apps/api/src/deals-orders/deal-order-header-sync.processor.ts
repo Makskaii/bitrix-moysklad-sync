@@ -19,6 +19,42 @@ const FIELD = 'deal-order-comments';
 export class DealOrderHeaderSyncProcessor {
   constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService, private readonly dryWrites?: DryRunWriteJournal) {}
 
+  /** Client changes are part of the ordinary #54 exchange and must not inherit
+   * the temporary local-only COMMENTS writer gate. The first event only seeds
+   * the bilateral baseline; later events can update the existing document. */
+  async processClient(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; attempt?: number; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
+    if ((process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || (await this.mode.read()).mode !== 'on') return 'DISABLED';
+    if (input.pair.entityType !== 'DEAL' || input.baselineId !== input.pair.id) return 'UNSUPPORTED';
+    const base24 = providerEndpoint(process.env.BITRIX24_REST_BASE_URL);
+    const baseMs = providerEndpoint(process.env.MOYSKLAD_API_BASE_URL);
+    if (!base24 || !baseMs) return 'DISABLED';
+    const event = await this.database.inboundEvent.findUnique({ where: { id: input.eventId }, select: { source: true } });
+    if (!event || (event.source !== 'BITRIX24' && event.source !== 'MOYSKLAD')) return 'UNSUPPORTED';
+    return this.database.$transaction(async (transaction) => {
+      await lockEntityPairState(transaction);
+      const pair = await transaction.entityPair.findFirst({ where: { id: input.pair.id, entityType: 'DEAL', active: true, bitrix24Id: input.pair.bitrix24Id, moyskladId: input.pair.moyskladId }, select: { id: true } });
+      const baseline = await transaction.entityPairBaseline.findUnique({ where: { pairId: input.pair.id } });
+      if (!pair || !baseline || baseline.settingsVersion !== input.eventConfig.version) return 'BASELINE_MISSING';
+      const previous = await transaction.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+      if (!previous) {
+        await transaction.entityPairSyncState.createMany({ data: [{ pairId: pair.id, settingsVersion: baseline.settingsVersion,
+          bitrix24Values: jsonRecord(baseline.bitrix24Values) as Prisma.InputJsonValue, moyskladValues: jsonRecord(baseline.moyskladValues) as Prisma.InputJsonValue }], skipDuplicates: true });
+        return 'BASELINE_INITIALIZED';
+      }
+      if (previous.settingsVersion !== baseline.settingsVersion) return 'BASELINE_MISSING';
+      let b24: Record<string, unknown>;
+      let ms: Record<string, unknown>;
+      try { [ms, b24] = await Promise.all([this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId), this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id)]); }
+      catch (error) {
+        if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
+        return 'HOLD_READ_FAILED';
+      }
+      return this.syncCompanyClient({ transaction, pairId: pair.id, eventId: input.eventId, settingsVersion: baseline.settingsVersion,
+        serviceCounterpartyId: input.eventConfig.config.serviceCounterpartyId, bitrix24DealId: input.pair.bitrix24Id,
+        moyskladOrderId: input.pair.moyskladId, b24, ms, previous, baseline, assertWorkerLease: input.assertWorkerLease });
+    }, { timeout: 60_000 });
+  }
+
   async process(input: { eventId: string; pair: Pair; eventConfig: VersionedFieldSettingsDto; baselineId: string; attempt?: number; assertWorkerLease?: () => Promise<void> }): Promise<HeaderResult> {
     if (process.env.ADMIN_PREVIEW !== '1' || process.env.LOCAL_HEADER_EXCHANGE !== '1' || process.env.LOCAL_HEADER_EXCHANGE_READY !== '1' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || (await this.mode.read()).mode !== 'on') return 'DISABLED';
     if (input.pair.entityType !== 'DEAL' || input.baselineId !== input.pair.id) return 'UNSUPPORTED';
@@ -31,7 +67,8 @@ export class DealOrderHeaderSyncProcessor {
     const direction = event.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : event.source === 'MOYSKLAD' ? 'MOYSKLAD_TO_BITRIX24' : null;
     if (!direction) return 'UNSUPPORTED';
     const rule = input.eventConfig.config.rules.find((candidate) => candidate.entity === 'deals-orders' && candidate.sourceField === 'COMMENTS' && candidate.targetField === 'description');
-    if (!rule || (rule.bitrix24ToMoysklad.transform.kind !== 'copy' && rule.moyskladToBitrix24.transform.kind !== 'copy')) return 'UNSUPPORTED';
+    if (!rule) return 'DISABLED';
+    if (rule.bitrix24ToMoysklad.transform.kind !== 'copy' && rule.moyskladToBitrix24.transform.kind !== 'copy') return 'UNSUPPORTED';
 
     return this.database.$transaction(async (transaction) => {
     // Manual pair assignment/reassignment uses this same advisory lock. Hold it
@@ -49,6 +86,15 @@ export class DealOrderHeaderSyncProcessor {
       return 'BASELINE_INITIALIZED';
     }
     if (previous.settingsVersion !== baseline.settingsVersion) return 'BASELINE_MISSING';
+    const previousB24 = jsonRecord(previous.bitrix24Values);
+    const previousMs = jsonRecord(previous.moyskladValues);
+    if (!Object.prototype.hasOwnProperty.call(previousB24, FIELD) || !Object.prototype.hasOwnProperty.call(previousMs, FIELD)) {
+      await transaction.entityPairSyncState.update({ where: { pairId: pair.id }, data: {
+        bitrix24Values: { ...previousB24, [FIELD]: baselineB24 },
+        moyskladValues: { ...previousMs, [FIELD]: baselineMs },
+      } });
+      return 'BASELINE_INITIALIZED';
+    }
 
     let b24: Record<string, unknown>;
     let ms: Record<string, unknown>;
@@ -106,6 +152,7 @@ export class DealOrderHeaderSyncProcessor {
         : false;
       if (!proposed) {
         try {
+          await this.mode.assertDealOrderExternalWriteAllowed(writeTo === 'MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; });
           if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
           else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
         } catch (error) {
@@ -182,8 +229,8 @@ export class DealOrderHeaderSyncProcessor {
       targetCompanyId = b24ClientId;
       targetAgentId = String(candidates[0].moyskladId);
     }
-    const base24 = localEndpoint(process.env.BITRIX24_REST_BASE_URL);
-    const baseMs = localEndpoint(process.env.MOYSKLAD_API_BASE_URL);
+    const base24 = providerEndpoint(process.env.BITRIX24_REST_BASE_URL);
+    const baseMs = providerEndpoint(process.env.MOYSKLAD_API_BASE_URL);
     if (!base24 || !baseMs) return 'DISABLED';
     await input.assertWorkerLease?.();
     if (source === 'MOYSKLAD') {
@@ -194,6 +241,7 @@ export class DealOrderHeaderSyncProcessor {
           : false;
         let verified: Record<string, unknown>;
         try {
+          if (!proposed) await this.mode.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; });
           if (!proposed) await this.writeBitrixCompany(base24, input.bitrix24DealId, targetCompanyId);
           verified = await this.reader.readBitrix24DealForBaseline(input.bitrix24DealId);
         } catch (error) { return providerResult(error); }
@@ -209,6 +257,7 @@ export class DealOrderHeaderSyncProcessor {
           : false;
         let verified: Record<string, unknown>;
         try {
+          if (!proposed) await this.mode.assertDealOrderExternalWriteAllowed('bitrix24ToMoysklad', async () => { await input.assertWorkerLease?.(); return true; });
           if (!proposed) await this.writeMoySkladAgent(baseMs, input.moyskladOrderId, agent);
           verified = await this.reader.readMoySkladCustomerOrderForBaseline(input.moyskladOrderId);
         } catch (error) { return providerResult(error); }
@@ -283,6 +332,14 @@ function localEndpoint(value?: string): URL | null {
     // Do not permit DNS names (including localhost) here: the local-release
     // escape hatch must not become a way to contact a remotely-resolved host.
     return ['127.0.0.1', '[::1]'].includes(url.hostname) && url.protocol === 'http:' && !url.username && !url.password ? url : null;
+  } catch { return null; }
+}
+
+function providerEndpoint(value?: string): URL | null {
+  try {
+    const url = new URL(value ?? '');
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.hash) return null;
+    return url;
   } catch { return null; }
 }
 

@@ -27,6 +27,15 @@ const moyskladUnitId = '42345678-1234-1234-1234-123456789abc';
 const oldEnv = new Map<string, string | undefined>();
 let bitrixComments = 'B24 initial';
 let moyskladDescription = 'MS initial';
+let bitrixCompanyId = '0';
+let moyskladAgentId: string | null = null;
+let bitrixOpportunity = '1';
+let moyskladOrderSum: number | string = 1;
+let opportunityWrites = 0;
+let bitrixRowPrice = 1;
+let moyskladPositionPrice = 100;
+let moyskladPositionVat = 0;
+let moyskladPositionVatEnabled = false;
 let failNextMoyskladWriteRetryAfter: string | null = null;
 let failNextBitrixWriteRetryAfter: string | null = null;
 let failNextBitrixRead: { status: number; retryAfter: string | null } | null = null;
@@ -121,7 +130,7 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   const readinessGated = await postB24(bitrixId, bitrixComments, 'entity-not-ready');
   assert.equal(readinessGated.status, 200);
   const { eventId: readinessGatedEventId } = await readinessGated.json() as { eventId: string };
-  await waitForEventStatus(database, readinessGatedEventId, 'SKIPPED_DISABLED');
+  await waitForEventStatus(database, readinessGatedEventId, 'SUCCEEDED');
   assert.equal(externalRequests.filter(isWrite).length, 0, 'global mode and mapping alone do not bypass entity readiness');
   process.env.LOCAL_HEADER_EXCHANGE_READY = '1';
 
@@ -202,7 +211,7 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   const disabled = await postB24(bitrixId, bitrixComments, 'local-gate-off');
   assert.equal(disabled.status, 200);
   const { eventId: disabledEventId } = await disabled.json() as { eventId: string };
-  await waitForEventStatus(database, disabledEventId, 'SKIPPED_DISABLED');
+  await waitForEventStatus(database, disabledEventId, 'SUCCEEDED');
   assert.equal(externalRequests.filter(isWrite).length, writesAfterRateLimit, 'the local exchange gate defaults closed');
 
   process.env.LOCAL_HEADER_EXCHANGE = '1';
@@ -231,6 +240,121 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   assert.ok(externalRequests.filter(isWrite).every((request) =>
     (request.method === 'PUT' && request.path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`) ||
     (request.method === 'POST' && request.path === '/b24/rest/crm.deal.update.json')));
+});
+
+test('paired-client updates run without COMMENTS mapping or the legacy header gate, preserve pair, and use MS conflict priority', async (t) => {
+  const database = app.get(DatabaseService);
+  const priorFlags = ['ADMIN_PREVIEW', 'LOCAL_HEADER_EXCHANGE', 'LOCAL_HEADER_EXCHANGE_READY'].map((key) => process.env[key]);
+  t.after(() => {
+    for (const [key, value] of ['ADMIN_PREVIEW', 'LOCAL_HEADER_EXCHANGE', 'LOCAL_HEADER_EXCHANGE_READY'].map((name, index) => [name, priorFlags[index]] as const)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  bitrixId = String(7_300_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const oldCompanyB24 = String(9_300_000_000 + Math.floor(Math.random() * 100_000)); const oldCompanyMs = randomUUID();
+  const b24CompanyA = String(9_310_000_000 + Math.floor(Math.random() * 100_000)); const companyAMs = randomUUID();
+  const b24CompanyB = String(9_320_000_000 + Math.floor(Math.random() * 100_000)); const companyBMs = randomUUID();
+  const b24CompanyC = String(9_330_000_000 + Math.floor(Math.random() * 100_000)); const companyCMs = randomUUID();
+  const b24CompanyD = String(9_340_000_000 + Math.floor(Math.random() * 100_000)); const companyDMs = randomUUID();
+  for (const [bitrix24Id, moyskladCompanyId] of [[oldCompanyB24, oldCompanyMs], [b24CompanyA, companyAMs], [b24CompanyB, companyBMs], [b24CompanyC, companyCMs], [b24CompanyD, companyDMs]]) {
+    await database.entityPair.create({ data: { entityType: 'COMPANY', bitrix24Id, moyskladId: moyskladCompanyId, moyskladType: 'counterparty', source: 'MANUAL', reason: 'client runtime test pair' } });
+  }
+  const settingsVersion = 950_000 + Math.floor(Math.random() * 10_000);
+  await createPairAndSettings(database, settingsVersion, false);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  process.env.ADMIN_PREVIEW = '0'; process.env.LOCAL_HEADER_EXCHANGE = '0'; process.env.LOCAL_HEADER_EXCHANGE_READY = '0';
+  bitrixCompanyId = oldCompanyB24; moyskladAgentId = oldCompanyMs;
+  const writesBeforeBaseline = externalRequests.filter(isWrite).length;
+  const pairId = (await database.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId } })).id;
+  const firstResponse = await postB24(bitrixId, bitrixComments, 'client-first-baseline');
+  const { eventId: firstEventId } = await firstResponse.json() as { eventId: string };
+  await waitForEventStatus(database, firstEventId, 'SUCCEEDED');
+  assert.equal(externalRequests.filter(isWrite).length, writesBeforeBaseline, 'first-event baseline only seeds client state');
+  const firstState = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId } });
+  assert.equal((firstState.bitrix24Values as Record<string, unknown>)['client:companyId'], oldCompanyB24);
+  assert.equal((firstState.moyskladValues as Record<string, unknown>)['client:agentId'], oldCompanyMs);
+
+  bitrixRowPrice = 2; moyskladOrderSum = 2;
+  const rowChange = await postB24(bitrixId, bitrixComments, 'no-comments-row-update');
+  const { eventId: rowEventId } = await rowChange.json() as { eventId: string };
+  await waitUntil(() => moyskladPositionPrice === 200);
+  await waitForEventStatus(database, rowEventId, 'SUCCEEDED');
+  assert.equal(bitrixOpportunity, '2', 'row-value change bypasses the one-kopeck total-only exception and restores the computed MS sum');
+  assert.ok(externalRequests.some((request) => request.method === 'PUT' && request.path.endsWith(`/customerorder/${moyskladId}/positions/${moyskladPositionId}`)), 'row update runs independently of header/comments gate');
+
+  bitrixCompanyId = b24CompanyA;
+  const b24Change = await postB24(bitrixId, bitrixComments, 'client-b24-change');
+  const { eventId: b24EventId } = await b24Change.json() as { eventId: string };
+  await waitUntil(() => moyskladAgentId === companyAMs);
+  await waitForEventStatus(database, b24EventId, 'SUCCEEDED');
+  assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: pairId } })).moyskladId, moyskladId, 'client update retains the same document pair');
+
+  moyskladAgentId = companyBMs;
+  const msChange = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-webhook-secret?requestId=client-ms-change`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }) });
+  const { eventId: msEventId } = await msChange.json() as { eventId: string };
+  await waitUntil(() => bitrixCompanyId === b24CompanyB);
+  await waitForEventStatus(database, msEventId, 'SUCCEEDED');
+
+  bitrixCompanyId = b24CompanyC; moyskladAgentId = companyDMs;
+  const conflict = await postB24(bitrixId, bitrixComments, 'client-simultaneous-conflict');
+  const { eventId: conflictEventId } = await conflict.json() as { eventId: string };
+  await waitUntil(() => bitrixCompanyId === b24CompanyD);
+  await waitForEventStatus(database, conflictEventId, 'SUCCEEDED');
+
+  bitrixCompanyId = '0';
+  const cleared = await postB24(bitrixId, bitrixComments, 'client-clear-to-service-counterparty');
+  const { eventId: clearEventId } = await cleared.json() as { eventId: string };
+  await waitUntil(() => moyskladAgentId === serviceCounterpartyId);
+  await waitForEventStatus(database, clearEventId, 'SUCCEEDED');
+  assert.ok(externalRequests.some((request) => request.method === 'GET' && request.path.endsWith(`/entity/counterparty/${serviceCounterpartyId}`)), 'configured service counterparty is confirmed through the provider before assignment');
+  assert.equal(externalRequests.some((request) => request.path.includes('/customerorder/create') || request.path.includes('/crm.deal.add')), false);
+});
+
+test('document totals retain only B24-origin one-kopeck RUB residue and otherwise restore from MS sum', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_400_000_000 + Math.floor(Math.random() * 1_000_000)); moyskladId = randomUUID();
+  const settingsVersion = 960_000 + Math.floor(Math.random() * 10_000);
+  const pair = await createConfirmedPairAndSettings(database, settingsVersion);
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  bitrixOpportunity = '1'; moyskladOrderSum = 1; opportunityWrites = 0;
+  const initial = await postB24(bitrixId, bitrixComments, 'total-baseline');
+  const { eventId: initialEventId } = await initial.json() as { eventId: string };
+  await waitForEventStatus(database, initialEventId, 'SUCCEEDED');
+
+  bitrixOpportunity = '1.01';
+  const penny = await postB24(bitrixId, bitrixComments, 'total-one-kopeck');
+  const { eventId: pennyEventId } = await penny.json() as { eventId: string };
+  await waitForEventStatus(database, pennyEventId, 'SUCCEEDED');
+  assert.equal(bitrixOpportunity, '1.01');
+  assert.equal(opportunityWrites, 0, 'one kopeck from a B24-origin total-only change must not trigger a corrective write');
+  const history = await database.operationalLog.findFirst({ where: { referenceId: pennyEventId, message: { contains: 'B24_ONE_KOPECK_RETAINED' } } });
+  assert.ok(history, 'the residue is recorded in event history with raw values');
+
+  bitrixOpportunity = '1.03';
+  const overTolerance = await postB24(bitrixId, bitrixComments, 'total-over-tolerance');
+  const { eventId: overEventId } = await overTolerance.json() as { eventId: string };
+  await waitForEventStatus(database, overEventId, 'SUCCEEDED');
+  assert.equal(bitrixOpportunity, '1');
+  assert.equal(opportunityWrites, 1, 'a divergence greater than one kopeck is restored from the read-only MySklad sum');
+
+  moyskladOrderSum = 1.05;
+  const msTotal = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-webhook-secret?requestId=total-ms-change`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: 'customerorder', href: `${fakeBase}/entity/customerorder/${moyskladId}` } }] }) });
+  const { eventId: msTotalEventId } = await msTotal.json() as { eventId: string };
+  await waitUntil(() => bitrixOpportunity === '1.05');
+  await waitForEventStatus(database, msTotalEventId, 'SUCCEEDED');
+  assert.equal(opportunityWrites, 2, 'only B24 OPPORTUNITY is writable; MS sum remains authoritative and read-only');
+
+  await database.syncDirectionSetting.upsert({ where: { entityKey: 'deals-orders' }, create: { entityKey: 'deals-orders', bitrix24ToMoysklad: false, moyskladToBitrix24: true }, update: { bitrix24ToMoysklad: false, moyskladToBitrix24: true } });
+  bitrixOpportunity = '1.08';
+  const directionCheck = await postB24(bitrixId, bitrixComments, 'total-target-direction');
+  const { eventId: directionEventId } = await directionCheck.json() as { eventId: string };
+  await waitUntil(() => bitrixOpportunity === '1.05');
+  await waitForEventStatus(database, directionEventId, 'SUCCEEDED');
+  assert.equal(opportunityWrites, 3, 'a B24 target write follows the MS→B24 direction even when B24→MS is disabled');
+  await database.syncDirectionSetting.upsert({ where: { entityKey: 'deals-orders' }, create: { entityKey: 'deals-orders', bitrix24ToMoysklad: true, moyskladToBitrix24: true }, update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
 });
 
 test('deal/order source read failures persist bounded Retry-After; permanent 4xx is held for review', async () => {
@@ -355,12 +479,13 @@ test('first confirmed event captures baseline with header-writer preview flags d
   assert.equal(response.status, 200);
   const { eventId } = await response.json() as { eventId: string };
   await waitForBaseline(database, pair.id);
+  await waitForEventStatus(database, eventId, 'SUCCEEDED');
   const baseline = await database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
   assert.ok(baseline, 'Q26.66 baseline capture is not gated by local preview flags');
   assert.deepEqual(externalRequests.slice(requestsBefore, requestsBefore + 4).map(({ method }) => method), ['POST', 'GET', 'GET', 'POST']);
-  assert.equal(externalRequests.length, requestsBefore + 4, 'disabled header exchange captures baseline without starting position sync');
+  assert.ok(externalRequests.length > requestsBefore + 4, 'ordinary row/client exchange remains active when only the legacy header writer is disabled');
   assert.equal(externalRequests.slice(requestsBefore).filter(isWrite).length, 0);
-  await waitForEventStatus(database, eventId, 'SKIPPED_DISABLED');
+  assertPositionReadPaths(requestsBefore);
 
   process.env.ADMIN_PREVIEW = '1';
   process.env.LOCAL_HEADER_EXCHANGE = '1';
@@ -445,11 +570,19 @@ test('dry first-event baseline uses the isolated dry database and performs reads
 });
 
 async function createConfirmedPairAndSettings(database: DatabaseService, settingsVersion: number) {
+  bitrixCompanyId = '0'; moyskladAgentId = null;
+  bitrixOpportunity = '1'; moyskladOrderSum = 1;
+  bitrixRowPrice = 1; moyskladPositionPrice = 100;
+  moyskladPositionVat = 0; moyskladPositionVatEnabled = false;
+  return createPairAndSettings(database, settingsVersion, true);
+}
+
+async function createPairAndSettings(database: DatabaseService, settingsVersion: number, includeComments: boolean) {
   const config = {
     schemaVersion: 1,
-    rules: [{ id: 'deal-comments', entity: 'deals-orders', sourceField: 'COMMENTS', targetField: 'description',
+    rules: includeComments ? [{ id: 'deal-comments', entity: 'deals-orders', sourceField: 'COMMENTS', targetField: 'description',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
-      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }] : [],
     groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: moyskladUnitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] }, serviceCounterpartyId,
   };
   await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
@@ -478,7 +611,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
       return;
     }
-    response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMMENTS: bitrixComments, DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
+    response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMPANY_ID: bitrixCompanyId, COMMENTS: bitrixComments, OPPORTUNITY: bitrixOpportunity, CURRENCY_ID: 'RUB', DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
+  } else if (path === '/b24/rest/crm.company.get.json' && request.method === 'POST') {
+    const id = new URLSearchParams(body).get('id') ?? '';
+    response.writeHead(200); response.end(JSON.stringify({ result: { ID: id, TITLE: `Company ${id}` } }));
   } else if (path === '/b24/rest/crm.deal.update.json' && request.method === 'POST') {
     if (failNextBitrixWriteRetryAfter) {
       const retryAfter = failNextBitrixWriteRetryAfter;
@@ -489,6 +625,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     const form = new URLSearchParams(body);
     bitrixComments = form.get('fields[COMMENTS]') ?? bitrixComments;
+    bitrixCompanyId = form.get('fields[COMPANY_ID]') ?? bitrixCompanyId;
+    if (form.has('fields[OPPORTUNITY]')) { bitrixOpportunity = form.get('fields[OPPORTUNITY]') ?? bitrixOpportunity; opportunityWrites++; }
     response.writeHead(200); response.end(JSON.stringify({ result: true }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}` && request.method === 'GET') {
     if (failNextMoyskladRead) {
@@ -498,13 +636,24 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
       return;
     }
-    response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, vatIncluded: false, updated: '2026-10-07T10:00:00+00:00' }));
-  } else if (path === `/ms/api/remap/1.2/entity/counterparty/${serviceCounterpartyId}` && request.method === 'GET') {
-    response.writeHead(200); response.end(JSON.stringify({ id: serviceCounterpartyId, meta: { type: 'counterparty' } }));
+    const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, sum: moyskladOrderSum, currency: { isoCode: 'RUB' }, vatIncluded: false, updated: '2026-10-07T10:00:00+00:00' };
+    if (moyskladAgentId) order.agent = { id: moyskladAgentId, meta: { href: `${fakeBase}/entity/counterparty/${moyskladAgentId}`, type: 'counterparty' } };
+    response.writeHead(200); response.end(JSON.stringify(order));
+  } else if (/^\/ms\/api\/remap\/1\.2\/entity\/counterparty\/[0-9a-f-]+$/i.test(path) && request.method === 'GET') {
+    const id = path.split('/').at(-1)!;
+    response.writeHead(200); response.end(JSON.stringify({ id, meta: { type: 'counterparty' }, name: id === serviceCounterpartyId ? 'Service counterparty' : 'Company' }));
   } else if (new URL(path, 'http://127.0.0.1').pathname === '/b24/rest/crm.item.productrow.list' && request.method === 'POST') {
-    response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: 1, priceNetto: 1, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0, taxIncluded: 'N' }] }, total: 1 }));
+    response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: bitrixRowPrice, priceNetto: bitrixRowPrice, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0, taxIncluded: 'N' }] }, total: 1 }));
+  } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions/${moyskladPositionId}` && request.method === 'GET') {
+    response.writeHead(200); response.end(JSON.stringify({ id: moyskladPositionId, assortment: { meta: { href: `${fakeBase}/entity/product/${moyskladProductId}`, type: 'product' } }, quantity: 1, price: moyskladPositionPrice, discount: 0, vat: moyskladPositionVat, vatEnabled: moyskladPositionVatEnabled }));
+  } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions/${moyskladPositionId}` && request.method === 'PUT') {
+    const payload = JSON.parse(body) as { quantity?: number; price?: number; vat?: number; vatEnabled?: boolean };
+    if (typeof payload.price === 'number') moyskladPositionPrice = payload.price;
+    if (typeof payload.vat === 'number') moyskladPositionVat = payload.vat;
+    if (typeof payload.vatEnabled === 'boolean') moyskladPositionVatEnabled = payload.vatEnabled;
+    response.writeHead(200); response.end(JSON.stringify({ id: moyskladPositionId }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions` && request.method === 'GET') {
-    response.writeHead(200); response.end(JSON.stringify({ rows: [{ id: moyskladPositionId, assortment: { meta: { href: `${fakeBase}/entity/product/${moyskladProductId}`, type: 'product' } }, quantity: 1, price: 100, discount: 0, vat: 0, vatEnabled: false }], meta: { size: 1 } }));
+    response.writeHead(200); response.end(JSON.stringify({ rows: [{ id: moyskladPositionId, assortment: { meta: { href: `${fakeBase}/entity/product/${moyskladProductId}`, type: 'product' } }, quantity: 1, price: moyskladPositionPrice, discount: 0, vat: moyskladPositionVat, vatEnabled: moyskladPositionVatEnabled }], meta: { size: 1 } }));
   } else if (path === `/ms/api/remap/1.2/entity/product/${moyskladProductId}` && request.method === 'GET') {
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladProductId, meta: { type: 'product' }, uom: { id: moyskladUnitId } }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}` && request.method === 'PUT') {
@@ -515,8 +664,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(429, { 'content-type': 'text/plain' }); response.end('temporarily rate limited');
       return;
     }
-    const payload = JSON.parse(body) as { description?: string };
+    const payload = JSON.parse(body) as { description?: string; agent?: { meta?: { href?: string } } };
     if (typeof payload.description === 'string') moyskladDescription = payload.description;
+    if (payload.agent?.meta?.href) moyskladAgentId = new URL(payload.agent.meta.href).pathname.split('/').at(-1) ?? null;
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription }));
   } else {
     response.writeHead(404); response.end(JSON.stringify({ error: 'Unexpected fake API call' }));
@@ -578,10 +728,10 @@ async function waitForBaseline(database: DatabaseService, pairId: string) {
 }
 
 function assertPositionReadPaths(startIndex: number) {
-  const paths = externalRequests.slice(startIndex).map(({ path }) => new URL(path, 'http://127.0.0.1').pathname).sort();
+  const paths = externalRequests.slice(startIndex).map(({ path }) => new URL(path, 'http://127.0.0.1').pathname)
+    .filter((path) => path === '/b24/rest/crm.item.productrow.list' || path.endsWith(`/customerorder/${moyskladId}/positions`) || path === `/ms/api/remap/1.2/entity/product/${moyskladProductId}`).sort();
   assert.deepEqual(paths, [
     '/b24/rest/crm.item.productrow.list',
-    `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`,
     `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions`,
     `/ms/api/remap/1.2/entity/product/${moyskladProductId}`,
   ].sort());

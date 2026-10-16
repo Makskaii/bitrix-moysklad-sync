@@ -146,7 +146,7 @@ export class DealOrderCreateOperationService {
       if (!token) throw new Error('Customer-order create is not configured');
       let orderId = operation.moyskladOrderId;
       if (!orderId) {
-        if (assertWorkerLease && !await assertWorkerLease()) throw new Error('Customer-order create event lease was lost before provider write');
+        await this.assertCreateMutationAllowed(input.bitrix24DealId, leaseToken, assertWorkerLease);
         const created = await requestJson(new URL('entity/customerorder', withSlash(base)), {
           method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' },
           body: JSON.stringify({ ...payload, syncId: operation.syncId }),
@@ -173,6 +173,7 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
+      await this.assertCreateMutationAllowed(input.bitrix24DealId, leaseToken, assertWorkerLease);
       await writeBitrixOrderNumber(input.bitrix24DealId, order.name);
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
@@ -276,6 +277,14 @@ export class DealOrderCreateOperationService {
     if (!await this.mode.isDirectionEnabled('deals-orders', 'bitrix24ToMoysklad')) {
       throw new Error('Customer-order create direction is disabled');
     }
+  }
+
+  private async assertCreateMutationAllowed(bitrix24DealId: string, leaseToken: string, assertWorkerLease?: () => Promise<boolean>) {
+    await this.mode.assertDealOrderExternalWriteAllowed('bitrix24ToMoysklad', async () => {
+      if (assertWorkerLease && !await assertWorkerLease()) return false;
+      const operation = await this.database.dealOrderCreateOperation.findUnique({ where: { bitrix24DealId }, select: { leaseToken: true, leaseUntil: true } });
+      return operation?.leaseToken === leaseToken && !!operation.leaseUntil && operation.leaseUntil > new Date();
+    });
   }
 
   private async getOrCreateOperation(input: DealOrderPreparedInput) {
