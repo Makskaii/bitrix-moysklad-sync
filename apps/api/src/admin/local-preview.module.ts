@@ -24,6 +24,11 @@ import { PairFirstEventProcessor } from '../pairs/pair-first-event.processor';
 import { PairResolutionController } from './pair-resolution.controller';
 import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
 import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
+import { DealOrderCreationPreparer } from '../deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreateOperationService } from '../deals-orders/deal-order-create-operation.service';
+import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
+import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
+import { DealOrderReverseCreateService } from '../deals-orders/deal-order-reverse-create.service';
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
@@ -60,7 +65,7 @@ export class LocalAdminPreviewModule {
         DryRunWriteJournal,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
-          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService,
           HistoricalInventoryService,
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
           { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },

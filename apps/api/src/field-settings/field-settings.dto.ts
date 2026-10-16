@@ -53,6 +53,19 @@ export type FieldGroupDto = {
   transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
 };
 
+export type DealOrderRuntimeDto = {
+  nativeOrderNumberingVerified: boolean;
+  defaultOrganizationId: string | null;
+  defaultStoreId: string | null;
+  defaultEmployeeId: string | null;
+  defaultProductGroupId?: string | null;
+  currencies: Array<{ bitrix24Code: string; moyskladId: string }>;
+  stages: Array<{ bitrix24StageId: string; moyskladId: string; creationEnabled: boolean }>;
+  organizations: Array<{ bitrix24Id: string; moyskladId: string }>;
+  stores: Array<{ bitrix24Id: string; moyskladId: string }>;
+  employees: Array<{ bitrix24Id: string; moyskladId: string }>;
+};
+
 /** Explicit binding for child endpoints. IDs are selected by an operator and are never discovered/guessed by runtime. */
 export type ClientChildResourceBindingDto = {
   id: string;
@@ -72,6 +85,7 @@ export type FieldSettingsConfigDto = {
   groups: FieldGroupDto[];
   childResourceBindings?: ClientChildResourceBindingDto[];
   references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };
+  dealOrderRuntime?: DealOrderRuntimeDto;
 } & Record<string, unknown>;
 
 export type VersionedFieldSettingsDto = {

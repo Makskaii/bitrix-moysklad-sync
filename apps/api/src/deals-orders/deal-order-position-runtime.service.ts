@@ -1,0 +1,540 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
+import { DatabaseService } from '../database.service';
+import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
+import { PairResolutionResult } from '../pairs/pair-resolver';
+import { DealOrderPairLease, withDealOrderPairLock } from './deal-order-pair-lock';
+
+type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
+type Result = { status: 'SYNCED' } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
+type Row = Record<string, unknown>;
+type Position = { id: string; quantity: number; price: number; discount?: number; vat?: number; vatEnabled?: boolean; assortment?: Row };
+const logger = new Logger('DealOrderPositionRuntimeService');
+
+class InvalidPositionSetError extends Error {}
+
+/** Addressed, idempotent quantity/price writes and row-level reconciliation for
+ * confirmed deal/order row links. Unsupported tax/discount semantics are held. */
+@Injectable()
+export class DealOrderPositionRuntimeService {
+  constructor(private readonly database: DatabaseService) {}
+
+  async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
+    if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
+    if (process.env.SYNC_MODE !== 'apply') return { status: 'MANUAL_REVIEW', reason: 'SYNC_MODE_NOT_APPLY' };
+    return await withDealOrderPairLock(this.database, input.pair.id, input.eventId, (lease) => this.processLocked(input, lease)) ??
+      { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_BUSY' };
+  }
+
+  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, lease: DealOrderPairLease): Promise<Result> {
+    const assertOwner = lease.assertOwner;
+    const pair = await this.database.entityPair.findFirst({
+      where: { id: input.pair.id, entityType: 'DEAL', active: true, bitrix24Id: input.pair.bitrix24Id, moyskladId: input.pair.moyskladId },
+      select: { id: true, bitrix24Id: true, moyskladId: true },
+    });
+    if (!pair) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PAIR_NOT_ACTIVE' };
+    const links = await this.database.dealOrderPositionPair.findMany({ where: { pairId: pair.id }, orderBy: { bitrix24ProductRowId: 'asc' } });
+
+    let b24Rows: Row[];
+    let msRows: Position[];
+    try {
+      [b24Rows, msRows] = await Promise.all([readAllBitrixRows(pair.bitrix24Id), readAllMoySkladPositions(pair.moyskladId)]);
+    } catch (error) {
+      if (error instanceof InvalidPositionSetError) {
+        logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, reason: 'DEAL_ORDER_POSITION_SET_INVALID' }));
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_INVALID' };
+      }
+      return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READ_FAILED' };
+    }
+    if (!links.length) return this.bootstrapHistoricalLinks(pair.id, pair.moyskladId, input.eventId, input.eventConfig, b24Rows, msRows, lease);
+    const linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
+    const linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
+    const newRows = b24Rows.filter((row) => !linkedSourceIds.has(String(row.id)));
+    const unlinkedTargets = msRows.filter((row) => !linkedTargetIds.has(row.id));
+    if (msRows.length > links.length + newRows.length || unlinkedTargets.length > newRows.length) {
+      return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_CHANGED' };
+    }
+    const productIds = [...new Set(b24Rows.map((row) => String(row.productId)))];
+    const productPairs = await this.database.entityPair.findMany({
+      where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
+      select: { bitrix24Id: true, moyskladId: true },
+    });
+    const sourceById = new Map(b24Rows.map((row) => [String(row.id), row]));
+    const targetById = new Map(msRows.map((row) => [row.id, row]));
+    const plans: Array<{ linkId: string; source: Row; target: Position; quantity: number; price: number; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'ECHO' }> = [];
+    const deletions: Array<{ linkId: string; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24'; target?: Position; source?: Row }> = [];
+    const alreadyDeleted: string[] = [];
+    for (const link of links) {
+      const source = sourceById.get(link.bitrix24ProductRowId);
+      const target = targetById.get(link.moyskladPositionId);
+      if (!target) {
+        if (source) {
+          if (!sameSourceValue(source, link.bitrix24Values) || !sameProductAndUnit(source, link.bitrix24Values)) {
+            return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DELETE_CONFLICT' };
+          }
+          const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { moyskladToBitrix24: true } });
+          if (!(directionSetting?.moyskladToBitrix24 ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
+          deletions.push({ linkId: link.id, direction: 'MOYSKLAD_TO_BITRIX24', source });
+          continue;
+        }
+        alreadyDeleted.push(link.id);
+        continue;
+      }
+      if (!source) {
+        if (!sameTargetValue(target, link.moyskladValues) || !sameProductTarget(target, link.moyskladValues)) {
+          return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DELETE_CONFLICT' };
+        }
+        const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { bitrix24ToMoysklad: true } });
+        if (!(directionSetting?.bitrix24ToMoysklad ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
+        deletions.push({ linkId: link.id, direction: 'BITRIX24_TO_MOYSKLAD', target });
+        continue;
+      }
+      const desired = sourceValues(source);
+      if (!desired) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_VALUE_UNSUPPORTED' };
+      if (!sameProductAndUnit(source, link.bitrix24Values) || !sameProductTarget(target, link.moyskladValues)) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_IDENTITY_CHANGED' };
+      }
+      const mappedUnit = input.eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      const linkedProducts = productPairs.filter((candidate) => candidate.bitrix24Id === String(source.productId));
+      const targetProductId = assortmentId(target.assortment);
+      if (!mappedUnit?.moyskladId || linkedProducts.length !== 1 || linkedProducts[0].moyskladId !== targetProductId) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED' };
+      }
+      try {
+        const product = await requestJson(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
+          return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED' };
+        }
+      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_READ_FAILED' }; }
+      const sourceChanged = !sameSourceValue(source, link.bitrix24Values);
+      const targetChanged = !sameTargetValue(target, link.moyskladValues);
+      if (targetChanged && (target.discount ?? 0) !== 0 || targetChanged && ((target.vatEnabled ?? false) || (target.vat ?? 0) !== 0)) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_VALUE_UNSUPPORTED' };
+      }
+      const direction = targetChanged ? 'MOYSKLAD_TO_BITRIX24' : sourceChanged ? 'BITRIX24_TO_MOYSKLAD' : 'ECHO';
+      const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
+      if (direction === 'MOYSKLAD_TO_BITRIX24' && !(directionSetting?.moyskladToBitrix24 ?? true) ||
+          direction === 'BITRIX24_TO_MOYSKLAD' && !(directionSetting?.bitrix24ToMoysklad ?? true)) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
+      }
+      plans.push({ linkId: link.id, source, target, ...desired, direction });
+    }
+    if (b24Rows.some((row) => !links.some((link) => link.bitrix24ProductRowId === String(row.id)))) {
+      if (!newRows.length) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_CHANGED' };
+    }
+    if (newRows.length && (plans.some((plan) => plan.direction !== 'ECHO') || deletions.length)) {
+      return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_CHANGED' };
+    }
+    if (newRows.length) {
+      const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { bitrix24ToMoysklad: true } });
+      if (!(directionSetting?.bitrix24ToMoysklad ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
+      const added = await this.addRows(pair.id, pair.moyskladId, newRows, input.eventConfig, assertOwner);
+      if (added.status !== 'SYNCED') return added;
+    }
+
+    for (const plan of plans) {
+      if (plan.direction === 'ECHO') continue;
+      try {
+        let verifiedB24: Row;
+        let verifiedMs: Row;
+        if (plan.direction === 'BITRIX24_TO_MOYSKLAD') {
+          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
+          if (!sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
+          if (plan.target.quantity !== plan.quantity || plan.target.price !== plan.price) {
+            if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+            await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
+              method: 'PUT', headers: msHeaders(), body: JSON.stringify({ quantity: plan.quantity, price: plan.price }),
+            });
+          }
+          const verified = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+          if (!isRecord(verified) || verified.id !== plan.target.id || verified.quantity !== plan.quantity || verified.price !== plan.price) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
+          verifiedB24 = sourceSnapshot(plan.source);
+          verifiedMs = targetSnapshot(verified);
+        } else {
+          const currentRows = await readAllBitrixRows(pair.bitrix24Id);
+          const currentSource = currentRows.find((row) => String(row.id) === String(plan.source.id));
+          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
+          if (!currentSource || !sameSourceValue(currentSource, plan.source) || !sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) {
+            return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
+          }
+          const quantity = plan.target.quantity;
+          const price = plan.target.price / 100;
+          if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+          await updateBitrixRow(plan.source.id, quantity, price);
+          const rows = await readAllBitrixRows(pair.bitrix24Id);
+          const verified = rows.find((row) => String(row.id) === String(plan.source.id));
+          if (!verified || verified.quantity !== quantity || verified.price !== price) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
+          verifiedB24 = sourceSnapshot(verified);
+          verifiedMs = targetSnapshot(plan.target);
+        }
+        if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+        await this.database.dealOrderPositionPair.update({
+          where: { id: plan.linkId },
+          data: { bitrix24Values: verifiedB24 as Prisma.InputJsonValue, moyskladValues: verifiedMs as Prisma.InputJsonValue, lastSyncedAt: new Date() },
+        });
+      } catch {
+        return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_WRITE_FAILED' };
+      }
+    }
+    for (const deletion of deletions) {
+      try {
+        if (deletion.direction === 'MOYSKLAD_TO_BITRIX24') {
+          const latestSource = await readAllBitrixRows(pair.bitrix24Id);
+          const latestTargetRows = await readAllMoySkladPositions(pair.moyskladId);
+          const currentSource = latestSource.find((row) => String(row.id) === String(deletion.source?.id));
+          if (!currentSource || !sameSourceValue(currentSource, deletion.source) || latestTargetRows.some((row) => row.id === links.find((link) => link.id === deletion.linkId)?.moyskladPositionId)) {
+            return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
+          }
+          if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+          await deleteBitrixRow(deletion.source?.id);
+          const afterDelete = await readAllBitrixRows(pair.bitrix24Id);
+          if (afterDelete.some((row) => String(row.id) === String(deletion.source?.id))) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
+          const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
+          if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+          continue;
+        }
+        const target = deletion.target;
+        if (!target) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_PAIR_MISSING' };
+        const latestSource = await readAllBitrixRows(pair.bitrix24Id);
+        const latestTarget = await readMoySkladPosition(pair.moyskladId, target.id);
+        if (latestSource.some((row) => String(row.id) === links.find((link) => link.id === deletion.linkId)?.bitrix24ProductRowId) ||
+            !sameTargetValue(latestTarget, target) || !sameProductTarget(latestTarget, target)) {
+          return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
+        }
+        if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+        await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(target.id)}`, withSlash(moyskladBase())), {
+          method: 'DELETE', headers: msHeaders(),
+        });
+        const afterDelete = await readAllMoySkladPositions(pair.moyskladId);
+        if (afterDelete.some((row) => row.id === target.id)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
+        const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
+        if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_FAILED' }; }
+    }
+    if (alreadyDeleted.length) {
+      const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.deleteMany({ where: { id: { in: alreadyDeleted } } }));
+      if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+    }
+    return { status: 'SYNCED' };
+  }
+
+  /** Bootstrap only when unique, confirmed product identity produces a one-to-one row relation on both sides. */
+  private async bootstrapHistoricalLinks(
+    pairId: string,
+    orderId: string,
+    eventId: string,
+    eventConfig: VersionedFieldSettingsDto,
+    b24Rows: Row[],
+    msRows: Position[],
+    lease: DealOrderPairLease,
+  ): Promise<Result> {
+    const hold = (reason: string): Result => {
+      logger.warn(JSON.stringify({ eventId, pairId, reason }));
+      return { status: 'MANUAL_REVIEW', reason };
+    };
+    if (!b24Rows.length || b24Rows.length !== msRows.length) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+    const productCounts = new Map<string, number>();
+    for (const row of b24Rows) {
+      const id = String(row.productId ?? '');
+      productCounts.set(id, (productCounts.get(id) ?? 0) + 1);
+    }
+    if ([...productCounts.values()].some((count) => count !== 1)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+
+    const productIds = [...productCounts.keys()];
+    const productPairs = await this.database.entityPair.findMany({
+      where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
+      select: { bitrix24Id: true, moyskladId: true },
+    });
+    const productBySource = new Map<string, string>();
+    for (const id of productIds) {
+      const candidates = productPairs.filter((candidate) => candidate.bitrix24Id === id);
+      if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_PRODUCT_PAIR_MISSING');
+      productBySource.set(id, candidates[0].moyskladId);
+    }
+
+    const targetCounts = new Map<string, number>();
+    for (const row of msRows) {
+      const id = row.assortment && isRecord(row.assortment.meta) && row.assortment.meta.type === 'product' ? assortmentId(row.assortment) : null;
+      if (!id) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+      targetCounts.set(id, (targetCounts.get(id) ?? 0) + 1);
+    }
+    if ([...targetCounts.values()].some((count) => count !== 1)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+
+    const linkedTargets = new Set<string>();
+    const snapshots: Array<{ bitrix24ProductRowId: string; moyskladPositionId: string; bitrix24Values: Row; moyskladValues: Row }> = [];
+    for (const source of b24Rows) {
+      const sourceId = String(source.id);
+      const productId = String(source.productId);
+      const targetProductId = productBySource.get(productId);
+      const target = msRows.find((candidate) => candidate.assortment && assortmentId(candidate.assortment) === targetProductId);
+      if (!target || !targetProductId || linkedTargets.has(target.id)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+      const desired = sourceValues(source);
+      const mappedUnit = eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      if (!desired || !mappedUnit?.moyskladId || !isUuid(mappedUnit.moyskladId) ||
+          !isRecord(target.assortment) || !isRecord(target.assortment.meta) || target.assortment.meta.type !== 'product' || !Number.isFinite(target.quantity) || target.quantity <= 0 ||
+          !Number.isFinite(target.price) || target.price < 0 || (target.discount ?? 0) !== 0 || (target.vatEnabled ?? false) || (target.vat ?? 0) !== 0) {
+        return hold('DEAL_ORDER_POSITION_BOOTSTRAP_VALUE_OR_UNIT_UNSUPPORTED');
+      }
+      try {
+        const product = await requestJson(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
+          return hold('DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_MISMATCH');
+        }
+      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_READ_FAILED' }; }
+      linkedTargets.add(target.id);
+      snapshots.push({
+        bitrix24ProductRowId: sourceId, moyskladPositionId: target.id,
+        bitrix24Values: sourceSnapshot(source), moyskladValues: targetSnapshot(target),
+      });
+    }
+    if (linkedTargets.size !== msRows.length) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
+    try {
+      const committed = await lease.commit((transaction) => transaction.dealOrderPositionPair.createMany({
+        data: snapshots.map((snapshot) => ({ pairId, ...snapshot, bitrix24Values: snapshot.bitrix24Values as Prisma.InputJsonValue, moyskladValues: snapshot.moyskladValues as Prisma.InputJsonValue })),
+      }));
+      if (!committed.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+      return { status: 'SYNCED' };
+    } catch { return hold('DEAL_ORDER_POSITION_BOOTSTRAP_STORE_FAILED'); }
+  }
+
+  private async addRows(pairId: string, orderId: string, rows: Row[], eventConfig: VersionedFieldSettingsDto, assertOwner: () => Promise<boolean>): Promise<Result> {
+    const units = eventConfig.config.references.units;
+    for (const row of rows) {
+      const rowId = String(row.id);
+      const desired = sourceValues(row);
+      const productId = String(row.productId ?? '');
+      const measureCode = row.measureCode;
+      const unit = units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
+      if (!desired || !/^\d{1,20}$/.test(rowId) || !/^\d{1,20}$/.test(productId) || !Number.isInteger(measureCode) || !unit?.moyskladId) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED' };
+      }
+      const candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED' };
+      const product = await requestJson(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() }).catch(() => null);
+      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== unit.moyskladId) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED' };
+      }
+      const payload = {
+        assortment: { meta: { type: 'product', href: new URL(`entity/product/${encodeURIComponent(product.id)}`, withSlash(moyskladBase())).href } },
+        quantity: desired.quantity, price: desired.price, discount: 0, vat: 0, vatEnabled: false,
+      };
+      let operation;
+      try {
+        operation = await this.database.dealOrderPositionAddOperation.upsert({
+          where: { pairId_bitrix24ProductRowId: { pairId, bitrix24ProductRowId: rowId } },
+          create: { pairId, bitrix24ProductRowId: rowId, payload: payload as Prisma.InputJsonValue },
+          update: {},
+        });
+      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_STORE_FAILED' }; }
+      if (stableJson(operation.payload) !== stableJson(payload)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_ADD_PAYLOAD_CHANGED' };
+      if (operation.status === 'SUCCEEDED' && operation.moyskladPositionId) {
+        return await this.persistAddedRow(pairId, row, operation.moyskladPositionId, payload, operation.id, undefined, assertOwner);
+      }
+      const now = new Date();
+      if (operation.leaseUntil && operation.leaseUntil > now) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_IN_PROGRESS' };
+      const leaseToken = randomUUID();
+      const lease = await this.database.dealOrderPositionAddOperation.updateMany({
+        where: { id: operation.id, OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] },
+        data: { leaseToken, leaseUntil: new Date(now.getTime() + 60_000) },
+      });
+      if (lease.count !== 1) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_IN_PROGRESS' };
+      const isRetryAfterAttempt = operation.attemptedAt !== null;
+      if (!isRetryAfterAttempt) await this.database.dealOrderPositionAddOperation.update({
+        where: { id: operation.id }, data: { attemptedAt: now },
+      });
+      try {
+        if (operation.moyskladPositionId) {
+          const recovered = await readMoySkladPosition(orderId, operation.moyskladPositionId);
+          if (!positionMatches(recovered, payload)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH' };
+          return await this.persistAddedRow(pairId, row, operation.moyskladPositionId, payload, operation.id, leaseToken, assertOwner);
+        }
+        const latestSourceRows = await readAllBitrixRows((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { bitrix24Id: true } })).bitrix24Id);
+        const latestSource = latestSourceRows.find((candidate) => String(candidate.id) === rowId);
+        if (!latestSource || !sameSourceValue(latestSource, row) || !sameProductAndUnit(latestSource, row)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_SOURCE_CHANGED');
+        const currentRows = await readAllMoySkladPositions(orderId);
+        const knownLinks = await this.database.dealOrderPositionPair.findMany({ where: { pairId }, select: { moyskladPositionId: true } });
+        const known = new Set(knownLinks.map((link) => link.moyskladPositionId));
+        const unlinked = currentRows.filter((position) => !known.has(position.id));
+        const exact = unlinked.filter((position) => positionMatches(position, payload));
+        const recoveryError = classifyPositionAddRecovery(isRetryAfterAttempt, exact.length);
+        if (recoveryError) return this.addUncertain(operation.id, leaseToken, recoveryError);
+        if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+        const created = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
+          method: 'POST', headers: msHeaders(), body: JSON.stringify(payload),
+        });
+        if (!isRecord(created) || !isUuid(created.id)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
+        const savedPositionId = await this.database.dealOrderPositionAddOperation.updateMany({
+          where: { id: operation.id, leaseToken }, data: { moyskladPositionId: created.id },
+        });
+        if (savedPositionId.count !== 1) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_LEASE_LOST_AFTER_PROVIDER_SUCCESS' };
+        const readback = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(created.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(readback) || readback.id !== created.id || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
+        return await this.persistAddedRow(pairId, row, created.id, payload, operation.id, leaseToken, assertOwner);
+      } catch {
+        await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operation.id, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'ADD_OUTCOME_UNKNOWN' } }).catch(() => undefined);
+        return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN' };
+      }
+    }
+    return { status: 'SYNCED' };
+  }
+
+  private async persistAddedRow(pairId: string, source: Row, positionId: string, payload: Row, operationId: string, leaseToken?: string, assertOwner?: () => Promise<boolean>): Promise<Result> {
+    try {
+      const position = await requestJson(new URL(`entity/customerorder/${encodeURIComponent((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { moyskladId: true } })).moyskladId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+      if (!isRecord(position) || position.id !== positionId || !positionMatches(position, payload)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH' };
+      if (assertOwner && !await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+      await this.database.$transaction(async (transaction) => {
+        await transaction.dealOrderPositionPair.upsert({
+          where: { pairId_bitrix24ProductRowId: { pairId, bitrix24ProductRowId: String(source.id) } },
+          create: { pairId, bitrix24ProductRowId: String(source.id), moyskladPositionId: positionId, bitrix24Values: sourceSnapshot(source) as Prisma.InputJsonValue, moyskladValues: targetSnapshot(position) as Prisma.InputJsonValue },
+          update: {},
+        });
+        await transaction.dealOrderPositionAddOperation.update({ where: { id: operationId }, data: { status: 'SUCCEEDED', moyskladPositionId: positionId, lastErrorCategory: null, leaseToken: null, leaseUntil: null } });
+      });
+      return { status: 'SYNCED' };
+    } catch {
+      return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_STORE_FAILED' };
+    }
+  }
+
+  private async addUncertain(operationId: string, leaseToken: string, reason: string): Promise<Result> {
+    await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operationId, leaseToken }, data: { status: 'UNCERTAIN', lastErrorCategory: reason, leaseToken: null, leaseUntil: null } });
+    return { status: 'MANUAL_REVIEW', reason };
+  }
+}
+
+export function classifyPositionAddRecovery(attempted: boolean, matchingUnlinkedCount: number): string | null {
+  // Matching values are not an identity proof: another actor can create an
+  // indistinguishable position. Never attach it to a Bitrix row implicitly.
+  if (matchingUnlinkedCount > 0) return 'DEAL_ORDER_POSITION_ADD_IDENTITY_UNPROVEN';
+  if (attempted) return 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN';
+  return null;
+}
+
+function sourceValues(row: Row): { quantity: number; price: number } | null {
+  const quantity = row.quantity;
+  const price = row.price;
+  const discountType = row.discountTypeId;
+  const discountRate = row.discountRate;
+  const discountSum = row.discountSum;
+  const taxRate = row.taxRate;
+  if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 || typeof price !== 'number' || !Number.isFinite(price) || price < 0 ||
+      (discountType !== 1 && discountType !== 2) || discountRate !== 0 || discountSum !== 0 || (taxRate !== null && taxRate !== 0)) return null;
+  const cents = String(price).match(/^\d+(?:\.\d{1,2})?$/) ? Math.round(price * 100) : NaN;
+  return Number.isSafeInteger(cents) ? { quantity, price: cents } : null;
+}
+
+function sameProductAndUnit(source: Row, old: unknown): boolean {
+  return isRecord(old) && String(source.productId) === String(old.productId) && source.measureCode === old.measureCode;
+}
+function sameProductTarget(target: Position, old: unknown): boolean {
+  if (!isRecord(old)) return false;
+  const oldAssortment = isRecord(old.assortment) && isRecord(old.assortment.meta) ? old.assortment.meta.href : null;
+  const newAssortment = isRecord(target.assortment) && isRecord(target.assortment.meta) ? target.assortment.meta.href : null;
+  return oldAssortment === newAssortment;
+}
+function assortmentId(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.meta) || typeof value.meta.href !== 'string') return null;
+  try { const href = new URL(value.meta.href); const id = href.pathname.split('/').at(-1) ?? ''; return isUuid(id) && /\/entity\/(?:product|service)\//.test(href.pathname) ? id : null; } catch { return null; }
+}
+function sameSourceValue(row: Row, old: unknown): boolean {
+  if (!isRecord(old)) return false;
+  return row.quantity === old.quantity && row.price === old.price && row.discountTypeId === old.discountTypeId && row.discountRate === old.discountRate && row.discountSum === old.discountSum && row.taxRate === old.taxRate;
+}
+function sameTargetValue(row: Position, old: unknown): boolean {
+  return isRecord(old) && row.quantity === old.quantity && row.price === old.price && row.discount === old.discount && row.vat === old.vat && row.vatEnabled === old.vatEnabled;
+}
+function positionMatches(value: unknown, expected: Row): boolean {
+  if (!isRecord(value) || !isRecord(value.assortment) || !isRecord(value.assortment.meta) || !isRecord(expected.assortment) || !isRecord(expected.assortment.meta)) return false;
+  return value.assortment.meta.type === expected.assortment.meta.type && value.assortment.meta.href === expected.assortment.meta.href &&
+    value.quantity === expected.quantity && value.price === expected.price && value.discount === expected.discount && value.vat === expected.vat && value.vatEnabled === expected.vatEnabled;
+}
+function stableJson(value: unknown): string { return JSON.stringify(value, (_key, child) => child && typeof child === 'object' && !Array.isArray(child) ? Object.fromEntries(Object.entries(child).sort(([a], [b]) => a.localeCompare(b))) : child); }
+function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate }; }
+function targetSnapshot(row: Row): Row { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
+
+async function readAllBitrixRows(id: string): Promise<Row[]> {
+  const all: Row[] = [];
+  let start = 0;
+  let expectedTotal: number | null = null;
+  do {
+    const url = new URL('crm.item.productrow.list', withSlash(bitrixBase()));
+    url.searchParams.set('filter[=ownerType]', 'D'); url.searchParams.set('filter[=ownerId]', id); url.searchParams.set('start', String(start));
+    const body = await requestJson(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ 'filter[=ownerType]': 'D', 'filter[=ownerId]': id, start: String(start) }) });
+    if (!isRecord(body) || !isRecord(body.result) || !Array.isArray(body.result.productRows) || typeof body.total !== 'number' || body.result.productRows.some((row) => !isRecord(row))) throw new Error();
+    if (expectedTotal === null) expectedTotal = body.total;
+    else if (body.total !== expectedTotal) throw new InvalidPositionSetError();
+    const rows = body.result.productRows as Row[];
+    all.push(...rows); start += rows.length;
+    if (rows.length === 0 && start < expectedTotal || all.length > 1000) throw new InvalidPositionSetError();
+  } while (start < (expectedTotal ?? 0));
+  if (expectedTotal === null || all.length !== expectedTotal) throw new InvalidPositionSetError();
+  if (all.some((row) => !/^\d{1,20}$/.test(String(row.id)))) throw new Error();
+  if (new Set(all.map((row) => String(row.id))).size !== all.length) throw new InvalidPositionSetError();
+  return all;
+}
+
+async function readAllMoySkladPositions(orderId: string): Promise<Position[]> {
+  const base = moyskladBase();
+  const first = new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(base));
+  const rows: Position[] = [];
+  let next: URL | null = first;
+  let expectedSize: number | null = null;
+  while (next) {
+    const page = await requestJson(next, { method: 'GET', headers: msHeaders() });
+    if (!isRecord(page) || !Array.isArray(page.rows) || !isRecord(page.meta) || typeof page.meta.size !== 'number') throw new Error();
+    if (expectedSize === null) expectedSize = page.meta.size;
+    if (page.rows.some((row) => !isRecord(row) || !isUuid(row.id))) throw new Error();
+    rows.push(...page.rows as Position[]);
+    const href = page.meta.nextHref;
+    next = typeof href === 'string' ? safeNextHref(href, base) : null;
+    if (rows.length > 1000 || (!next && rows.length !== expectedSize)) throw new Error();
+  }
+  if (new Set(rows.map((row) => row.id)).size !== rows.length) throw new InvalidPositionSetError();
+  return rows;
+}
+
+async function readMoySkladPosition(orderId: string, positionId: string): Promise<Position> {
+  const value = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+  if (!isRecord(value) || value.id !== positionId || typeof value.quantity !== 'number' || typeof value.price !== 'number') throw new Error();
+  return value as Position;
+}
+
+async function updateBitrixRow(rowId: unknown, quantity: number, price: number): Promise<void> {
+  if (!/^\d{1,20}$/.test(String(rowId))) throw new Error();
+  const body = new URLSearchParams({ id: String(rowId), 'fields[quantity]': String(quantity), 'fields[price]': String(price) });
+  const result = await requestJson(new URL('crm.item.productrow.update', withSlash(bitrixBase())), {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
+  });
+  if (!isRecord(result) || !isRecord(result.result) || !isRecord(result.result.productRow) || String(result.result.productRow.id) !== String(rowId)) throw new Error();
+}
+
+async function deleteBitrixRow(rowId: unknown): Promise<void> {
+  if (!/^\d{1,20}$/.test(String(rowId))) throw new Error();
+  const body = new URLSearchParams({ id: String(rowId) });
+  await requestJson(new URL('crm.item.productrow.delete', withSlash(bitrixBase())), {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
+  });
+}
+
+function safeNextHref(href: string, base: URL): URL { const next = new URL(href); if (next.origin !== base.origin || !next.pathname.includes('/entity/customerorder/')) throw new Error(); return next; }
+async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
+  const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new Error(); });
+  if (!response.ok) throw new Error();
+  if (init.method === 'DELETE') return null;
+  return response.json().catch(() => { throw new Error(); });
+}
+function bitrixBase(): URL { return configuredBase('BITRIX24_REST_BASE_URL'); }
+function moyskladBase(): URL { return configuredBase('MOYSKLAD_API_BASE_URL'); }
+function configuredBase(name: string): URL {
+  const url = new URL(process.env[name] ?? '');
+  const local = ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname);
+  if (url.username || url.password || (url.protocol !== 'https:' && !(local && url.protocol === 'http:'))) throw new Error();
+  return url;
+}
+function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
+function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error(); return { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' }; }
+function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
+

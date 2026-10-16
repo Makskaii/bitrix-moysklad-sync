@@ -13,6 +13,11 @@ import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { writeOperationalLog } from '../monitoring-log';
+import { DealOrderCreationPreparer } from '../deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreateOperationService } from '../deals-orders/deal-order-create-operation.service';
+import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
+import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
+import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../deals-orders/deal-order-reverse-create.service';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -47,6 +52,11 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() @Inject(CLIENT_DEPENDENCY_RESOLVER) private readonly clientDependencies?: ClientDependencyResolver,
     @Optional() private readonly documentReader?: DryRunDocumentReader,
     @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
+    @Optional() private readonly creationPreparer?: DealOrderCreationPreparer,
+    @Optional() private readonly createOperation?: DealOrderCreateOperationService,
+    @Optional() private readonly positionRuntime?: DealOrderPositionRuntimeService,
+    @Optional() private readonly fieldRuntime?: DealOrderFieldRuntimeService,
+    @Optional() private readonly reverseCreate?: DealOrderReverseCreateService,
   ) {}
 
   onApplicationBootstrap() {
@@ -176,6 +186,59 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       result = { status: 'unavailable', reason: 'PAIR_STORE_UNAVAILABLE' };
     }
 
+    // A post-boundary, unpaired Bitrix deal is eligible to create exactly one
+    // customer order. The operation is durable and provider-idempotent; all
+    // other unresolved cases retain the ordinary manual-review behavior.
+    if (result.status === 'unmatched' && input.sourceSystem === 'BITRIX24' && this.creationPreparer && this.createOperation && this.fieldSettings) {
+      if (process.env.SYNC_MODE !== 'apply') {
+        await this.finish(event.id, 'SKIPPED_DISABLED', 'DEAL_ORDER_CREATE_REQUIRES_APPLY_MODE', workerLease);
+        return null;
+      }
+      try {
+        const config = await this.fieldSettings.eventConfig(event.id);
+        const prepared = await this.creationPreparer.prepare({ bitrix24DealId: input.externalId, eventId: event.id, eventConfig: config });
+        if (prepared.status === 'WAITING') {
+          await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
+          const inactiveStage = prepared.reason === 'STAGE_NOT_READY';
+          const unconfiguredStage = prepared.reason === 'STAGE_NOT_CONFIGURED';
+          await this.finish(event.id, inactiveStage ? 'SUCCEEDED' : unconfiguredStage ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
+            inactiveStage ? 'DEAL_ORDER_STAGE_NOT_ENABLED' : prepared.reason, workerLease,
+            inactiveStage || unconfiguredStage ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
+          return null;
+        }
+        await workerLease?.assertOwned();
+        await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
+        result = await this.resolver.resolve(input);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
+        await this.finish(event.id, 'RETRYABLE_FAILURE', 'CUSTOMER_ORDER_CREATE_RETRY', workerLease,
+          retryAtForFailure(error, event.attempts + 1));
+        logger.warn(JSON.stringify({ eventId: event.id, reason }));
+        return null;
+      }
+    }
+    if (result.status === 'unmatched' && input.sourceSystem === 'MOYSKLAD' && event.eventType === 'CREATE' && this.reverseCreate && this.fieldSettings) {
+      if (process.env.SYNC_MODE !== 'apply') {
+        await this.finish(event.id, 'SKIPPED_DISABLED', 'DEAL_ORDER_CREATE_REQUIRES_APPLY_MODE', workerLease);
+        return null;
+      }
+      try {
+        const eventConfig = await this.fieldSettings.eventConfig(event.id);
+        await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig });
+        result = await this.resolver.resolve(input);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'REVERSE_DEAL_CREATE_FAILED';
+        if (error instanceof DealOrderReverseManualReviewError) {
+          await this.finish(event.id, 'MANUAL_REVIEW', 'REVERSE_DEAL_CREATE_REVIEW', workerLease);
+        } else {
+          await this.finish(event.id, 'RETRYABLE_FAILURE', 'REVERSE_DEAL_CREATE_RETRY', workerLease,
+            retryAtForFailure(error, event.attempts + 1));
+        }
+        logger.warn(JSON.stringify({ eventId: event.id, reason }));
+        return null;
+      }
+    }
+
     if (result.status !== 'confirmed') {
       await workerLease?.assertOwned();
       result = await this.database.$transaction(async (transaction) => {
@@ -252,7 +315,16 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             await this.finish(event.id, 'RETRYABLE_FAILURE', 'DEAL_ORDER_HEADER_RETRY', workerLease, headerResult.retryAfter);
           } else {
             const holdReason = headerHoldReason(headerResult as string);
-            if (holdReason) await this.finish(event.id, 'MANUAL_REVIEW', holdReason, workerLease);
+            const positions = process.env.SYNC_MODE === 'apply' && this.positionRuntime
+              ? await this.positionRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
+              : { status: 'SYNCED' as const };
+            const fields = process.env.SYNC_MODE === 'apply' && this.fieldRuntime
+              ? await this.fieldRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
+              : { status: 'SYNCED' as const, heldRules: 0 };
+            const runtimeHold = [positions, fields].find((item) => item.status === 'MANUAL_REVIEW') as { status: 'MANUAL_REVIEW'; reason: string } | undefined;
+            const runtimeRetry = [positions, fields].find((item) => item.status === 'RETRY') as { status: 'RETRY'; reason: string } | undefined;
+            if (runtimeRetry) await this.finish(event.id, 'RETRYABLE_FAILURE', runtimeRetry.reason, workerLease, retryAtForFailure(new Error(runtimeRetry.reason), attempt));
+            else if (holdReason || runtimeHold) await this.finish(event.id, 'MANUAL_REVIEW', holdReason ?? runtimeHold!.reason, workerLease);
             else await this.finish(event.id, headerResult === 'DISABLED' ? 'SKIPPED_DISABLED' : 'SUCCEEDED', headerResult === 'DISABLED' ? 'DEAL_ORDER_HEADER_DISABLED' : null, workerLease);
           }
         } else {

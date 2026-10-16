@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
-import { FieldSettingsConfigDto, NamedReferenceKind, VersionedFieldSettingsDto } from './field-settings.dto';
+import { FieldSettingsConfigDto, NamedReferenceKind, NamedReferencePair, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 import { validateChildResourceBindings } from '../clients/client-child-resource-sync';
@@ -452,19 +452,69 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const units = validateUnits(references.units);
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
-  const namedPairs = validateNamedPairs(references.namedPairs ?? []);
+  const namedPairs = validateNamedPairs(references.namedPairs ?? []) as NamedReferencePair[];
   const serviceCounterpartyId = value.serviceCounterpartyId === undefined || value.serviceCounterpartyId === null || value.serviceCounterpartyId === ''
     ? null
     : isString(value.serviceCounterpartyId) && isUuid(value.serviceCounterpartyId)
       ? value.serviceCounterpartyId
       : (() => { throw new BadRequestException('serviceCounterpartyId must be a MoySklad counterparty UUID or empty'); })();
+  const dealOrderRuntime = value.dealOrderRuntime === undefined ? undefined : validateDealOrderRuntime(value.dealOrderRuntime, namedPairs);
   const rules = value.rules.map(validateRule);
   const groups = value.groups.map(validateGroup);
   const childBindingError = validateChildResourceBindings(value.childResourceBindings);
   if (childBindingError) throw new BadRequestException(childBindingError);
   assertUniqueIds(rules, 'Field rule');
   assertUniqueIds(groups, 'Field group');
-  return { ...value, serviceCounterpartyId, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  return { ...value, serviceCounterpartyId, dealOrderRuntime, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair[]): NonNullable<FieldSettingsConfigDto['dealOrderRuntime']> {
+  if (!isRecord(value) || typeof value.nativeOrderNumberingVerified !== 'boolean' || !Array.isArray(value.currencies) || !Array.isArray(value.stages) || !Array.isArray(value.organizations) || !Array.isArray(value.stores) || !Array.isArray(value.employees)) {
+    throw new BadRequestException('dealOrderRuntime must include confirmed currency, stage, organization, store, and employee mappings');
+  }
+  const id = (candidate: unknown) => isString(candidate) && isUuid(candidate);
+  const pairs = (items: unknown[], label: string) => {
+    const seen = new Set<string>();
+    return items.map((item) => {
+      if (!isRecord(item) || !isString(item.bitrix24Id) || !item.bitrix24Id.trim() || !id(item.moyskladId)) throw new BadRequestException(`${label} mapping is invalid`);
+      const key = item.bitrix24Id.trim();
+      if (seen.has(key)) throw new BadRequestException(`${label} source mapping is duplicated`);
+      seen.add(key);
+      return { bitrix24Id: key, moyskladId: item.moyskladId as string };
+    });
+  };
+  const currencies = value.currencies.map((item: unknown) => {
+    if (!isRecord(item) || !isString(item.bitrix24Code) || !item.bitrix24Code.trim() || !id(item.moyskladId)) throw new BadRequestException('Currency mapping is invalid');
+    return { bitrix24Code: item.bitrix24Code.trim(), moyskladId: item.moyskladId as string };
+  });
+  const stages = value.stages.map((item: unknown) => {
+    if (!isRecord(item) || !isString(item.bitrix24StageId) || !item.bitrix24StageId.trim() || !id(item.moyskladId) || typeof item.creationEnabled !== 'boolean') throw new BadRequestException('Deal stage mapping is invalid');
+    return { bitrix24StageId: item.bitrix24StageId.trim(), moyskladId: item.moyskladId as string, creationEnabled: item.creationEnabled };
+  });
+  const organizations = pairs(value.organizations, 'Organization');
+  const stores = pairs(value.stores, 'Store');
+  const employees = pairs(value.employees, 'Employee');
+  for (const [items, key, label] of [[currencies, 'bitrix24Code', 'Currency'], [stages, 'bitrix24StageId', 'Deal stage']] as Array<[Array<Record<string, unknown>>, string, string]>) {
+    const seen = new Set<string>();
+    for (const item of items) {
+      const value = String(item[key]);
+      if (seen.has(value)) throw new BadRequestException(`${label} source mapping is duplicated`);
+      seen.add(value);
+    }
+  }
+  if (!id(value.defaultOrganizationId) || !id(value.defaultStoreId) || !id(value.defaultEmployeeId) || (value.defaultProductGroupId != null && !id(value.defaultProductGroupId))) throw new BadRequestException('Default deal-order references must be UUIDs');
+  const confirmed = (kind: NamedReferenceKind, sourceId: string, targetId: string) => namedPairs.some((pair) => pair.kind === kind && pair.bitrix24Id === sourceId && pair.moyskladId === targetId && pair.status === 'confirmed');
+  for (const item of currencies) if (!confirmed('currencies', item.bitrix24Code, item.moyskladId)) throw new BadRequestException(`Currency ${item.bitrix24Code} must be a confirmed named reference`);
+  for (const item of stages) if (!confirmed('dealStages', item.bitrix24StageId, item.moyskladId)) throw new BadRequestException(`Deal stage ${item.bitrix24StageId} must be a confirmed named reference`);
+  for (const item of organizations) if (!confirmed('organizations', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Organization ${item.bitrix24Id} must be a confirmed named reference`);
+  for (const item of stores) if (!confirmed('warehouses', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Store ${item.bitrix24Id} must be a confirmed warehouse named reference`);
+  for (const item of employees) if (!confirmed('employees', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Employee ${item.bitrix24Id} must be a confirmed named reference`);
+  if (!namedPairs.some((pair) => pair.kind === 'organizations' && pair.moyskladId === value.defaultOrganizationId && pair.status === 'confirmed') ||
+      !namedPairs.some((pair) => pair.kind === 'warehouses' && pair.moyskladId === value.defaultStoreId && pair.status === 'confirmed') ||
+      !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
+    throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
+  }
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

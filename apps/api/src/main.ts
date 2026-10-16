@@ -28,6 +28,11 @@ import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.service';
 import { DryRunDocumentReader } from './dry-run-document-reader';
 import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
+import { DealOrderCreationPreparer } from './deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreateOperationService } from './deals-orders/deal-order-create-operation.service';
+import { DealOrderPositionRuntimeService } from './deals-orders/deal-order-position-runtime.service';
+import { DealOrderFieldRuntimeService } from './deals-orders/deal-order-field-runtime.service';
+import { DealOrderReverseCreateService } from './deals-orders/deal-order-reverse-create.service';
 import { HistoricalInventoryController } from './admin/historical-inventory.controller';
 import { HistoricalInventoryService } from './historical-inventory.service';
 import { HistoricalDealOrderMatchingController } from './admin/historical-deal-order-matching.controller';
@@ -68,7 +73,7 @@ class AppController {
     { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
     EventWorkerLeaseService, DatabaseRecoveryService,
     WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
-    FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+    FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
     DryRunWriteJournal,
     { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCardRuntimeService, ProductCardEventProcessor,

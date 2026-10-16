@@ -238,6 +238,8 @@ model EntityPair {
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
+  dealOrderPositions DealOrderPositionPair[]
+  dealOrderPositionAdds DealOrderPositionAddOperation[]
 
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
@@ -327,6 +329,92 @@ model EntityPairSyncState {
   childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model DealOrderCreateOperation {
+  bitrix24DealId String   @id
+  syncId         String   @unique
+  payload        Json
+  confirmedCustomerPairIds Json @default("[]")
+  settingsVersion Int
+  status         String   @default("PENDING")
+  moyskladOrderId String?
+  lastErrorCategory String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
+model DealOrderReverseCreateOperation {
+  moyskladOrderId String   @id
+  syncId          String   @unique
+  eventId         String
+  payload         Json
+  settingsVersion Int
+  status          String   @default("PENDING")
+  bitrix24DealId  String?
+  lastErrorCategory String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  positions       DealOrderReversePositionOperation[]
+
+  @@index([status, updatedAt])
+}
+
+model DealOrderReversePositionOperation {
+  id                  String   @id @default(cuid())
+  moyskladOrderId     String
+  moyskladPositionId  String
+  payload             Json
+  status              String   @default("PENDING")
+  bitrix24ProductRowId String?
+  lastErrorCategory   String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  operation           DealOrderReverseCreateOperation @relation(fields: [moyskladOrderId], references: [moyskladOrderId], onDelete: Cascade)
+
+  @@unique([moyskladOrderId, moyskladPositionId])
+  @@index([status, updatedAt])
+}
+
+model DealOrderPositionPair {
+  id                     String     @id @default(cuid())
+  pairId                 String
+  bitrix24ProductRowId   String
+  moyskladPositionId     String
+  bitrix24Values         Json
+  moyskladValues         Json
+  lastSyncedAt           DateTime   @default(now())
+  pair                   EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, bitrix24ProductRowId])
+  @@unique([pairId, moyskladPositionId])
+}
+
+model DealOrderPositionAddOperation {
+  id                   String     @id @default(cuid())
+  pairId               String
+  bitrix24ProductRowId String
+  payload              Json
+  status               String     @default("PENDING")
+  attemptedAt          DateTime?
+  leaseToken           String?
+  leaseUntil           DateTime?
+  moyskladPositionId   String?
+  lastErrorCategory    String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  pair                 EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, bitrix24ProductRowId])
+  @@index([status, updatedAt])
 }
 
 model PairReviewCase {
