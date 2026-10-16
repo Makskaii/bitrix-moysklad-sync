@@ -164,12 +164,15 @@ export class MonitoringController {
     if (body?.confirmed !== true) throw new BadRequestException('confirmed must be true');
     if (!this.fieldSettings) throw new ServiceUnavailableException('Field settings are not available');
     const actorId = await this.audit.resolveActorId(request);
-    const fieldSettingsVersion = await this.fieldSettings.repinEvent(eventId);
+    const fieldSettingsVersion = await this.database.$transaction(async (transaction) => {
+      const version = await this.fieldSettings!.repinEvent(eventId, transaction);
+      await this.audit.record(transaction, {
+        actorId, action: 'EVENT_RECOMPUTE_REQUESTED', targetType: 'InboundEvent', targetId: eventId,
+        after: { settingsVersion: version },
+      });
+      return version;
+    }, { isolationLevel: 'Serializable' });
     this.processor.enqueue(eventId);
-    await this.database.$transaction((transaction) => this.audit.record(transaction, {
-      actorId, action: 'EVENT_RECOMPUTE_REQUESTED', targetType: 'InboundEvent', targetId: eventId,
-      after: { settingsVersion: fieldSettingsVersion },
-    }));
     await writeOperationalLog(this.database, 'ADMIN', 'One event recompute requested with newer field settings', eventId);
     return { eventId, status: 'RECEIVED', fieldSettingsVersion };
   }

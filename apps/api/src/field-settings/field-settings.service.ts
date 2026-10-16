@@ -390,52 +390,60 @@ export class FieldSettingsService {
     return new Map(rows.map((row) => [row.eventId, { version: row.version, transforms: configuredTransforms(row.config) }]));
   }
 
-  async repinEvent(eventId: string) {
+  async repinEvent(eventId: string, transaction?: Prisma.TransactionClient) {
+    if (transaction) {
+      await this.ensureInitialized(transaction);
+      return this.repinEventInTransaction(transaction, eventId);
+    }
     await this.ensureInitialized();
-    return this.database.$transaction(async (transaction) => {
-      const states = await transaction.$queryRaw<Array<{ version: number }>>`
+    return this.database.$transaction((tx) => this.repinEventInTransaction(tx, eventId), { isolationLevel: 'Serializable' });
+  }
+
+  private async repinEventInTransaction(transaction: Prisma.TransactionClient, eventId: string) {
+    const states = await transaction.$queryRaw<Array<{ version: number }>>`
         SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR SHARE
       `;
-      const activeVersion = states[0]?.version;
-      if (!activeVersion) throw new Error('Active field settings state is unavailable');
-      const events = await transaction.$queryRaw<Array<{ status: string }>>`
+    const activeVersion = states[0]?.version;
+    if (!activeVersion) throw new Error('Active field settings state is unavailable');
+    const events = await transaction.$queryRaw<Array<{ status: string }>>`
         SELECT "status" FROM "InboundEvent" WHERE "id" = ${eventId} FOR UPDATE
       `;
-      const status = events[0]?.status;
-      if (!status) throw new NotFoundException('Event not found');
-      if (!['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'SUCCEEDED', 'UNCHANGED', 'SUPERSEDED', 'SKIPPED_DIRECTION_DISABLED'].includes(status)) {
-        throw new ConflictException('Only one completed or reviewable event can be explicitly recomputed');
-      }
-      const changed = await transaction.$executeRaw`
+    const status = events[0]?.status;
+    if (!status) throw new NotFoundException('Event not found');
+    if (!['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'SUCCEEDED', 'UNCHANGED', 'SUPERSEDED', 'SKIPPED_DIRECTION_DISABLED'].includes(status)) {
+      throw new ConflictException('Only one completed or reviewable event can be explicitly recomputed');
+    }
+    const changed = await transaction.$executeRaw`
         UPDATE "InboundEventSettings" SET "settingsVersion" = ${activeVersion}, "pinnedAt" = CURRENT_TIMESTAMP
         WHERE "eventId" = ${eventId}
       `;
-      if (changed !== 1) throw new NotFoundException('Event settings were not found');
-      await transaction.$executeRaw`
+    if (changed !== 1) throw new NotFoundException('Event settings were not found');
+    await transaction.$executeRaw`
         UPDATE "InboundEvent" SET "status" = 'RECEIVED', "processingStartedAt" = NULL, "lastErrorCategory" = NULL, "retryAfter" = NULL
         WHERE "id" = ${eventId}
       `;
-      return activeVersion;
-    }, { isolationLevel: 'Serializable' });
+    return activeVersion;
   }
 
-  private async ensureInitialized() {
+  private async ensureInitialized(transaction?: Prisma.TransactionClient) {
     const initialConfig = JSON.stringify(DEFAULT_FIELD_SETTINGS);
-    await this.database.$transaction(async (transaction) => {
-      await transaction.$executeRaw`
+    const initialize = async (tx: Prisma.TransactionClient) => {
+      await tx.$executeRaw`
         INSERT INTO "FieldSettingsVersion" ("version", "config")
         VALUES (1, ${initialConfig}::jsonb) ON CONFLICT ("version") DO NOTHING
       `;
-      await transaction.$executeRaw`
+      await tx.$executeRaw`
         INSERT INTO "FieldSettingsState" ("id", "version") VALUES ('global', 1)
         ON CONFLICT ("id") DO NOTHING
       `;
-      await transaction.$executeRaw`
+      await tx.$executeRaw`
         INSERT INTO "InboundEventSettings" ("eventId", "settingsVersion", "pinnedAt")
         SELECT "id", 1, "receivedAt" FROM "InboundEvent"
         ON CONFLICT ("eventId") DO NOTHING
       `;
-    }, { isolationLevel: 'Serializable' });
+    };
+    if (transaction) await initialize(transaction);
+    else await this.database.$transaction(initialize, { isolationLevel: 'Serializable' });
   }
 }
 

@@ -7,8 +7,10 @@ import { INestApplication } from '@nestjs/common';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { NestFactory } from '@nestjs/core';
 import { chromium } from '@playwright/test';
+import { ContactSyncProcessor } from '../src/contact-sync.service';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseService } from '../src/database.service';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { RetentionService } from '../src/retention.service';
 
 const nativeFetch = globalThis.fetch;
@@ -167,6 +169,60 @@ test('real admin APIs authorize, inventory labels, review and audit survive a se
   const nextPage = await (await adminFetch(`/api/admin/audit?actorId=BITRIX24_USER%3A59&action=PAIR_REASSIGNED&limit=1&cursor=${encodeURIComponent(auditPage.nextCursor)}`)).json() as { entries: Array<{ id: string }>; nextCursor: string | null };
   assert.equal(nextPage.entries.length, 1);
   assert.notEqual(nextPage.entries[0]?.id, auditPage.entries[0]?.id);
+
+  const fieldSettings = app.get(FieldSettingsService);
+  const previousSettings = await fieldSettings.active();
+  const nextSettings = await fieldSettings.save(previousSettings.config, 'synthetic-admin-token');
+  const recomputeEventId = `recompute-${suffix}`;
+  eventIds.push(recomputeEventId);
+  await database.inboundEvent.create({ data: { id: recomputeEventId, source: 'BITRIX24', deliveryKey: recomputeEventId, payload: {}, status: 'SUCCEEDED' } });
+  await database.inboundEventSettings.create({ data: { eventId: recomputeEventId, settingsVersion: previousSettings.version } });
+  await database.$executeRawUnsafe(`
+    CREATE FUNCTION "reject_recompute_audit"() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW."action" = 'EVENT_RECOMPUTE_REQUESTED' THEN RAISE EXCEPTION 'Synthetic audit storage failure'; END IF;
+      RETURN NEW;
+    END; $$
+  `);
+  await database.$executeRawUnsafe(`CREATE TRIGGER "reject_recompute_audit" BEFORE INSERT ON "AdminAuditEntry" FOR EACH ROW EXECUTE FUNCTION "reject_recompute_audit"()`);
+  const processor = app.get(ContactSyncProcessor);
+  const originalEnqueue = processor.enqueue.bind(processor);
+  const enqueued: string[] = [];
+  const enqueueObservations: Array<Promise<{ eventStatus: string | undefined; settingsVersion: number | undefined; auditCount: number }>> = [];
+  (processor as unknown as { enqueue: (id: string) => void }).enqueue = (id) => {
+    enqueued.push(id);
+    enqueueObservations.push((async () => {
+      const [eventRow, settingsRow, auditCount] = await Promise.all([
+        database.inboundEvent.findUnique({ where: { id } }),
+        database.inboundEventSettings.findUnique({ where: { eventId: id } }),
+        database.adminAuditEntry.count({ where: { action: 'EVENT_RECOMPUTE_REQUESTED', targetId: id } }),
+      ]);
+      return { eventStatus: eventRow?.status, settingsVersion: settingsRow?.settingsVersion, auditCount };
+    })());
+  };
+  let failedRecompute: Response;
+  try {
+    failedRecompute = await adminFetch(`/api/admin/monitoring/events/${recomputeEventId}/recompute`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirmed: true }),
+    });
+  } finally {
+    await database.$executeRawUnsafe(`DROP TRIGGER "reject_recompute_audit" ON "AdminAuditEntry"`);
+    await database.$executeRawUnsafe(`DROP FUNCTION "reject_recompute_audit"()`);
+  }
+  assert.equal(failedRecompute.status, 500);
+  assert.deepEqual(enqueued, [], 'failed audit must not enqueue processing');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: recomputeEventId } })).status, 'SUCCEEDED', 'failed audit rolls back event status');
+  assert.equal((await database.inboundEventSettings.findUniqueOrThrow({ where: { eventId: recomputeEventId } })).settingsVersion, previousSettings.version, 'failed audit rolls back event settings repin');
+  const successfulRecompute = await adminFetch(`/api/admin/monitoring/events/${recomputeEventId}/recompute`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirmed: true }),
+  });
+  assert.equal(successfulRecompute.status, 201);
+  assert.deepEqual(enqueued, [recomputeEventId], 'enqueue occurs once after a successful commit');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: recomputeEventId } })).status, 'RECEIVED');
+  assert.equal((await database.inboundEventSettings.findUniqueOrThrow({ where: { eventId: recomputeEventId } })).settingsVersion, nextSettings.version);
+  assert.equal(await database.adminAuditEntry.count({ where: { action: 'EVENT_RECOMPUTE_REQUESTED', targetId: recomputeEventId } }), 1);
+  assert.deepEqual(await enqueueObservations[0], { eventStatus: 'RECEIVED', settingsVersion: nextSettings.version, auditCount: 1 }, 'the enqueue hook observes both event changes and audit already committed');
+  (processor as unknown as { enqueue: typeof processor.enqueue }).enqueue = originalEnqueue;
 
   const baselineEvent = await database.inboundEvent.create({ data: { id: `baseline-${suffix}`, source: 'BITRIX24', deliveryKey: `baseline-${suffix}`, payload: {}, status: 'SUCCEEDED' } });
   eventIds.push(baselineEvent.id);
