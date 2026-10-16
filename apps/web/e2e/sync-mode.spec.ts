@@ -20,6 +20,9 @@ test('risky mode changes require UI confirmation and unavailable directions stay
     return route.fulfill({ json: { key: 'contacts-companies', bitrix24ToMoysklad: false, moyskladToBitrix24: true } });
   });
   await page.route('**/api/admin/sync-mode/recovery', (route) => route.fulfill({ json: { status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null } }));
+  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: {
+    status: 'READY', previousLaunchBoundary: '2026-10-07T00:00:00.000Z', pairsRestored: true, lostEventsAcknowledged: true,
+  } }));
   await page.route('**/api/admin/monitoring/queue', (route) => route.fulfill({ json: { counts: {}, events: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/incidents*', (route) => route.fulfill({ json: { cases: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/logs*', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));

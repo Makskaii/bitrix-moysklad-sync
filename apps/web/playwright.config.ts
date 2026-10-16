@@ -1,5 +1,8 @@
 import { defineConfig } from '@playwright/test';
 
+// The local UI suite mocks the preview API per test; run those supported flows by default.
+process.env.ADMIN_PREVIEW_EXPECTED ??= '1';
+
 export default defineConfig({
   testDir: './e2e',
   workers: 1,

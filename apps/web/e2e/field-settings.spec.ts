@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 test('field settings select, save, and reload field pairs while preview stays read-only', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
   const writes: string[] = [];
   let version = 1;
   let config = { rules: [{ id: 'locked-rule', entity: 'contacts', sourceField: 'UF_CRM_LOCKED', targetField: 'attributes.locked', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: [], childResourceBindings: [], references: {
@@ -15,7 +15,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode/recovery', (route) => route.fulfill({ json: { status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null } }));
-  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: { status: 'READY', previousLaunchBoundary: null, pairsRestored: true, lostEventsAcknowledged: true } }));
+  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: { status: 'READY', previousLaunchBoundary: '2026-10-07T00:00:00.000Z', pairsRestored: true, lostEventsAcknowledged: true } }));
   await page.route('**/api/admin/sync-mode', (route) => route.fulfill({ json: { mode: 'off' } }));
   await page.route('**/api/admin/monitoring/queue**', (route) => route.fulfill({ json: { counts: {}, events: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/incidents**', (route) => route.fulfill({ json: { cases: [], nextCursor: null } }));
