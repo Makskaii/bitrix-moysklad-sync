@@ -17,10 +17,13 @@ test('Bitrix24 inventory rejects missing and inconsistent paging metadata', asyn
 
 test('Bitrix24 inventory accepts contract sized pages and stable next offsets', async () => {
   process.env.BITRIX24_REST_BASE_URL = 'https://example.invalid/rest/';
-  const first = await providerWith({ result: Array.from({ length: 50 }, (_, index) => ({ ID: index + 1 })), total: 51, next: 50 })
+  const first = await providerWith({ result: [{ ID: 17, TITLE: 'Northwind LLC', UF_CRM_1719834633: 'ms-17' }], total: 1 })
     .bitrixPage('COMPANY', 0, 'synthetic-token');
-  assert.equal(first.rows.length, 50);
-  assert.equal(first.next, 50);
+  assert.deepEqual(first.rows[0], { id: '17', uuid: 'ms-17', displayLabel: 'Northwind LLC' });
+  const firstPage = await providerWith({ result: Array.from({ length: 50 }, (_, index) => ({ ID: index + 1 })), total: 51, next: 50 })
+    .bitrixPage('COMPANY', 0, 'synthetic-token');
+  assert.equal(firstPage.rows.length, 50);
+  assert.equal(firstPage.next, 50);
   const last = await providerWith({ result: [{ ID: 51 }], total: 51 }).bitrixPage('COMPANY', 50, 'synthetic-token');
   assert.equal(last.next, null);
   assert.equal(last.total, 51);
@@ -34,7 +37,8 @@ test('MoySklad top-level and nested pages reject absent, mismatched, and truncat
   await assert.rejects(providerWith({ rows, meta: { size: 3, offset: 1, limit: 1000 } }).counterpartyPage(0), /INVALID_PAGINATION/);
   await assert.rejects(providerWith({ rows: [rows[0]], meta: { size: 2, offset: 0, limit: 1000 } }).counterpartyPage(0), /INVALID_PAGINATION/);
   await assert.rejects(providerWith({ rows: [rows[0]], meta: { size: 2, offset: 0, limit: 1000 } }).contactpersonPage('parent-id', 0), /INVALID_PAGINATION/);
-  const page = await providerWith({ rows, meta: { size: 2, offset: 0, limit: 1000 } }).contactpersonPage('parent-id', 0);
+  const page = await providerWith({ rows: [{ id: 'child-1', name: 'Ada Lovelace' }, rows[1]], meta: { size: 2, offset: 0, limit: 1000 } }).contactpersonPage('parent-id', 0);
   assert.equal(page.total, 2);
   assert.equal(page.rows[0]?.parentId, 'parent-id');
+  assert.equal(page.rows[0]?.displayLabel, 'Ada Lovelace');
 });

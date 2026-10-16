@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
-import { manualReviewFields } from './admin/manual-review-details';
+import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from './admin/manual-review-details';
 import { assertApplyExternalWrite } from './external-write-guard';
 import { ProviderFailure, isRetryableFailure, providerResponseFailure, retryAtForFailure } from './provider-failure';
 import { SyncModeService } from './sync-mode.service';
@@ -191,10 +191,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
                     externalEntityId: event.externalEntityId,
                     externalEntityType: event.externalEntityType,
                     reason: review.reason,
-                    diagnostic: review.diagnostic,
+                    diagnostic: sanitizeReviewDiagnosticForStorage(review.diagnostic) as Prisma.InputJsonValue,
                     ...manualReviewFields(review.diagnostic),
                   },
-                  update: { reason: review.reason, diagnostic: review.diagnostic, ...manualReviewFields(review.diagnostic) },
+                  update: { reason: review.reason, diagnostic: sanitizeReviewDiagnosticForStorage(review.diagnostic) as Prisma.InputJsonValue, ...manualReviewFields(review.diagnostic) },
                 });
               }
               return tx.inboundEvent.update({

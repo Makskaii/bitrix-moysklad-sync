@@ -12,7 +12,7 @@ import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyReso
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { ClientChildResourceSync, ClientChildResourceSnapshot, syncPinnedClientChildResources } from './client-child-resource-sync';
-import { manualReviewFields } from '../admin/manual-review-details';
+import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from '../admin/manual-review-details';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -325,8 +325,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       await assertFenceInTransaction(workerLease, tx);
       await tx.manualReviewCase.upsert({ where: { eventId: event.id }, create: {
         eventId: event.id, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId,
-        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
-      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
+        externalEntityType: event.externalEntityType, reason, diagnostic: sanitizeReviewDiagnosticForStorage(diagnostic) as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
+      }, update: { reason, diagnostic: sanitizeReviewDiagnosticForStorage(diagnostic) as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
       await tx.operationalLog.create({ data: { category: 'CLIENT_DEPENDENCY', message: `Document client dependency held: ${reason}.`, referenceId: event.id } });
       if (event.status === 'RECEIVED') await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'RECEIVED' }, data: { status: 'MANUAL_REVIEW', lastErrorCategory: reason } });
     });
@@ -550,6 +550,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const protectEmptyFallbackInn = entity === 'COMPANY' && direction === 'BITRIX24_TO_MOYSKLAD'
         && pair.reason?.includes('exact_name_and_phone') === true && !stringValue(moysklad.inn);
       const writes = buildWrites(config.config, mappingEntity, direction, bitrix, moysklad, prior, applicable, this.settings, protectEmptyFallbackInn);
+      if (writes.criticalClears.length) {
+        const clear = writes.criticalClears[0]!;
+        return this.hold(event, 'CRITICAL_FIELD_CLEAR_REVIEW', {
+          pairId: pair.id, fieldTitle: clear.fieldTitle, previousValue: clear.previousValue,
+          proposedValue: clear.restoreValue, sourceProposedValue: clear.sourceProposedValue,
+          proposedValueMeaning: 'RESTORE_PREVIOUS_VALUE', criticalClears: writes.criticalClears,
+        });
+      }
       if (writes.ambiguous) return this.hold(event, writes.ambiguous, { pairId: pair.id });
       if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await this.gateway.updateMoysklad(msType, pair.moyskladId, pair.moyskladParentId, writes.moysklad, event.id); }
       if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await this.gateway.updateBitrix(bitrixEntity, pair.bitrix24Id, writes.bitrix24, event.id); }
@@ -906,8 +914,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }
       await tx.manualReviewCase.upsert({ where: { eventId: event.id }, create: {
         eventId: event.id, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId,
-        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
-      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
+        externalEntityType: event.externalEntityType, reason, diagnostic: sanitizeReviewDiagnosticForStorage(diagnostic) as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
+      }, update: { reason, diagnostic: sanitizeReviewDiagnosticForStorage(diagnostic) as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
       await tx.inboundEvent.updateMany({ where: { id: event.id, status: event.status }, data: { status: 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: reason } });
       await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client event requires review: ${reason}.`, referenceId: event.id } });
     });
@@ -959,6 +967,7 @@ function selectFields(record: ClientRecord, rules: any[], groups: any[], side: '
 function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24', bitrix: ClientRecord, ms: ClientRecord, prior: { bitrix24Values: unknown; moyskladValues: unknown }, rules: any[], settings: FieldSettingsService, protectEmptyFallbackInn = false) {
   const bitrix24: Record<string, unknown> = {};
   const moysklad: Record<string, unknown> = {};
+  const criticalClears: Array<{ fieldTitle: string; previousValue: unknown; restoreValue: unknown; sourceProposedValue: unknown }> = [];
   let ambiguous: string | null = null;
   const defaultTarget = direction === 'BITRIX24_TO_MOYSKLAD' ? moysklad : bitrix24;
   const previousB = isRecord(prior.bitrix24Values) ? prior.bitrix24Values : {};
@@ -994,6 +1003,10 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
     if (!sourceChanged || equal(sourceNow[srcField], targetNow[destField])) continue;
     const transformed = settings.transformField(config, entity, direction, destField, sourceNow);
     if (!transformed || transformed.error) continue;
+    if (rule.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[destField])) {
+      criticalClears.push({ fieldTitle: destField, previousValue: targetNow[destField], restoreValue: targetNow[destField], sourceProposedValue: transformed.value });
+      continue;
+    }
     defaultTarget[destField] = transformed.value;
   }
   for (const group of Array.isArray(config?.groups) ? config.groups : []) {
@@ -1013,12 +1026,17 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
     if (targetChanged) continue;
     const transformed = settings.transformField(config, entity, direction, group.targetField, sourceNow);
     if (transformed?.error) ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.error}`;
-    else if (transformed && !equal(transformed.value, targetNow[group.targetField])) defaultTarget[group.targetField] = transformed.value;
+    else if (transformed && !equal(transformed.value, targetNow[group.targetField])) {
+      if (group.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[group.targetField])) {
+        criticalClears.push({ fieldTitle: group.targetField, previousValue: targetNow[group.targetField], restoreValue: targetNow[group.targetField], sourceProposedValue: transformed.value });
+      } else defaultTarget[group.targetField] = transformed.value;
+    }
   }
-  return { bitrix24, moysklad, ambiguous };
+  return { bitrix24, moysklad, ambiguous, criticalClears };
 }
 
 function equal(a: unknown, b: unknown) { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); }
+function isEmptyValue(value: unknown) { return value === null || value === undefined || typeof value === 'string' && value.trim() === ''; }
 function matchesWrittenFields(writes: Record<string, unknown>, readback: Record<string, unknown>) {
   return Object.entries(writes).every(([field, value]) => Object.prototype.hasOwnProperty.call(readback, field) && equal(readback[field], value));
 }

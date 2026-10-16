@@ -325,6 +325,7 @@ model ClientInventoryObject {
   nativeType  String
   externalId  String
   matchValue  String?
+  displayLabel String?
   parentId    String?
   companyType String?
   status      String   @default("PENDING")

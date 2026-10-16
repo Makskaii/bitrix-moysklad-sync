@@ -129,7 +129,7 @@ test('company searches exclude MoySklad individual counterparties', async () => 
   assert.deepEqual(rows.map((row) => row.id), ['legal']);
 });
 
-test('initial inventory requests and preserves only native company type metadata', async () => {
+test('initial inventory requests native company type and safe display labels', async () => {
   process.env.MOYSKLAD_API_BASE_URL = 'https://inventory.fake/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-inventory-token';
   const requests: URL[] = [];
@@ -140,10 +140,10 @@ test('initial inventory requests and preserves only native company type metadata
   const provider = new HttpClientInventoryProvider(fetcher);
   const counterparty = await provider.counterpartyPage(0);
   const contactpersons = await provider.contactpersonPage('parent-id', 0);
-  assert.equal(requests[0]?.searchParams.get('fields'), 'id,companyType');
-  assert.equal(requests[1]?.searchParams.get('fields'), 'id');
-  assert.deepEqual(counterparty.rows, [{ id: 'counterparty-id', parentId: null, companyType: 'individual' }]);
-  assert.deepEqual(contactpersons.rows, [{ id: 'counterparty-id', parentId: 'parent-id' }]);
+  assert.equal(requests[0]?.searchParams.get('fields'), 'id,name,companyType');
+  assert.equal(requests[1]?.searchParams.get('fields'), 'id,name');
+  assert.deepEqual(counterparty.rows, [{ id: 'counterparty-id', parentId: null, companyType: 'individual', displayLabel: null }]);
+  assert.deepEqual(contactpersons.rows, [{ id: 'counterparty-id', parentId: 'parent-id', displayLabel: null }]);
 });
 
 test('Bitrix24 company searches request and retain the duplicate marker', async () => {

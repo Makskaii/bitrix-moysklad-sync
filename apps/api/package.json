@@ -5,6 +5,7 @@
     "build": "tsc -p tsconfig.build.json",
     "test:admin": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-access.integration.js",
     "test:admin-audit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-audit.integration.js",
+    "test:admin-operations:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-operations.postgres.integration.js",
     "test:events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/events-intake.integration.js",
     "test:sync-mode-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode.service.unit.js",
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",

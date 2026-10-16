@@ -6,6 +6,7 @@ import { ClientLifecycleController } from './client-lifecycle.controller';
 import { AdminPreviewController } from './admin-preview.controller';
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
+import { DatabaseRecoveryService } from '../database-recovery.service';
 import { SyncModeController } from './sync-mode.controller';
 import { SyncModeService } from '../sync-mode.service';
 import { SyncRecoveryService } from '../sync-recovery.service';
@@ -54,7 +55,7 @@ import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from '../clients/cli
 
 @Module({})
 export class LocalAdminPreviewModule {
-  static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
+  static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider, localPreviewAccess = true): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
       controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController, ClientLifecycleController] : [])],
@@ -63,6 +64,7 @@ export class LocalAdminPreviewModule {
         AdminAuditService,
         SyncModeService,
         SyncRecoveryService,
+        DatabaseRecoveryService,
         ContactSyncProcessor,
         ContactSyncStatusReader,
         EventIntakeService,
@@ -85,7 +87,7 @@ export class LocalAdminPreviewModule {
           PairFirstEventProcessor,
         ] : []),
         WebhookDiagnosticLog,
-        { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
+        { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: localPreviewAccess },
         AdminAccessGuard,
       ],
     };

@@ -41,15 +41,17 @@ export class MonitoringController {
         },
       }),
     ]);
-    const settingsByEvent = this.fieldSettings
+    const [settingsByEvent, labelsByEvent] = await Promise.all([this.fieldSettings
       ? await this.fieldSettings.eventSettings(events.map((event) => event.id))
-      : new Map<string, { version: number; transforms: string[] }>();
+      : new Map<string, { version: number; transforms: string[] }>(), this.readClientLabels(events)]);
     return {
       counts: Object.fromEntries(counts.map((row) => [row.status, row._count._all])),
       events: events.map((event) => ({
         ...event,
         fieldSettingsVersion: settingsByEvent.get(event.id)?.version ?? null,
         transforms: settingsByEvent.get(event.id)?.transforms ?? [],
+        entityLabel: labelsByEvent.get(event.id)?.label ?? null,
+        labelStatus: labelsByEvent.get(event.id)?.status ?? 'NAME_UNAVAILABLE_FOR_ENTITY',
       })),
       nextCursor: getNextCursor(events, take),
     };
@@ -66,12 +68,40 @@ export class MonitoringController {
       take,
       select: { id: true, eventId: true, source: true, eventType: true, externalEntityId: true, externalEntityType: true, reason: true, diagnostic: true, entityLabel: true, fieldTitle: true, previousValue: true, proposedValue: true, status: true, openedAt: true, resolvedAt: true },
     });
-    return { cases: cases.map((item) => ({ ...item, diagnostic: sanitizeReviewDiagnostic(item.diagnostic), ...manualReviewDetails(item.diagnostic),
-      entityLabel: item.entityLabel ?? manualReviewDetails(item.diagnostic).entityLabel ?? null,
-      fieldTitle: item.fieldTitle ?? manualReviewDetails(item.diagnostic).fieldTitle ?? null,
-      previousValue: item.previousValue ?? manualReviewDetails(item.diagnostic).previousValue ?? null,
-      proposedValue: item.proposedValue ?? manualReviewDetails(item.diagnostic).proposedValue ?? null,
-    })), nextCursor: getNextCursor(cases, take) };
+    const labels = await this.readClientLabels(cases);
+    return { cases: cases.map((item) => {
+      const details = manualReviewDetails(item.diagnostic);
+      const entityLabel = item.entityLabel ?? details.entityLabel ?? labels.get(item.eventId)?.label ?? null;
+      const previousValue = item.previousValue ?? details.previousValue ?? null;
+      const proposedValue = item.proposedValue ?? details.proposedValue ?? null;
+      return { ...item, diagnostic: sanitizeReviewDiagnostic(item.diagnostic),
+        fieldTitle: item.fieldTitle ?? details.fieldTitle ?? null,
+        previousValue, proposedValue,
+        valueStatus: previousValue !== null || proposedValue !== null ? 'AVAILABLE' : 'NOT_PROVIDED_BY_RUNTIME',
+        valueReason: previousValue !== null || proposedValue !== null ? null : 'Runtime did not supply a prior/ proposed field value for this incident.',
+        labelStatus: entityLabel ? 'NAME_AVAILABLE' : labels.get(item.eventId)?.status ?? 'NAME_UNAVAILABLE_FOR_ENTITY',
+        entityLabel,
+      };
+    }), nextCursor: getNextCursor(cases, take) };
+  }
+
+  private async readClientLabels(rows: Array<{ id?: string; eventId?: string; source: string; externalEntityId: string | null; externalEntityType: string | null }>) {
+    const keys = rows.flatMap((row) => {
+      const entityType = row.externalEntityType?.toUpperCase();
+      return row.externalEntityId && (entityType === 'COMPANY' || entityType === 'CONTACT')
+        ? [{ rowId: row.eventId ?? row.id ?? '', system: row.source, entityType, externalId: row.externalEntityId }]
+        : [];
+    });
+    if (!keys.length) return new Map<string, { label: string | null; status: string }>();
+    const cached = await this.database.clientInventoryObject.findMany({
+      where: { OR: keys.map(({ system, entityType, externalId }) => ({ system, entityType, externalId })) },
+      select: { system: true, entityType: true, externalId: true, displayLabel: true },
+    });
+    const labelMap = new Map(cached.map((row) => [`${row.system}:${row.entityType}:${row.externalId}`, row.displayLabel as string | null]));
+    return new Map(keys.map(({ rowId, system, entityType, externalId }) => {
+      const label = labelMap.get(`${system}:${entityType}:${externalId}`) ?? null;
+      return [rowId, { label, status: label ? 'CACHED_NAME_AVAILABLE' : 'CACHED_NAME_UNAVAILABLE' }];
+    }));
   }
 
   @Patch('incidents/:incidentId/resolve')

@@ -12,7 +12,7 @@ type MappingStatus = {
   checkpointAt: string | null;
 };
 type InventorySystem = 'BITRIX24' | 'MOYSKLAD';
-type UnmatchedRow = { system: InventorySystem; entityType: 'COMPANY' | 'CONTACT'; nativeType: string; externalId: string; matchValue: string | null; parentId: string | null; reason: string | null; observedAt: string };
+type UnmatchedRow = { system: InventorySystem; entityType: 'COMPANY' | 'CONTACT'; nativeType: string; externalId: string; matchValue: string | null; displayLabel: string | null; parentId: string | null; reason: string | null; observedAt: string };
 
 const reasons: Record<string, string> = {
   UUID_MISSING: 'В поле UUID нет значения',
@@ -88,7 +88,7 @@ export function ClientMappingPage({ accessToken, onError, onForbidden }: {
 
   const progress = status ? status.bitrix24CompanyProcessed + status.bitrix24ContactProcessed + status.moyskladCounterpartyProcessed + status.moyskladContactpersonProcessed : 0;
   return <>
-    <header className="page-heading"><p className="eyebrow">КОМПАНИИ И КОНТАКТЫ</p><h2>Первичная карта клиентов</h2><p>Инвентаризация читает ID и UUID записей любого возраста. Она не изменяет карточки в Bitrix24 или МойСклад и не запускает перенос исторических документов.</p></header>
+    <header className="page-heading"><p className="eyebrow">КОМПАНИИ И КОНТАКТЫ</p><h2>Первичная карта клиентов</h2><p>Инвентаризация читает ID, UUID и доступные названия записей любого возраста. Она не изменяет карточки в Bitrix24 или МойСклад и не запускает перенос исторических документов.</p></header>
     <section className="panel">
       <div className="panel-heading"><div><p className="eyebrow">ВОЗОБНОВЛЯЕМЫЙ ПРОЦЕСС</p><h3>Состояние карты</h3></div><span className="availability-tag">{status?.status ?? 'Загрузка'}</span></div>
       <p className="panel-description">Этап: {phaseLabel(status?.phase)} · записей проверено: {progress.toLocaleString('ru-RU')}</p>
@@ -106,7 +106,7 @@ export function ClientMappingPage({ accessToken, onError, onForbidden }: {
         <label>Запись<select value={entityFilter} onChange={(event) => setEntityFilter(event.target.value as 'COMPANY' | 'CONTACT' | 'ALL')}><option value="ALL">Все типы</option><option value="COMPANY">Компании</option><option value="CONTACT">Контакты</option></select></label>
       </div>
       {!rows.length ? <p className="muted-empty">После завершения инвентаризации здесь появятся записи с причиной.</p> : <div className="pair-list">{rows.map((row) => <article className="pair-card" key={`${row.system}:${row.entityType}:${row.externalId}`}>
-        <div><strong>{row.system === 'BITRIX24' ? 'Bitrix24' : 'МойСклад'} · {row.entityType === 'COMPANY' ? 'Компания' : 'Контакт'} · {nativeTypeLabel(row.nativeType)} · ID {row.externalId}</strong>{row.parentId && <p className="panel-description">Родительский контрагент · ID {row.parentId}</p>}<p className="panel-description">{reasons[row.reason ?? ''] ?? row.reason ?? 'Причина не указана'}{row.matchValue ? ` · UUID: ${row.matchValue}` : ''}</p></div>
+        <div><strong>{row.displayLabel ?? 'Название не получено из проверенного источника'}</strong><p className="panel-description">{row.system === 'BITRIX24' ? 'Bitrix24' : 'МойСклад'} · {row.entityType === 'COMPANY' ? 'Компания' : 'Контакт'} · {nativeTypeLabel(row.nativeType)} · ID {row.externalId}</p>{row.parentId && <p className="panel-description">Родительский контрагент · ID {row.parentId}</p>}<p className="panel-description">{reasons[row.reason ?? ''] ?? row.reason ?? 'Причина не указана'}{row.matchValue ? ` · UUID: ${row.matchValue}` : ''}</p></div>
         <span className="availability-tag">Несопоставлено</span>
       </article>)}</div>}
       {nextCursor && <button type="button" className="refresh-monitoring" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? 'Загрузка…' : 'Загрузить ещё'}</button>}

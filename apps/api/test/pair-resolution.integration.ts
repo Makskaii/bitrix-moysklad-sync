@@ -67,7 +67,7 @@ function createDatabase() {
         return { count: matches.length };
       },
     },
-    clientInventoryObject: { updateMany: async () => ({ count: 0 }) },
+    clientInventoryObject: { updateMany: async () => ({ count: 0 }), findMany: async () => [] },
     inboundEvent: { updateMany: async (args: unknown) => { requeueCalls.push(args); return { count: 0 }; } },
     adminAuditEntry: { create: async ({ data }: { data: Record<string, unknown> }) => { const entry = { ...data, id: `audit-${audits.length + 1}` }; audits.push(entry); return entry; } },
     $queryRaw: async () => [],
