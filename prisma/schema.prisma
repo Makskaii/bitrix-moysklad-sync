@@ -244,6 +244,23 @@ model EntityPair {
   @@index([entityType, moyskladId, active])
 }
 
+model ClientDependencyRetry {
+  id              String   @id @default(cuid())
+  eventId         String
+  sourceSystem    String
+  sourceEntityId  String
+  companySourceId String
+  status          String   @default("PENDING")
+  reason          String
+  attempts        Int      @default(0)
+  retryAfter      DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([eventId, sourceSystem, sourceEntityId, companySourceId])
+  @@index([status, retryAfter])
+}
+
 model ClientInventoryJob {
   id                                String    @id @default("client-map")
   status                            String    @default("idle")
@@ -307,6 +324,7 @@ model EntityPairSyncState {
   settingsVersion Int
   bitrix24Values  Json
   moyskladValues  Json
+  childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }

@@ -211,3 +211,67 @@ test('a deal event resolves its pinned company and contact dependencies before b
   assert.ok(calls.every((call) => call.eventId === 'event-1' && call.sourceSystem === 'BITRIX24'));
   assert.equal(state.event.status, 'SUCCEEDED');
 });
+
+test('an optional contact dependency failure is queued separately and does not block the company-backed document', async () => {
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  const state = createDatabase(2);
+  const scheduled: Array<{ eventId: string; sourceSystem: string; entity: string; sourceId: string; primaryCompanySourceId?: string | null; reason: string }> = [];
+  const processor = new PairFirstEventProcessor(
+    state.database as never,
+    { resolve: async () => ({ status: 'confirmed', pair }) } as never,
+    { eventConfig: async () => currentConfig } as never,
+    new DealOrderBaselineService(state.database as never, {
+      readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }),
+      readMoySkladCustomerOrderForBaseline: async () => ({}),
+    } as never),
+    { process: async () => 'NOOP' } as never,
+    undefined,
+    { read: async () => ({ mode: 'on' }) } as never,
+    {
+      resolveForDocument: async (input: typeof scheduled[number]) => input.entity === 'CONTACT'
+        ? { status: 'REVIEW', reason: 'CLIENT_PROVIDER_REJECTED' }
+        : { status: 'RESOLVED', pair, selectedSourceId: input.sourceId, reason: 'PERSISTED_PAIR' },
+      scheduleOptionalContactRetry: async (input: typeof scheduled[number], reason: string) => { scheduled.push({ ...input, reason }); },
+    } as never,
+    { readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }) } as never,
+  );
+
+  try { await processor.process('event-1'); }
+  finally {
+    if (previousMode === undefined) delete process.env.SYNC_MODE;
+    else process.env.SYNC_MODE = previousMode;
+  }
+
+  assert.equal(state.event.status, 'SUCCEEDED');
+  assert.equal(scheduled.length, 1);
+  assert.deepEqual({ entity: scheduled[0]?.entity, sourceId: scheduled[0]?.sourceId, primaryCompanySourceId: scheduled[0]?.primaryCompanySourceId, reason: scheduled[0]?.reason }, {
+    entity: 'CONTACT', sourceId: 'contact-9', primaryCompanySourceId: 'company-8', reason: 'CLIENT_PROVIDER_REJECTED',
+  });
+});
+
+test('a document with no client is held only when no service counterparty is configured', async () => {
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  const state = createDatabase(2);
+  const processor = new PairFirstEventProcessor(
+    state.database as never,
+    { resolve: async () => ({ status: 'confirmed', pair }) } as never,
+    { eventConfig: async () => currentConfig } as never,
+    new DealOrderBaselineService(state.database as never, {
+      readBitrix24DealForBaseline: async () => ({}), readMoySkladCustomerOrderForBaseline: async () => ({}),
+    } as never),
+    { process: async () => 'NOOP' } as never,
+    undefined,
+    { read: async () => ({ mode: 'on' }) } as never,
+    { resolveForDocument: async () => { assert.fail('no explicit client should not invoke client resolution'); } } as never,
+    { readBitrix24DealForBaseline: async () => ({}) } as never,
+  );
+  try { await processor.process('event-1'); }
+  finally {
+    if (previousMode === undefined) delete process.env.SYNC_MODE;
+    else process.env.SYNC_MODE = previousMode;
+  }
+  assert.equal(state.event.status, 'MANUAL_REVIEW');
+  assert.equal(state.event.lastErrorCategory, 'SERVICE_COUNTERPARTY_NOT_CONFIGURED');
+});
