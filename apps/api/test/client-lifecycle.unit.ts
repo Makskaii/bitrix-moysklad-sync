@@ -1,0 +1,192 @@
+import { strict as assert } from 'node:assert';
+import { test } from 'node:test';
+import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
+
+test('tombstone targets one entity-type/native-ID pair and repeats idempotently', async () => {
+  const records = [
+    { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '42', moyskladId: 'ms-company', active: true, lifecycleStatus: 'ACTIVE' },
+    { id: 'contact-pair', entityType: 'CONTACT', bitrix24Id: '42', moyskladId: 'ms-contact', active: true, lifecycleStatus: 'ACTIVE' },
+  ];
+  const updates: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => records.find((row) =>
+        row.entityType === where.entityType && row.bitrix24Id === where.bitrix24Id) ?? null,
+      update: async (input: { where: { id: string }; data: Record<string, unknown> }) => {
+        updates.push(input);
+        const row = records.find((candidate) => candidate.id === input.where.id)!;
+        Object.assign(row, input.data);
+        return row;
+      },
+    },
+    operationalLog: { create: async () => ({}) },
+  };
+  const database = { $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx) };
+  const service = new ClientLifecycleService(database as never);
+
+  const first = await service.tombstoneByNativeId('BITRIX24', 'COMPANY', '42', 'DELETE_CONFIRMED');
+  const repeated = await service.tombstoneByNativeId('BITRIX24', 'COMPANY', '42', 'DELETE_CONFIRMED');
+
+  assert.deepEqual(first, { status: 'TOMBSTONED', pairId: 'company-pair', changed: true });
+  assert.deepEqual(repeated, { status: 'TOMBSTONED', pairId: 'company-pair', changed: false });
+  assert.equal(updates.length, 1);
+  assert.equal(records[0]?.active, false);
+  assert.equal(records[0]?.lifecycleStatus, 'TOMBSTONED');
+  assert.equal(records[1]?.active, true);
+  assert.equal(records[1]?.lifecycleStatus, 'ACTIVE');
+});
+
+test('pair write gate refuses tombstoned pairs and leaves unrelated active pairs usable', async () => {
+  const states: Record<string, { active: boolean; lifecycleStatus: string; entityType: string }> = {
+    gone: { active: false, lifecycleStatus: 'TOMBSTONED', entityType: 'COMPANY' },
+    live: { active: true, lifecycleStatus: 'ACTIVE', entityType: 'COMPANY' },
+  };
+  const database = { entityPair: { findUnique: async ({ where }: { where: { id: string } }) => states[where.id] ?? null } };
+  const service = new ClientLifecycleService(database as never);
+
+  await assert.rejects(() => service.assertPairActive('gone', 'COMPANY'), /PAIR_TOMBSTONED/);
+  await service.assertPairActive('live', 'COMPANY');
+  await assert.rejects(() => service.assertPairActive('live', 'CONTACT'), /PAIR_NOT_AVAILABLE/);
+});
+
+test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 404', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldMode = process.env.SYNC_MODE;
+  const oldBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldToken = process.env.MOYSKLAD_API_TOKEN;
+  process.env.SYNC_MODE = 'dry';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://fixture.invalid/api/remap/1.2';
+  process.env.MOYSKLAD_API_TOKEN = 'fixture-token';
+  const updates: Record<string, unknown>[] = [];
+  const pair = { id: 'pair-1', entityType: 'COMPANY', bitrix24Id: 'b24-1', moyskladId: 'ms-1', moyskladType: 'counterparty', moyskladParentId: null, active: true, lifecycleStatus: 'ACTIVE', deletionMarkerStatus: 'NOT_CONFIGURED', deletionTimelineStatus: 'NOT_REQUIRED', tombstoneSource: null, tombstonedAt: null };
+  const event = { id: 'event-1', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', externalEntityId: 'ms-1', payload: {}, status: 'RECEIVED', attempts: 0 };
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => where.entityType === 'COMPANY' && where.moyskladId === 'ms-1' ? pair : null,
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); updates.push(data); return pair; },
+    },
+    inboundEvent: { update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(event, data); return event; } },
+    operationalLog: { create: async () => ({}) },
+  };
+  const database = {
+    $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+    entityPair: {
+      findUnique: async () => pair,
+      findFirst: async () => pair,
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return { count: 1 }; },
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return pair; },
+    },
+    inboundEntityLock: {
+      updateMany: async () => ({ count: 0 }), create: async () => ({}), deleteMany: async () => ({ count: 1 }),
+    },
+    inboundEvent: {
+      findUnique: async () => event,
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(event, data); return { count: 1 }; },
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(event, data); return event; },
+    },
+  };
+  globalThis.fetch = async () => new Response(null, { status: 404 });
+  try {
+    const service = new ClientLifecycleService(database as never);
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-1');
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.active, false);
+    assert.equal(pair.moyskladId, 'ms-1');
+    assert.equal(event.status, 'SUCCEEDED');
+    assert.equal(updates.length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+    if (oldBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldBase;
+    if (oldToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldToken;
+  }
+});
+
+test('MoySklad provider outage remains retryable and does not tombstone the pair', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldToken = process.env.MOYSKLAD_API_TOKEN;
+  process.env.MOYSKLAD_API_BASE_URL = 'https://fixture.invalid/api/remap/1.2';
+  process.env.MOYSKLAD_API_TOKEN = 'fixture-token';
+  const pair = { id: 'pair-1', entityType: 'COMPANY', bitrix24Id: 'b24-1', moyskladId: 'ms-1', active: true, lifecycleStatus: 'ACTIVE' };
+  const event = { id: 'event-2', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', externalEntityId: 'ms-1', payload: {}, status: 'RECEIVED', attempts: 0 };
+  const database = {
+    entityPair: { findUnique: async () => pair, findFirst: async () => pair },
+    inboundEntityLock: {
+      updateMany: async () => ({ count: 0 }), create: async () => ({}), deleteMany: async () => ({ count: 1 }),
+    },
+    inboundEvent: {
+      findUnique: async () => event,
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(event, data); return { count: 1 }; },
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(event, data); return event; },
+    },
+  };
+  globalThis.fetch = async () => new Response(null, { status: 503 });
+  try {
+    const service = new ClientLifecycleService(database as never);
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-2');
+    assert.equal(pair.lifecycleStatus, 'ACTIVE');
+    assert.equal(pair.active, true);
+    assert.equal(event.status, 'RETRYABLE_FAILURE');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldBase;
+    if (oldToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldToken;
+  }
+});
+
+test('restore keeps the same native IDs and requires verified provider identity plus confirmation', async () => {
+  const pair = { id: 'pair-restore', entityType: 'COMPANY', bitrix24Id: 'b24-restore', moyskladId: 'ms-restore', moyskladType: 'counterparty', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED', tombstonedAt: null, tombstoneSource: null, tombstoneReason: null, deletionMarkerStatus: 'NOT_CONFIGURED' };
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findUnique: async () => pair,
+      findFirst: async () => null,
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return pair; },
+    },
+    adminAuditEntry: { create: async ({ data }: { data: Record<string, unknown> }) => { auditEntries.push(data); } },
+  };
+  const auditEntries: Record<string, unknown>[] = [];
+  const database = {
+    entityPair: { findUnique: async () => pair },
+    $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+  };
+  const gateway = {
+    readBitrix: async (_entity: string, id: string) => ({ ID: id }),
+    readMoysklad: async (_type: string, id: string) => ({ id }),
+  };
+  const service = new ClientLifecycleService(database as never, gateway as never);
+  await assert.rejects(() => service.restore('pair-restore', false, 'BITRIX24_USER:42'), /EXPLICIT_RESTORE_CONFIRMATION_REQUIRED/);
+  const result = await service.restore('pair-restore', true, 'BITRIX24_USER:42');
+  assert.deepEqual(result, { status: 'RESTORED', pairId: 'pair-restore' });
+  assert.equal(pair.id, 'pair-restore');
+  assert.equal(pair.bitrix24Id, 'b24-restore');
+  assert.equal(pair.moyskladId, 'ms-restore');
+  assert.equal(pair.active, true);
+  assert.equal(pair.lifecycleStatus, 'ACTIVE');
+  assert.deepEqual(auditEntries[0], {
+    actorId: 'BITRIX24_USER:42', action: 'CLIENT_LIFECYCLE_RESTORED', targetType: 'COMPANY', targetId: 'pair-restore',
+    reason: 'VERIFIED_BOTH_NATIVE_IDS',
+    before: { lifecycleStatus: 'TOMBSTONED', tombstonedAt: null, tombstoneSource: null, tombstoneReason: null },
+    after: { lifecycleStatus: 'ACTIVE', bitrix24Id: 'b24-restore', moyskladId: 'ms-restore' },
+  });
+});
+
+test('restore refuses when a provider read returns another identity', async () => {
+  const pair = { id: 'pair-restore', entityType: 'COMPANY', bitrix24Id: 'b24-restore', moyskladId: 'ms-restore', moyskladType: 'counterparty', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED', deletionMarkerStatus: 'NOT_CONFIGURED' };
+  let transactionStarted = false;
+  const database = {
+    entityPair: { findUnique: async () => pair },
+    $transaction: async () => { transactionStarted = true; throw new Error('unexpected transaction'); },
+  };
+  const gateway = {
+    readBitrix: async () => ({ ID: 'different-b24-id' }),
+    readMoysklad: async (_type: string, id: string) => ({ id }),
+  };
+  const service = new ClientLifecycleService(database as never, gateway as never);
+  await assert.rejects(() => service.restore('pair-restore', true, 'BITRIX24_USER:42'), /PAIR_IDENTITY_VERIFICATION_FAILED/);
+  assert.equal(transactionStarted, false);
+  assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+});

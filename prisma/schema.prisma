@@ -255,6 +255,13 @@ model EntityPair {
   active           Boolean              @default(true)
   source           String               @default("MANUAL")
   reason           String?
+  lifecycleStatus  String               @default("ACTIVE")
+  tombstonedAt     DateTime?
+  tombstoneSource  String?
+  tombstoneReason  String?
+  deletionMarkerStatus String            @default("NOT_CONFIGURED")
+  deletionTimelineStatus String          @default("NOT_REQUIRED")
+  deletionTimelineLeaseUntil DateTime?
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
@@ -264,6 +271,7 @@ model EntityPair {
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
+  @@index([lifecycleStatus, tombstonedAt])
 }
 
 model ClientDependencyRetry {
