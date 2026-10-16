@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, Param, Post, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, Param, Post, Put, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard, readBitrixAdministratorIdentity } from './admin-access.guard';
 import { ClientLifecycleService } from '../clients/client-lifecycle.service';
 
@@ -9,6 +9,17 @@ export class ClientLifecycleController {
 
   @Get()
   list() { return this.lifecycle.listTombstones(); }
+
+  @Get('marker-fields')
+  markerFields() { return this.lifecycle.deletionMarkerFields(); }
+
+  @Put('marker-fields')
+  saveMarkerFields(@Body() body: unknown) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || !('fields' in body)) {
+      throw new BadRequestException('An explicit fields object is required');
+    }
+    return this.lifecycle.saveDeletionMarkerFields((body as { fields?: unknown }).fields);
+  }
 
   @Post(':pairId/restore')
   async restore(@Param('pairId') pairId: string, @Body() body: unknown, @Headers('authorization') authorization?: string) {

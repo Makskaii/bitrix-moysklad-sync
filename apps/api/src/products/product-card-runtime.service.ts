@@ -5,6 +5,7 @@ import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { SyncModeService } from '../sync-mode.service';
 import { ProductCardHttpApi } from './product-card-api';
+import { ClientLifecycleService } from '../clients/client-lifecycle.service';
 import { ProductCardApi, ProductCardLeaseError, ProductCardSettings, ProductCardStateStore, ProductCardSyncService } from './product-card-sync.service';
 
 const PRODUCT_PAIR_LOCK_LEASE_MS = 60_000;
@@ -34,6 +35,7 @@ export class ProductCardRuntimeService {
     private readonly api: ProductCardHttpApi,
     private readonly fieldSettings: FieldSettingsService,
     private readonly syncMode: SyncModeService,
+    private readonly lifecycle?: ClientLifecycleService,
   ) {}
 
   async preflight(source: 'BITRIX24' | 'MOYSKLAD'): Promise<ProductCardRuntimeGate> {
@@ -112,7 +114,8 @@ export class ProductCardRuntimeService {
     const stateStore = new DatabaseProductCardStateStore(this.database, withBothLeases);
     const reconciler = new ProductCardSyncService(guardedApi, stateStore);
     try {
-      return await reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings, attempt: input.attempt });
+      const reconcile = () => reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings, attempt: input.attempt });
+      return this.lifecycle ? await this.lifecycle.withPairActiveLock(pair.id, 'PRODUCT', reconcile) : await reconcile();
     } catch (error) {
       if (error instanceof ProductCardWriteGateError) {
         return { ...error.gate, changedFields: [] as [] };

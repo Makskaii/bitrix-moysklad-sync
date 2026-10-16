@@ -15,6 +15,7 @@ model TrialAction {
 
 model SyncSetting {
   id                        String    @id @default("global")
+  clientDeletionMarkerFields Json     @default("{}")
   serviceMode               String    @default("off")
   offSince                  DateTime?
   lastInactiveAt            DateTime?
@@ -260,6 +261,8 @@ model EntityPair {
   tombstoneSource  String?
   tombstoneReason  String?
   deletionMarkerStatus String            @default("NOT_CONFIGURED")
+  deletionMarkerAttempts Int              @default(0)
+  deletionMarkerRetryAfter DateTime?
   deletionTimelineStatus String          @default("NOT_REQUIRED")
   deletionTimelineLeaseUntil DateTime?
   createdAt        DateTime             @default(now())
