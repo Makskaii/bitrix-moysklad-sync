@@ -40,4 +40,3 @@ test('planned delivery date preserves only the calendar day in the documented My
   assert.deepEqual(normalizePlannedDeliveryDate('2026-02-30', 'BITRIX24'), { supported: false });
   assert.deepEqual(normalizePlannedDeliveryDate('2026-10-09T17:45:00Z', 'MOYSKLAD'), { supported: false });
 });
-

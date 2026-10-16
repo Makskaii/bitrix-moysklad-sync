@@ -32,4 +32,3 @@ function isValidDay(value: string): boolean {
   const check = new Date(Date.UTC(year, month - 1, day));
   return check.getUTCFullYear() === year && check.getUTCMonth() === month - 1 && check.getUTCDate() === day;
 }
-

@@ -611,4 +611,3 @@ function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href 
 function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error(); return { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' }; }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
-

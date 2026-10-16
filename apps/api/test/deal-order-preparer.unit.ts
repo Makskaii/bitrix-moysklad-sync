@@ -199,5 +199,3 @@ async function fakeFetch(input: string | URL | Request, init?: RequestInit): Pro
 
 function msRef(type: string, id: string) { return `https://moysklad.test/api/remap/1.2/entity/${type}/${id}`; }
 function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } }); }
-
-

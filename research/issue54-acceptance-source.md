@@ -54,4 +54,3 @@ The content below is a sanitized copy of the issue body as retrieved. The issue 
 
 ## Уже сделано / зависимости / история
 Закрытые #4/#38 исследовали сделки и dry-webhooks. PR #47/#48/#51 — частичные slices, не полный обмен. #45/#50 historical inventory/matching нельзя применять к старым документам. Зависит от клиента, settings, event engine и admin journal blocks. Агент технически проверяет writable fields, IDs/pairs строк, pack/UOM, полноту чтения удалённых строк и API-required fields. Пока денежное преобразование шапки не подтверждено, документ не записывается с искажённой суммой: manual review; ошибка только отдельной строки пропускает её с причиной. Заменяет открытые #16 и #17; учитывает Q26.59–Q26.61.
-
