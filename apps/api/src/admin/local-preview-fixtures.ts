@@ -26,6 +26,7 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
         bitrix24: APPROVED_PRICE_TYPES.map((price) => ({ id: String(price.bitrix24Id), code: price.bitrix24Code, label: `Демо: тип цены ${price.bitrix24Code}` })),
         moysklad: unique(APPROVED_PRICE_TYPES.flatMap((price) => price.moyskladId ? [{ id: price.moyskladId, code: price.bitrix24Code, label: `Демо: ${price.moyskladLabel ?? price.bitrix24Code}` }] : [])),
       },
+      productCatalogs: [{ id: '11', code: 'demo-products', label: 'Демо: товары' }],
     };
   }
 

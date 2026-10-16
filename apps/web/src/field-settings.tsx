@@ -32,6 +32,19 @@ type DictionaryMap = {
 };
 type ReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages';
 type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: 'suggested' | 'confirmed' | 'unmapped' };
+type DealOrderRuntime = {
+  nativeOrderNumberingVerified: boolean;
+  bitrix24ProductCatalogId?: string | null;
+  moyskladProductFields?: Array<'name' | 'code' | 'description'>;
+  defaultOrganizationId: string | null;
+  defaultStoreId: string | null;
+  defaultEmployeeId: string | null;
+  currencies: Array<{ bitrix24Code: string; moyskladId: string }>;
+  stages: Array<{ bitrix24StageId: string; moyskladId: string; creationEnabled: boolean }>;
+  organizations: Array<{ bitrix24Id: string; moyskladId: string }>;
+  stores: Array<{ bitrix24Id: string; moyskladId: string }>;
+  employees: Array<{ bitrix24Id: string; moyskladId: string }>;
+};
 type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
@@ -42,15 +55,16 @@ type ChildResourceBinding = {
   bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: ChildFieldPair[] };
 };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   priceTypes: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
   dictionaries: Array<{ key: string; bitrix24Field: string; bitrix24ListId: string; moyskladAttributeId: string; moyskladDirectoryId: string; values?: { bitrix24: DictionaryOption[]; moysklad: DictionaryOption[] } }>;
   namedReferences: Partial<Record<ReferenceKind, { sources: Array<{ source: { id: string; code: string; label: string; group?: string }; targetId: string | null; targetLabel: string | null; status: string; suggestion: { id: string; code: string; label: string } | null; ambiguousSuggestions: Array<{ id: string; code: string; label: string }> }>; targets: Array<{ id: string; code: string; label: string }> }>>;
+  productCatalogs: Array<{ id: string; code: string; label: string }>;
 };
-const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
+const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {}, productCatalogs: [] };
 const referenceKinds: Array<[ReferenceKind, string]> = [
   ['employees', 'Сотрудники'], ['currencies', 'Валюты'], ['organizations', 'Организации'], ['warehouses', 'Склады'], ['projects', 'Проекты'], ['dealStages', 'Стадии сделок ↔ статусы заказов'],
 ];
@@ -303,7 +317,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       const pairs = current.references.namedPairs ?? [];
       const target = catalogs.namedReferences[kind]?.targets.find((item) => item.id === targetId);
       const next: NamedReferencePair = { kind, bitrix24Id: source.id, bitrix24Label: source.label, moyskladId: targetId || null, moyskladLabel: target?.label ?? null, status: targetId ? status : 'unmapped' };
-      return { ...current, references: { ...current.references, namedPairs: [...pairs.filter((pair) => pair.kind !== kind || pair.bitrix24Id !== source.id), next] } };
+      const updated = { ...current, references: { ...current.references, namedPairs: [...pairs.filter((pair) => pair.kind !== kind || pair.bitrix24Id !== source.id), next] } };
+      return updated.dealOrderRuntime ? { ...updated, dealOrderRuntime: runtimeFromConfirmedPairs(updated, updated.dealOrderRuntime) } : updated;
     });
   }
 
@@ -468,6 +483,11 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       </li>)}</ul>}
     </section>;
   };
+  const confirmedReferences = (kind: ReferenceKind) => (draft.references.namedPairs ?? []).filter((pair) => pair.kind === kind && pair.status === 'confirmed' && pair.moyskladId);
+  const changeRuntime = (update: (current: DealOrderRuntime) => DealOrderRuntime) => changeDraft((current) => {
+    const base = current.dealOrderRuntime ?? runtimeFromConfirmedPairs(current);
+    return { ...current, dealOrderRuntime: update(base) };
+  });
 
   return <>
     <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2></div>
@@ -715,6 +735,38 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       </section>
       </details>
 
+      <section className="field-editor-section" aria-label="Настройки обмена сделок и заказов">
+        <div className="panel-heading"><div><p className="eyebrow">ОБМЕН СДЕЛОК И ЗАКАЗОВ</p><h3>Новые заказы и продуктовые пары</h3></div></div>
+        <p className="panel-description">Настройки применяются к новым событиям после явного сохранения версии. Для MyСклад → Bitrix24 отсутствующий товар сначала создаётся в выбранном каталоге Bitrix24 и связывается с товаром MyСклад; товар MyСклад не изменяется. Стадия, валюта, единицы и каталог должны быть подтверждены вручную.</p>
+        {!draft.dealOrderRuntime ? <button type="button" className="button-secondary" onClick={() => changeDraft((current) => ({ ...current, dealOrderRuntime: runtimeFromConfirmedPairs(current) }))}>Настроить обмен заказами</button> : (() => {
+          const runtime = draft.dealOrderRuntime!;
+          const organizationOptions = confirmedReferences('organizations');
+          const storeOptions = confirmedReferences('warehouses');
+          const employeeOptions = confirmedReferences('employees');
+          const productFields = runtime.moyskladProductFields ?? ['name'];
+          const setProductField = (field: 'code' | 'description', enabled: boolean) => changeRuntime((current) => ({ ...current, moyskladProductFields: [...new Set(['name', ...(current.moyskladProductFields ?? ['name']).filter((value) => value !== field), ...(enabled ? [field] : [])])] as Array<'name' | 'code' | 'description'> }));
+          return <div className="reference-map-list">
+            <label>Каталог товаров Bitrix24<select aria-label="Каталог товаров Bitrix24 для создания" value={runtime.bitrix24ProductCatalogId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, bitrix24ProductCatalogId: event.currentTarget.value || null }))}>
+              <option value="">Выберите каталог вручную</option>{catalogs.productCatalogs.map((catalog) => <option key={catalog.id} value={catalog.id}>{catalog.label} · {catalog.id}</option>)}
+            </select></label>
+            <fieldset><legend>Разрешённые поля из карточки товара MyСклад</legend>
+              <label><input type="checkbox" checked disabled />Наименование (обязательное)</label>
+              <label><input type="checkbox" checked={productFields.includes('code')} onChange={(event) => setProductField('code', event.currentTarget.checked)} />Код</label>
+              <label><input type="checkbox" checked={productFields.includes('description')} onChange={(event) => setProductField('description', event.currentTarget.checked)} />Описание</label>
+            </fieldset>
+            <label><input type="checkbox" checked={runtime.nativeOrderNumberingVerified} onChange={(event) => changeRuntime((current) => ({ ...current, nativeOrderNumberingVerified: event.currentTarget.checked }))} />Проверена нумерация заказов MyСклад (номер записывается в отдельное поле Bitrix24)</label>
+            <label>Организация MyСклад по умолчанию<select aria-label="Организация MyСклад по умолчанию" value={runtime.defaultOrganizationId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultOrganizationId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{organizationOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
+            <label>Склад MyСклад по умолчанию<select aria-label="Склад MyСклад по умолчанию" value={runtime.defaultStoreId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultStoreId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{storeOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
+            <label>Ответственный MyСклад по умолчанию<select aria-label="Ответственный MyСклад по умолчанию" value={runtime.defaultEmployeeId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultEmployeeId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{employeeOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
+            <fieldset><legend>Стадии, при входе в которые создаётся заказ MyСклад</legend>{runtime.stages.map((stage) => {
+              const ref = confirmedReferences('dealStages').find((pair) => pair.bitrix24Id === stage.bitrix24StageId);
+              return <label key={stage.bitrix24StageId}><input type="checkbox" checked={stage.creationEnabled} onChange={(event) => changeRuntime((current) => ({ ...current, stages: current.stages.map((candidate) => candidate.bitrix24StageId === stage.bitrix24StageId ? { ...candidate, creationEnabled: event.currentTarget.checked } : candidate) }))} />{ref?.bitrix24Label ?? stage.bitrix24StageId} · {stage.bitrix24StageId}</label>;
+            })}</fieldset>
+            <p>Валюты и пары организации, склада, ответственного и стадий берутся только из подтверждённых связей выше. Единицы для карточек и строк должны быть сопоставлены в разделе «Единицы каталога».</p>
+          </div>;
+        })()}
+      </section>
+
       <div className="field-save-bar"><p>Сохранение создаёт версию {document.version + 1} и сразу применяется к новым событиям.</p><button type="button" onClick={() => setShowSaveWarning(true)} disabled={saving}>Сохранить новую версию</button></div>
       {showSaveWarning && <div className="field-save-warning" role="alertdialog" aria-label="Предупреждение о настройках">
         <h3>Подтвердите изменение настроек</h3>
@@ -820,6 +872,35 @@ function isSupportedChildFieldPair(bitrix24Field: string, moyskladField: string)
   return true;
 }
 
+function runtimeFromConfirmedPairs(config: SettingsConfig, previous?: DealOrderRuntime): DealOrderRuntime {
+  const pairs = config.references.namedPairs ?? [];
+  const confirmed = (kind: ReferenceKind) => pairs.filter((pair) => pair.kind === kind && pair.status === 'confirmed' && pair.moyskladId);
+  const preserveOrChoose = (previousId: string | null | undefined, kind: ReferenceKind) => {
+    const options = confirmed(kind);
+    return options.some((pair) => pair.moyskladId === previousId) ? previousId! : options[0]?.moyskladId ?? null;
+  };
+  const currencies = confirmed('currencies').map((pair) => ({ bitrix24Code: pair.bitrix24Id, moyskladId: pair.moyskladId! }));
+  const stages = confirmed('dealStages').map((pair) => ({
+    bitrix24StageId: pair.bitrix24Id,
+    moyskladId: pair.moyskladId!,
+    creationEnabled: previous?.stages.find((stage) => stage.bitrix24StageId === pair.bitrix24Id)?.creationEnabled ?? false,
+  }));
+  const mappings = (kind: ReferenceKind) => confirmed(kind).map((pair) => ({ bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId! }));
+  return {
+    nativeOrderNumberingVerified: previous?.nativeOrderNumberingVerified ?? false,
+    bitrix24ProductCatalogId: previous?.bitrix24ProductCatalogId ?? null,
+    moyskladProductFields: previous?.moyskladProductFields ?? ['name'],
+    defaultOrganizationId: preserveOrChoose(previous?.defaultOrganizationId, 'organizations'),
+    defaultStoreId: preserveOrChoose(previous?.defaultStoreId, 'warehouses'),
+    defaultEmployeeId: preserveOrChoose(previous?.defaultEmployeeId, 'employees'),
+    currencies,
+    stages,
+    organizations: mappings('organizations'),
+    stores: mappings('warehouses'),
+    employees: mappings('employees'),
+  };
+}
+
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {
   const next = structuredClone(config);
   const unitIds = new Set(next.references.units.map((row) => String(row.bitrix24Id)));
@@ -859,7 +940,7 @@ function includeCurrentNamedSources(config: SettingsConfig, catalogs: Catalogs):
 }
 
 async function loadCatalogPages(headers: Record<string, string>, inspect: (response: Response) => void): Promise<Catalogs> {
-  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {} };
+  const result: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {}, productCatalogs: [] };
   for (const kind of ['units', 'priceTypes'] as const) {
     for (const system of ['bitrix24', 'moysklad'] as const) {
       let cursor: string | null = null;
@@ -880,5 +961,6 @@ async function loadCatalogPages(headers: Record<string, string>, inspect: (respo
   const metadata = await metaResponse.json() as Catalogs;
   result.dictionaries = metadata.dictionaries;
   result.namedReferences = metadata.namedReferences;
+  result.productCatalogs = metadata.productCatalogs ?? [];
   return result;
 }

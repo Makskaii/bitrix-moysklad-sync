@@ -451,6 +451,8 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   store.status = 'confirmed';
   config.dealOrderRuntime = {
     nativeOrderNumberingVerified: true,
+    bitrix24ProductCatalogId: '11',
+    moyskladProductFields: ['name', 'code', 'description'],
     defaultOrganizationId: organization.moyskladId,
     defaultStoreId: store.moyskladId,
     defaultEmployeeId: employee.moyskladId,
@@ -472,6 +474,12 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   const invalid = structuredClone(config);
   invalid.dealOrderRuntime.defaultStoreId = 'not-a-uuid';
   assert.equal((await save(invalid)).status, 400, 'unvalidated default references are rejected');
+  const staleCatalog = structuredClone(config);
+  staleCatalog.dealOrderRuntime.bitrix24ProductCatalogId = '12';
+  assert.equal((await save(staleCatalog)).status, 400, 'unlisted product catalogs cannot be selected');
+  const missingRequiredProductName = structuredClone(config);
+  missingRequiredProductName.dealOrderRuntime.moyskladProductFields = ['code'];
+  assert.equal((await save(missingRequiredProductName)).status, 400, 'new product cards require the explicitly allowed source name');
 });
 
 test('saving creates an immutable version and activates it for future events only', async () => {

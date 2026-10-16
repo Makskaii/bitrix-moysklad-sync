@@ -368,6 +368,25 @@ model DealOrderReverseCreateOperation {
   @@index([status, updatedAt])
 }
 
+model DealOrderReverseProductOperation {
+  moyskladProductId  String   @id
+  syncId             String   @unique
+  eventId            String
+  settingsVersion    Int
+  bitrix24CatalogId  String
+  payload            Json
+  status             String   @default("PENDING")
+  bitrix24ProductId  String?
+  lastErrorCategory  String?
+  attemptedAt        DateTime?
+  leaseToken         String?
+  leaseUntil         DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
 model DealOrderReversePositionOperation {
   id                  String   @id @default(cuid())
   moyskladOrderId     String

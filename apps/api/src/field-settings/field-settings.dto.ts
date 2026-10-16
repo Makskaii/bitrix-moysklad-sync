@@ -55,6 +55,10 @@ export type FieldGroupDto = {
 
 export type DealOrderRuntimeDto = {
   nativeOrderNumberingVerified: boolean;
+  /** Explicitly selected Bitrix24 product catalog for the MS→B24 prerequisite path. */
+  bitrix24ProductCatalogId?: string | null;
+  /** MySklad product fields permitted on newly created Bitrix24 product cards. Name is mandatory. */
+  moyskladProductFields?: Array<'name' | 'code' | 'description'>;
   defaultOrganizationId: string | null;
   defaultStoreId: string | null;
   defaultEmployeeId: string | null;

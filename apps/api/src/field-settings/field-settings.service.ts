@@ -52,12 +52,17 @@ export class FieldSettingsService {
     await this.validateConfiguredFields(config, bitrixAccessToken);
     const active = await this.active();
     const riskChanges = fieldRuleRiskChanges(active.config, config);
-    const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references);
+    const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references) ||
+      JSON.stringify(config.dealOrderRuntime) !== JSON.stringify(active.config.dealOrderRuntime);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const namedCatalogs = await this.readOnlyData.referenceCatalogs(bitrixAccessToken);
     const configuredUnitSources = new Set(config.references.units.map((unit) => String(unit.bitrix24Id)));
     const configuredPriceSources = new Set(config.references.priceTypes.map((priceType) => String(priceType.bitrix24Id)));
+    const productCatalogId = config.dealOrderRuntime?.bitrix24ProductCatalogId ?? null;
+    if (productCatalogId && !catalogs.productCatalogs.some((candidate) => candidate.id === productCatalogId)) {
+      throw new BadRequestException(`Bitrix24 product catalog ${productCatalogId} no longer exists`);
+    }
     const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
     for (const mapping of config.references.dictionaries) {
       const live = dictionaryCatalogs.find((candidate) => candidate.key === mapping.key);
@@ -473,6 +478,16 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     throw new BadRequestException('dealOrderRuntime must include confirmed currency, stage, organization, store, and employee mappings');
   }
   const id = (candidate: unknown) => isString(candidate) && isUuid(candidate);
+  const productCatalogId = value.bitrix24ProductCatalogId === undefined || value.bitrix24ProductCatalogId === null || value.bitrix24ProductCatalogId === ''
+    ? null
+    : isString(value.bitrix24ProductCatalogId) && /^\d+$/.test(value.bitrix24ProductCatalogId)
+      ? value.bitrix24ProductCatalogId
+      : (() => { throw new BadRequestException('bitrix24ProductCatalogId must be a numeric Bitrix24 catalog ID or empty'); })();
+  const allowedProductFields = ['name', 'code', 'description'] as const;
+  const moyskladProductFields = value.moyskladProductFields === undefined ? ['name'] : value.moyskladProductFields;
+  if (!Array.isArray(moyskladProductFields) || moyskladProductFields.some((field) => !allowedProductFields.includes(field as typeof allowedProductFields[number])) || new Set(moyskladProductFields).size !== moyskladProductFields.length || (productCatalogId && !moyskladProductFields.includes('name'))) {
+    throw new BadRequestException('moyskladProductFields must be unique supported product fields and include name when a catalog is selected');
+  }
   const pairs = (items: unknown[], label: string) => {
     const seen = new Set<string>();
     return items.map((item) => {
@@ -514,7 +529,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

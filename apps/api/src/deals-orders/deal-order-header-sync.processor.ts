@@ -45,7 +45,7 @@ export class DealOrderHeaderSyncProcessor {
     const baselineMs = scalar((baseline.moyskladValues as Record<string, unknown>)[`rule:${rule.id}`]);
     const previous = await transaction.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
     if (!previous) {
-      await transaction.entityPairSyncState.createMany({ data: [{ pairId: pair.id, settingsVersion: baseline.settingsVersion, bitrix24Values: { [FIELD]: baselineB24 }, moyskladValues: { [FIELD]: baselineMs } }], skipDuplicates: true });
+      await transaction.entityPairSyncState.createMany({ data: [{ pairId: pair.id, settingsVersion: baseline.settingsVersion, bitrix24Values: { ...jsonRecord(baseline.bitrix24Values), [FIELD]: baselineB24 }, moyskladValues: { ...jsonRecord(baseline.moyskladValues), [FIELD]: baselineMs } }], skipDuplicates: true });
       return 'BASELINE_INITIALIZED';
     }
     if (previous.settingsVersion !== baseline.settingsVersion) return 'BASELINE_MISSING';
@@ -154,10 +154,13 @@ export class DealOrderHeaderSyncProcessor {
   }
 
   private async persist(transaction: Prisma.TransactionClient, pairId: string, settingsVersion: number, b24: string, ms: string) {
+    const previous = await transaction.entityPairSyncState.findUnique({ where: { pairId }, select: { bitrix24Values: true, moyskladValues: true } });
+    const bitrix24Values = { ...jsonRecord(previous?.bitrix24Values), [FIELD]: b24 };
+    const moyskladValues = { ...jsonRecord(previous?.moyskladValues), [FIELD]: ms };
     await transaction.entityPairSyncState.upsert({
       where: { pairId },
-      create: { pairId, settingsVersion, bitrix24Values: { [FIELD]: b24 }, moyskladValues: { [FIELD]: ms } },
-      update: { settingsVersion, bitrix24Values: { [FIELD]: b24 }, moyskladValues: { [FIELD]: ms } },
+      create: { pairId, settingsVersion, bitrix24Values, moyskladValues },
+      update: { settingsVersion, bitrix24Values, moyskladValues },
     });
   }
 }
@@ -173,4 +176,5 @@ function localEndpoint(value?: string): URL | null {
 
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
 function scalar(value: unknown): string | null { return typeof value === 'string' ? value : null; }
+function jsonRecord(value: Prisma.JsonValue | null | undefined): Record<string, unknown> { return isRecord(value) ? value : {}; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
