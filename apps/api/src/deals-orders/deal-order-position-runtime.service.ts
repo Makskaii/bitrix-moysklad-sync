@@ -372,7 +372,7 @@ export class DealOrderPositionRuntimeService {
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_REJECTED' };
       }
       if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || typeof product.uom.id !== 'string') {
-        return { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_INVALID' };
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_INVALID' };
       }
       if (product.uom.id !== unit.moyskladId) {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_UNIT_MISMATCH');
@@ -589,7 +589,7 @@ class PositionProviderRequestError extends Error {
 }
 function isTransientProductLookupFailure(error: unknown): boolean {
   if (!(error instanceof PositionProviderRequestError)) return false;
-  if (error.failure === 'NETWORK' || error.failure === 'INVALID_BODY') return true;
+  if (error.failure === 'NETWORK') return true;
   return error.status === 408 || error.status === 425 || error.status === 429 || (error.status !== null && error.status >= 500);
 }
 function safeNextHref(href: string, base: URL): URL { const next = new URL(href); if (next.origin !== base.origin || !next.pathname.includes('/entity/customerorder/')) throw new Error(); return next; }

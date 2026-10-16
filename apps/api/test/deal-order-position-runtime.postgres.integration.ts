@@ -25,7 +25,7 @@ let calls: Array<{ method: string; path: string }> = [];
 let positionAdds = 0;
 let failPositionReadId: string | null = null;
 let pauseAfterNextMsPositionUpdate = false;
-let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' = 'NORMAL';
+let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MALFORMED_JSON' | 'INVALID_SHAPE' | 'INVALID_UOM' | 'UNAUTHORIZED' = 'NORMAL';
 let productReadCalls = 0;
 
 before(async () => {
@@ -242,6 +242,41 @@ test('transient MySklad product lookup failures retry without skipping, then add
   }
 });
 
+test('invalid product responses and non-transient 4xx are held without skipping, then resume without a duplicate', async () => {
+  const cases: Array<{ behavior: 'MALFORMED_JSON' | 'INVALID_SHAPE' | 'INVALID_UOM' | 'UNAUTHORIZED'; dealId: string }> = [
+    { behavior: 'MALFORMED_JSON', dealId: uniqueDealId() },
+    { behavior: 'INVALID_SHAPE', dealId: uniqueDealId() },
+    { behavior: 'INVALID_UOM', dealId: uniqueDealId() },
+    { behavior: 'UNAUTHORIZED', dealId: uniqueDealId() },
+  ];
+  for (const { behavior, dealId } of cases) {
+    const one = await seed(dealId);
+    b24Rows = [b24Rows[0], { id: '305', productId: 904, measureCode: 796, quantity: 1, price: 7, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
+    positionAdds = 0;
+    productReadBehavior = behavior;
+    productReadCalls = 0;
+    const eventId = `event-add-product-invalid-${behavior.toLowerCase()}-${dealId}`;
+    try {
+      const held = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+      assert.equal(held.status, 'MANUAL_REVIEW', behavior);
+      assert.equal(positionAdds, 0, `${behavior} must not add a row`);
+      assert.equal(await db.dealOrderPositionAddOperation.findUnique({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '305' } } }), null,
+        `${behavior} must not persist an add operation`);
+      const journal = await db.operationalLog.findMany({ where: { referenceId: eventId } });
+      assert.equal(journal.some((entry) => entry.message.includes('DEAL_ORDER_POSITION_ROW_SKIPPED')), false,
+        `${behavior} must be held, not silently skipped`);
+
+      productReadBehavior = 'NORMAL';
+      const retry = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+      assert.deepEqual(retry, { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN' }, `${behavior} should resume after provider data is corrected`);
+      assert.equal(positionAdds, 1);
+      const resumed = await runtime.process({ pair: confirmed(one.pair), eventId, eventConfig: config() });
+      assert.deepEqual(resumed, { status: 'SYNCED', rowValuesChanged: true });
+      assert.equal(positionAdds, 1, `${behavior} repeat must not create a duplicate`);
+    } finally { productReadBehavior = 'NORMAL'; }
+  }
+});
+
 async function seed(dealId: string) {
   await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
   const orderId = randomUUID();
@@ -286,6 +321,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (productReadCalls > 1 && productReadBehavior === 'SERVER_ERROR') return send(response, {}, 500);
     if (productReadCalls > 1 && productReadBehavior === 'NETWORK_ERROR') { request.socket.destroy(); return; }
     if (productReadCalls > 1 && productReadBehavior === 'TIMEOUT') return;
+    if (productReadCalls > 1 && productReadBehavior === 'MALFORMED_JSON') { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{'); return; }
+    if (productReadCalls > 1 && productReadBehavior === 'INVALID_SHAPE') return send(response, { id: productId, meta: { type: 'service' }, uom: { id: unitId } });
+    if (productReadCalls > 1 && productReadBehavior === 'INVALID_UOM') return send(response, { id: productId, meta: { type: 'product' }, uom: { id: 796 } });
+    if (productReadCalls > 1 && productReadBehavior === 'UNAUTHORIZED') return send(response, {}, 401);
     return send(response, { id: productId, meta: { type: 'product' }, uom: { id: unitId } });
   }
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
