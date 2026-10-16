@@ -18,10 +18,12 @@ function createDatabase() {
   const reviews: Review[] = [];
   let nextId = 0;
   const requeueCalls: unknown[] = [];
+  const audits: Array<Record<string, unknown>> = [];
   const database = {
     pairs,
     reviews,
     requeueCalls,
+    audits,
     entityPair: {
       findFirst: async ({ where }: { where: Partial<Pair> }) => pairs.find((pair) =>
         Object.entries(where).every(([key, value]) => pair[key as keyof Pair] === value)) ?? null,
@@ -65,8 +67,9 @@ function createDatabase() {
         return { count: matches.length };
       },
     },
-    clientInventoryObject: { updateMany: async () => ({ count: 0 }) },
+    clientInventoryObject: { updateMany: async () => ({ count: 0 }), findMany: async () => [] },
     inboundEvent: { updateMany: async (args: unknown) => { requeueCalls.push(args); return { count: 0 }; } },
+    adminAuditEntry: { create: async ({ data }: { data: Record<string, unknown> }) => { const entry = { ...data, id: `audit-${audits.length + 1}` }; audits.push(entry); return entry; } },
     $queryRaw: async () => [],
     $transaction: async <T>(operation: (tx: unknown) => Promise<T>) => operation(database as unknown),
   };
@@ -130,6 +133,18 @@ test('manual reassignment requires an explicit replace flag and keeps prior assi
   assert.equal(database.pairs.find((pair) => pair.id === original.id)?.active, false);
   assert.equal(replacement.active, true);
   assert.equal((await pairs.listActive('DEAL')).length, 1);
+});
+
+test('admin pair reassignments preserve old and new IDs in the audit trail', async () => {
+  const database = createDatabase();
+  const pairs = new EntityPairService(database as never);
+  const original = await pairs.assign({ entityType: 'DEAL', bitrix24Id: 'deal-42', moyskladId: 'order-9' });
+  const replacement = await pairs.assign({ entityType: 'DEAL', bitrix24Id: 'deal-42', moyskladId: 'order-10', replaceExisting: true }, 'BITRIX24_USER:7');
+  const entry = database.audits[0];
+  assert.equal(entry.action, 'PAIR_REASSIGNED');
+  assert.equal(entry.actorId, 'BITRIX24_USER:7');
+  assert.deepEqual(entry.before, [{ id: original.id, entityType: 'DEAL', bitrix24Id: 'deal-42', moyskladId: 'order-9', moyskladType: null, moyskladParentId: null, reason: 'ADMIN_ASSIGNED' }]);
+  assert.deepEqual(entry.after, { id: replacement.id, entityType: 'DEAL', bitrix24Id: 'deal-42', moyskladId: 'order-10', moyskladType: null, moyskladParentId: null, reason: 'ADMIN_REASSIGNED' });
 });
 
 test('manual CONTACT pairs require a native MoySklad type and parent ID for nested contacts', async () => {

@@ -3,6 +3,7 @@ import { DatabaseService } from '../database.service';
 import { EntityType, isEntityType } from './pair-resolver';
 import { isUniqueConstraintError } from './pair-db-errors';
 import { lockEntityPairState } from './pair-db-lock';
+import { createAdminAuditEntry } from '../admin/admin-audit.service';
 
 export type { EntityType } from './pair-resolver';
 
@@ -18,6 +19,9 @@ export type EntityPairDto = {
   source: string;
   reason: string | null;
   createdAt: Date;
+  bitrix24Label?: string | null;
+  moyskladLabel?: string | null;
+  labelStatus?: 'CACHED_NAMES_AVAILABLE' | 'CACHED_NAMES_UNAVAILABLE';
 };
 
 /** Stable queue shape for an unresolved source-side identity. */
@@ -31,6 +35,8 @@ export type PairReviewDto = {
   status: 'OPEN';
   openedAt: Date;
   resolvedAt: Date | null;
+  sourceLabel: string | null;
+  labelStatus: 'CACHED_NAME_AVAILABLE' | 'CACHED_NAME_UNAVAILABLE';
 };
 
 type PairSourceSystem = 'BITRIX24' | 'MOYSKLAD';
@@ -54,7 +60,20 @@ export class EntityPairService {
       orderBy: [{ entityType: 'asc' }, { createdAt: 'desc' }],
       select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, moyskladParentId: true, active: true, source: true, reason: true, createdAt: true },
     });
-    return rows.map((row) => ({ ...row, entityType: row.entityType as EntityType, active: true }));
+    const labels = await this.database.clientInventoryObject.findMany({
+      where: { OR: rows.flatMap((row) => [
+        { system: 'BITRIX24', entityType: row.entityType, externalId: row.bitrix24Id },
+        { system: 'MOYSKLAD', entityType: row.entityType, externalId: row.moyskladId },
+      ]) },
+      select: { system: true, entityType: true, externalId: true, displayLabel: true },
+    });
+    const labelByKey = new Map(labels.map((row) => [`${row.system}:${row.entityType}:${row.externalId}`, row.displayLabel]));
+    return rows.map((row) => {
+      const bitrix24Label = labelByKey.get(`BITRIX24:${row.entityType}:${row.bitrix24Id}`) ?? null;
+      const moyskladLabel = labelByKey.get(`MOYSKLAD:${row.entityType}:${row.moyskladId}`) ?? null;
+      return { ...row, entityType: row.entityType as EntityType, active: true, bitrix24Label, moyskladLabel,
+        labelStatus: bitrix24Label && moyskladLabel ? 'CACHED_NAMES_AVAILABLE' as const : 'CACHED_NAMES_UNAVAILABLE' as const };
+    });
   }
 
   async listOpenReviews(): Promise<PairReviewDto[]> {
@@ -62,10 +81,19 @@ export class EntityPairService {
       where: { status: 'OPEN' }, orderBy: { openedAt: 'asc' },
       select: { id: true, entityType: true, sourceSystem: true, sourceEntityId: true, eventId: true, reason: true, status: true, openedAt: true, resolvedAt: true },
     });
-    return rows.map((row) => ({ ...row, entityType: row.entityType as EntityType, sourceSystem: row.sourceSystem as PairSourceSystem, status: 'OPEN' as const }));
+    const labels = await this.database.clientInventoryObject.findMany({
+      where: { OR: rows.map((row) => ({ system: row.sourceSystem, entityType: row.entityType, externalId: row.sourceEntityId })) },
+      select: { system: true, entityType: true, externalId: true, displayLabel: true },
+    });
+    const labelByKey = new Map(labels.map((row) => [`${row.system}:${row.entityType}:${row.externalId}`, row.displayLabel]));
+    return rows.map((row) => {
+      const sourceLabel = labelByKey.get(`${row.sourceSystem}:${row.entityType}:${row.sourceEntityId}`) ?? null;
+      return { ...row, entityType: row.entityType as EntityType, sourceSystem: row.sourceSystem as PairSourceSystem, status: 'OPEN' as const,
+        sourceLabel, labelStatus: sourceLabel ? 'CACHED_NAME_AVAILABLE' as const : 'CACHED_NAME_UNAVAILABLE' as const };
+    });
   }
 
-  async assign(input: AssignEntityPairInput): Promise<EntityPairDto> {
+  async assign(input: AssignEntityPairInput, actorId?: string): Promise<EntityPairDto> {
     validate(input);
     try {
       return await this.database.$transaction(async (transaction) => {
@@ -119,6 +147,15 @@ export class EntityPairService {
             reason: conflicts.length ? 'ADMIN_REASSIGNED' : 'ADMIN_ASSIGNED',
           },
         });
+        if (actorId) await createAdminAuditEntry(transaction, {
+          actorId,
+          action: conflicts.length ? 'PAIR_REASSIGNED' : 'PAIR_CREATED',
+          targetType: 'EntityPair',
+          targetId: pair.id,
+          reason: pair.reason,
+          before: conflicts.map(({ id, entityType, bitrix24Id, moyskladId, moyskladType, moyskladParentId, reason }) => ({ id, entityType, bitrix24Id, moyskladId, moyskladType, moyskladParentId, reason })),
+          after: { id: pair.id, entityType: pair.entityType, bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, moyskladType: pair.moyskladType, moyskladParentId: pair.moyskladParentId, reason: pair.reason },
+        });
         await transaction.pairReviewCase.updateMany({
           where: {
             entityType: input.entityType,
@@ -150,21 +187,7 @@ export class EntityPairService {
           },
           data: { status: 'RESOLVED', resolvedAt: new Date() },
         });
-        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
-          where: {
-            source: 'BITRIX24', externalEntityType: 'deal', externalEntityId: input.bitrix24Id,
-            status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
-          },
-          data: { status: 'RECEIVED', lastErrorCategory: null },
-        });
-        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
-          where: {
-            source: 'MOYSKLAD', externalEntityType: 'customerorder', externalEntityId: input.moyskladId,
-            status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
-          },
-          data: { status: 'RECEIVED', lastErrorCategory: null },
-        });
-        return { ...pair, entityType: pair.entityType as EntityType, active: true };
+        return { ...pair, entityType: pair.entityType as EntityType, active: true, labelStatus: 'CACHED_NAMES_UNAVAILABLE' as const };
       });
     } catch (error) {
       if (error instanceof ConflictException) throw error;

@@ -1,7 +1,7 @@
 export type ClientInventoryEntity = 'COMPANY' | 'CONTACT';
 export type ClientInventoryTargetType = 'counterparty' | 'contactperson';
-export type BitrixClientRow = { id: string; uuid: string | null };
-export type MoyskladClientRow = { id: string; parentId?: string | null; companyType?: string | null };
+export type BitrixClientRow = { id: string; uuid: string | null; displayLabel?: string | null };
+export type MoyskladClientRow = { id: string; parentId?: string | null; companyType?: string | null; displayLabel?: string | null };
 export type ClientPage<T> = { rows: T[]; next: number | null; total: number | null };
 
 export interface ClientInventoryProvider {
@@ -18,15 +18,19 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     const base = requiredUrl(process.env.BITRIX24_REST_BASE_URL, 'Bitrix24 REST URL');
     const method = entity === 'COMPANY' ? 'crm.company.list.json' : 'crm.contact.list.json';
     const field = entity === 'COMPANY' ? 'UF_CRM_1719834633' : 'UF_CRM_1719834658';
+    const labelFields = entity === 'COMPANY' ? ['TITLE'] : ['LAST_NAME', 'NAME', 'SECOND_NAME'];
     const payload = await this.request(new URL(method, withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams([['select[]', 'ID'], ['select[]', field], ['start', String(start)], ['auth', accessToken]]),
+      body: new URLSearchParams([['select[]', 'ID'], ['select[]', field], ...labelFields.map((name) => ['select[]', name] as [string, string]), ['start', String(start)], ['auth', accessToken]]),
     });
     const result = isRecord(payload) ? payload.result : null;
     if (!Array.isArray(result)) throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_RESPONSE');
     const rows = result.map((row) => {
       if (!isRecord(row) || !readId(row.ID)) throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_ROW');
-      return { id: readId(row.ID)!, uuid: readOptionalString(row[field]) };
+      const displayLabel = entity === 'COMPANY'
+        ? safeDisplayLabel(row.TITLE)
+        : safeDisplayLabel([row.LAST_NAME, row.NAME, row.SECOND_NAME].filter((part) => typeof part === 'string' && part.trim()).join(' '));
+      return { id: readId(row.ID)!, uuid: readOptionalString(row[field]), displayLabel };
     });
     if (!isRecord(payload) || !Number.isInteger(payload.total) || Number(payload.total) < 0) {
       throw new Error('BITRIX24_CLIENT_INVENTORY_INVALID_PAGINATION');
@@ -50,7 +54,7 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     url.searchParams.set('offset', String(offset));
     // companyType is the minimal native metadata needed to distinguish
     // organization counterparties from individual clients in the UUID map.
-    url.searchParams.set('fields', 'id,companyType');
+    url.searchParams.set('fields', 'id,name,companyType');
     return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }), offset);
   }
 
@@ -58,7 +62,7 @@ export class HttpClientInventoryProvider implements ClientInventoryProvider {
     const url = this.moyskladUrl(`entity/counterparty/${encodeURIComponent(counterpartyId)}/contactpersons`);
     url.searchParams.set('limit', '1000');
     url.searchParams.set('offset', String(offset));
-    url.searchParams.set('fields', 'id');
+    url.searchParams.set('fields', 'id,name');
     return readMoyskladPage(await this.request(url, { method: 'GET', headers: this.moyskladHeaders() }), offset, counterpartyId);
   }
 
@@ -96,6 +100,7 @@ function readMoyskladPage(payload: unknown, requestedOffset: number, parentId?: 
     return {
       id: readId(row.id)!, parentId: parentId ?? null,
       ...(parentId === undefined ? { companyType: readOptionalString(row.companyType) } : {}),
+      displayLabel: safeDisplayLabel(row.name),
     };
   });
   const total = Number(size);
@@ -113,6 +118,12 @@ function readId(value: unknown): string | null {
 
 function readOptionalString(value: unknown): string | null {
   return typeof value === 'string' && value.length ? value : null;
+}
+
+function safeDisplayLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const label = value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
+  return label || null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

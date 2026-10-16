@@ -5,6 +5,8 @@ test('risky mode changes require UI confirmation and unavailable directions stay
   const directionWrites: unknown[] = [];
   let currentMode = 'off';
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
+  await page.route('**/api/admin/overview', (route) => route.fulfill({ json: { queue: {}, openManualReviews: 0, openPairReviews: 0, activePairs: 0, lastEventAt: null } }));
+  await page.route('**/api/admin/audit**', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode', (route) => {
     if (route.request().method() === 'PATCH') {

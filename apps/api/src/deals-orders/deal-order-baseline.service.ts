@@ -105,6 +105,13 @@ export class DealOrderBaselineService {
 
 function projectApprovedValues(config: VersionedFieldSettingsDto['config'], record: Record<string, unknown>, system: 'bitrix24' | 'moysklad') {
   const values: Record<string, unknown> = {};
+  if (system === 'bitrix24') {
+    values['client:companyId'] = approvedValue(record.COMPANY_ID);
+    values['deal-order-total'] = { amount: approvedValue(record.OPPORTUNITY), currencyCode: approvedValue(record.CURRENCY_ID) };
+  } else {
+    values['client:agentId'] = approvedValue(agentId(record.agent));
+    values['deal-order-total'] = { amount: approvedValue(record.sum), currencyCode: approvedValue(orderCurrencyCode(record)) };
+  }
   const rules = Array.isArray(config.rules) ? config.rules : [];
   for (const rule of rules) {
     if (rule.entity !== 'deals-orders' || (!rule.bitrix24ToMoysklad.enabled && !rule.moyskladToBitrix24.enabled)) continue;
@@ -122,6 +129,11 @@ function projectApprovedValues(config: VersionedFieldSettingsDto['config'], reco
   return values;
 }
 
+function orderCurrencyCode(record: Record<string, unknown>): unknown {
+  const currency = isRecord(record.currency) ? record.currency : isRecord(record.rate) && isRecord(record.rate.currency) ? record.rate.currency : null;
+  return currency?.isoCode ?? currency?.code ?? null;
+}
+
 function approvedValue(value: unknown): unknown {
   if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value ?? null;
   if (Array.isArray(value)) return value.slice(0, 100).map(approvedValue);
@@ -137,6 +149,14 @@ function approvedValue(value: unknown): unknown {
     return result;
   }
   return null;
+}
+
+function agentId(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.id)) return value.id;
+  if (!isRecord(value.meta) || typeof value.meta.href !== 'string') return null;
+  const match = /\/counterparty\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?(?:\?.*)?$/i.exec(value.meta.href);
+  return match?.[1] ?? null;
 }
 
 function readTimestamp(value: unknown): Date | null {

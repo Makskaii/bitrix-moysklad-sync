@@ -386,6 +386,7 @@ function safeDealEventType(value: string | null): string | null {
 }
 
 function bitrixEntityType(value: string | null): string | null {
+  if (value === 'CATALOG.PRODUCT.ON.DELETE') return 'product';
   if (value?.startsWith('ONCRMDEAL')) return 'deal';
   if (value?.startsWith('ONCRMCONTACT')) return 'contact';
   if (value?.startsWith('ONCRMCOMPANY')) return 'company';

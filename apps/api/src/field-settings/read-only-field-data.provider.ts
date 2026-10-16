@@ -5,6 +5,7 @@ export type CatalogCandidate = { id: string; code: string; label: string };
 export type LiveFieldCatalogs = {
   units: { bitrix24: CatalogCandidate[]; moysklad: CatalogCandidate[] };
   priceTypes: { bitrix24: CatalogCandidate[]; moysklad: CatalogCandidate[] };
+  productCatalogs: CatalogCandidate[];
 };
 export type NamedReferenceItem = { id: string; code: string; label: string; group?: string };
 export type LiveReferenceCatalogs = Record<'employees' | 'currencies' | 'organizations' | 'warehouses' | 'projects' | 'dealStages', { bitrix24: NamedReferenceItem[]; moysklad: NamedReferenceItem[] }>;
@@ -47,12 +48,15 @@ export class ReadOnlyFieldDataProvider {
   }
 
   async catalogs(bitrixAccessToken: string): Promise<LiveFieldCatalogs> {
-    const [b24Units, b24Prices, msUnits, msPrices] = await Promise.all([
+    const [b24Units, b24Prices, msUnits, msPrices, catalogPayload] = await Promise.all([
       this.bitrixList(bitrixAccessToken, 'catalog.measure.list'),
       this.bitrixList(bitrixAccessToken, 'catalog.priceType.list'),
       this.moyskladList('/entity/uom'),
       this.moyskladList('/context/companysettings/pricetype'),
+      this.bitrixCall(bitrixAccessToken, 'catalog.catalog.list', {}),
     ]);
+    const catalogRoot = asRecord(catalogPayload);
+    const catalogRows = Array.isArray(catalogRoot.catalogs) ? catalogRoot.catalogs : Array.isArray(catalogPayload) ? catalogPayload : [];
     return {
       units: {
         bitrix24: b24Units.map((row) => ({ id: text(row.id), code: text(row.code ?? row.symbolIntl ?? row.symbol), label: text(row.name ?? row.title ?? row.symbolIntl ?? row.code) })),
@@ -62,6 +66,11 @@ export class ReadOnlyFieldDataProvider {
         bitrix24: b24Prices.map((row) => ({ id: text(row.id), code: text(row.xmlId ?? row.code ?? row.name), label: text(row.name ?? row.code) })),
         moysklad: msPrices.map((row) => ({ id: text(row.id), code: text(row.externalCode ?? row.name), label: text(row.name) })),
       },
+      productCatalogs: catalogRows.filter(isRecord).flatMap((row) => {
+        const id = row.id;
+        if (!(typeof id === 'string' || typeof id === 'number') || !/^\d+$/.test(String(id))) return [];
+        return [{ id: String(id), code: String(row.code ?? id), label: String(row.name ?? row.title ?? `Каталог ${id}`) }];
+      }),
     };
   }
 

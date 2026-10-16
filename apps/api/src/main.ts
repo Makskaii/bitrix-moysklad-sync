@@ -4,6 +4,9 @@ import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { resolve } from 'node:path';
 import { AdminController } from './admin/admin.controller';
+import { AdminAuditController } from './admin/admin-audit.controller';
+import { AdminAuditService } from './admin/admin-audit.service';
+import { ClientLifecycleController } from './admin/client-lifecycle.controller';
 import { AdminAccessGuard } from './admin/admin-access.guard';
 import { ContactSyncStatusController } from './admin/contact-sync-status.controller';
 import { SyncModeController } from './admin/sync-mode.controller';
@@ -28,6 +31,12 @@ import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.service';
 import { DryRunDocumentReader } from './dry-run-document-reader';
 import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
+import { DealOrderCreationPreparer } from './deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreateOperationService } from './deals-orders/deal-order-create-operation.service';
+import { DealOrderPositionRuntimeService } from './deals-orders/deal-order-position-runtime.service';
+import { DealOrderFieldRuntimeService } from './deals-orders/deal-order-field-runtime.service';
+import { DealOrderReverseCreateService } from './deals-orders/deal-order-reverse-create.service';
+import { DealOrderTotalReconciliationHandler } from './deals-orders/deal-order-total-reconciliation';
 import { HistoricalInventoryController } from './admin/historical-inventory.controller';
 import { HistoricalInventoryService } from './historical-inventory.service';
 import { HistoricalDealOrderMatchingController } from './admin/historical-deal-order-matching.controller';
@@ -46,6 +55,7 @@ import { EventWorkerLeaseService } from './event-worker-lease.service';
 import { ProductCardEventProcessor } from './products/product-card-event.processor';
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
+import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from './clients/client-lifecycle.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
@@ -63,19 +73,20 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
+  controllers: [AppController, AdminController, AdminAuditController, ClientLifecycleController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
-    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
+    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
     EventWorkerLeaseService, DatabaseRecoveryService,
-    WebhookDiagnosticLog, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
-    FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+    WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
+    FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
     DryRunWriteJournal,
     { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCardRuntimeService, ProductCardEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
     { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
-    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor,
+    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, ClientLifecycleService,
+    { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
 class AppModule {}

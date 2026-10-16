@@ -1,8 +1,12 @@
 import { Controller, DynamicModule, Get, Module, Provider, Type } from '@nestjs/common';
 import { AdminController } from './admin.controller';
+import { AdminAuditController } from './admin-audit.controller';
+import { AdminAuditService } from './admin-audit.service';
+import { ClientLifecycleController } from './client-lifecycle.controller';
 import { AdminPreviewController } from './admin-preview.controller';
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
+import { DatabaseRecoveryService } from '../database-recovery.service';
 import { SyncModeController } from './sync-mode.controller';
 import { SyncModeService } from '../sync-mode.service';
 import { SyncRecoveryService } from '../sync-recovery.service';
@@ -24,6 +28,12 @@ import { PairFirstEventProcessor } from '../pairs/pair-first-event.processor';
 import { PairResolutionController } from './pair-resolution.controller';
 import { DealOrderBaselineService } from '../deals-orders/deal-order-baseline.service';
 import { DealOrderHeaderSyncProcessor } from '../deals-orders/deal-order-header-sync.processor';
+import { DealOrderCreationPreparer } from '../deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreateOperationService } from '../deals-orders/deal-order-create-operation.service';
+import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
+import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
+import { DealOrderReverseCreateService } from '../deals-orders/deal-order-reverse-create.service';
+import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-total-reconciliation';
 import { HistoricalInventoryController } from './historical-inventory.controller';
 import { HistoricalInventoryService } from '../historical-inventory.service';
 import { ReadOnlyFieldDataProvider } from '../field-settings/read-only-field-data.provider';
@@ -41,17 +51,20 @@ import { EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProductCardEventProcessor } from '../products/product-card-event.processor';
 import { ProductCardHttpApi } from '../products/product-card-api';
 import { ProductCardRuntimeService } from '../products/product-card-runtime.service';
+import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from '../clients/client-lifecycle.service';
 
 @Module({})
 export class LocalAdminPreviewModule {
-  static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
+  static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider, localPreviewAccess = true): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController, ClientLifecycleController] : [])],
       providers: [
         databaseProvider,
+        AdminAuditService,
         SyncModeService,
         SyncRecoveryService,
+        DatabaseRecoveryService,
         ContactSyncProcessor,
         ContactSyncStatusReader,
         EventIntakeService,
@@ -60,20 +73,21 @@ export class LocalAdminPreviewModule {
         DryRunWriteJournal,
         DryRunDocumentReader,
         ...(databaseProvider === DatabaseService ? [
-          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor,
+          FieldSettingsService, { provide: ReadOnlyFieldDataProvider, useClass: fieldDataProvider }, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
           HistoricalInventoryService,
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
           { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
           { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
           { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
-          ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor,
-          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
+          ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor, ClientLifecycleService,
+          { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
+          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,
         ] : []),
         WebhookDiagnosticLog,
-        { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: true },
+        { provide: LOCAL_ADMIN_PREVIEW_ACCESS, useValue: localPreviewAccess },
         AdminAccessGuard,
       ],
     };

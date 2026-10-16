@@ -83,3 +83,36 @@ test('nightly execution skips if an inactive interval touched the window after s
     else process.env.SYNC_MODE = oldMode;
   }
 });
+
+test('deal/order provider mutation remains inside the active-pair lifecycle lease', async () => {
+  let locked = false;
+  let activeChecks = 0;
+  const database = {
+    syncSetting: { findUnique: async () => ({ serviceMode: 'on' }) },
+    syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+  };
+  const lifecycle = {
+    withPairActiveLock: async <T>(_pairId: string, _type: string, work: () => Promise<T>) => {
+      assert.equal(locked, false);
+      locked = true;
+      try { return await work(); } finally { locked = false; }
+    },
+    assertPairActive: async () => { activeChecks += 1; assert.equal(locked, true); },
+  };
+  const service = new SyncModeService(database as never, undefined, lifecycle as never);
+  const oldMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  try {
+    const result = await service.runDealOrderExternalWrite('moyskladToBitrix24', async () => true,
+      { id: 'pair-1', entityType: 'DEAL' }, async () => {
+        assert.equal(locked, true);
+        return 'written';
+      });
+    assert.equal(result, 'written');
+    assert.equal(activeChecks, 1);
+    assert.equal(locked, false);
+  } finally {
+    if (oldMode === undefined) delete process.env.SYNC_MODE;
+    else process.env.SYNC_MODE = oldMode;
+  }
+});

@@ -15,6 +15,7 @@ model TrialAction {
 
 model SyncSetting {
   id                        String    @id @default("global")
+  clientDeletionMarkerFields Json     @default("{}")
   serviceMode               String    @default("off")
   offSince                  DateTime?
   lastInactiveAt            DateTime?
@@ -74,6 +75,22 @@ model DatabaseRecoveryAudit {
   recoveryState          DatabaseRecoveryState @relation(fields: [recoveryStateId], references: [id], onDelete: Restrict)
 
   @@index([occurredAt])
+}
+
+model AdminAuditEntry {
+  id         String   @id @default(cuid())
+  actorId    String
+  action     String
+  targetType String
+  targetId   String?
+  reason     String?
+  before     Json?
+  after      Json?
+  occurredAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([targetType, targetId, occurredAt])
 }
 
 model SyncDirectionSetting {
@@ -160,6 +177,10 @@ model ManualReviewCase {
   externalEntityType String?
   reason             String
   diagnostic         Json?
+  entityLabel        String?
+  fieldTitle         String?
+  previousValue      Json?
+  proposedValue      Json?
   status             String    @default("OPEN")
   openedAt           DateTime  @default(now())
   resolvedAt         DateTime?
@@ -235,13 +256,25 @@ model EntityPair {
   active           Boolean              @default(true)
   source           String               @default("MANUAL")
   reason           String?
+  lifecycleStatus  String               @default("ACTIVE")
+  tombstonedAt     DateTime?
+  tombstoneSource  String?
+  tombstoneReason  String?
+  deletionMarkerStatus String            @default("NOT_CONFIGURED")
+  deletionMarkerAttempts Int              @default(0)
+  deletionMarkerRetryAfter DateTime?
+  deletionTimelineStatus String          @default("NOT_REQUIRED")
+  deletionTimelineLeaseUntil DateTime?
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
+  dealOrderPositions DealOrderPositionPair[]
+  dealOrderPositionAdds DealOrderPositionAddOperation[]
 
   @@index([entityType, active, createdAt])
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
+  @@index([lifecycleStatus, tombstonedAt])
 }
 
 model ClientDependencyRetry {
@@ -292,6 +325,7 @@ model ClientInventoryObject {
   nativeType  String
   externalId  String
   matchValue  String?
+  displayLabel String?
   parentId    String?
   companyType String?
   status      String   @default("PENDING")
@@ -327,6 +361,114 @@ model EntityPairSyncState {
   childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model DealOrderCreateOperation {
+  bitrix24DealId String   @id
+  syncId         String   @unique
+  payload        Json
+  confirmedCustomerPairIds Json @default("[]")
+  skippedRows    Json     @default("[]")
+  settingsVersion Int
+  status         String   @default("PENDING")
+  moyskladOrderId String?
+  lastErrorCategory String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
+model DealOrderReverseCreateOperation {
+  moyskladOrderId String   @id
+  syncId          String   @unique
+  eventId         String
+  payload         Json
+  skippedRows     Json     @default("[]")
+  settingsVersion Int
+  status          String   @default("PENDING")
+  bitrix24DealId  String?
+  lastErrorCategory String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  positions       DealOrderReversePositionOperation[]
+
+  @@index([status, updatedAt])
+}
+
+model DealOrderReverseProductOperation {
+  moyskladProductId  String   @id
+  syncId             String   @unique
+  eventId            String
+  settingsVersion    Int
+  bitrix24CatalogId  String
+  payload            Json
+  status             String   @default("PENDING")
+  bitrix24ProductId  String?
+  lastErrorCategory  String?
+  attemptedAt        DateTime?
+  leaseToken         String?
+  leaseUntil         DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
+model DealOrderReversePositionOperation {
+  id                  String   @id @default(cuid())
+  moyskladOrderId     String
+  moyskladPositionId  String
+  payload             Json
+  status              String   @default("PENDING")
+  skipReason          String?
+  bitrix24ProductRowId String?
+  lastErrorCategory   String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  operation           DealOrderReverseCreateOperation @relation(fields: [moyskladOrderId], references: [moyskladOrderId], onDelete: Cascade)
+
+  @@unique([moyskladOrderId, moyskladPositionId])
+  @@index([status, updatedAt])
+}
+
+model DealOrderPositionPair {
+  id                     String     @id @default(cuid())
+  pairId                 String
+  bitrix24ProductRowId   String
+  moyskladPositionId     String
+  bitrix24Values         Json
+  moyskladValues         Json
+  lastSyncedAt           DateTime   @default(now())
+  pair                   EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, bitrix24ProductRowId])
+  @@unique([pairId, moyskladPositionId])
+}
+
+model DealOrderPositionAddOperation {
+  id                   String     @id @default(cuid())
+  pairId               String
+  bitrix24ProductRowId String
+  payload              Json
+  status               String     @default("PENDING")
+  attemptedAt          DateTime?
+  leaseToken           String?
+  leaseUntil           DateTime?
+  moyskladPositionId   String?
+  lastErrorCategory    String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  pair                 EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, bitrix24ProductRowId])
+  @@index([status, updatedAt])
 }
 
 model PairReviewCase {

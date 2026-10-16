@@ -439,6 +439,49 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.equal(invalidSourceSave.status, 400, 'stale/deleted Bitrix24 source references cannot be saved');
 });
 
+test('deal-order runtime requires unique explicitly confirmed header and stage mappings', async () => {
+  const active = await fetch(`${apiUrl}/api/admin/field-settings`).then((response) => response.json()) as { config: Record<string, any> };
+  const config = structuredClone(active.config);
+  const confirmedPair = (kind: string) => config.references.namedPairs.find((pair: any) => pair.kind === kind);
+  const organization = confirmedPair('organizations');
+  const store = confirmedPair('warehouses');
+  const employee = confirmedPair('employees');
+  const currency = confirmedPair('currencies');
+  const stage = confirmedPair('dealStages');
+  store.status = 'confirmed';
+  config.dealOrderRuntime = {
+    nativeOrderNumberingVerified: true,
+    bitrix24ProductCatalogId: '11',
+    moyskladProductFields: ['name', 'code', 'description'],
+    defaultOrganizationId: organization.moyskladId,
+    defaultStoreId: store.moyskladId,
+    defaultEmployeeId: employee.moyskladId,
+    currencies: [{ bitrix24Code: currency.bitrix24Id, moyskladId: currency.moyskladId }],
+    stages: [{ bitrix24StageId: stage.bitrix24Id, moyskladId: stage.moyskladId, creationEnabled: true }],
+    organizations: [{ bitrix24Id: organization.bitrix24Id, moyskladId: organization.moyskladId }],
+    stores: [{ bitrix24Id: store.bitrix24Id, moyskladId: store.moyskladId }],
+    employees: [{ bitrix24Id: employee.bitrix24Id, moyskladId: employee.moyskladId }],
+  };
+  const save = async (candidate: unknown) => fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: candidate }),
+  });
+  const accepted = await save(config);
+  assert.equal(accepted.status, 200);
+  const duplicate = structuredClone(config);
+  duplicate.dealOrderRuntime.stages.push({ ...duplicate.dealOrderRuntime.stages[0] });
+  assert.equal((await save(duplicate)).status, 400, 'duplicate stage source IDs are rejected');
+  const invalid = structuredClone(config);
+  invalid.dealOrderRuntime.defaultStoreId = 'not-a-uuid';
+  assert.equal((await save(invalid)).status, 400, 'unvalidated default references are rejected');
+  const staleCatalog = structuredClone(config);
+  staleCatalog.dealOrderRuntime.bitrix24ProductCatalogId = '12';
+  assert.equal((await save(staleCatalog)).status, 400, 'unlisted product catalogs cannot be selected');
+  const missingRequiredProductName = structuredClone(config);
+  missingRequiredProductName.dealOrderRuntime.moyskladProductFields = ['code'];
+  assert.equal((await save(missingRequiredProductName)).status, 400, 'new product cards require the explicitly allowed source name');
+});
+
 test('saving creates an immutable version and activates it for future events only', async () => {
   const originalResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal(originalResponse.status, 200);

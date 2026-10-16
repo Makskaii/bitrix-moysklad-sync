@@ -16,6 +16,7 @@ const targetId = randomUUID();
 const pairId = `client-apply-pair-${suffix}`;
 const eventIds: string[] = [];
 let database: DatabaseService;
+let settings: FieldSettingsService;
 let server: Server;
 let address: string;
 let bitrix: Record<string, unknown>;
@@ -31,7 +32,7 @@ before(async () => {
   assert.notEqual(databaseUrl.searchParams.get('schema'), dryDatabaseUrl.searchParams.get('schema'));
   process.env.SYNC_MODE = 'apply';
   database = new DatabaseService();
-  const settings = new FieldSettingsService(database, {
+  settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
         bitrix24: [{ code: 'TITLE', writable: true }],
@@ -110,7 +111,6 @@ after(async () => {
 });
 
 test('APPLY client field writes use only fake loopback providers and persist confirmed readbacks', async () => {
-  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
   const gateway = new HttpClientSyncGateway();
   const processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, gateway, { readCompanyInn: async () => null } as never);
   const accept = async (key: string, source: 'BITRIX24' | 'MOYSKLAD') => {
@@ -135,4 +135,20 @@ test('APPLY client field writes use only fake loopback providers and persist con
   assert.ok(writes.some((request) => request.method === 'PUT' && request.path.includes('/entity/counterparty/')));
   assert.ok(writes.some((request) => request.method === 'POST' && request.path.endsWith('/crm.company.update.json')));
   assert.ok(writes.every((request) => new URL(request.path, address).origin === address), 'all requests remained inside the loopback fake provider');
+
+  const active = await settings.active();
+  await settings.save({ ...active.config, rules: [{ id: 'company-title-name-critical', entity: 'companies', sourceField: 'TITLE', targetField: 'name', criticality: 'critical',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }], groups: [] }, 'synthetic-loopback-token');
+  bitrix = { ...bitrix, TITLE: '' };
+  const clearEventId = await accept('critical-clear', 'BITRIX24');
+  assert.equal(await processor.process(clearEventId), 'REVIEW', 'a critical source-side clear is held for review instead of erasing the target');
+  const review = await database.manualReviewCase.findUnique({ where: { eventId: clearEventId } });
+  assert.equal(review?.reason, 'CRITICAL_FIELD_CLEAR_REVIEW');
+  assert.equal(review?.fieldTitle, 'name');
+  assert.equal(review?.previousValue, 'Updated in MySklad');
+  assert.equal(review?.proposedValue, 'Updated in MySklad', 'the prior target value is the explicit suggested restore value');
+  assert.equal(moysklad.name, 'Updated in MySklad', 'the external target was not cleared');
+  assert.ok(JSON.stringify(review?.diagnostic).includes('sourceProposedValue'), 'the incoming empty value is distinguished from the restore suggestion');
 });

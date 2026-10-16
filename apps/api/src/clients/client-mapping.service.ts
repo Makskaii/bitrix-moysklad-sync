@@ -67,7 +67,7 @@ export class ClientMappingService {
         ...(after ? { OR: [{ system: { gt: after.system } }, { system: after.system, entityType: { gt: after.entityType } }, { system: after.system, entityType: after.entityType, externalId: { gt: after.externalId } }] } : {}),
       },
       orderBy: [{ system: 'asc' }, { entityType: 'asc' }, { externalId: 'asc' }], take: 101,
-      select: { system: true, entityType: true, nativeType: true, externalId: true, matchValue: true, parentId: true, reason: true, observedAt: true },
+      select: { system: true, entityType: true, nativeType: true, externalId: true, matchValue: true, displayLabel: true, parentId: true, reason: true, observedAt: true },
     });
     const hasMore = rows.length > 100;
     const entries = rows.slice(0, 100);
@@ -155,8 +155,8 @@ export class ClientMappingService {
     for (const row of rows) {
       await this.database.clientInventoryObject.upsert({
         where: { system_entityType_externalId: { system: 'BITRIX24', entityType, externalId: row.id } },
-        create: { system: 'BITRIX24', entityType, nativeType: entityType === 'COMPANY' ? 'company' : 'contact', externalId: row.id, matchValue: row.uuid, status: 'PENDING' },
-        update: { matchValue: row.uuid, status: 'PENDING', reason: null, observedAt: new Date() },
+        create: { system: 'BITRIX24', entityType, nativeType: entityType === 'COMPANY' ? 'company' : 'contact', externalId: row.id, matchValue: row.uuid, displayLabel: row.displayLabel, status: 'PENDING' },
+        update: { matchValue: row.uuid, displayLabel: row.displayLabel, status: 'PENDING', reason: null, observedAt: new Date() },
       });
       await this.checkLease(owner);
     }
@@ -168,8 +168,8 @@ export class ClientMappingService {
       for (const entityType of entityTypes) {
         await this.database.clientInventoryObject.upsert({
           where: { system_entityType_externalId: { system: 'MOYSKLAD', entityType, externalId: row.id } },
-          create: { system: 'MOYSKLAD', entityType, nativeType, externalId: row.id, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, status: 'INVENTORIED' },
-          update: { nativeType, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, status: 'INVENTORIED', reason: null, observedAt: new Date() },
+          create: { system: 'MOYSKLAD', entityType, nativeType, externalId: row.id, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, displayLabel: row.displayLabel, status: 'INVENTORIED' },
+          update: { nativeType, parentId: row.parentId ?? null, companyType: nativeType === 'counterparty' ? row.companyType ?? null : null, displayLabel: row.displayLabel, status: 'INVENTORIED', reason: null, observedAt: new Date() },
         });
       }
       await this.checkLease(owner);
