@@ -75,6 +75,10 @@ export class DealOrderFieldRuntimeService {
     });
     let heldRules = 0;
     for (const rule of rules) {
+      // COMMENTS/description is deliberately owned by the local header
+      // processor, whose readiness gate prevents this pilot mapping from
+      // falling through to generic attribute writes.
+      if (rule.sourceField === 'COMMENTS' && rule.targetField === 'description') continue;
       if (touchesExactOptionalStringEndpoint(rule.sourceField, rule.targetField) && !isExactOptionalStringMapping(rule.sourceField, rule.targetField)) {
         heldRules++;
         this.logHeld(input.eventId, pair.id, rule.id, 'OPTIONAL_STRING_MAPPING_NOT_APPROVED');
