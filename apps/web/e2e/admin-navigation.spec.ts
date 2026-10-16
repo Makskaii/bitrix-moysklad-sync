@@ -1,6 +1,9 @@
 import { expect, test } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: {
+    status: 'READY', previousLaunchBoundary: '2026-10-07T00:00:00.000Z', pairsRestored: true, lostEventsAcknowledged: true,
+  } }));
   await page.route('**/api/admin/monitoring/queue**', (route) => route.fulfill({ json: { counts: {}, events: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/incidents**', (route) => route.fulfill({ json: { cases: [], nextCursor: null } }));
   await page.route('**/api/admin/monitoring/logs**', (route) => route.fulfill({ json: { entries: [], nextCursor: null } }));
@@ -8,7 +11,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('administrator can navigate the agreed shell without placeholder actions sending writes', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   const writes: string[] = [];
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
@@ -42,7 +45,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
     version: 1, createdAt: '2026-10-07T00:00:00.000Z', config: { rules: [], groups: [], references: { units: [], priceTypes: [], dictionaries: [] } },
   } }));
   await page.route('**/api/admin/field-settings/catalogs', (route) => route.fulfill({ json: {
-    units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [],
+    units: { bitrix24: [], moysklad: [] }, priceTypes: { bitrix24: [], moysklad: [] }, dictionaries: [], namedReferences: {},
   } }));
   await page.route('**/api/admin/field-settings/catalogs?*', (route) => route.fulfill({ json: { items: [], nextCursor: null } }));
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok', database: 'ok' } }));
@@ -79,7 +82,7 @@ test('administrator can navigate the agreed shell without placeholder actions se
 });
 
 test('admin shell navigation is withheld after an access denial', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ status: 403, json: { message: 'Administrator access required' } }));
@@ -94,7 +97,7 @@ test('admin shell navigation is withheld after an access denial', async ({ page 
 });
 
 test('admin shell shows a loading failure without opening administrative sections', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
   await page.route('**/api/admin/trial-actions', (route) => route.abort());
@@ -106,7 +109,7 @@ test('admin shell shows a loading failure without opening administrative section
 });
 
 test('admin navigation stays hidden while protected workspace data is loading', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   let finishLoading!: () => void;
   const dataReady = new Promise<void>((resolve) => { finishLoading = resolve; });
@@ -128,7 +131,7 @@ test('admin navigation stays hidden while protected workspace data is loading', 
 });
 
 test('admin shell closes when a protected setting is denied by the server', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
@@ -150,7 +153,7 @@ test('admin shell closes when a protected setting is denied by the server', asyn
 });
 
 test('settings show a failure instead of implying a successful update', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));
@@ -172,7 +175,7 @@ test('settings show a failure instead of implying a successful update', async ({
 });
 
 test('monitoring closes the admin workspace when a protected action is denied', async ({ page }) => {
-  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1');
+  test.skip(process.env.ADMIN_PREVIEW_EXPECTED !== '1', 'This test requires the local preview test mode.');
 
   await page.route('**/api/admin/preview-mode', (route) => route.fulfill({ json: { enabled: true } }));
   await page.route('**/api/admin/trial-actions', (route) => route.fulfill({ json: [] }));

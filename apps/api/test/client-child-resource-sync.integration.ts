@@ -1,0 +1,347 @@
+import { strict as assert } from 'node:assert';
+import { after, before, test } from 'node:test';
+import { createServer, Server } from 'node:http';
+import { AddressInfo } from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { ClientChildResourceBindingDto } from '../src/field-settings/field-settings.dto';
+import { ClientChildResourceSync, syncPinnedClientChildResources, validateChildResourceBindings } from '../src/clients/client-child-resource-sync';
+
+const companyId = '100';
+const requisiteId = '200';
+const bankDetailId = '300';
+const counterpartyId = randomUUID();
+const accountId = randomUUID();
+let server: Server;
+let baseUrl: string;
+let requisite: Record<string, unknown>;
+let bankDetail: Record<string, unknown>;
+let counterparty: Record<string, unknown>;
+let account: Record<string, unknown>;
+let calls: Array<{ method: string; path: string; body: string }> = [];
+let accountPutReturnsUncertainOnce = false;
+const testProviderOrigins = { allowTestProviderOrigins: true };
+
+const binding: ClientChildResourceBindingDto = {
+  id: 'manual-child-pair-1', entity: 'companies', bitrix24CompanyId: companyId, bitrix24RequisiteId: requisiteId,
+  moyskladCounterpartyId: counterpartyId,
+  legalFields: [
+    { bitrix24Field: 'RQ_INN', moyskladField: 'inn' },
+    { bitrix24Field: 'RQ_KPP', moyskladField: 'kpp' },
+    { bitrix24Field: 'RQ_COMPANY_FULL_NAME', moyskladField: 'legalTitle' },
+    { bitrix24Field: 'RQ_OGRN', moyskladField: 'ogrn' },
+    { bitrix24Field: 'RQ_OKPO', moyskladField: 'okpo' },
+  ],
+  bankDetail: { bitrix24Id: bankDetailId, moyskladAccountId: accountId, fields: [
+    { bitrix24Field: 'RQ_ACC_NUM', moyskladField: 'accountNumber' },
+    { bitrix24Field: 'RQ_BANK_NAME', moyskladField: 'bankName' },
+    { bitrix24Field: 'RQ_BIC', moyskladField: 'bic' },
+    { bitrix24Field: 'RQ_BANK_ADDR', moyskladField: 'bankLocation' },
+    { bitrix24Field: 'RQ_COR_ACC_NUM', moyskladField: 'correspondentAccount' },
+  ] },
+};
+
+before(async () => {
+  requisite = { ID: requisiteId, ENTITY_TYPE_ID: '4', ENTITY_ID: companyId, RQ_INN: '111', RQ_KPP: 'old-kpp', RQ_COMPANY_FULL_NAME: 'Old legal name', RQ_OGRN: 'old-ogrn', RQ_OKPO: 'old-okpo' };
+  bankDetail = { ID: bankDetailId, ENTITY_ID: requisiteId, RQ_ACC_NUM: 'old-account', RQ_BANK_NAME: 'Old Bank', RQ_BIC: 'old-bic', RQ_BANK_ADDR: 'Old bank address', RQ_COR_ACC_NUM: 'old-correspondent' };
+  counterparty = { id: counterpartyId, companyType: 'legal', inn: '222', kpp: 'old-kpp', legalTitle: 'Old legal name', ogrn: 'old-ogrn', okpo: 'old-okpo' };
+  account = { id: accountId, accountNumber: 'old-account', bankName: 'Old Bank', bic: 'old-bic', bankLocation: 'Old bank address', correspondentAccount: 'old-correspondent' };
+  server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const body = Buffer.concat(chunks).toString('utf8');
+    const path = request.url ?? '';
+    const method = request.method ?? 'GET';
+    calls.push({ method, path, body });
+    response.setHeader('content-type', 'application/json');
+    if (path.endsWith('/crm.requisite.get.json')) return response.end(JSON.stringify({ result: requisite }));
+    if (path.endsWith('/crm.requisite.update.json')) {
+      const fields = decodeBitrixFields(body); requisite = { ...requisite, ...fields };
+      return response.end(JSON.stringify({ result: true }));
+    }
+    if (path.endsWith('/crm.requisite.bankdetail.get.json')) return response.end(JSON.stringify({ result: bankDetail }));
+    if (path.endsWith('/crm.requisite.bankdetail.update.json')) {
+      const fields = decodeBitrixFields(body); bankDetail = { ...bankDetail, ...fields };
+      return response.end(JSON.stringify({ result: true }));
+    }
+    if (path === `/api/remap/1.2/entity/counterparty/${counterpartyId}` && method === 'GET') return response.end(JSON.stringify(counterparty));
+    if (path === `/api/remap/1.2/entity/counterparty/${counterpartyId}` && method === 'PUT') {
+      counterparty = { ...counterparty, ...JSON.parse(body) as Record<string, unknown> };
+      return response.end(JSON.stringify(counterparty));
+    }
+    if (path === `/api/remap/1.2/entity/counterparty/${counterpartyId}/accounts/${accountId}` && method === 'GET') return response.end(JSON.stringify(account));
+    if (path === `/api/remap/1.2/entity/counterparty/${counterpartyId}/accounts/${accountId}` && method === 'PUT') {
+      account = { ...account, ...JSON.parse(body) as Record<string, unknown> };
+      if (accountPutReturnsUncertainOnce) { accountPutReturnsUncertainOnce = false; response.statusCode = 500; return response.end(JSON.stringify({ error: 'synthetic uncertain response' })); }
+      return response.end(JSON.stringify(account));
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: `Unexpected fake request ${method} ${path}` }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  process.env.BITRIX24_REST_BASE_URL = `${baseUrl}/rest/`;
+  process.env.MOYSKLAD_API_BASE_URL = `${baseUrl}/api/remap/1.2/`;
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-loopback-token';
+});
+
+after(async () => {
+  if (server?.listening) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+});
+
+test('explicit child IDs validate only documented writable requisite, bank-detail and account fields', () => {
+  assert.equal(validateChildResourceBindings([binding]), null);
+  assert.equal(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'RQ_OGRNIP', moyskladField: 'ogrnip' }] }]), null);
+  assert.equal(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'RQ_COMPANY_NAME', moyskladField: 'legalTitle' }] }]), null, 'field-code shape is valid; company-type compatibility is checked against the live counterparty');
+  assert.match(validateChildResourceBindings([{ ...binding, legalFields: [{ bitrix24Field: 'ID', moyskladField: 'id' }] }]) ?? '', /Unsupported or read-only requisite mapping/);
+  assert.match(validateChildResourceBindings([{ ...binding, bankDetail: { ...binding.bankDetail!, fields: [{ bitrix24Field: 'RQ_COUNTRY_CODE_GUESS', moyskladField: 'country' }] } }]) ?? '', /Unsupported or read-only bank mapping/);
+  assert.match(validateChildResourceBindings([{ ...binding, bitrix24RequisiteId: '' }]) ?? '', /explicit company, requisite, and counterparty IDs/);
+});
+
+test('missing or ambiguous explicit binding holds without any provider calls', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const missing = await adapter.syncForPair({ eventId: 'missing', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  const ambiguous = await adapter.syncForPair({ eventId: 'ambiguous', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding, { ...binding, id: 'second' }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(missing, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_BINDING_MISSING' });
+  assert.deepEqual(ambiguous, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_BINDING_AMBIGUOUS' });
+  assert.equal(calls.length, 0);
+});
+
+test('event-pinned settings version supplies the child binding to the extension point', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  let eventConfigCalls = 0;
+  const pinned = await syncPinnedClientChildResources({
+    adapter,
+    settings: { async eventConfig(eventId) { eventConfigCalls++; assert.equal(eventId, 'pinned-child-event'); return { version: 19, config: { childResourceBindings: [binding] } }; } },
+    eventId: 'pinned-child-event', direction: 'BITRIX24_TO_MOYSKLAD', bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId,
+  });
+  assert.equal(eventConfigCalls, 1);
+  assert.equal(pinned.settingsVersion, 19);
+  assert.equal(pinned.result.status, 'BASELINE');
+  assert.equal(calls.some((call) => call.method === 'PUT'), false, 'pinned first observation remains read-only');
+});
+
+test('dry mode journals exact legal/bank proposals and performs no external writes', async () => {
+  process.env.SYNC_MODE = 'dry';
+  calls = [];
+  const proposals: Array<Record<string, unknown>> = [];
+  const adapter = new ClientChildResourceSync(fetch, { async propose(input) { proposals.push(input); return true; } }, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'dry-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE', 'first observation does not journal or write legal/bank records');
+  requisite = { ...requisite, RQ_INN: 'dry-inn-change' };
+  bankDetail = { ...bankDetail, RQ_ACC_NUM: 'dry-account-proposal', RQ_BANK_ADDR: 'new bank address' };
+  const result = await adapter.syncForPair({ eventId: 'dry-event', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state });
+  assert.equal(result.status, 'JOURNALED');
+  assert.equal(proposals.length, 2);
+  assert.deepEqual(proposals.map((row) => row.entityType).sort(), ['MOYSKLAD_ACCOUNT', 'MOYSKLAD_COUNTERPARTY']);
+  assert.deepEqual(proposals.find((row) => row.entityType === 'MOYSKLAD_COUNTERPARTY')?.fields, { inn: 'dry-inn-change' });
+  assert.deepEqual(proposals.find((row) => row.entityType === 'MOYSKLAD_ACCOUNT')?.fields, { accountNumber: 'dry-account-proposal', bankLocation: 'new bank address' });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false);
+});
+
+test('APPLY maps requisite/bank-detail through their official update methods and MySklad account child endpoint with verified readback', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'apply-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  requisite = { ...requisite, RQ_INN: '7712345678', RQ_KPP: '770101001', RQ_COMPANY_FULL_NAME: 'Acme Legal LLC', RQ_OGRN: 'new-ogrn', RQ_OKPO: 'new-okpo' };
+  bankDetail = { ...bankDetail, RQ_ACC_NUM: '40702810900000000001', RQ_BANK_NAME: 'Test Bank', RQ_BIC: '044525001', RQ_BANK_ADDR: 'New bank address', RQ_COR_ACC_NUM: '30101810400000000225' };
+  accountPutReturnsUncertainOnce = true;
+  const result = await adapter.syncForPair({ eventId: 'apply-event', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state });
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(counterparty.inn, '7712345678');
+  assert.equal(counterparty.kpp, '770101001');
+  assert.equal(counterparty.legalTitle, 'Acme Legal LLC');
+  assert.equal(counterparty.ogrn, 'new-ogrn');
+  assert.equal(counterparty.okpo, 'new-okpo');
+  assert.equal(account.accountNumber, '40702810900000000001');
+  assert.equal(account.bic, '044525001');
+  assert.equal(account.bankLocation, 'New bank address');
+  assert.ok(calls.some((call) => call.path.endsWith('/crm.requisite.get.json')));
+  assert.ok(calls.some((call) => call.path.endsWith('/crm.requisite.get.json')));
+  assert.ok(calls.some((call) => call.path.endsWith('/crm.requisite.bankdetail.get.json')));
+  assert.equal(calls.some((call) => call.path.endsWith('/crm.requisite.update.json') || call.path.endsWith('/crm.requisite.bankdetail.update.json')), false, 'forward direction writes only to MySklad');
+  assert.ok(calls.some((call) => call.method === 'PUT' && call.path.endsWith(`/accounts/${accountId}`)));
+  assert.equal(calls.filter((call) => call.method === 'PUT' && call.path.endsWith(`/accounts/${accountId}`)).length, 1, 'uncertain write response is verified by readback and never blindly repeated');
+  assert.ok(calls.every((call) => new URL(call.path, baseUrl).origin === baseUrl));
+  const writeCount = calls.filter((call) => call.method === 'PUT').length;
+  const echo = await adapter.syncForPair({ eventId: 'apply-echo', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: result.state });
+  assert.equal(echo.status, 'UNCHANGED');
+  assert.equal(calls.filter((call) => call.method === 'PUT').length, writeCount, 'echo uses reconciled snapshot and does not repeat writes');
+});
+
+test('bank-only binding verifies requisite ownership before reading or writing the bank detail', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const originalRequisite = requisite;
+  requisite = { ...requisite, ENTITY_ID: '999' };
+  const bankOnly = { ...binding, legalFields: [] };
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const prior = { bitrix24: { requisite: { RQ_BIK: 'baseline' }, bankDetail: { RQ_BIK: 'baseline' } }, moysklad: { counterparty: {}, account: { bic: 'baseline' } } };
+  await assert.rejects(adapter.syncForPair({ eventId: 'foreign-bank-requisite', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [bankOnly], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior }), (error: unknown) => error instanceof Error && error.message === 'BITRIX24_API_FAILURE' && (error as { status?: number }).status === 404);
+  assert.equal(calls.some((call) => call.path.endsWith('/crm.requisite.bankdetail.get.json') || call.method === 'PUT'), false, 'a foreign requisite prevents bank-detail reads and all writes');
+  assert.deepEqual(prior.bitrix24.requisite, { RQ_BIK: 'baseline' }, 'failure cannot advance the caller-owned snapshot');
+  requisite = originalRequisite;
+});
+
+test('per-type legal mappings allow supported RU/UZ fields and review incompatible fields without writes', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  counterparty = { ...counterparty, companyType: 'legal' };
+  const shortName = await adapter.syncForPair({ eventId: 'short-name-as-legal-title', direction: 'BITRIX24_TO_MOYSKLAD',
+    bindings: [{ ...binding, bankDetail: undefined, legalFields: [{ bitrix24Field: 'RQ_COMPANY_NAME', moyskladField: 'legalTitle' }] }],
+    bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(shortName, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false, 'short company name must not overwrite a full legal title');
+  calls = [];
+  counterparty = { ...counterparty, companyType: 'entrepreneur' };
+  const entrepreneurBinding = { ...binding, bankDetail: undefined, legalFields: [
+    { bitrix24Field: 'RQ_COMPANY_FULL_NAME', moyskladField: 'legalTitle' }, { bitrix24Field: 'RQ_INN', moyskladField: 'inn' },
+    { bitrix24Field: 'RQ_OGRNIP', moyskladField: 'ogrnip' }, { bitrix24Field: 'RQ_OKPO', moyskladField: 'okpo' },
+  ] };
+  const entrepreneur = await adapter.syncForPair({ eventId: 'entrepreneur-binding', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [entrepreneurBinding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(entrepreneur.status, 'BASELINE', 'valid entrepreneur fields including OGRNIP remain supported');
+  const invalidPrior = { bitrix24: { requisite: { RQ_KPP: 'old', RQ_OGRN: 'old' }, bankDetail: {} }, moysklad: { counterparty: { kpp: 'old', ogrn: 'old' }, account: {} } };
+  const entrepreneurInvalid = await adapter.syncForPair({ eventId: 'entrepreneur-invalid', direction: 'BITRIX24_TO_MOYSKLAD',
+    bindings: [{ ...binding, bankDetail: undefined, legalFields: [{ bitrix24Field: 'RQ_KPP', moyskladField: 'kpp' }, { bitrix24Field: 'RQ_OGRN', moyskladField: 'ogrn' }] }],
+    bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: invalidPrior });
+  assert.deepEqual(entrepreneurInvalid, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.deepEqual(invalidPrior.moysklad.counterparty, { kpp: 'old', ogrn: 'old' }, 'invalid field mappings cannot advance prior state');
+  assert.equal(calls.some((call) => call.method === 'PUT'), false);
+  counterparty = { ...counterparty, companyType: 'legalUZ' };
+  const uzBankOnly = await adapter.syncForPair({ eventId: 'uz-bank-only', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, legalFields: [] }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(uzBankOnly.status, 'BASELINE', 'UZ company types remain valid for their bank-account resource');
+  const uzTitle = await adapter.syncForPair({ eventId: 'uz-legal-title', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined, legalFields: [{ bitrix24Field: 'RQ_COMPANY_FULL_NAME', moyskladField: 'legalTitle' }] }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(uzTitle.status, 'BASELINE', 'legalTitle is compatible for UZ companies');
+  calls = [];
+  const uzRussianLegalFields = await adapter.syncForPair({ eventId: 'uz-ru-legal-fields', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined, legalFields: [{ bitrix24Field: 'RQ_INN', moyskladField: 'inn' }] }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: invalidPrior });
+  assert.deepEqual(uzRussianLegalFields, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_FIELD_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false);
+  counterparty = { ...counterparty, companyType: 'individual' };
+  calls = [];
+  const individual = await adapter.syncForPair({ eventId: 'individual-binding', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, bankDetail: undefined }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(individual, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_TYPE_UNSUPPORTED', bindingId: binding.id });
+  assert.equal(calls.some((call) => call.method === 'PUT'), false);
+  counterparty = { ...counterparty, companyType: 'legalKZ' };
+  calls = [];
+  const unknownRegionBank = await adapter.syncForPair({ eventId: 'unrecognized-region-bank-only', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [{ ...binding, legalFields: [] }], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.deepEqual(unknownRegionBank, { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_TARGET_REGION_UNSUPPORTED', bindingId: binding.id }, 'unrecognized region types are held rather than assumed compatible');
+  assert.equal(calls.some((call) => call.path.endsWith('/crm.requisite.bankdetail.get.json') || call.method === 'PUT'), false);
+  counterparty = { ...counterparty, companyType: 'legal' };
+});
+
+test('APPLY child writes honor database-recovery guard before any provider mutation', async () => {
+  const { setDatabaseRecoveryReady } = await import('../src/external-write-guard');
+  const previousMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'recovery-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  const priorInn = baseline.state.bitrix24.requisite.RQ_INN;
+  requisite = { ...requisite, RQ_INN: 'blocked-write' };
+  setDatabaseRecoveryReady(false);
+  try {
+    await assert.rejects(adapter.syncForPair({ eventId: 'recovery-blocked', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state }), /BLOCKED_DATABASE_RECOVERY_REQUIRED/);
+    assert.equal(calls.some((call) => call.method === 'PUT' || call.path.endsWith('/crm.requisite.update.json') || call.path.endsWith('/crm.requisite.bankdetail.update.json')), false);
+    assert.equal(baseline.state.bitrix24.requisite.RQ_INN, priorInn, 'blocked write leaves the saved snapshot untouched');
+  } finally {
+    setDatabaseRecoveryReady(true);
+    if (previousMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = previousMode;
+  }
+});
+
+test('provider URL validation rejects untrusted hosts and non-provider paths before credentials or requests are sent', async () => {
+  const oldB24 = process.env.BITRIX24_REST_BASE_URL;
+  const oldAllowedB24 = process.env.BITRIX24_ALLOWED_ORIGIN;
+  const oldMs = process.env.MOYSKLAD_API_BASE_URL;
+  const oldMode = process.env.SYNC_MODE;
+  process.env.SYNC_MODE = 'apply';
+  process.env.BITRIX24_REST_BASE_URL = 'https://evil.com/rest/webhook/';
+  process.env.BITRIX24_ALLOWED_ORIGIN = 'https://portal.bitrix24.ru';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://attacker.example/api/remap/1.2/';
+  const requests: string[] = [];
+  const adapter = new ClientChildResourceSync(async (input) => {
+    const url = String(input); requests.push(url);
+    if (url.startsWith('https://portal.bitrix24.ru/rest/')) return Response.json({ result: requisite });
+    throw new Error('unexpected untrusted request');
+  });
+  try {
+    await assert.rejects(adapter.syncForPair({ eventId: 'bad-provider-origins', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId }),
+      (error: unknown) => error instanceof Error && error.message.includes('API_FAILURE') && (error as { status?: number }).status === 400);
+    assert.equal(requests.length, 0, 'no credentials or request are sent to untrusted origins');
+    process.env.BITRIX24_REST_BASE_URL = 'https://portal.bitrix24.ru/rest/webhook/';
+    process.env.MOYSKLAD_API_BASE_URL = 'http://127.0.0.1/api/remap/1.2/';
+    await assert.rejects(adapter.syncForPair({ eventId: 'production-loopback-denied', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId }),
+      (error: unknown) => error instanceof Error && error.message.includes('API_FAILURE') && (error as { status?: number }).status === 400);
+    assert.equal(requests.length, 1, 'only the explicitly configured HTTPS Bitrix portal is called; HTTP loopback is rejected');
+    assert.ok(requests.every((url) => new URL(url).origin === 'https://portal.bitrix24.ru'));
+  } finally {
+    if (oldB24 === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldB24;
+    if (oldAllowedB24 === undefined) delete process.env.BITRIX24_ALLOWED_ORIGIN; else process.env.BITRIX24_ALLOWED_ORIGIN = oldAllowedB24;
+    if (oldMs === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMs;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+  }
+});
+
+test('lease loss aborts child transfer before provider write', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'lease-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  requisite = { ...requisite, RQ_INN: 'lease-change' };
+  let checks = 0;
+  await assert.rejects(adapter.syncForPair({
+    eventId: 'lease-lost', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding],
+    bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state,
+    assertLease: async () => { checks += 1; throw new Error('LEASE_LOST'); },
+  }), /LEASE_LOST/);
+  assert.equal(checks, 1);
+  assert.equal(calls.some((call) => call.method === 'PUT' || call.path.endsWith('/crm.requisite.update.json') || call.path.endsWith('/crm.requisite.bankdetail.update.json')), false);
+});
+
+test('reverse sync retains explicit child IDs and updates correct B24 requisite/bank detail', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'reverse-baseline', direction: 'MOYSKLAD_TO_BITRIX24', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  counterparty = { ...counterparty, inn: '9988776655', kpp: '770201002', legalTitle: 'Reverse Legal LLC' };
+  account = { ...account, accountNumber: '40802810000000000002', bankName: 'Reverse Bank', bic: '044525999', bankLocation: 'Reverse bank address', correspondentAccount: '30101810900000000999' };
+  const result = await adapter.syncForPair({ eventId: 'reverse-event', direction: 'MOYSKLAD_TO_BITRIX24', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, prior: baseline.state });
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(requisite.RQ_INN, '9988776655');
+  assert.equal(bankDetail.RQ_ACC_NUM, '40802810000000000002');
+  assert.equal(bankDetail.RQ_BIC, '044525999');
+  assert.ok(calls.some((call) => call.path.endsWith('/crm.requisite.update.json') && new URLSearchParams(call.body).get('id') === requisiteId));
+  assert.ok(calls.some((call) => call.path.endsWith('/crm.requisite.bankdetail.update.json') && new URLSearchParams(call.body).get('id') === bankDetailId));
+});
+
+test('fallback with empty MySklad INN retains the legal INN exception', async () => {
+  process.env.SYNC_MODE = 'apply';
+  calls = [];
+  counterparty = { ...counterparty, inn: '' };
+  const adapter = new ClientChildResourceSync(fetch, undefined, testProviderOrigins);
+  const baseline = await adapter.syncForPair({ eventId: 'fallback-baseline', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId });
+  assert.equal(baseline.status, 'BASELINE');
+  requisite = { ...requisite, RQ_INN: 'source-inn-after-fallback' };
+  const result = await adapter.syncForPair({ eventId: 'fallback-event', direction: 'BITRIX24_TO_MOYSKLAD', bindings: [binding], bitrix24CompanyId: companyId, moyskladCounterpartyId: counterpartyId, fallbackMatch: 'exact_name_and_phone', prior: baseline.state });
+  assert.equal(result.status, 'UNCHANGED');
+  assert.equal(counterparty.inn, '', 'fallback does not copy B24 INN into an empty MySklad INN');
+  assert.ok(calls.every((call) => !call.path.endsWith('/crm.requisite.update.json')));
+});
+
+function decodeBitrixFields(body: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of new URLSearchParams(body)) {
+    const match = /^fields\[([^\]]+)\]$/.exec(key);
+    if (match) result[match[1]] = value;
+  }
+  return result;
+}

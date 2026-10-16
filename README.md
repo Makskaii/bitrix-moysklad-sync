@@ -52,9 +52,19 @@ docker compose -p local-admin-preview-test -f docker-compose.yml -f docker-compo
 docker compose -p local-admin-preview-off-test -f docker-compose.yml -f docker-compose.preview-off-test.yml --profile test run --build --rm browser-smoke
 ```
 
+Проверки интерфейса Playwright по умолчанию выполняют сценарии локального предпросмотра с ответами API, заданными непосредственно в тестах:
+
+```sh
+npm run test:e2e --workspace @sync/web
+```
+
+В этом режиме единственный намеренный пропуск — проверка закрытого интерфейса вне Bitrix24; она несовместима с ожидаемым preview-режимом. Чтобы проверить закрытый интерфейс и намеренно пропустить preview-сценарии, задайте `ADMIN_PREVIEW_EXPECTED=0` перед запуском. Значение `1` включает preview-сценарии; тесты подменяют их API-ответы браузерными маршрутами и не открывают доступ реальному серверу.
+
 ## Приём событий
 
 При запуске задаётся `SYNC_MODE=apply|dry`; рабочий режим `on|pause|off` хранится в настройках сервиса. Для обычного Compose-запуска приём выключен (`off`); для вебхуков настраиваются отдельные секреты `BITRIX24_EVENT_APPLICATION_TOKEN` и `MOYSKLAD_WEBHOOK_SECRET`. Bitrix24 отправляет событие на `POST /webhooks/bitrix24`; токен проверяется по `auth.application_token`. URL вебхука МойСклад имеет вид `https://<host>/webhooks/moysklad/<secret>`. Приёмщик поддерживает тело с `events[]`, где элемент содержит `action` и ссылку `meta.href`; [руководство МойСклад](https://github.com/moysklad/workbook-api-doc/blob/master/pages/workbook/articles/webhooks.md) документирует `requestId` и повторное использование этого ID при повторной доставке.
+
+Для настройки синхронизации реквизитов компании задайте `BITRIX24_REST_BASE_URL` с полным REST webhook URL и `BITRIX24_ALLOWED_ORIGIN` с точным HTTPS origin этого Bitrix24 портала (например, `https://portal.bitrix24.ru`). Сервис сравнивает origin до отправки webhook URL, содержащего секрет, и отклоняет несовпадение.
 
 Событие сначала фиксируется в PostgreSQL, после чего endpoint отвечает `200`. Каждый элемент `events[]` МойСклад сохраняется отдельно; при наличии `requestId` ключ очереди использует ID, позицию события в batch и отпечаток тела. У вебхуков без документированного ID доставки каждый приём получает уникальный ключ: это at-least-once сохранение, чтобы не потерять позднее настоящее изменение с тем же телом; обработчики должны перечитывать текущее состояние и быть безопасны при повторной обработке. Во время `pause` события сохраняются до возобновления обработки; `off` отвечает `410` и ничего не сохраняет. В режиме `dry` приложение использует `DRY_DATABASE_URL` в отдельной PostgreSQL БД/схеме; запуск fail-closed, если dry и apply цели совпадают. Dry-предложения и состояние очереди остаются в изолированном тестовом контуре и не воспроизводятся в apply.
 

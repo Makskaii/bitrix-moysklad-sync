@@ -35,6 +35,7 @@ import { CLIENT_SYNC_GATEWAY, ClientSyncProcessor } from '../clients/client-sync
 import { HttpClientSyncGateway } from '../clients/client-sync.gateway';
 import { CLIENT_CANDIDATE_GATEWAY, HttpClientCandidateGateway } from '../clients/client-candidate.gateway';
 import { CLIENT_DEPENDENCY_RESOLVER } from '../clients/client-dependency-resolver';
+import { ClientChildResourceSync } from '../clients/client-child-resource-sync';
 import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from '../event-dispatcher.service';
 import { EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProductCardEventProcessor } from '../products/product-card-event.processor';
@@ -63,7 +64,8 @@ export class LocalAdminPreviewModule {
           HistoricalInventoryService,
           HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
           { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
-          { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
+          { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
+          { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
           ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor,
           { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor) => [products, clients], inject: [ProductCardEventProcessor, ClientSyncProcessor] },
           EntityPairService, PairResolutionProvider,

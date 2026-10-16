@@ -187,6 +187,28 @@ h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: -.02em; }
 .field-version-line strong { color: #27384e; font-size: 13px; }
 .field-version-line span { padding: 4px 8px; border-radius: 20px; background: #eaf5e9; color: #397449; }
 .field-editor-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid #edf0f5; }
+.child-resource-editor .panel-heading { align-items: center; }
+.child-binding-empty { padding: 14px; border-radius: 8px; background: #f5f8fc; color: #718097; font-size: 12px; }
+.child-binding-card { margin-top: 14px; padding: 16px; border: 1px solid #dce6f3; border-radius: 10px; background: #fbfdff; }
+.child-binding-card-heading, .child-binding-identities, .child-binding-field-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr); align-items: end; gap: 12px; }
+.child-binding-card-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; color: #263b59; }
+.child-binding-identities { margin: 12px 0; }
+.child-binding-identities label, .child-binding-field-row label { display: grid; gap: 5px; color: #52647e; font-size: 12px; }
+.child-binding-identities input, .child-binding-identities select, .child-binding-field-row select { width: 100%; min-height: 36px; padding: 7px 10px; border: 1px solid #dce4ef; border-radius: 6px; background: #fff; color: #27384e; font: inherit; }
+.child-binding-preview { display: grid; gap: 4px; margin: 12px 0; padding: 11px 13px; border-left: 3px solid #5b8bd9; border-radius: 4px; background: #f1f6ff; color: #52647e; font-size: 12px; }
+.child-binding-preview strong { color: #263b59; }
+.child-binding-field-list { display: grid; gap: 9px; margin: 13px 0; }
+.child-binding-field-row { grid-template-columns: minmax(180px, 1fr) 18px minmax(180px, 1fr) 32px; align-items: end; padding: 9px; border: 1px solid #e7edf5; border-radius: 7px; background: #fff; }
+.child-binding-field-row > span { padding-bottom: 9px; color: #718097; text-align: center; }
+.child-binding-toggle { display: flex; align-items: center; gap: 8px; margin: 16px 0 8px; color: #344965; font-size: 13px; }
+.child-binding-toggle input { accent-color: #376fc4; }
+.child-binding-validation { margin-top: 12px; color: #357352; font-size: 12px; }
+.child-binding-validation[role="alert"] { padding: 10px 12px; border-radius: 6px; background: #fff4f1; color: #9c382b; line-height: 1.5; }
+@media (max-width: 700px) {
+  .child-binding-identities, .child-binding-field-row { grid-template-columns: 1fr; }
+  .child-binding-field-row > span { display: none; }
+  .child-binding-field-row .mapping-remove { justify-self: end; }
+}
 .field-settings-panel > .field-editor-section[aria-label="Правила полей"] { margin-top: 14px; padding-top: 14px; }
 .field-mapping-context { display: grid; grid-template-columns: minmax(160px, .8fr) minmax(240px, 1.4fr) auto; gap: 10px; align-items: end; margin-bottom: 14px; }
 .field-mapping-context label { display: grid; gap: 5px; color: #52657e; font-size: 11px; }

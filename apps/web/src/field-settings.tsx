@@ -18,7 +18,7 @@ type FieldGroup = {
   targetField: string;
   sourceFields: string[];
   criticality: 'critical' | 'optional' | 'tbd';
-  transform: { kind: 'join-non-empty'; separator: string };
+  transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
 };
 type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
 type PriceTypePair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladLabel: string | null; status: string };
@@ -35,8 +35,14 @@ type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Lab
 type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
+type ChildFieldPair = { bitrix24Field: string; moyskladField: string };
+type ChildResourceBinding = {
+  id: string; entity: 'companies'; bitrix24CompanyId: string; bitrix24RequisiteId: string;
+  moyskladCounterpartyId: string; legalFields: ChildFieldPair[];
+  bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: ChildFieldPair[] };
+};
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
@@ -63,6 +69,20 @@ const entityOptions = [
 ] as const;
 
 const deferredEntities = new Set(['smart-invoices']);
+const requisiteFields: Array<[string, string]> = [
+  ['RQ_COMPANY_NAME', 'Краткое наименование'], ['RQ_COMPANY_FULL_NAME', 'Полное наименование'], ['RQ_INN', 'ИНН'],
+  ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OGRNIP', 'ОГРНИП'], ['RQ_OKPO', 'ОКПО'],
+];
+const counterpartyFields: Array<[string, string]> = [
+  ['legalTitle', 'Полное наименование'], ['inn', 'ИНН'], ['kpp', 'КПП'], ['ogrn', 'ОГРН'], ['ogrnip', 'ОГРНИП'], ['okpo', 'ОКПО'],
+];
+const bankDetailFields: Array<[string, string]> = [
+  ['RQ_BANK_NAME', 'Название банка'], ['RQ_BANK_ADDR', 'Адрес банка'], ['RQ_BIK', 'БИК'], ['RQ_BIC', 'BIC'],
+  ['RQ_ACC_NUM', 'Расчётный счёт'], ['RQ_COR_ACC_NUM', 'Корреспондентский счёт'],
+];
+const accountFields: Array<[string, string]> = [
+  ['bankName', 'Название банка'], ['bankLocation', 'Адрес банка'], ['bic', 'BIC'], ['accountNumber', 'Номер счёта'], ['correspondentAccount', 'Корреспондентский счёт'],
+];
 
 function entityTypeForUI(entity: string): ActiveEntityPair['entityType'] | null {
   switch (entity) {
@@ -182,7 +202,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [mappingEntity, setMappingEntity] = useState('deals-orders');
   const metadataRequest = useRef(0);
   const [saveValidationError, setSaveValidationError] = useState('');
-  const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ' });
+  const [groupForm, setGroupForm] = useState({ entity: 'contacts', direction: 'BITRIX24_TO_MOYSKLAD' as FieldGroup['direction'], targetField: '', sourceFields: '', separator: ' ', transformKind: 'join-non-empty' as FieldGroup['transform']['kind'], valueType: '' });
 
   const headers: Record<string, string> = {
     ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
@@ -326,12 +346,14 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   function addGroup(event: React.FormEvent) {
     event.preventDefault();
-    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim()) return;
+    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
       criticality: 'tbd',
-      transform: { kind: 'join-non-empty', separator: groupForm.separator },
+      transform: groupForm.transformKind === 'split-non-empty'
+        ? { kind: 'split-non-empty', separator: groupForm.separator, valueType: groupForm.valueType }
+        : { kind: 'join-non-empty', separator: groupForm.separator },
     };
     changeDraft((current) => ({ ...current, groups: [...current.groups, group] }));
     setGroupForm((current) => ({ ...current, targetField: '', sourceFields: '' }));
@@ -394,6 +416,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   async function save() {
     if (!draft) return;
+    const childErrors = childBindingErrors(draft.childResourceBindings ?? [], activePairs.filter((pair) => pair.entityType === 'COMPANY'));
+    if (childErrors.length) {
+      setSaveValidationError(`Настройки реквизитов: ${childErrors.join('; ')}`);
+      setShowSaveWarning(false);
+      return;
+    }
     if (draft.rules.some((rule) => !rule.sourceField.trim() || !rule.targetField.trim())) {
       setSaveValidationError('Выберите оба поля или удалите незавершённую строку.');
       setShowSaveWarning(false);
@@ -445,6 +473,70 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
     <div className="page-heading"><p className="eyebrow">ПРАВИЛА ПЕРЕНОСА</p><h2>Соответствия полей</h2></div>
     <section className="panel field-settings-panel" aria-label="Редактор соответствий полей">
       <div className="field-version-line"><strong>Версия {document.version}</strong><span>Активна для новых событий</span></div>
+
+      <section className="field-editor-section" aria-label="Служебный контрагент">
+        <div className="panel-heading"><div><p className="eyebrow">ЗАКАЗ БЕЗ КЛИЕНТА</p><h3>Служебный контрагент МойСклад</h3></div></div>
+        <p className="panel-description">Используется только при создании заказа покупателя по сделке без компании и контакта. Вставьте UUID контрагента МойСклад; пустое значение блокирует только такое создание.</p>
+        <label>UUID контрагента<input aria-label="UUID служебного контрагента МойСклад" value={draft.serviceCounterpartyId ?? ''} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" onChange={(event) => setDraft((current) => current ? { ...current, serviceCounterpartyId: event.currentTarget.value.trim() || null } : current)} /></label>
+      </section>
+
+      <section className="field-editor-section child-resource-editor" aria-label="Реквизиты компаний">
+        <div className="panel-heading"><div><p className="eyebrow">ДОЧЕРНИЕ РЕСУРСЫ КОМПАНИИ</p><h3>Юридические и банковские реквизиты</h3></div>
+          <button type="button" className="button-secondary" onClick={() => changeDraft((current) => ({ ...current, childResourceBindings: [...(current.childResourceBindings ?? []), { id: newLocalId(), entity: 'companies', bitrix24CompanyId: '', bitrix24RequisiteId: '', moyskladCounterpartyId: '', legalFields: [] }] }))}>＋ Добавить связь реквизитов</button>
+        </div>
+        <p className="panel-description">Связь применяется только к выбранной паре компании. ID реквизита Bitrix24, банковской строки и счёта МойСклад вводятся явно; поиск и выбор по умолчанию не выполняются. Настроенные поля передаются в обоих направлениях.</p>
+        {(draft.childResourceBindings ?? []).length === 0 && <p className="child-binding-empty">Связи не настроены. Юридические и банковские дочерние ресурсы не синхронизируются.</p>}
+        {(draft.childResourceBindings ?? []).map((binding, index) => {
+          const errorMessages = childBindingErrors(draft.childResourceBindings ?? [], activePairs.filter((pair) => pair.entityType === 'COMPANY'))
+            .filter((message) => message.startsWith(`Связь ${index + 1}:`));
+          const companyPair = activePairs.find((pair) => pair.entityType === 'COMPANY' && pair.bitrix24Id === binding.bitrix24CompanyId && pair.moyskladId === binding.moyskladCounterpartyId);
+          const updateBinding = (update: (current: ChildResourceBinding) => ChildResourceBinding) => changeDraft((current) => ({
+            ...current, childResourceBindings: (current.childResourceBindings ?? []).map((candidate) => candidate.id === binding.id ? update(candidate) : candidate),
+          }));
+          const fieldRows = (kind: 'legalFields' | 'bankDetail.fields', rows: ChildFieldPair[], leftFields: Array<[string, string]>, rightFields: Array<[string, string]>) => <div className="child-binding-field-list" aria-label={kind === 'legalFields' ? 'Юридические поля' : 'Банковские поля'}>
+            {rows.map((row, rowIndex) => <div className="child-binding-field-row" key={`${kind}-${rowIndex}`}>
+              <label>{kind === 'legalFields' ? 'Реквизит Bitrix24' : 'Банковское поле Bitrix24'}<select aria-label={`${kind === 'legalFields' ? 'Юридическое поле Bitrix24' : 'Банковское поле Bitrix24'} ${index + 1} ${rowIndex + 1}`} value={row.bitrix24Field} onChange={(event) => updateBinding((current) => kind === 'legalFields'
+                ? { ...current, legalFields: current.legalFields.map((item, i) => i === rowIndex ? { ...item, bitrix24Field: event.target.value } : item) }
+                : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: current.bankDetail.fields.map((item, i) => i === rowIndex ? { ...item, bitrix24Field: event.target.value } : item) } : undefined })}>
+                <option value="">Выберите поле</option>{leftFields.map(([code, title]) => <option key={code} value={code} disabled={kind === 'legalFields' && Boolean(row.moyskladField) && !isSupportedChildFieldPair(code, row.moyskladField)}>{title} · {code}</option>)}
+              </select></label>
+              <span aria-hidden="true">→</span>
+              <label>Поле МойСклад<select aria-label={`${kind === 'legalFields' ? 'Юридическое поле МойСклад' : 'Банковское поле МойСклад'} ${index + 1} ${rowIndex + 1}`} value={row.moyskladField} onChange={(event) => updateBinding((current) => kind === 'legalFields'
+                ? { ...current, legalFields: current.legalFields.map((item, i) => i === rowIndex ? { ...item, moyskladField: event.target.value } : item) }
+                : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: current.bankDetail.fields.map((item, i) => i === rowIndex ? { ...item, moyskladField: event.target.value } : item) } : undefined })}>
+                <option value="">Выберите поле</option>{rightFields.map(([code, title]) => <option key={code} value={code} disabled={kind === 'legalFields' && Boolean(row.bitrix24Field) && !isSupportedChildFieldPair(row.bitrix24Field, code)}>{title} · {code}</option>)}
+              </select></label>
+              <button type="button" className="mapping-remove" aria-label={`Удалить поле ${rowIndex + 1} связи ${index + 1}`} onClick={() => updateBinding((current) => kind === 'legalFields'
+                ? { ...current, legalFields: current.legalFields.filter((_, i) => i !== rowIndex) }
+                : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: current.bankDetail.fields.filter((_, i) => i !== rowIndex) } : undefined })}>⊖</button>
+            </div>)}
+            <button type="button" className="button-secondary" onClick={() => updateBinding((current) => kind === 'legalFields'
+              ? { ...current, legalFields: [...current.legalFields, { bitrix24Field: '', moyskladField: '' }] }
+              : { ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, fields: [...current.bankDetail.fields, { bitrix24Field: '', moyskladField: '' }] } : undefined })}>＋ Добавить пару полей</button>
+          </div>;
+          return <article className="child-binding-card" key={binding.id} aria-label={`Связь реквизитов ${index + 1}`}>
+            <div className="child-binding-card-heading"><strong>Связь {index + 1}</strong><button type="button" className="mapping-remove" aria-label={`Удалить связь реквизитов ${index + 1}`} onClick={() => changeDraft((current) => ({ ...current, childResourceBindings: (current.childResourceBindings ?? []).filter((item) => item.id !== binding.id) }))}>Удалить</button></div>
+            <div className="child-binding-identities">
+              <label>Пара компании<select aria-label={`Пара компании ${index + 1}`} value={companyPair?.id ?? ''} onChange={(event) => {
+                const pair = activePairs.find((item) => item.id === event.target.value && item.entityType === 'COMPANY');
+                updateBinding((current) => ({ ...current, bitrix24CompanyId: pair?.bitrix24Id ?? '', moyskladCounterpartyId: pair?.moyskladId ?? '' }));
+              }}><option value="">Выберите активную пару</option>{activePairs.filter((pair) => pair.entityType === 'COMPANY').map((pair) => <option key={pair.id} value={pair.id}>Bitrix24 {pair.bitrix24Id} ↔ МойСклад {pair.moyskladId}</option>)}</select></label>
+              <label>ID реквизита Bitrix24<input aria-label={`ID реквизита Bitrix24 ${index + 1}`} inputMode="numeric" value={binding.bitrix24RequisiteId} onChange={(event) => updateBinding((current) => ({ ...current, bitrix24RequisiteId: event.target.value.trim() }))} /></label>
+            </div>
+            {(!activePairs.some((pair) => pair.entityType === 'COMPANY' && pair.active)) && <p role="alert" className="inline-error">Нет активных пар компаний. Сначала создайте и подтвердите пару компании.</p>}
+            <div className="child-binding-preview"><strong>Предпросмотр связи</strong><span>{companyPair ? `Bitrix24 компания ${binding.bitrix24CompanyId} ↔ контрагент МойСклад ${binding.moyskladCounterpartyId}` : 'Пара компании не выбрана'}</span><span>Реквизит Bitrix24: {binding.bitrix24RequisiteId || 'не задан'}</span><span>Юридических полей: {binding.legalFields.filter((field) => field.bitrix24Field && field.moyskladField).length}</span></div>
+            {fieldRows('legalFields', binding.legalFields, requisiteFields, counterpartyFields)}
+            <label className="child-binding-toggle"><input type="checkbox" aria-label={`Включить банковские реквизиты ${index + 1}`} checked={Boolean(binding.bankDetail)} onChange={(event) => updateBinding((current) => ({ ...current, bankDetail: event.target.checked ? { bitrix24Id: '', moyskladAccountId: '', fields: [] } : undefined }))} /> Настроить банковские реквизиты</label>
+            {binding.bankDetail && <>
+              <div className="child-binding-identities bank-identities">
+                <label>ID банковских реквизитов Bitrix24<input aria-label={`ID банковских реквизитов Bitrix24 ${index + 1}`} inputMode="numeric" value={binding.bankDetail.bitrix24Id} onChange={(event) => updateBinding((current) => ({ ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, bitrix24Id: event.target.value.trim() } : undefined }))} /></label>
+                <label>UUID счёта МойСклад<input aria-label={`UUID счёта МойСклад ${index + 1}`} value={binding.bankDetail.moyskladAccountId} onChange={(event) => updateBinding((current) => ({ ...current, bankDetail: current.bankDetail ? { ...current.bankDetail, moyskladAccountId: event.target.value.trim() } : undefined }))} /></label>
+              </div>{fieldRows('bankDetail.fields', binding.bankDetail.fields, bankDetailFields, accountFields)}
+            </>}
+            <div className="child-binding-validation" role={errorMessages.length ? 'alert' : 'status'}>{errorMessages.length ? `Требуется исправить: ${errorMessages.join('; ')}` : 'Связь заполнена. При сохранении будет создана новая версия настроек.'}</div>
+          </article>;
+        })}
+      </section>
 
       <section className="field-editor-section" aria-label="Правила полей">
         <div className="field-mapping-context">
@@ -508,10 +600,18 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
           <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
-          <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD">Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
-          <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => setGroupForm({ ...groupForm, sourceFields: [...event.currentTarget.selectedOptions].map((option) => option.value).join(',') })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD" disabled={groupForm.transformKind === 'split-non-empty'}>Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
+          <label>Преобразование<select aria-label="Преобразование группы" value={groupForm.transformKind} onChange={(event) => {
+            const transformKind = event.target.value as FieldGroup['transform']['kind'];
+            setGroupForm({ ...groupForm, transformKind, ...(transformKind === 'split-non-empty' ? { direction: 'MOYSKLAD_TO_BITRIX24' as const } : {}) });
+          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
+          <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
+            const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
+            setGroupForm({ ...groupForm, sourceFields: (groupForm.transformKind === 'split-non-empty' ? selected.slice(0, 1) : selected).join(',') });
+          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
+          {groupForm.transformKind === 'split-non-empty' && <label>Тип значения Bitrix24<select aria-label="Тип значения Bitrix24" value={groupForm.valueType} onChange={(event) => setGroupForm({ ...groupForm, valueType: event.target.value })}><option value="">Выберите тип</option>{['WORK', 'HOME', 'MOBILE', 'MAILING', 'OTHER', 'FAX', 'PAGER'].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>}
           <button type="submit" className="button-secondary">Добавить составное правило</button>
         </form>
         {draft.groups.length ? <div className="field-rule-list">{draft.groups.map((group) => <article key={group.id} className="field-rule-row"><div><strong>{group.sourceFields.join(' + ')} → {group.targetField}</strong><small>{group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'Bitrix24 → МойСклад' : 'МойСклад → Bitrix24'} · пропуск пустых частей</small><label>Критичность<select aria-label={`Критичность группы ${group.targetField}`} value={group.criticality ?? 'tbd'} onChange={(event) => changeDraft((current) => ({ ...current, groups: current.groups.map((item) => item.id === group.id ? { ...item, criticality: event.target.value as FieldGroup['criticality'] } : item) }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label></div><button type="button" className="button-secondary" aria-label={`Удалить группу ${group.targetField}`} onClick={() => changeDraft((current) => ({ ...current, groups: current.groups.filter((item) => item.id !== group.id) }))}>Удалить</button></article>)}</div> : <p className="muted-empty">Составные группы ещё не настроены.</p>}
@@ -619,7 +719,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
       {showSaveWarning && <div className="field-save-warning" role="alertdialog" aria-label="Предупреждение о настройках">
         <h3>Подтвердите изменение настроек</h3>
         <p>Новая версия начнёт действовать для новых событий. Уже принятые события сохранят прежние правила; обычный повтор не переключает версию. Массового пересчёта не будет.</p>
-        {document && draft && fieldRuleRiskChanges(document.config, draft).length > 0 && <div role="alert"><strong>Рискованные изменения ключей или направлений:</strong><ul>{fieldRuleRiskChanges(document.config, draft).map((change) => <li key={change}>{change}</li>)}</ul><p>После подтверждения эти изменения будут записаны в журнал администрирования.</p></div>}
+        {document && draft && fieldRuleRiskChanges(document.config, draft).length > 0 && <div role="alert"><strong>Изменения правил и дочерних реквизитов:</strong><ul>{fieldRuleRiskChanges(document.config, draft).map((change) => <li key={change}>{change}</li>)}</ul><p>После подтверждения эти изменения будут записаны в журнал администрирования.</p></div>}
         <button type="button" onClick={() => void save()} disabled={saving}>{saving ? 'Сохраняем…' : 'Подтвердить и сохранить'}</button>
         <button type="button" className="button-secondary" onClick={() => setShowSaveWarning(false)} disabled={saving}>Отмена</button>
       </div>}
@@ -663,7 +763,61 @@ function fieldRuleRiskChanges(previous: SettingsConfig, next: SettingsConfig): s
     if (oldGroup.direction !== newGroup.direction) changes.push(`Изменено направление группы: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
   }
   for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`Добавлена группа: ${newGroup.entity} ${newGroup.sourceFields.join(' + ')} → ${newGroup.targetField}`);
+  const oldBindings = new Map((previous.childResourceBindings ?? []).map((binding) => [binding.id, binding]));
+  const newBindings = new Map((next.childResourceBindings ?? []).map((binding) => [binding.id, binding]));
+  for (const [id, oldBinding] of oldBindings) {
+    const newBinding = newBindings.get(id);
+    if (!newBinding) changes.push(`Удалена связь юридических/банковских реквизитов компании ${oldBinding.bitrix24CompanyId || '(без выбранной пары)'}`);
+    else if (JSON.stringify(oldBinding) !== JSON.stringify(newBinding)) changes.push(`Изменена связь юридических/банковских реквизитов компании ${newBinding.bitrix24CompanyId || '(без выбранной пары)'}`);
+  }
+  for (const [id, binding] of newBindings) if (!oldBindings.has(id)) changes.push(`Добавлена связь юридических/банковских реквизитов компании ${binding.bitrix24CompanyId || '(без выбранной пары)'}`);
   return changes;
+}
+
+function childBindingErrors(bindings: ChildResourceBinding[], companyPairs: ActiveEntityPair[]): string[] {
+  const errors: string[] = [];
+  const assignedCompanies = new Set<string>();
+  const validPairs = new Set(companyPairs.filter((pair) => pair.active).map((pair) => `${pair.bitrix24Id}:${pair.moyskladId}`));
+  for (const [index, binding] of bindings.entries()) {
+    const prefix = `Связь ${index + 1}`;
+    if (!binding.bitrix24CompanyId || !binding.moyskladCounterpartyId || !validPairs.has(`${binding.bitrix24CompanyId}:${binding.moyskladCounterpartyId}`)) errors.push(`${prefix}: выберите существующую активную пару компании`);
+    if (binding.bitrix24CompanyId && assignedCompanies.has(binding.bitrix24CompanyId)) errors.push(`${prefix}: для компании уже настроена другая связь`);
+    if (binding.bitrix24CompanyId) assignedCompanies.add(binding.bitrix24CompanyId);
+    if (!/^\d+$/.test(binding.bitrix24RequisiteId)) errors.push(`${prefix}: укажите ID реквизита Bitrix24`);
+    const legal = validateChildFieldPairs(binding.legalFields, requisiteFields, counterpartyFields, `${prefix}: юридические поля`);
+    errors.push(...legal.errors);
+    const bank = binding.bankDetail ? validateChildFieldPairs(binding.bankDetail.fields, bankDetailFields, accountFields, `${prefix}: банковские поля`) : { errors: [], count: 0 };
+    errors.push(...bank.errors);
+    if (binding.bankDetail) {
+      if (!/^\d+$/.test(binding.bankDetail.bitrix24Id)) errors.push(`${prefix}: укажите ID банковских реквизитов Bitrix24`);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(binding.bankDetail.moyskladAccountId)) errors.push(`${prefix}: укажите UUID счёта МойСклад`);
+    }
+    if (!legal.count && !bank.count) errors.push(`${prefix}: добавьте хотя бы одну пару полей`);
+  }
+  return errors;
+}
+
+function validateChildFieldPairs(rows: ChildFieldPair[], allowedSources: Array<[string, string]>, allowedTargets: Array<[string, string]>, label: string) {
+  const errors: string[] = [];
+  const sources = new Set<string>();
+  const targets = new Set<string>();
+  let count = 0;
+  for (const [index, row] of rows.entries()) {
+    if (!row.bitrix24Field || !row.moyskladField) { errors.push(`${label}, строка ${index + 1}: выберите оба поля`); continue; }
+    if (!allowedSources.some(([code]) => code === row.bitrix24Field) || !allowedTargets.some(([code]) => code === row.moyskladField)) { errors.push(`${label}, строка ${index + 1}: поле не поддерживается`); continue; }
+    if (!isSupportedChildFieldPair(row.bitrix24Field, row.moyskladField)) { errors.push(`${label}, строка ${index + 1}: неподдерживаемая пара ${row.bitrix24Field} → ${row.moyskladField}`); continue; }
+    if (sources.has(row.bitrix24Field) || targets.has(row.moyskladField)) errors.push(`${label}: поля должны использоваться только один раз`);
+    sources.add(row.bitrix24Field);
+    targets.add(row.moyskladField);
+    count += 1;
+  }
+  return { errors, count };
+}
+
+function isSupportedChildFieldPair(bitrix24Field: string, moyskladField: string) {
+  if ((bitrix24Field === 'RQ_OGRNIP') !== (moyskladField === 'ogrnip')) return false;
+  if (bitrix24Field === 'RQ_COMPANY_NAME' && moyskladField === 'legalTitle') return false;
+  return true;
 }
 
 function includeCurrentCatalogSources(config: SettingsConfig, catalogs: Catalogs): SettingsConfig {

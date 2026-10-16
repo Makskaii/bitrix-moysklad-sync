@@ -11,6 +11,7 @@ import {
 export const CLIENT_CANDIDATE_GATEWAY = Symbol('CLIENT_CANDIDATE_GATEWAY');
 
 export interface WritableClientCandidateGateway extends ClientCandidateGateway {
+  readCounterparty(id: string): Promise<Record<string, unknown>>;
   readCompanyInn(sourceSystem: ClientSystem, id: string): Promise<string | null>;
   unmarkedBitrixCompanyEquivalents(input: { id: string; name: string | null; phone: string | null; inn: string | null }): Promise<ClientCandidate[]>;
   createTarget(input: {
@@ -42,6 +43,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     return values[0] ?? null;
   }
 
+  async readCounterparty(counterpartyId: string): Promise<Record<string, unknown>> {
+    const record = await this.moyskladRequest(`entity/counterparty/${encodeURIComponent(counterpartyId)}`, 'GET');
+    if (!isRecord(record) || id(record.id) !== counterpartyId) throw new Error('SERVICE_COUNTERPARTY_ID_MISMATCH');
+    return record;
+  }
+
   async unmarkedBitrixCompanyEquivalents(input: { id: string; name: string | null; phone: string | null; inn: string | null }): Promise<ClientCandidate[]> {
     let rows: Record<string, unknown>[] = [];
     if (input.inn) {
@@ -64,9 +71,10 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     return this.candidates(rows.map((row) => ({ ...row, ...(input.inn && !row.inn ? { inn: input.inn } : {}) })), 'COMPANY', 'BITRIX24');
   }
 
-  async findPair(entity: ClientEntity, sourceId: string, sourceSystem: ClientSystem = 'BITRIX24') {
+  async findPair(entity: ClientEntity, sourceId: string, sourceSystem: ClientSystem = 'BITRIX24', companyTargetId?: string | null) {
     const pair = await this.database.entityPair.findFirst({
-      where: { entityType: entity, active: true, ...(sourceSystem === 'BITRIX24' ? { bitrix24Id: sourceId } : { moyskladId: sourceId }) },
+      where: { entityType: entity, active: true, ...(sourceSystem === 'BITRIX24' ? { bitrix24Id: sourceId } : { moyskladId: sourceId }),
+        ...(entity === 'CONTACT' && sourceSystem === 'BITRIX24' && companyTargetId !== undefined ? { moyskladParentId: companyTargetId } : {}) },
       select: { bitrix24Id: true, moyskladId: true, moyskladType: true },
     });
     if (!pair) return null;

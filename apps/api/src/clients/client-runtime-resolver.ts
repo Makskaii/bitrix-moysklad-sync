@@ -45,7 +45,7 @@ export type CandidateEvidence = {
 };
 
 export interface ClientCandidateGateway {
-  findPair(entity: ClientEntity, sourceId: string, sourceSystem?: ClientSystem): Promise<{ targetId: string; targetType: ClientTargetType | 'company' | 'contact' } | null>;
+  findPair(entity: ClientEntity, sourceId: string, sourceSystem?: ClientSystem, companyTargetId?: string | null): Promise<{ targetId: string; targetType: ClientTargetType | 'company' | 'contact' } | null>;
   companyByInn(inn: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   companyByExactNameAndPhone(name: string, phone: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   contactByCompanyAndNamePhone(companyId: string, normalizedName: string, normalizedPhone: string, email?: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
@@ -61,7 +61,7 @@ export class ClientRuntimeResolver {
   async resolve(source: ClientSource, primaryCompanyTargetId?: string | null): Promise<ClientResolution> {
     const sourceSystem = source.sourceSystem ?? 'BITRIX24';
     const targetSystem = sourceSystem === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24';
-    const existing = await this.gateway.findPair(source.entity, source.id, sourceSystem);
+    const existing = await this.gateway.findPair(source.entity, source.id, sourceSystem, source.entity === 'CONTACT' ? primaryCompanyTargetId : undefined);
     if (existing) return { action: 'USE_PAIR', targetId: existing.targetId, targetType: existing.targetType, targetSystem, reason: 'PERSISTED_PAIR' };
 
     if (source.entity === 'COMPANY') return this.resolveCompany(source, targetSystem);

@@ -6,6 +6,7 @@ import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, NamedReferenceKind, VersionedFieldSettingsDto } from './field-settings.dto';
 import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
+import { validateChildResourceBindings } from '../clients/client-child-resource-sync';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -342,13 +343,33 @@ export class FieldSettingsService {
     const groups = Array.isArray(config.groups) ? config.groups : [];
     const group = groups.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.direction === direction && candidate.targetField === targetField);
     if (isRecord(group)) {
-      if (!Array.isArray(group.sourceFields) || !isRecord(group.transform) || group.transform.kind !== 'join-non-empty' || typeof group.transform.separator !== 'string') {
+      if (!Array.isArray(group.sourceFields) || !isRecord(group.transform) || typeof group.transform.separator !== 'string') {
         return { value: null, error: 'transform is not supported', transform: 'unsupported' };
       }
       const fields = group.sourceFields.filter(isString);
-      if (fields.some((field) => source[field] !== undefined && source[field] !== null && typeof source[field] === 'object')) return { value: null, error: 'a source value is not a scalar', transform: 'join-non-empty' };
-      const value = fields.map((field) => source[field]).filter((part) => part !== undefined && part !== null).map(String).map((part) => part.trim()).filter(Boolean).join(group.transform.separator);
-      return { value, error: null, transform: 'join-non-empty' };
+      if (group.transform.kind === 'join-non-empty') {
+        const separator = group.transform.separator;
+        const values: string[] = [];
+        for (const field of fields) {
+          const raw = source[field];
+          const parts = Array.isArray(raw) ? raw.map((entry) => isRecord(entry) ? entry.VALUE : entry) : [raw];
+          for (const part of parts) if (part !== undefined && part !== null && typeof part !== 'object') {
+            const normalized = String(part).trim();
+            if (normalized) values.push(normalized);
+          }
+        }
+        return { value: values.join(separator), error: null, transform: 'join-non-empty' };
+      }
+      if (group.transform.kind === 'split-non-empty' && direction === 'MOYSKLAD_TO_BITRIX24' && isString(group.transform.valueType) && group.transform.valueType.trim()) {
+        const separator = group.transform.separator;
+        const valueType = group.transform.valueType;
+        const values = fields.flatMap((field) => {
+          const raw = source[field];
+          return raw === undefined || raw === null ? [] : String(raw).split(separator).map((item) => item.trim()).filter(Boolean);
+        });
+        return { value: values.map((VALUE) => ({ VALUE, VALUE_TYPE: valueType })), error: null, transform: 'split-non-empty' };
+      }
+      return { value: null, error: 'split-non-empty requires MOYSKLAD_TO_BITRIX24 and an explicit value type', transform: 'split-non-empty' };
     }
     return null;
   }
@@ -432,11 +453,18 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
   const priceTypes = validatePriceTypes(references.priceTypes);
   const dictionaries = validateDictionaries(references.dictionaries);
   const namedPairs = validateNamedPairs(references.namedPairs ?? []);
+  const serviceCounterpartyId = value.serviceCounterpartyId === undefined || value.serviceCounterpartyId === null || value.serviceCounterpartyId === ''
+    ? null
+    : isString(value.serviceCounterpartyId) && isUuid(value.serviceCounterpartyId)
+      ? value.serviceCounterpartyId
+      : (() => { throw new BadRequestException('serviceCounterpartyId must be a MoySklad counterparty UUID or empty'); })();
   const rules = value.rules.map(validateRule);
   const groups = value.groups.map(validateGroup);
+  const childBindingError = validateChildResourceBindings(value.childResourceBindings);
+  if (childBindingError) throw new BadRequestException(childBindingError);
   assertUniqueIds(rules, 'Field rule');
   assertUniqueIds(groups, 'Field group');
-  return { ...value, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  return { ...value, serviceCounterpartyId, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
 }
 
 function assertUniqueIds(items: unknown[], label: string) {
@@ -547,9 +575,22 @@ function validateGroup(value: unknown) {
   if (value.direction !== 'BITRIX24_TO_MOYSKLAD' && value.direction !== 'MOYSKLAD_TO_BITRIX24') {
     throw new BadRequestException('Field group direction is invalid');
   }
-  if (!isRecord(value.transform) || value.transform.kind !== 'join-non-empty' || typeof value.transform.separator !== 'string') {
-    throw new BadRequestException('Field groups currently support the join-non-empty transform');
+  if (!isRecord(value.transform) || typeof value.transform.separator !== 'string' || value.transform.separator.length === 0) {
+    throw new BadRequestException('Field groups require a supported transform and separator');
   }
+  if (value.transform.kind === 'split-non-empty') {
+    if (value.direction !== 'MOYSKLAD_TO_BITRIX24') throw new BadRequestException('split-non-empty must target Bitrix24');
+    if (!isString(value.transform.valueType) || !value.transform.valueType.trim()) throw new BadRequestException('split-non-empty requires an explicit valueType');
+    if (!['contact', 'company', 'contacts', 'companies', 'contacts-companies'].includes(value.entity) || !['PHONE', 'EMAIL'].includes(value.targetField)) {
+      throw new BadRequestException('split-non-empty only supports Bitrix24 company/contact PHONE or EMAIL fields');
+    }
+    const allowedValueTypes = value.targetField === 'PHONE'
+      ? ['WORK', 'MOBILE', 'FAX', 'HOME', 'PAGER', 'MAILING', 'OTHER']
+      : ['WORK', 'HOME', 'MAILING', 'OTHER'];
+    if (!allowedValueTypes.includes(value.transform.valueType)) {
+      throw new BadRequestException(`VALUE_TYPE ${value.transform.valueType} is not documented for Bitrix24 ${value.targetField}`);
+    }
+  } else if (value.transform.kind !== 'join-non-empty') throw new BadRequestException('Field group transform is unsupported');
   return { ...value, criticality: validateCriticality(value.criticality) };
 }
 
@@ -601,6 +642,9 @@ function fieldRuleRiskChanges(before: FieldSettingsConfigDto, after: FieldSettin
     if (oldGroup.direction !== newGroup.direction) changes.push(`group direction changed for ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
   }
   for (const [id, newGroup] of newGroups) if (!oldGroups.has(id)) changes.push(`added group ${newGroup.entity}:${newGroup.sourceFields.join('+')} → ${newGroup.targetField}`);
+  if (JSON.stringify(before.childResourceBindings ?? []) !== JSON.stringify(after.childResourceBindings ?? [])) {
+    changes.push('company requisite/bank child-resource bindings changed');
+  }
   return changes;
 }
 
@@ -633,15 +677,13 @@ function previewRule(rule: unknown, sample: JsonRecord, sampleIndex: number) {
 function previewGroup(group: unknown, sample: JsonRecord, sampleIndex: number) {
   if (!isRecord(group) || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) return [];
   const fields = group.sourceFields.filter(isString);
-  const values = fields.map((field) => sample[field]).filter((value) => value !== undefined && value !== null).map((value) => String(value).trim()).filter(Boolean);
-  const value = group.transform.kind === 'join-non-empty' && isString(group.transform.separator)
-    ? values.join(group.transform.separator)
-    : null;
+  const transformed = applyGroupTransform(group, sample, String(group.direction));
   return [{
     sampleIndex,
     field: group.targetField,
     source: Object.fromEntries(fields.map((field) => [field, sample[field] ?? null])),
-    value,
+    value: transformed.value,
+    ...(transformed.error ? { error: transformed.error } : {}),
     direction: group.direction,
     transform: group.transform.kind,
     writes: 0,
@@ -667,18 +709,41 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
   for (const group of Array.isArray(config.groups) ? config.groups : []) {
     if (!isRecord(group) || group.entity !== entity || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
     const fields = group.sourceFields.filter(isString);
-    if (group.transform.kind !== 'join-non-empty' || typeof group.transform.separator !== 'string') {
+    if (typeof group.transform.separator !== 'string') {
       result[group.targetField] = { value: null, error: 'transform is not supported', transform: String(group.transform.kind) };
       continue;
     }
-    const values = fields.map((field) => source[field]).filter((item) => item !== undefined && item !== null).map((item) => typeof item === 'string' || typeof item === 'number' ? String(item).trim() : '');
-    if (fields.some((field) => source[field] !== undefined && source[field] !== null && typeof source[field] === 'object')) {
-      result[group.targetField] = { value: null, error: 'a source value is not a scalar', transform: 'join-non-empty' };
-    } else {
-      result[group.targetField] = { value: values.filter(Boolean).join(group.transform.separator), transform: 'join-non-empty' };
-    }
+    const transformed = applyGroupTransform(group, source, direction);
+    result[group.targetField] = transformed;
   }
   return result;
+}
+
+function applyGroupTransform(group: JsonRecord, source: JsonRecord, direction: string): { value: unknown; error?: string; transform: string } {
+  const fields = Array.isArray(group.sourceFields) ? group.sourceFields.filter(isString) : [];
+  const transform = group.transform;
+  if (!isRecord(transform) || typeof transform.separator !== 'string' || transform.separator.length === 0) return { value: null, error: 'transform is not supported', transform: 'unsupported' };
+  if (transform.kind === 'join-non-empty') {
+    const values: string[] = [];
+    for (const field of fields) {
+      const raw = source[field];
+      const parts = Array.isArray(raw) ? raw.map((entry) => isRecord(entry) ? entry.VALUE : entry) : [raw];
+      for (const part of parts) if (part !== undefined && part !== null && typeof part !== 'object') {
+        const normalized = String(part).trim();
+        if (normalized) values.push(normalized);
+      }
+    }
+    return { value: values.join(transform.separator), transform: 'join-non-empty' };
+  }
+  if (transform.kind === 'split-non-empty' && direction === 'MOYSKLAD_TO_BITRIX24' && isString(transform.valueType) && transform.valueType.trim()) {
+    const values = splitValues(fields.map((field) => source[field]), transform.separator);
+    return { value: values.map((VALUE) => ({ VALUE, VALUE_TYPE: transform.valueType })), transform: 'split-non-empty' };
+  }
+  return { value: null, error: 'split-non-empty requires MOYSKLAD_TO_BITRIX24 and an explicit value type', transform: 'split-non-empty' };
+}
+
+function splitValues(values: unknown[], separator: string) {
+  return values.flatMap((raw) => raw == null ? [] : String(raw).split(separator).map((part) => part.trim()).filter(Boolean));
 }
 
 function configuredTransforms(config: FieldSettingsConfig): string[] {

@@ -6,6 +6,9 @@ test('admin can browse queue, manual-review cases, separate log categories, and 
   await page.route('**/api/admin/sync-mode', (route) => route.fulfill({ json: { mode: 'on' } }));
   await page.route('**/api/admin/sync-mode/entities', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/admin/sync-mode/recovery', (route) => route.fulfill({ json: { status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null } }));
+  await page.route('**/api/admin/sync-mode/database-recovery', (route) => route.fulfill({ json: {
+    status: 'READY', previousLaunchBoundary: '2026-10-07T00:00:00.000Z', pairsRestored: true, lostEventsAcknowledged: true,
+  } }));
   await page.route('**/api/admin/monitoring/**', (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith('/queue')) return route.fulfill({ json: { counts: { RETRYABLE_FAILURE: 1 }, events: [{ id: 'event-1', source: 'BITRIX24', eventType: 'ONCRMCONTACTUPDATE', externalEntityId: '42', status: 'RETRYABLE_FAILURE', receivedAt: '2026-10-05T10:00:00.000Z', attempts: 2, direction: null, lastErrorCategory: 'EXTERNAL_API_FAILURE' }], nextCursor: null } });
