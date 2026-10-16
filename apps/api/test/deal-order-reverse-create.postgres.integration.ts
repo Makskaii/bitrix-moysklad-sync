@@ -206,6 +206,21 @@ test('missing confirmed product-catalog selection holds an unpaired product for 
   assert.equal(dealAdds, 0);
 });
 
+test('ambiguous Bitrix24 product recovery identity is held for review without creating a deal', async () => {
+  activeOrderId = ids.order;
+  await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: ids.order } });
+  await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: ids.product } });
+  await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
+  await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
+  dealAdds = 0; rowAdds = 0; productAdds = 0; items = []; rows = [];
+  const candidate = { id: 905, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 796 };
+  products = [candidate, { ...candidate, id: 906 }];
+  orderPositions = [position('ambiguous-1', 1)];
+  await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  assert.equal(productAdds, 0);
+  assert.equal(dealAdds, 0);
+});
+
 function config(): any {
   return { version: 4, createdAt: new Date(0).toISOString(), config: {
     schemaVersion: 1, rules: [], groups: [], serviceCounterpartyId: null,
