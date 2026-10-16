@@ -19,6 +19,11 @@ let fakeBase = '';
 const externalRequests: Array<{ method: string; path: string }> = [];
 let bitrixId = '';
 let moyskladId = '';
+const serviceCounterpartyId = '12345678-1234-1234-1234-123456789abd';
+const bitrixProductId = '9001';
+const moyskladProductId = '22345678-1234-1234-1234-123456789abc';
+const moyskladPositionId = '32345678-1234-1234-1234-123456789abc';
+const moyskladUnitId = '42345678-1234-1234-1234-123456789abc';
 const oldEnv = new Map<string, string | undefined>();
 let bitrixComments = 'B24 initial';
 let moyskladDescription = 'MS initial';
@@ -81,11 +86,12 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
     rules: [{ id: 'deal-comments', entity: 'deals-orders', sourceField: 'COMMENTS', targetField: 'description',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
-    groups: [], references: { units: [], priceTypes: [], dictionaries: [] },
+    groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: moyskladUnitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] }, serviceCounterpartyId,
   };
   await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
   await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
   await database.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, source: 'MANUAL', reason: 'public integration fixture' } });
+  await createProductPair(database);
 
   const intake = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -96,13 +102,18 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
 
   for (let attempt = 0; attempt < 50 && externalRequests.length < 3; attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
   await waitForEventStatus(database, eventId, 'SUCCEEDED');
-  assert.deepEqual(externalRequests.map(({ method, path }) => [method, path]), [
+  assert.deepEqual(externalRequests.slice(0, 4).map(({ method, path }) => [method, path]), [
     ['POST', '/b24/rest/crm.deal.get.json'], // dependency discovery reads the deal before baseline capture
+    ['GET', `/ms/api/remap/1.2/entity/counterparty/${serviceCounterpartyId}`],
     ['GET', `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`],
     ['POST', '/b24/rest/crm.deal.get.json'],
   ]);
+  assertPositionReadPaths(4);
   assert.equal(externalRequests.filter(isWrite).length, 0, 'baseline capture must not write either system');
   assert.equal(moyskladDescription, 'MS initial');
+  const syncStateAfterHeaderNoop = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: (await database.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: bitrixId } })).id } });
+  assert.equal((syncStateAfterHeaderNoop.bitrix24Values as Record<string, unknown>)['rule:deal-comments'], 'B24 initial', 'header state initialization preserves field-runtime snapshots');
+  assert.equal((syncStateAfterHeaderNoop.bitrix24Values as Record<string, unknown>)['deal-order-comments'], 'B24 initial', 'header and field-runtime state share a complete snapshot');
 
 
   process.env.LOCAL_HEADER_EXCHANGE_READY = '0';
@@ -185,7 +196,6 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   assert.equal(bitrixComments, 'rate limited update', 'a malformed rejected B24 write does not change provider state');
 
   const writesAfterRateLimit = externalRequests.filter(isWrite).length;
-  const requestsBeforeGate = externalRequests.length;
   const base24BeforeGate = process.env.BITRIX24_REST_BASE_URL;
   process.env.LOCAL_HEADER_EXCHANGE = '0';
   bitrixComments = 'must not write while disabled';
@@ -196,18 +206,19 @@ test('local-only header exchange uses bilateral baseline, MS conflict priority, 
   assert.equal(externalRequests.filter(isWrite).length, writesAfterRateLimit, 'the local exchange gate defaults closed');
 
   process.env.LOCAL_HEADER_EXCHANGE = '1';
+  const requestsBeforeGate = externalRequests.length;
   const pair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId } });
   const eventConfig = await app.get(FieldSettingsService).eventConfig(disabledEventId);
   const headerSync = app.get(DealOrderHeaderSyncProcessor);
   process.env.BITRIX24_REST_BASE_URL = 'https://external.example/rest/';
   assert.equal(await headerSync.process({ eventId: disabledEventId, pair: { id: pair.id, entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, status: 'MANUAL', source: 'PERSISTED' }, eventConfig, baselineId: pair.id }), 'DISABLED');
-  assert.equal(externalRequests.length, requestsBeforeGate + 1, 'the header writer rejects non-loopback B24 before making another HTTP request');
+  assert.equal(externalRequests.length, requestsBeforeGate, 'the header writer rejects non-loopback B24 before making another HTTP request');
   process.env.BITRIX24_REST_BASE_URL = base24BeforeGate;
 
   const baseMsBeforeGate = process.env.MOYSKLAD_API_BASE_URL;
   process.env.MOYSKLAD_API_BASE_URL = 'http://remote.example/api/';
   assert.equal(await headerSync.process({ eventId: disabledEventId, pair: { id: pair.id, entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, status: 'MANUAL', source: 'PERSISTED' }, eventConfig, baselineId: pair.id }), 'DISABLED');
-  assert.equal(externalRequests.length, requestsBeforeGate + 1, 'the header writer rejects non-loopback MySklad before making another HTTP request');
+  assert.equal(externalRequests.length, requestsBeforeGate, 'the header writer rejects non-loopback MySklad before making another HTTP request');
   process.env.MOYSKLAD_API_BASE_URL = baseMsBeforeGate;
 
   const unconfirmedId = String(Number(bitrixId) + 1);
@@ -346,7 +357,8 @@ test('first confirmed event captures baseline with header-writer preview flags d
   await waitForBaseline(database, pair.id);
   const baseline = await database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
   assert.ok(baseline, 'Q26.66 baseline capture is not gated by local preview flags');
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
+  assert.deepEqual(externalRequests.slice(requestsBefore, requestsBefore + 4).map(({ method }) => method), ['POST', 'GET', 'GET', 'POST']);
+  assert.equal(externalRequests.length, requestsBefore + 4, 'disabled header exchange captures baseline without starting position sync');
   assert.equal(externalRequests.slice(requestsBefore).filter(isWrite).length, 0);
   await waitForEventStatus(database, eventId, 'SKIPPED_DISABLED');
 
@@ -377,7 +389,8 @@ test('pause stores event without provider reads; resume captures current state o
   await waitForEventStatus(database, eventId, 'SUCCEEDED');
   const baseline = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
   assert.equal((baseline.bitrix24Values as { 'rule:deal-comments'?: string })['rule:deal-comments'], 'current state on resume');
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
+  assert.deepEqual(externalRequests.slice(requestsBefore, requestsBefore + 4).map(({ method }) => method), ['POST', 'GET', 'GET', 'POST']);
+  assertPositionReadPaths(requestsBefore + 4);
   assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'pause permits baseline source reads but no sync writes');
   assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).status, 'SUCCEEDED');
 });
@@ -423,10 +436,11 @@ test('dry first-event baseline uses the isolated dry database and performs reads
   const response = await postB24(bitrixId, 'dry first event', 'dry-baseline-only');
   assert.equal(response.status, 200);
   await waitForBaseline(database, pair.id);
+  await waitForEventStatus(database, (await response.json() as { eventId: string }).eventId, 'SUCCEEDED');
   const applyDatabase = new PrismaClient({ datasources: { db: { url: applyDatabaseUrl } } });
   assert.equal(await applyDatabase.entityPairBaseline.findUnique({ where: { pairId: pair.id } }), null);
   await applyDatabase.$disconnect();
-  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'POST']);
+  assert.deepEqual(externalRequests.slice(requestsBefore).map(({ method }) => method), ['POST', 'GET', 'GET', 'POST']);
   assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'dry mode performs no external synchronization writes');
 });
 
@@ -436,11 +450,17 @@ async function createConfirmedPairAndSettings(database: DatabaseService, setting
     rules: [{ id: 'deal-comments', entity: 'deals-orders', sourceField: 'COMMENTS', targetField: 'description',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
-    groups: [], references: { units: [], priceTypes: [], dictionaries: [] },
+    groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: moyskladUnitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] }, serviceCounterpartyId,
   };
   await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
   await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
+  await createProductPair(database);
   return database.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: bitrixId, moyskladId, source: 'MANUAL', reason: 'first-event baseline boundary fixture' } });
+}
+
+async function createProductPair(database: DatabaseService) {
+  await database.entityPair.deleteMany({ where: { entityType: 'PRODUCT' } });
+  await database.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: bitrixProductId, moyskladId: moyskladProductId, moyskladType: 'product', source: 'MANUAL', reason: 'baseline position fixture prerequisite' } });
 }
 
 async function reply(request: IncomingMessage, response: ServerResponse) {
@@ -479,6 +499,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       return;
     }
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, updated: '2026-10-07T10:00:00+00:00' }));
+  } else if (path === `/ms/api/remap/1.2/entity/counterparty/${serviceCounterpartyId}` && request.method === 'GET') {
+    response.writeHead(200); response.end(JSON.stringify({ id: serviceCounterpartyId, meta: { type: 'counterparty' } }));
+  } else if (new URL(path, 'http://127.0.0.1').pathname === '/b24/rest/crm.item.productrow.list' && request.method === 'POST') {
+    response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: 1, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0 }] }, total: 1 }));
+  } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions` && request.method === 'GET') {
+    response.writeHead(200); response.end(JSON.stringify({ rows: [{ id: moyskladPositionId, assortment: { meta: { href: `${fakeBase}/entity/product/${moyskladProductId}`, type: 'product' } }, quantity: 1, price: 100, discount: 0, vat: 0, vatEnabled: false }], meta: { size: 1 } }));
+  } else if (path === `/ms/api/remap/1.2/entity/product/${moyskladProductId}` && request.method === 'GET') {
+    response.writeHead(200); response.end(JSON.stringify({ id: moyskladProductId, meta: { type: 'product' }, uom: { id: moyskladUnitId } }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}` && request.method === 'PUT') {
     if (failNextMoyskladWriteRetryAfter) {
       const retryAfter = failNextMoyskladWriteRetryAfter;
@@ -516,7 +544,8 @@ async function waitForEventStatus(database: DatabaseService, id: string, status:
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.fail(`timed out waiting for event ${id} to reach ${status}`);
+  const finalState = await database.inboundEvent.findUnique({ where: { id }, select: { status: true, lastErrorCategory: true, retryAfter: true } });
+  assert.fail(`timed out waiting for event ${id} to reach ${status}; final=${JSON.stringify(finalState)}`);
 }
 
 async function waitForEventAttempt(database: DatabaseService, id: string, attempts: number) {
@@ -546,6 +575,15 @@ async function waitForBaseline(database: DatabaseService, pairId: string) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`timed out waiting for baseline ${pairId}; fake requests: ${JSON.stringify(externalRequests)}`);
+}
+
+function assertPositionReadPaths(startIndex: number) {
+  const paths = externalRequests.slice(startIndex).map(({ path }) => new URL(path, 'http://127.0.0.1').pathname).sort();
+  assert.deepEqual(paths, [
+    '/b24/rest/crm.item.productrow.list',
+    `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions`,
+    `/ms/api/remap/1.2/entity/product/${moyskladProductId}`,
+  ].sort());
 }
 
 function isWrite(request: { method: string; path: string }) {
