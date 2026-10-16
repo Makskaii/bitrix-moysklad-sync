@@ -1,5 +1,7 @@
 import { Controller, DynamicModule, Get, Module, Provider, Type } from '@nestjs/common';
 import { AdminController } from './admin.controller';
+import { AdminAuditController } from './admin-audit.controller';
+import { AdminAuditService } from './admin-audit.service';
 import { AdminPreviewController } from './admin-preview.controller';
 import { AdminAccessGuard, LOCAL_ADMIN_PREVIEW_ACCESS } from './admin-access.guard';
 import { DatabaseService } from '../database.service';
@@ -53,9 +55,10 @@ export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController] : [])],
       providers: [
         databaseProvider,
+        AdminAuditService,
         SyncModeService,
         SyncRecoveryService,
         ContactSyncProcessor,

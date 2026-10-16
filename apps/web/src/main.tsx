@@ -13,16 +13,20 @@ type RecoveryStatus = { status: string; provider: string; bitrixStart: number; m
 type DatabaseRecoveryStatus = { status: string; previousLaunchBoundary: string | null; pairsRestored: boolean; lostEventsAcknowledged: boolean; acknowledgedAt?: string | null; acknowledgement?: string | null; audit?: Array<{ action: string; actorId: string; oldBoundaryAt: string | null; boundaryAt: string; occurredAt: string; acknowledgement: string }> };
 type BitrixAuth = { access_token: string };
 type BitrixSdk = { init(callback: () => void): void; getAuth(): BitrixAuth | false };
-type QueueEvent = { id: string; source: string; eventType: string | null; externalEntityId: string | null; status: string; receivedAt: string; attempts: number; direction: string | null; lastErrorCategory: string | null };
+type QueueEvent = { id: string; source: string; eventType: string | null; externalEntityId: string | null; status: string; receivedAt: string; attempts: number; direction: string | null; lastErrorCategory: string | null; retryAfter: string | null };
 type QueueSnapshot = { counts: Record<string, number>; events: QueueEvent[]; nextCursor: string | null };
-type ReviewCase = { id: string; eventId: string; source: string; externalEntityId: string | null; reason: string; diagnostic: Record<string, string | number | boolean> | null; status: string; openedAt: string };
+type ReviewCase = { id: string; eventId: string; source: string; externalEntityId: string | null; reason: string; diagnostic: Record<string, unknown> | null; entityLabel: string | null; fieldTitle: string | null; previousValue: unknown; proposedValue: unknown; status: string; openedAt: string };
 type OperationalLog = { id: string; category: string; message: string; referenceId: string | null; occurredAt: string };
 type ApiAttempt = { id: string; eventId: string | null; provider: string; operation: string; method: string; statusCode: number | null; succeeded: boolean; occurredAt: string };
+type AdminAuditRow = { id: string; actorId: string; action: string; targetType: string; targetId: string | null; reason: string | null; before: unknown; after: unknown; occurredAt: string };
+type OverviewStats = { queue: Record<string, number>; openManualReviews: number; openPairReviews: number; activePairs: number; lastEventAt: string | null };
+const emptyOverview: OverviewStats = { queue: {}, openManualReviews: 0, openPairReviews: 0, activePairs: 0, lastEventAt: null };
 type AdminSection = 'overview' | 'queue' | 'pairs' | 'clients' | 'history' | 'matching' | 'review' | 'settings' | 'dictionaries' | 'fields' | 'logs';
 declare global { interface Window { BX24?: BitrixSdk } }
 
 const trialActionsEndpoint = '/api/admin/trial-actions';
-const logCategories = ['EVENT', 'SCHEDULED', 'ERROR', 'ADMIN'] as const;
+const logCategories = ['EVENTS', 'CRON_SYSTEM', 'MANUAL'] as const;
+const logCategoryLabels: Record<typeof logCategories[number], string> = { EVENTS: 'События', CRON_SYSTEM: 'Система и расписание', MANUAL: 'Действия вручную' };
 const sections: { id: AdminSection; label: string; icon: string }[] = [
   { id: 'overview', label: 'Обзор', icon: '⌂' },
   { id: 'queue', label: 'Очередь и попытки', icon: '≡' },
@@ -54,7 +58,10 @@ function App() {
   const [logNextCursor, setLogNextCursor] = useState<string | null>(null);
   const [apiAttempts, setApiAttempts] = useState<ApiAttempt[]>([]);
   const [attemptNextCursor, setAttemptNextCursor] = useState<string | null>(null);
-  const [logCategory, setLogCategory] = useState<typeof logCategories[number]>('EVENT');
+  const [auditEntries, setAuditEntries] = useState<AdminAuditRow[]>([]);
+  const [auditNextCursor, setAuditNextCursor] = useState<string | null>(null);
+  const [overview, setOverview] = useState<OverviewStats>(emptyOverview);
+  const [logCategory, setLogCategory] = useState<typeof logCategories[number]>('EVENTS');
   const [mode, setMode] = useState<ServiceMode>('off');
   const [entities, setEntities] = useState<EntityControl[]>([]);
   const [confirmMode, setConfirmMode] = useState<ServiceMode | null>(null);
@@ -80,18 +87,20 @@ function App() {
 
   async function refresh(token = accessToken) {
     const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
-    const [actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse] = await Promise.all([
+    const [actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse, overviewResponse, auditResponse] = await Promise.all([
       fetch(trialActionsEndpoint, { headers }),
       fetch('/api/admin/sync-mode', { headers }),
       fetch('/api/admin/sync-mode/entities', { headers }),
       fetch('/api/admin/sync-mode/recovery', { headers }),
       fetch('/api/admin/sync-mode/database-recovery', { headers }),
+      fetch('/api/admin/overview', { headers }),
+      fetch('/api/admin/audit?limit=50', { headers }),
     ]);
-    if ([actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse].some((response) => response.status === 403)) {
+    if ([actionsResponse, modeResponse, entitiesResponse, recoveryResponse, databaseRecoveryResponse, overviewResponse, auditResponse].some((response) => response.status === 403)) {
       denyAdminAccess();
       throw new Error('Доступ только для администратора Bitrix24');
     }
-    if (!actionsResponse.ok || !modeResponse.ok || !entitiesResponse.ok || !recoveryResponse.ok || !databaseRecoveryResponse.ok) {
+    if (!actionsResponse.ok || !modeResponse.ok || !entitiesResponse.ok || !recoveryResponse.ok || !databaseRecoveryResponse.ok || !overviewResponse.ok || !auditResponse.ok) {
       throw new Error('Не удалось загрузить состояние админки');
     }
 
@@ -100,6 +109,10 @@ function App() {
     setEntities(await entitiesResponse.json() as EntityControl[]);
     setRecovery(await recoveryResponse.json() as RecoveryStatus);
     setDatabaseRecovery(await databaseRecoveryResponse.json() as DatabaseRecoveryStatus);
+    setOverview(await overviewResponse.json() as OverviewStats);
+    const auditPage = await auditResponse.json() as { entries: AdminAuditRow[]; nextCursor: string | null };
+    setAuditEntries(auditPage.entries);
+    setAuditNextCursor(auditPage.nextCursor);
     const [queueResponse, incidentResponse, logResponse, attemptResponse] = await Promise.all([
       fetch('/api/admin/monitoring/queue', { headers }),
       fetch('/api/admin/monitoring/incidents?status=OPEN', { headers }),
@@ -259,14 +272,14 @@ function App() {
     setLogNextCursor(page.nextCursor);
   }
 
-  async function loadMore(kind: 'queue' | 'incidents' | 'logs' | 'api') {
+  async function loadMore(kind: 'queue' | 'incidents' | 'logs' | 'api' | 'audit') {
     const headers: Record<string, string> = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
-    const cursor = kind === 'queue' ? queueSnapshot.nextCursor : kind === 'incidents' ? incidentNextCursor : kind === 'logs' ? logNextCursor : attemptNextCursor;
+    const cursor = kind === 'queue' ? queueSnapshot.nextCursor : kind === 'incidents' ? incidentNextCursor : kind === 'logs' ? logNextCursor : kind === 'api' ? attemptNextCursor : auditNextCursor;
     if (!cursor) return;
     const endpoint = kind === 'queue' ? `/api/admin/monitoring/queue?cursor=${encodeURIComponent(cursor)}`
       : kind === 'incidents' ? `/api/admin/monitoring/incidents?status=OPEN&cursor=${encodeURIComponent(cursor)}`
         : kind === 'logs' ? `/api/admin/monitoring/logs?category=${logCategory}&cursor=${encodeURIComponent(cursor)}`
-          : `/api/admin/monitoring/api-attempts?cursor=${encodeURIComponent(cursor)}`;
+          : kind === 'api' ? `/api/admin/monitoring/api-attempts?cursor=${encodeURIComponent(cursor)}` : `/api/admin/audit?cursor=${encodeURIComponent(cursor)}`;
     const response = await fetch(endpoint, { headers });
     handleForbidden(response);
     if (!response.ok) throw new Error('Не удалось загрузить следующую страницу мониторинга');
@@ -279,9 +292,12 @@ function App() {
     } else if (kind === 'logs') {
       const page = await response.json() as { entries: OperationalLog[]; nextCursor: string | null };
       setLogs((current) => [...current, ...page.entries]); setLogNextCursor(page.nextCursor);
-    } else {
+    } else if (kind === 'api') {
       const page = await response.json() as { attempts: ApiAttempt[]; nextCursor: string | null };
       setApiAttempts((current) => [...current, ...page.attempts]); setAttemptNextCursor(page.nextCursor);
+    } else {
+      const page = await response.json() as { entries: AdminAuditRow[]; nextCursor: string | null };
+      setAuditEntries((current) => [...current, ...page.entries]); setAuditNextCursor(page.nextCursor);
     }
   }
 
@@ -349,7 +365,7 @@ function App() {
         </nav>
 
         <div className="page-content">
-          {activeSection === 'overview' && <Overview mode={mode} recovery={recovery} serviceStatus={serviceStatus} actions={actions} loading={loading} message={message} setMessage={setMessage} submit={submitTrialAction} error={error} />}
+          {activeSection === 'overview' && <Overview mode={mode} recovery={recovery} serviceStatus={serviceStatus} actions={actions} loading={loading} message={message} setMessage={setMessage} submit={submitTrialAction} error={error} stats={overview} />}
           {activeSection === 'queue' && <MonitoringPage kind="queue" queue={queueSnapshot} attempts={apiAttempts} onLoadMore={loadMore} onError={setError} />}
           {activeSection === 'pairs' && <PairManager accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
           {activeSection === 'clients' && <ClientMappingPage accessToken={accessToken} onError={setError} onForbidden={denyAdminAccess} />}
@@ -359,7 +375,7 @@ function App() {
           {activeSection === 'settings' && <Settings accessToken={accessToken} mode={mode} entities={entities} recovery={recovery} databaseRecovery={databaseRecovery} setDatabaseRecovery={setDatabaseRecovery} confirmMode={confirmMode} setConfirmMode={setConfirmMode} saveMode={saveMode} confirmDirections={confirmDirections} setConfirmDirections={setConfirmDirections} saveDirections={saveDirections} error={error} setError={setError} />}
           {activeSection === 'dictionaries' && <UnavailablePage title="Справочники" eyebrow="СОПОСТАВЛЕНИЯ ЗНАЧЕНИЙ" description="Связи сотрудников, организаций, складов, валют и значений справочников пока не загружаются. Демонстрационные пары не используются." action="Добавить соответствие" />}
           {activeSection === 'fields' && <FieldSettingsPage accessToken={accessToken} onForbidden={denyAdminAccess} onError={setError} />}
-          {activeSection === 'logs' && <MonitoringPage kind="logs" logs={logs} logCategory={logCategory} onCategory={showLogCategory} logNextCursor={logNextCursor} attempts={apiAttempts} attemptNextCursor={attemptNextCursor} onLoadMore={loadMore} onError={setError} />}
+          {activeSection === 'logs' && <MonitoringPage kind="logs" logs={logs} logCategory={logCategory} onCategory={showLogCategory} logNextCursor={logNextCursor} attempts={apiAttempts} attemptNextCursor={attemptNextCursor} auditEntries={auditEntries} auditNextCursor={auditNextCursor} onLoadMore={loadMore} onError={setError} />}
           {error && activeSection !== 'overview' && activeSection !== 'settings' && <p role="alert" className="inline-error">{error}</p>}
         </div>
       </section>
@@ -372,7 +388,7 @@ function App() {
   </main>;
 }
 
-function Overview({ mode, recovery, serviceStatus, actions, loading, message, setMessage, submit, error }: {
+function Overview({ mode, recovery, serviceStatus, actions, loading, message, setMessage, submit, error, stats }: {
   mode: ServiceMode;
   recovery: RecoveryStatus;
   serviceStatus: string;
@@ -382,6 +398,7 @@ function Overview({ mode, recovery, serviceStatus, actions, loading, message, se
   setMessage: (value: string) => void;
   submit: (event: React.FormEvent) => void;
   error: string;
+  stats: OverviewStats;
 }) {
   const modeLabel = mode === 'on' ? 'Включён' : mode === 'pause' ? 'Пауза' : 'Выключен';
   const recoveryLabel = recovery.status === 'idle' ? 'Не запущен' : recovery.status === 'running' ? 'Выполняется' : recovery.status;
@@ -393,14 +410,14 @@ function Overview({ mode, recovery, serviceStatus, actions, loading, message, se
       <article className="status-card"><span className="card-label">Поиск изменений</span><strong>{recoveryLabel}</strong><small>{recovery.error || (recovery.status === 'idle' ? 'Последний ответ API' : `Источник: ${recovery.provider === 'BITRIX24' ? 'Bitrix24' : 'МойСклад'}`)}</small></article>
     </div>
     <section className="panel metrics-panel">
-      <div className="panel-heading"><div><p className="eyebrow">ПОКАЗАТЕЛИ</p><h3>Обмен и данные</h3></div><span className="availability-tag">Часть показателей недоступна</span></div>
+      <div className="panel-heading"><div><p className="eyebrow">ПОКАЗАТЕЛИ</p><h3>Обмен и данные</h3></div><span className="availability-tag">Данные из API</span></div>
       <div className="metric-grid">
-        <Metric label="Записи в очереди" />
-        <Metric label="Активные пары" />
-        <Metric label="Случаи проверки" />
-        <Metric label="Последняя операция" />
+        <article className="metric"><span>События в очереди</span><strong>{loading ? '…' : Object.values(stats.queue).reduce((sum, count) => sum + count, 0)}</strong></article>
+        <article className="metric"><span>Активные пары</span><strong>{loading ? '…' : stats.activePairs}</strong></article>
+        <article className="metric"><span>Открытые проверки</span><strong>{loading ? '…' : stats.openManualReviews + stats.openPairReviews}</strong></article>
+        <article className="metric"><span>Последнее событие</span><strong>{loading ? '…' : stats.lastEventAt ? new Date(stats.lastEventAt).toLocaleString('ru-RU') : 'Нет событий'}</strong></article>
       </div>
-      <p className="honesty-note"><span aria-hidden="true">i</span> Сводные показатели очереди, пар и последней операции пока не подключены. Очередь и случаи ручной проверки доступны в своих разделах.</p>
+      <p className="honesty-note"><span aria-hidden="true">i</span> Доступны проверки очереди и ручные решения; фактическое применение внешних изменений определяется серверным режимом и направлением обмена.</p>
     </section>
     <section className="panel trial-panel">
       <div className="panel-heading"><div><p className="eyebrow">ЛОКАЛЬНАЯ БАЗА</p><h3>Пробный контур</h3></div><span className="availability-tag is-local">Техническая проверка</span></div>
@@ -418,7 +435,7 @@ function Overview({ mode, recovery, serviceStatus, actions, loading, message, se
   </>;
 }
 
-function MonitoringPage({ kind, queue, incidents, incidentNextCursor, logs, logCategory, logNextCursor, attempts, attemptNextCursor, onCategory, onLoadMore, onResolve, onRetry, onError }: {
+function MonitoringPage({ kind, queue, incidents, incidentNextCursor, logs, logCategory, logNextCursor, attempts, attemptNextCursor, auditEntries, auditNextCursor, onCategory, onLoadMore, onResolve, onRetry, onError }: {
   kind: 'queue' | 'review' | 'logs';
   queue?: QueueSnapshot;
   incidents?: ReviewCase[];
@@ -428,8 +445,10 @@ function MonitoringPage({ kind, queue, incidents, incidentNextCursor, logs, logC
   logNextCursor?: string | null;
   attempts?: ApiAttempt[];
   attemptNextCursor?: string | null;
+  auditEntries?: AdminAuditRow[];
+  auditNextCursor?: string | null;
   onCategory?: (category: typeof logCategories[number]) => Promise<void>;
-  onLoadMore: (kind: 'queue' | 'incidents' | 'logs' | 'api') => Promise<void>;
+  onLoadMore: (kind: 'queue' | 'incidents' | 'logs' | 'api' | 'audit') => Promise<void>;
   onResolve?: (id: string) => Promise<void>;
   onRetry?: (id: string) => Promise<void>;
   onError: (message: string) => void;
@@ -447,28 +466,33 @@ function MonitoringPage({ kind, queue, incidents, incidentNextCursor, logs, logC
       <section className="panel monitoring-panel" aria-label="Очередь событий">
         <div className="panel-heading"><div><p className="eyebrow">ТЕКУЩЕЕ СОСТОЯНИЕ</p><h3>События очереди</h3></div></div>
         <div className="metric-grid">{Object.entries(queue?.counts ?? {}).map(([status, count]) => <article className="metric" key={status}><span>{status}</span><strong>{count}</strong></article>)}</div>
-        {queue?.events.length ? <div className="monitor-list">{queue.events.map((event) => <article key={event.id}><div><strong>{event.eventType ?? event.source}</strong><small>{event.source} · {event.externalEntityId ? `ID ${event.externalEntityId}` : 'без ID'} · {new Date(event.receivedAt).toLocaleString('ru-RU')}</small></div><span className={`event-status status-${event.status.toLowerCase()}`}>{event.status}</span><small>Попыток: {event.attempts}{event.lastErrorCategory ? ` · ${event.lastErrorCategory}` : ''}</small></article>)}</div> : <p className="muted-empty">Очередь пуста.</p>}
+        {queue?.events.length ? <div className="monitor-list">{queue.events.map((event) => <article key={event.id}><div><strong>{event.eventType ?? event.source}</strong><small>{event.source} · {event.externalEntityId ? `ID ${event.externalEntityId}` : 'без ID'} · {new Date(event.receivedAt).toLocaleString('ru-RU')}{event.direction ? ` · ${event.direction}` : ''}</small></div><span className={`event-status status-${event.status.toLowerCase()}`}>{event.status}</span><small>Попыток: {event.attempts}{event.lastErrorCategory ? ` · ${event.lastErrorCategory}` : ''}{event.retryAfter ? ` · повтор после ${new Date(event.retryAfter).toLocaleString('ru-RU')}` : ''}</small></article>)}</div> : <p className="muted-empty">Очередь пуста.</p>}
         {queue?.nextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('queue'))}>Загрузить следующие события</button>}
       </section>
       <ApiAttempts attempts={attempts ?? []} nextCursor={attemptNextCursor} onLoadMore={onLoadMore} onError={onError} />
     </>}
     {kind === 'review' && <section className="panel monitoring-panel" aria-label="Случаи ручной проверки">
-      {incidents?.length ? <div className="monitor-list">{incidents.map((incident) => <article key={incident.id}><div><strong>{incident.reason}</strong><small>{incident.source} · {incident.externalEntityId ? `ID ${incident.externalEntityId}` : 'без ID'} · событие {incident.eventId}</small>{incident.diagnostic && <small>Диагностика: {Object.entries(incident.diagnostic).map(([key, value]) => `${key}=${value}`).join(' · ')}</small>}<small>{new Date(incident.openedAt).toLocaleString('ru-RU')}</small></div><div className="incident-actions"><button type="button" className="button-secondary" onClick={() => run(() => onRetry?.(incident.id) ?? Promise.resolve())}>Повторить</button><button type="button" className="button-secondary" onClick={() => run(() => onResolve?.(incident.id) ?? Promise.resolve())}>Отметить решённым</button></div></article>)}</div> : <p className="muted-empty">Открытых случаев ручной проверки нет.</p>}
+      {incidents?.length ? <div className="monitor-list">{incidents.map((incident) => <article key={incident.id}><div><strong>{incident.entityLabel ? `${incident.entityLabel} · ` : ''}{incident.reason}</strong><small>{incident.source} · {incident.externalEntityId ? `ID ${incident.externalEntityId}` : 'без ID'} · событие {incident.eventId}</small>{incident.fieldTitle && <small>Поле: {incident.fieldTitle}</small>}{incident.previousValue !== null && incident.previousValue !== undefined && <small>Текущее значение: {JSON.stringify(incident.previousValue)}</small>}{incident.proposedValue !== null && incident.proposedValue !== undefined && <small>Предлагаемое значение: {JSON.stringify(incident.proposedValue)}</small>}{incident.diagnostic && <small>Диагностика: {Object.entries(incident.diagnostic).map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`).join(' · ')}</small>}<small>{new Date(incident.openedAt).toLocaleString('ru-RU')}</small></div><div className="incident-actions"><button type="button" className="button-secondary" onClick={() => run(() => onRetry?.(incident.id) ?? Promise.resolve())}>Повторить</button><button type="button" className="button-secondary" onClick={() => run(() => onResolve?.(incident.id) ?? Promise.resolve())}>Отметить решённым</button></div></article>)}</div> : <p className="muted-empty">Открытых случаев ручной проверки нет.</p>}
       {incidentNextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('incidents'))}>Загрузить следующие случаи</button>}
     </section>}
     {kind === 'logs' && <>
       <section className="panel monitoring-panel" aria-label="Операционные журналы">
         <div className="panel-heading"><div><p className="eyebrow">СОБЫТИЯ И ДЕЙСТВИЯ</p><h3>Операционные журналы</h3></div></div>
-        <div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => onCategory && run(() => onCategory(category))}>{category}</button>)}</div>
+        <div className="log-tabs">{logCategories.map((category) => <button key={category} type="button" aria-pressed={logCategory === category} onClick={() => onCategory && run(() => onCategory(category))}>{logCategoryLabels[category]}</button>)}</div>
         {logs?.length ? <div className="monitor-list">{logs.map((entry) => <article key={entry.id}><div><strong>{entry.message}</strong><small>{new Date(entry.occurredAt).toLocaleString('ru-RU')}{entry.referenceId ? ` · ${entry.referenceId}` : ''}</small></div><span className="event-status">{entry.category}</span></article>)}</div> : <p className="muted-empty">В этой категории пока нет записей.</p>}
         {logNextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('logs'))}>Загрузить следующие записи</button>}
       </section>
       <ApiAttempts attempts={attempts ?? []} nextCursor={attemptNextCursor} onLoadMore={onLoadMore} onError={onError} />
+      <section className="panel monitoring-panel" aria-label="Аудит действий администратора">
+        <div className="panel-heading"><div><p className="eyebrow">НЕИЗМЕНЯЕМАЯ ИСТОРИЯ</p><h3>Аудит действий администратора</h3></div></div>
+        {auditEntries?.length ? <div className="monitor-list">{auditEntries.map((entry) => <article key={entry.id}><div><strong>{entry.action} · {entry.targetType}</strong><small>{entry.actorId} · {new Date(entry.occurredAt).toLocaleString('ru-RU')}{entry.targetId ? ` · ${entry.targetId}` : ''}{entry.reason ? ` · ${entry.reason}` : ''}</small><details><summary>До / после</summary><pre>{JSON.stringify({ before: entry.before, after: entry.after }, null, 2)}</pre></details></div></article>)}</div> : <p className="muted-empty">Записей аудита пока нет.</p>}
+        {auditNextCursor && <button className="load-more" type="button" onClick={() => run(() => onLoadMore('audit'))}>Загрузить следующие записи</button>}
+      </section>
     </>}
   </>;
 }
 
-function ApiAttempts({ attempts, nextCursor, onLoadMore, onError }: { attempts: ApiAttempt[]; nextCursor?: string | null; onLoadMore: (kind: 'queue' | 'incidents' | 'logs' | 'api') => Promise<void>; onError: (message: string) => void }) {
+function ApiAttempts({ attempts, nextCursor, onLoadMore, onError }: { attempts: ApiAttempt[]; nextCursor?: string | null; onLoadMore: (kind: 'queue' | 'incidents' | 'logs' | 'api' | 'audit') => Promise<void>; onError: (message: string) => void }) {
   return <section className="panel monitoring-panel" aria-label="История вызовов API"><div className="panel-heading"><div><p className="eyebrow">ВНЕШНИЕ СИСТЕМЫ</p><h3>История вызовов API</h3></div></div>
     {attempts.length ? <div className="monitor-list">{attempts.map((attempt) => <article key={attempt.id}><div><strong>{attempt.provider} · {attempt.operation}</strong><small>{attempt.method} · {new Date(attempt.occurredAt).toLocaleString('ru-RU')}{attempt.eventId ? ` · событие ${attempt.eventId}` : ''}</small></div><span className={`event-status ${attempt.succeeded ? 'status-succeeded' : 'status-manual_review'}`}>{attempt.statusCode ?? 'ошибка сети'} · {attempt.succeeded ? 'OK' : 'ошибка'}</span></article>)}</div> : <p className="muted-empty">История вызовов API пуста.</p>}
     {nextCursor && <button className="load-more" type="button" onClick={() => void onLoadMore('api').catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Загрузить следующие вызовы</button>}
@@ -622,18 +646,22 @@ const pairReviewReasonLabels: Record<string, string> = {
 };
 type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; source: string; reason: string | null; createdAt: string };
 type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; eventId: string | null; reason: string; openedAt: string };
+type ClientLifecycleRow = { id: string; entityType: 'COMPANY' | 'CONTACT'; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; lifecycleStatus: string; tombstonedAt: string | null; tombstoneSource: string | null; tombstoneReason: string | null; deletionMarkerStatus: string; deletionTimelineStatus: string };
 
 function PairManager({ accessToken, onError, onForbidden }: { accessToken: string; onError: (message: string) => void; onForbidden: () => void }) {
   const [pairs, setPairs] = useState<PairRow[]>([]);
   const [reviews, setReviews] = useState<PairReviewRow[]>([]);
+  const [lifecycleRows, setLifecycleRows] = useState<ClientLifecycleRow[]>([]);
+  const [lifecycleError, setLifecycleError] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
   async function refresh() {
     const headers: Record<string, string> = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
-    const [pairsResponse, reviewsResponse] = await Promise.all([
+    const [pairsResponse, reviewsResponse, lifecycleResponse] = await Promise.all([
       fetch('/api/admin/pairs', { headers }),
       fetch('/api/admin/pairs/reviews', { headers }),
+      fetch('/api/admin/clients/lifecycle', { headers }),
     ]);
     if (pairsResponse.status === 403 || reviewsResponse.status === 403) {
       onForbidden();
@@ -642,6 +670,17 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
     if (!pairsResponse.ok || !reviewsResponse.ok) throw new Error('Не удалось загрузить пары записей');
     setPairs(await pairsResponse.json() as PairRow[]);
     setReviews(await reviewsResponse.json() as PairReviewRow[]);
+    if (lifecycleResponse.status === 403) {
+      onForbidden();
+      throw new Error('Доступ только для администратора Bitrix24');
+    }
+    if (!lifecycleResponse.ok) {
+      setLifecycleRows([]);
+      setLifecycleError('Статус удалённых пар пока недоступен. Повторите загрузку; восстановление не предлагается без данных сервера.');
+    } else {
+      setLifecycleRows(await lifecycleResponse.json() as ClientLifecycleRow[]);
+      setLifecycleError('');
+    }
   }
 
   useEffect(() => {
@@ -670,6 +709,23 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
     }
   }
 
+  async function restore(pairId: string) {
+    if (!window.confirm('Восстановить ту же пару по проверенным ID обеих систем? Внешние записи не создаются и не изменяются.')) return;
+    setSaving(true);
+    try {
+      const response = await fetch(`/api/admin/clients/lifecycle/${encodeURIComponent(pairId)}/restore`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+        body: JSON.stringify({ confirmed: true }),
+      });
+      if (response.status === 403) { onForbidden(); throw new Error('Доступ только для администратора Bitrix24'); }
+      const result = await response.json().catch(() => null) as { status?: string } | null;
+      if (!response.ok) throw new Error(result?.status ? `Не удалось восстановить пару: ${result.status}` : 'Не удалось проверить и восстановить пару');
+      if (result?.status !== 'RESTORED') throw new Error('Сервер не подтвердил восстановление пары');
+      await refresh();
+      onError('');
+    } finally { setSaving(false); }
+  }
+
   return <>
     <PageHeading eyebrow="СВЯЗИ ЗАПИСЕЙ" title="Пары Bitrix24 и МойСклад" subtitle="Подтверждённая пара хранится по ID обеих записей. Непроверенное совпадение всегда остаётся на ручной проверке." />
     <section className="panel pair-manager">
@@ -680,19 +736,29 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
         {pair.reason && <small>Основание: {pair.reason}</small>}
       </article>)}</div> : <p className="empty-state">Сохранённых пар пока нет.</p>}
     </section>
+    <section className="panel pair-manager" aria-label="Удалённые клиентские пары">
+      <p className="eyebrow">ЖИЗНЕННЫЙ ЦИКЛ КЛИЕНТА</p><h3>Приостановленные пары · {lifecycleRows.length}</h3>
+      <p className="pair-safety-note">Удалённая запись не считается несопоставленной и не удаляет запись партнёра. Восстановление проверяет, что обе исходные записи по тем же ID всё ещё существуют.</p>
+      {lifecycleError ? <p role="alert" className="inline-error">{lifecycleError}</p> : lifecycleRows.length ? <div className="pair-list">{lifecycleRows.map((row) => <article className="pair-card" key={row.id}>
+        <div><span className="pair-entity">{row.entityType === 'COMPANY' ? 'Компания' : 'Контакт'}</span><span className="pair-state">Удалена в {row.tombstoneSource ?? 'неизвестной системе'} · {row.tombstonedAt ? new Date(row.tombstonedAt).toLocaleString('ru-RU') : 'время неизвестно'}</span></div>
+        <div className="pair-sides"><p><small>Bitrix24 · ID</small><code>{row.bitrix24Id}</code></p><b aria-hidden="true">↔</b><p><small>МойСклад · {row.moyskladType ?? 'ID'}</small><code>{row.moyskladId}</code>{row.moyskladParentId && <small>Родительский ID · {row.moyskladParentId}</small>}</p></div>
+        <small>Причина: {row.tombstoneReason ?? 'не указана'} · Метка удаления: {row.deletionMarkerStatus} · Запись в истории Bitrix24: {row.deletionTimelineStatus}</small>
+        {row.deletionMarkerStatus === 'NOT_CONFIGURED' && <button type="button" disabled={saving} onClick={() => void restore(row.id).catch((cause: unknown) => onError(cause instanceof Error ? cause.message : String(cause)))}>Проверить и восстановить</button>}
+      </article>)}</div> : <p className="empty-state">Удалённых связанных клиентских пар нет.</p>}
+    </section>
     <section className="panel pair-manager">
       <p className="eyebrow">ТРЕБУЕТСЯ РЕШЕНИЕ</p><h3>Ручная проверка пар · {reviews.length}</h3>
       <p className="pair-safety-note">Новое сопоставление сохраняет только связь ID в базе сервиса. Оно не создаёт, не изменяет, не объединяет и не удаляет записи во внешних системах.</p>
-      {reviews.length ? <div className="pair-review-list">{reviews.map((review) => <PairReviewForm key={review.id} review={review} saving={saving} onAssign={assign} />)}</div> : <p className="empty-state">Открытых случаев ручной проверки нет.</p>}
+      {reviews.length ? <div className="pair-review-list">{reviews.map((review) => <PairReviewForm key={review.id} review={review} saving={saving} existingPairs={pairs} onAssign={assign} />)}</div> : <p className="empty-state">Открытых случаев ручной проверки нет.</p>}
     </section>
     <section className="panel pair-manager">
       <p className="eyebrow">РУЧНОЕ НАЗНАЧЕНИЕ</p><h3>Создать или переназначить пару</h3>
-      <ManualPairForm saving={saving} onAssign={assign} />
+      <ManualPairForm saving={saving} existingPairs={pairs} onAssign={assign} />
     </section>
   </>;
 }
 
-function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: PairReviewRow; saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [bitrix24Id, setBitrix24Id] = useState(review.sourceSystem === 'BITRIX24' ? review.sourceEntityId : '');
   const [moyskladId, setMoyskladId] = useState(review.sourceSystem === 'MOYSKLAD' ? review.sourceEntityId : '');
   const [moyskladType, setMoyskladType] = useState<'counterparty' | 'contactperson'>('counterparty');
@@ -700,6 +766,7 @@ function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; s
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [localError, setLocalError] = useState('');
+  const conflicts = existingPairs.filter((pair) => pair.entityType === review.entityType && (pair.bitrix24Id === bitrix24Id.trim() || pair.moyskladId === moyskladId.trim()));
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -717,15 +784,16 @@ function PairReviewForm({ review, saving, onAssign }: { review: PairReviewRow; s
       <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
       <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
       {review.entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
+      {replaceExisting && conflicts.length > 0 && <p className="pair-safety-note" role="status">Будет заменена активная связь: {conflicts.map((pair) => `${pair.bitrix24Id} ↔ ${pair.moyskladId}`).join('; ')} → {bitrix24Id.trim()} ↔ {moyskladId.trim()}. Изменится связь в сервисе; внешние записи не изменяются.</p>}
       <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
-      <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
+      <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Подтверждаю замену показанной активной пары (если она есть).</label>
       <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
       {localError && <p className="inline-error" role="alert">{localError}</p>}
     </form>
   </article>;
 }
 
-function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [entityType, setEntityType] = useState<PairEntityType>('DEAL');
   const [bitrix24Id, setBitrix24Id] = useState('');
   const [moyskladId, setMoyskladId] = useState('');
@@ -734,6 +802,7 @@ function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (inpu
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [localError, setLocalError] = useState('');
+  const conflicts = existingPairs.filter((pair) => pair.entityType === entityType && (pair.bitrix24Id === bitrix24Id.trim() || pair.moyskladId === moyskladId.trim()));
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -754,8 +823,9 @@ function ManualPairForm({ saving, onAssign }: { saving: boolean; onAssign: (inpu
     <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
     <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
       {entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
+    {replaceExisting && conflicts.length > 0 && <p className="pair-safety-note" role="status">Будет заменена активная связь: {conflicts.map((pair) => `${pair.bitrix24Id} ↔ ${pair.moyskladId}`).join('; ')} → {bitrix24Id.trim()} ↔ {moyskladId.trim()}. События не переигрываются автоматически; новая пара применяется при следующем событии.</p>}
     <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
-    <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Заменить существующие пары для выбранной записи.</label>
+    <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Подтверждаю замену показанной активной пары (если она есть).</label>
     <button type="submit" disabled={!confirmed || saving}>Сохранить пару</button>
     {localError && <p className="inline-error" role="alert">{localError}</p>}
   </form>;

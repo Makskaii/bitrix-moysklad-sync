@@ -76,6 +76,22 @@ model DatabaseRecoveryAudit {
   @@index([occurredAt])
 }
 
+model AdminAuditEntry {
+  id         String   @id @default(cuid())
+  actorId    String
+  action     String
+  targetType String
+  targetId   String?
+  reason     String?
+  before     Json?
+  after      Json?
+  occurredAt DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([targetType, targetId, occurredAt])
+}
+
 model SyncDirectionSetting {
   id                 String   @id @default(cuid())
   entityKey          String   @unique
@@ -160,6 +176,10 @@ model ManualReviewCase {
   externalEntityType String?
   reason             String
   diagnostic         Json?
+  entityLabel        String?
+  fieldTitle         String?
+  previousValue      Json?
+  proposedValue      Json?
   status             String    @default("OPEN")
   openedAt           DateTime  @default(now())
   resolvedAt         DateTime?

@@ -12,6 +12,7 @@ import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyReso
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { ClientChildResourceSync, ClientChildResourceSnapshot, syncPinnedClientChildResources } from './client-child-resource-sync';
+import { manualReviewFields } from '../admin/manual-review-details';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -324,8 +325,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       await assertFenceInTransaction(workerLease, tx);
       await tx.manualReviewCase.upsert({ where: { eventId: event.id }, create: {
         eventId: event.id, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId,
-        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue,
-      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue } });
+        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
+      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
       await tx.operationalLog.create({ data: { category: 'CLIENT_DEPENDENCY', message: `Document client dependency held: ${reason}.`, referenceId: event.id } });
       if (event.status === 'RECEIVED') await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'RECEIVED' }, data: { status: 'MANUAL_REVIEW', lastErrorCategory: reason } });
     });
@@ -905,8 +906,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }
       await tx.manualReviewCase.upsert({ where: { eventId: event.id }, create: {
         eventId: event.id, source: event.source, eventType: event.eventType, externalEntityId: event.externalEntityId,
-        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue,
-      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue } });
+        externalEntityType: event.externalEntityType, reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic),
+      }, update: { reason, diagnostic: diagnostic as Prisma.InputJsonValue, ...manualReviewFields(diagnostic) } });
       await tx.inboundEvent.updateMany({ where: { id: event.id, status: event.status }, data: { status: 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: reason } });
       await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client event requires review: ${reason}.`, referenceId: event.id } });
     });

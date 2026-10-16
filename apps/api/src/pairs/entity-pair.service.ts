@@ -3,6 +3,7 @@ import { DatabaseService } from '../database.service';
 import { EntityType, isEntityType } from './pair-resolver';
 import { isUniqueConstraintError } from './pair-db-errors';
 import { lockEntityPairState } from './pair-db-lock';
+import { createAdminAuditEntry } from '../admin/admin-audit.service';
 
 export type { EntityType } from './pair-resolver';
 
@@ -65,7 +66,7 @@ export class EntityPairService {
     return rows.map((row) => ({ ...row, entityType: row.entityType as EntityType, sourceSystem: row.sourceSystem as PairSourceSystem, status: 'OPEN' as const }));
   }
 
-  async assign(input: AssignEntityPairInput): Promise<EntityPairDto> {
+  async assign(input: AssignEntityPairInput, actorId?: string): Promise<EntityPairDto> {
     validate(input);
     try {
       return await this.database.$transaction(async (transaction) => {
@@ -119,6 +120,15 @@ export class EntityPairService {
             reason: conflicts.length ? 'ADMIN_REASSIGNED' : 'ADMIN_ASSIGNED',
           },
         });
+        if (actorId) await createAdminAuditEntry(transaction, {
+          actorId,
+          action: conflicts.length ? 'PAIR_REASSIGNED' : 'PAIR_CREATED',
+          targetType: 'EntityPair',
+          targetId: pair.id,
+          reason: pair.reason,
+          before: conflicts.map(({ id, entityType, bitrix24Id, moyskladId, moyskladType, moyskladParentId, reason }) => ({ id, entityType, bitrix24Id, moyskladId, moyskladType, moyskladParentId, reason })),
+          after: { id: pair.id, entityType: pair.entityType, bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, moyskladType: pair.moyskladType, moyskladParentId: pair.moyskladParentId, reason: pair.reason },
+        });
         await transaction.pairReviewCase.updateMany({
           where: {
             entityType: input.entityType,
@@ -149,20 +159,6 @@ export class EntityPairService {
             status: 'OPEN',
           },
           data: { status: 'RESOLVED', resolvedAt: new Date() },
-        });
-        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
-          where: {
-            source: 'BITRIX24', externalEntityType: 'deal', externalEntityId: input.bitrix24Id,
-            status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
-          },
-          data: { status: 'RECEIVED', lastErrorCategory: null },
-        });
-        if (input.entityType === 'DEAL') await transaction.inboundEvent.updateMany({
-          where: {
-            source: 'MOYSKLAD', externalEntityType: 'customerorder', externalEntityId: input.moyskladId,
-            status: 'MANUAL_REVIEW', lastErrorCategory: { in: ['PAIR_REVIEW_REQUIRED', 'PAIR_RESOLUTION_UNAVAILABLE'] },
-          },
-          data: { status: 'RECEIVED', lastErrorCategory: null },
         });
         return { ...pair, entityType: pair.entityType as EntityType, active: true };
       });
