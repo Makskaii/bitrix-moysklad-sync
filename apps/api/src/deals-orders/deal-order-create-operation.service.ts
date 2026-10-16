@@ -26,6 +26,7 @@ export type DealOrderPreparedInput = {
   sourceRowIds: string[];
   sourceRowValues: Array<Record<string, unknown>>;
   sourceMeasureCodes: number[];
+  skippedRows?: Array<{ sourceRowId: string; reason: string }>;
   unitMappings: Array<{ bitrix24Id: number; moyskladId: string | null; status: 'configured' | 'unmapped' }>;
   payload: {
     agent: Reference;
@@ -42,7 +43,7 @@ export type DealOrderPreparedInput = {
 
 type Reference = { meta: { type: string; href: string } };
 type Result =
-  | { status: 'CREATED'; bitrix24DealId: string; moyskladOrderId: string }
+  | { status: 'CREATED' | 'PARTIAL'; bitrix24DealId: string; moyskladOrderId: string; skippedRows?: Array<{ sourceRowId: string; reason: string }> }
   | { status: 'ALREADY_PAIRED'; bitrix24DealId: string; moyskladOrderId: string };
 
 export class DealOrderPairConflictError extends Error {
@@ -91,8 +92,9 @@ export class DealOrderCreateOperationService {
   async createAndPair(input: DealOrderPreparedInput, assertWorkerLease?: () => Promise<boolean>): Promise<Result> {
     await this.assertWriteEnabled();
     const existingOperation = await this.database.dealOrderCreateOperation.findUnique({ where: { bitrix24DealId: input.bitrix24DealId } });
-    if (existingOperation?.status === 'SUCCEEDED' && existingOperation.moyskladOrderId) {
-      return { status: 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId: existingOperation.moyskladOrderId };
+    if ((existingOperation?.status === 'SUCCEEDED' || existingOperation?.status === 'PARTIAL') && existingOperation.moyskladOrderId) {
+      return { status: existingOperation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId: existingOperation.moyskladOrderId,
+        skippedRows: readSkippedRows(existingOperation.skippedRows) };
     }
 
     const currentPair = await this.database.entityPair.findFirst({
@@ -115,14 +117,15 @@ export class DealOrderCreateOperationService {
     const operation = existingOperation?.status === 'WAITING'
       ? await this.database.dealOrderCreateOperation.update({
           where: { bitrix24DealId: input.bitrix24DealId },
-          data: { payload: input.payload as Prisma.InputJsonValue, confirmedCustomerPairIds: frozenPairIds as Prisma.InputJsonValue, settingsVersion: input.settingsVersion, status: 'PENDING', lastErrorCategory: null },
+          data: { payload: input.payload as Prisma.InputJsonValue, confirmedCustomerPairIds: frozenPairIds as Prisma.InputJsonValue, skippedRows: (input.skippedRows ?? []) as Prisma.InputJsonValue, settingsVersion: input.settingsVersion, status: 'PENDING', lastErrorCategory: null },
         })
       : existingOperation ?? await this.getOrCreateOperation(input);
     if (legacyAttemptMissingPairIds) {
       await this.database.dealOrderCreateOperation.update({ where: { bitrix24DealId: input.bitrix24DealId }, data: { confirmedCustomerPairIds: frozenPairIds as Prisma.InputJsonValue } });
     }
-    if (operation.status === 'SUCCEEDED' && operation.moyskladOrderId) {
-      return { status: 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId: operation.moyskladOrderId };
+    if ((operation.status === 'SUCCEEDED' || operation.status === 'PARTIAL') && operation.moyskladOrderId) {
+      return { status: operation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId: operation.moyskladOrderId,
+        skippedRows: readSkippedRows(operation.skippedRows) };
     }
     if (operation.status !== 'PENDING') throw new Error(`Customer-order create operation is ${operation.status}`);
 
@@ -162,7 +165,11 @@ export class DealOrderCreateOperationService {
       const order = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
-      const verifiedPositions = assertOrderReadback(order, orderId, payload.positions, payload.attributes ?? [], base, 'shipmentAddress' in payload ? { shipmentAddress: payload.shipmentAddress } : {});
+      const expectedNativeFields = {
+        ...('shipmentAddress' in payload ? { shipmentAddress: payload.shipmentAddress } : {}),
+        ...('vatIncluded' in payload ? { vatIncluded: payload.vatIncluded } : {}),
+      };
+      const verifiedPositions = assertOrderReadback(order, orderId, payload.positions, payload.attributes ?? [], base, expectedNativeFields);
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
@@ -281,6 +288,7 @@ export class DealOrderCreateOperationService {
           syncId: randomUUID(),
           payload: input.payload as Prisma.InputJsonValue,
           confirmedCustomerPairIds: (input.confirmedCustomerPairIds ?? []) as Prisma.InputJsonValue,
+          skippedRows: (input.skippedRows ?? []) as Prisma.InputJsonValue,
           settingsVersion: input.settingsVersion,
           status: 'PENDING',
         },
@@ -324,15 +332,17 @@ export class DealOrderCreateOperationService {
           })),
         });
       }
+      const skippedRows = readSkippedRows(await transaction.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: input.bitrix24DealId }, select: { skippedRows: true } }).then((item) => item.skippedRows));
+      const partial = skippedRows.length > 0;
       await transaction.dealOrderCreateOperation.update({
         where: { bitrix24DealId: input.bitrix24DealId },
-        data: { status: 'SUCCEEDED', moyskladOrderId, lastErrorCategory: null, leaseToken: null, leaseUntil: null },
+        data: { status: partial ? 'PARTIAL' : 'SUCCEEDED', moyskladOrderId, lastErrorCategory: partial ? 'ROWS_SKIPPED' : null, leaseToken: null, leaseUntil: null },
       });
       await transaction.pairReviewCase.updateMany({
         where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: input.bitrix24DealId, status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
       });
-      return { status: 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId };
+      return { status: partial ? 'PARTIAL' : 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId, ...(partial ? { skippedRows } : {}) };
     }, { timeout: 30_000 });
   }
 }
@@ -407,12 +417,21 @@ function readPairIds(value: unknown): string[] {
   return value.filter((id): id is string => typeof id === 'string' && !!id.trim());
 }
 
+function readSkippedRows(value: unknown): Array<{ sourceRowId: string; reason: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is { sourceRowId: string; reason: string } => isRecord(item) &&
+    typeof item.sourceRowId === 'string' && typeof item.reason === 'string');
+}
+
 function assertOrderReadback(value: unknown, expectedId: string, expectedPositions: CustomerOrderPosition[], expectedAttributes: NonNullable<DealOrderPreparedInput['payload']['attributes']>, base: URL, expectedNativeFields: Record<string, unknown>): Array<{ id: string; values: Record<string, unknown> }> {
   if (!isRecord(value) || value.id !== expectedId || !isRecord(value.meta) || value.meta.type !== 'customerorder' ||
       !isRecord(value.positions) || !Array.isArray(value.positions.rows)) {
     throw new Error('Customer-order readback failed');
   }
   const rows = value.positions.rows;
+  if ('vatIncluded' in expectedNativeFields && value.vatIncluded !== expectedNativeFields.vatIncluded) {
+    throw new Error('Customer-order VAT inclusion readback differs from the prepared order');
+  }
   for (const expected of expectedAttributes) {
     const expectedId = expected.meta.href.match(/\/metadata\/attributes\/([0-9a-f-]{36})$/i)?.[1];
     if (!expectedId) throw new Error('Customer-order attribute ID is invalid');
@@ -422,6 +441,7 @@ function assertOrderReadback(value: unknown, expectedId: string, expectedPositio
     if (typeof actual === 'symbol' || !sameAttributeValue(actual, expected.value, base)) throw new Error('Customer-order attribute readback differs from prepared value');
   }
   for (const [field, expected] of Object.entries(expectedNativeFields)) {
+    if (field === 'vatIncluded') continue;
     if (field !== 'shipmentAddress' || !sameScalar(value[field] ?? null, expected)) throw new Error('Customer-order native field readback differs from prepared value');
   }
   if (rows.length !== expectedPositions.length) throw new Error('Customer-order readback positions differ from the prepared order');

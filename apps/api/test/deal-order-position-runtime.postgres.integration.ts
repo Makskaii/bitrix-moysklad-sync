@@ -16,6 +16,8 @@ let server: Server;
 let base = '';
 let productPairId = '';
 let runtime: DealOrderPositionRuntimeService;
+let activeOrderId = '';
+let vatIncluded = false;
 let b24Rows: Record<string, unknown>[] = [];
 let msRows: Record<string, unknown>[] = [];
 let calls: Array<{ method: string; path: string }> = [];
@@ -48,24 +50,37 @@ after(async () => {
   if (server) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
-test('quantity/price updates use exact row/position IDs in both directions and pre-read+read back', async () => {
+test('quantity, discount, and price updates use exact row/position IDs in both directions and pre-read+read back', async () => {
   const one = await seed('98101');
   calls = [];
-  b24Rows[0] = { ...b24Rows[0], quantity: 3, price: 8 };
+  b24Rows[0] = { ...b24Rows[0], quantity: 3, price: 9, priceNetto: 10, discountTypeId: 2, discountRate: 10, discountSum: 1 };
   const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-row-update-b24', eventConfig: config() });
   assert.deepEqual(result, { status: 'SYNCED' });
-  assert.equal(msRows[0].quantity, 3); assert.equal(msRows[0].price, 800);
+  assert.equal(msRows[0].quantity, 3); assert.equal(msRows[0].price, 1000); assert.equal(msRows[0].discount, 10);
   assert.ok(calls.some((call) => call.method === 'PUT' && call.path.endsWith(`/positions/${one.positionId}`)));
   assert.equal(calls.some((call) => /productrows\.set/.test(call.path)), false);
 
-  await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { bitrix24Values: sourceValues({ id: '301', productId: 904, measureCode: 796, quantity: 3, price: 8 }), moyskladValues: targetValues(msRows[0]) } });
-  msRows[0] = { ...msRows[0], quantity: 4, price: 900 };
+  await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { bitrix24Values: sourceValues(b24Rows[0]), moyskladValues: targetValues(msRows[0]) } });
+  msRows[0] = { ...msRows[0], quantity: 4, price: 900, discount: 20 };
   calls = [];
   const reverse = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-row-update-ms', eventConfig: config() });
   assert.deepEqual(reverse, { status: 'SYNCED' });
-  assert.equal(b24Rows[0].quantity, 4); assert.equal(b24Rows[0].price, 9);
+  assert.equal(b24Rows[0].quantity, 4); assert.equal(b24Rows[0].price, 7.2); assert.equal(b24Rows[0].discountRate, 20);
   assert.ok(calls.some((call) => call.path.endsWith('/crm.item.productrow.update')));
   assert.equal(calls.some((call) => /productrows\.set/.test(call.path)), false);
+});
+
+test('addressed row updates preserve explicitly excluded VAT and only use the current MS order VAT mode', async () => {
+  const one = await seed('98106');
+  vatIncluded = false;
+  b24Rows[0] = { ...b24Rows[0], quantity: 2, price: 10, priceNetto: 10, taxRate: 20, taxIncluded: 'N' };
+  calls = [];
+  const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-row-update-vat-excluded', eventConfig: config() });
+  assert.deepEqual(result, { status: 'SYNCED' });
+  assert.equal(msRows[0].price, 1000);
+  assert.equal(msRows[0].vatEnabled, true);
+  assert.equal(msRows[0].vat, 20);
+  assert.ok(calls.some((call) => call.method === 'GET' && call.path.endsWith(`/entity/customerorder/${one.pair.moyskladId}`)));
 });
 
 test('deletions remove only the linked address on either provider, never replace a full row list', async () => {
@@ -132,6 +147,7 @@ test('new MySklad position ID is journaled before readback and retry resumes wit
 
 async function seed(dealId: string) {
   const orderId = randomUUID();
+  activeOrderId = orderId;
   const pair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: dealId, moyskladId: orderId, source: 'MANUAL' } });
   b24Rows = [{ id: '301', productId: 904, measureCode: 796, quantity: 2, price: 5, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
   const positionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -142,7 +158,7 @@ async function seed(dealId: string) {
 function config(): any { return { version: 2, createdAt: new Date(0).toISOString(), config: { schemaVersion: 1, rules: [], groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: unitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] } }, references: { units: [], priceTypes: [], dictionaries: [] } }; }
 function msPosition(id: string, quantity: number, price: number) { return { id, assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${productId}` } }, quantity, price, discount: 0, vat: 0, vatEnabled: false }; }
 function confirmed(pair: any): any { return { id: pair.id, entityType: 'DEAL', bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, status: 'CONFIRMED', source: 'PERSISTED' }; }
-function sourceValues(row: Record<string, unknown>): any { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate }; }
+function sourceValues(row: Record<string, unknown>): any { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
 function targetValues(row: Record<string, unknown>): any { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
 
 async function reply(request: IncomingMessage, response: ServerResponse) {
@@ -155,14 +171,16 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { result: { productRows: b24Rows.slice(start, start + 50) }, total: b24Rows.length });
   }
   if (url.pathname === '/rest/crm.item.productrow.update') {
-    const id = params.get('id'); const row = b24Rows.find((entry) => String(entry.id) === id);
-    if (row) { row.quantity = Number(params.get('fields[quantity]')); row.price = Number(params.get('fields[price]')); }
+    const payload = JSON.parse(text) as { id: string; fields: Record<string, unknown> };
+    const row = b24Rows.find((entry) => String(entry.id) === payload.id);
+    if (row) Object.assign(row, payload.fields);
     return send(response, { result: { productRow: row } });
   }
   if (url.pathname === '/rest/crm.item.productrow.delete') {
     b24Rows = b24Rows.filter((entry) => String(entry.id) !== params.get('id'));
     return send(response, { result: true });
   }
+  if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}` && request.method === 'GET') return send(response, { id: activeOrderId, vatIncluded });
   if (url.pathname === '/api/remap/1.2/entity/product/' + productId) return send(response, { id: productId, meta: { type: 'product' }, uom: { id: unitId } });
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);

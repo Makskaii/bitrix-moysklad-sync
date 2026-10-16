@@ -336,6 +336,7 @@ model DealOrderCreateOperation {
   syncId         String   @unique
   payload        Json
   confirmedCustomerPairIds Json @default("[]")
+  skippedRows    Json     @default("[]")
   settingsVersion Int
   status         String   @default("PENDING")
   moyskladOrderId String?
@@ -354,6 +355,7 @@ model DealOrderReverseCreateOperation {
   syncId          String   @unique
   eventId         String
   payload         Json
+  skippedRows     Json     @default("[]")
   settingsVersion Int
   status          String   @default("PENDING")
   bitrix24DealId  String?
@@ -393,6 +395,7 @@ model DealOrderReversePositionOperation {
   moyskladPositionId  String
   payload             Json
   status              String   @default("PENDING")
+  skipReason          String?
   bitrix24ProductRowId String?
   lastErrorCategory   String?
   createdAt           DateTime @default(now())

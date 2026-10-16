@@ -498,11 +498,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
       return;
     }
-    response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, updated: '2026-10-07T10:00:00+00:00' }));
+    response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, vatIncluded: false, updated: '2026-10-07T10:00:00+00:00' }));
   } else if (path === `/ms/api/remap/1.2/entity/counterparty/${serviceCounterpartyId}` && request.method === 'GET') {
     response.writeHead(200); response.end(JSON.stringify({ id: serviceCounterpartyId, meta: { type: 'counterparty' } }));
   } else if (new URL(path, 'http://127.0.0.1').pathname === '/b24/rest/crm.item.productrow.list' && request.method === 'POST') {
-    response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: 1, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0 }] }, total: 1 }));
+    response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: 1, priceNetto: 1, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0, taxIncluded: 'N' }] }, total: 1 }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions` && request.method === 'GET') {
     response.writeHead(200); response.end(JSON.stringify({ rows: [{ id: moyskladPositionId, assortment: { meta: { href: `${fakeBase}/entity/product/${moyskladProductId}`, type: 'product' } }, quantity: 1, price: 100, discount: 0, vat: 0, vatEnabled: false }], meta: { size: 1 } }));
   } else if (path === `/ms/api/remap/1.2/entity/product/${moyskladProductId}` && request.method === 'GET') {
@@ -581,6 +581,7 @@ function assertPositionReadPaths(startIndex: number) {
   const paths = externalRequests.slice(startIndex).map(({ path }) => new URL(path, 'http://127.0.0.1').pathname).sort();
   assert.deepEqual(paths, [
     '/b24/rest/crm.item.productrow.list',
+    `/ms/api/remap/1.2/entity/customerorder/${moyskladId}`,
     `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions`,
     `/ms/api/remap/1.2/entity/product/${moyskladProductId}`,
   ].sort());

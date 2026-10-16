@@ -81,7 +81,7 @@ after(async () => {
 test('partial B24 row-create response loss resumes the same deal and addressed rows without duplicate adds', async () => {
   dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0; loseProductCreateResponse = true; loseSecondRowResponse = true; items = []; rows = []; products = [];
   nextDealId = 801;
-  orderPositions = [position('p1', 2), position('p2', 3), { ...position('p3', 1), price: 0 }];
+  orderPositions = [{ ...position('p1', 2), discount: 10, vat: 20, vatEnabled: true }, position('p2', 3), { ...position('p3', 1), price: 0 }, { id: 'p4-skipped', quantity: 1, price: 12, assortment: {} }];
   const eventConfig = config();
   const input = { moyskladOrderId: ids.order, eventId: `event-${suffix}`, eventConfig };
   const firstAttempt = await service.createAndPair(input).then(() => null, (error: unknown) => error);
@@ -98,10 +98,11 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(afterLoss.bitrix24DealId, '801', 'created deal ID persists before row writes');
   assert.equal(afterLoss.status, 'PENDING');
   assert.equal(afterLoss.positions.filter((row) => row.bitrix24ProductRowId === '1001').length, 1);
-  assert.equal(afterLoss.positions.filter((row) => row.bitrix24ProductRowId === null).length, 2);
+  assert.equal(afterLoss.positions.filter((row) => row.status === 'PENDING' && row.bitrix24ProductRowId === null).length, 2);
+  assert.equal(afterLoss.positions.find((row) => row.moyskladPositionId === 'p4-skipped')?.status, 'SKIPPED');
 
   const result = await service.createAndPair(input);
-  assert.deepEqual(result, { status: 'CREATED', bitrix24DealId: '801' });
+  assert.deepEqual(result, { status: 'PARTIAL', bitrix24DealId: '801', skippedRows: [{ sourceRowId: 'p4-skipped', reason: 'PRODUCT_ID_MISSING' }] });
   assert.equal(productAdds, 1, 'product create response recovery never creates a duplicate');
   assert.equal(msProductWrites, 0, 'product cards are never written to MySklad');
   assert.equal(products[0].iblockId, 42);
@@ -113,17 +114,24 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '903');
   assert.equal(dealAdds, 1, 'deal is never duplicated');
   assert.equal(rowAdds, 3, 'ambiguous row response recovered by durable sort slots, no duplicate row is added');
-  assert.equal(rows.length, 3, 'unpaired product position was skipped');
+  assert.equal(rows.length, 3, 'invalid source position is omitted without dropping valid rows');
   assert.equal(items[0].title, 'Заказ покупателя SO-54');
   assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
   assert.equal(items[0].originId, ids.order);
-  assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 123.45, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
+  assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 133.33, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
+  assert.deepEqual([rows[0].discountRate, rows[0].taxRate, rows[0].taxIncluded], [10, 20, 'Y']);
   assert.equal(rows.some((row) => Number(row.productId) !== 903), false);
   const savedPair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', moyskladId: ids.order, active: true } });
   assert.equal(savedPair.bitrix24Id, '801');
   const links = await db.dealOrderPositionPair.findMany({ where: { pairId: savedPair.id }, orderBy: { moyskladPositionId: 'asc' } });
   assert.equal(links.length, 3);
-  assert.equal((await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: ids.order } })).status, 'SUCCEEDED');
+  const reverseOperation = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: ids.order }, include: { positions: true } });
+  assert.equal(reverseOperation.status, 'PARTIAL');
+  assert.deepEqual(reverseOperation.skippedRows, [{ sourceRowId: 'p4-skipped', reason: 'PRODUCT_ID_MISSING' }]);
+  assert.equal(reverseOperation.positions.find((row) => row.moyskladPositionId === 'p4-skipped')?.status, 'SKIPPED');
+  assert.deepEqual(await service.createAndPair(input), result, 'repeat preserves the partial outcome without creating another deal or rows');
+  assert.equal(dealAdds, 1);
+  assert.equal(rowAdds, 3);
 });
 
 test('concurrent retries create one missing B24 product and durably pair it before using the product row', async () => {
@@ -246,7 +254,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const body = bodyText ? JSON.parse(bodyText) as Record<string, any> : {};
   const pathname = new URL(request.url ?? '/', base).pathname;
   if (pathname === '/api/remap/1.2/entity/product/' + ids.product) return send(response, { id: ids.product, meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { id: ids.unit } });
-  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, state: { id: ids.state }, rate: { currency: { id: ids.currency } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
+  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: ids.state }, rate: { currency: { id: ids.currency } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
     return send(response, { rows: orderPositions.slice(offset, offset + 100) });

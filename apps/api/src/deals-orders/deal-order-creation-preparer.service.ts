@@ -5,6 +5,7 @@ import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients
 import { isPlannedDeliveryDateMapping, normalizePlannedDeliveryDate, toMoySkladPlannedDeliveryDate, touchesPlannedDeliveryDateEndpoint } from './planned-delivery-date';
 import { writeOperationalLog } from '../monitoring-log';
 import { DealOrderPreparedInput } from './deal-order-create-operation.service';
+import { bitrixMoneyToMoySklad } from './deal-order-money';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -98,6 +99,8 @@ export class DealOrderCreationPreparer {
     const sourceRowIdsPreflight = new Set<string>();
     for (const row of rows) {
       const sourceRowId = readRowId(row.id);
+      if (!sourceRowId) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
+      const rowId = sourceRowId;
       if (!sourceRowId || sourceRowIdsPreflight.has(sourceRowId)) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
       sourceRowIdsPreflight.add(sourceRowId);
     }
@@ -156,9 +159,15 @@ export class DealOrderCreationPreparer {
     const sourceRowValues: Array<Record<string, unknown>> = [];
     const sourceProductIds: string[] = [];
     const sourceMeasureCodes: number[] = [];
+    const skippedRows: Array<{ sourceRowId: string; reason: string }> = [];
+    const vatInclusionModes = new Set(rows.filter((row) => row.taxRate !== null && row.taxRate !== undefined).map((row) => row.taxIncluded));
+    const mixedVatInclusion = vatInclusionModes.size > 1;
+    const vatIncluded = vatInclusionModes.size === 1 ? vatInclusionModes.values().next().value === 'Y' : null;
     const units = input.eventConfig.config.references.units;
     for (const row of rows) {
       const sourceRowId = readRowId(row.id);
+      if (!sourceRowId) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
+      const rowId = sourceRowId;
       const productId = readNumericId(row.productId);
       const measureCode = readNumber(row.measureCode);
       const unit = measureCode === null ? null : units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
@@ -169,9 +178,9 @@ export class DealOrderCreationPreparer {
       const discountSum = readNumber(row.discountSum);
       const taxRate = row.taxRate === null ? null : readNumber(row.taxRate);
       const skipRow = async (reason: string) => {
-        await writeOperationalLog(this.database, 'EVENT', `Deal-order row ${sourceRowId} skipped; reason=${reason}`, input.eventId);
+        skippedRows.push({ sourceRowId: rowId, reason });
+        await writeOperationalLog(this.database, 'EVENT', `Deal-order row ${rowId} skipped; reason=${reason}`, input.eventId);
       };
-      if (!sourceRowId) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
       if (!productId) { await skipRow('PRODUCT_ID_MISSING'); continue; }
       if (!measureCode || !unit?.moyskladId) { await skipRow('UNIT_UNMAPPED'); continue; }
       if (quantity === null || quantity <= 0 || priceCents === null || discountTypeId === null || discountRate === null || discountSum === null ||
@@ -179,12 +188,9 @@ export class DealOrderCreationPreparer {
         await skipRow(priceCents === null ? 'PRICE_MISSING_OR_UNSUPPORTED' : 'ROW_VALUE_UNSUPPORTED');
         continue;
       }
-      // Q26.43 requires discount fidelity. Bitrix `price` is already the
-      // post-discount/tax unit amount; until the approved gross/net conversion
-      // is implemented, accepting non-zero discounts or tax would risk
-      // changing the order total. Hold the whole document rather than sending
-      // a lossy/compound position.
-      if ((discountTypeId !== 1 && discountTypeId !== 2) || discountRate !== 0 || discountSum !== 0 || taxRate !== null) {
+      if (mixedVatInclusion && taxRate !== null) { await skipRow('MIXED_VAT_INCLUSION_NOT_REPRESENTABLE'); continue; }
+      const money = bitrixMoneyToMoySklad(row);
+      if (!money) {
         await skipRow('DISCOUNT_OR_VAT_TRANSFORM_UNSUPPORTED');
         continue;
       }
@@ -206,15 +212,15 @@ export class DealOrderCreationPreparer {
       rowsPrepared.push({
         assortment: { meta: { type: assortment.type, href: assortment.href } },
         quantity,
-        price: priceCents,
-        discount: discountTypeId === 2 ? discountRate : 0,
-        vat: taxRate ?? 0,
-        vatEnabled: taxRate !== null,
+        price: money.price,
+        discount: money.discount,
+        vat: money.vat,
+        vatEnabled: money.vatEnabled,
       });
-      sourceRowIds.push(sourceRowId);
+      sourceRowIds.push(rowId);
       sourceRowValues.push({
-        productId, measureCode, quantity, price: row.price,
-        discountTypeId, discountRate, discountSum, taxRate,
+        productId, measureCode, quantity, price: row.price, priceNetto: row.priceNetto,
+        discountTypeId, discountRate, discountSum, taxRate, taxIncluded: row.taxIncluded,
       });
       sourceProductIds.push(productId);
       sourceMeasureCodes.push(measureCode);
@@ -233,6 +239,7 @@ export class DealOrderCreationPreparer {
       sourceRowIds,
       sourceRowValues,
       sourceMeasureCodes,
+      skippedRows,
       unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, moyskladId: unit.moyskladId, status: unit.status })),
       payload: {
         agent: { meta: { type: 'counterparty', href: msHref(msBase, `entity/counterparty/${agentCounterpartyId}`) } },
@@ -242,6 +249,7 @@ export class DealOrderCreationPreparer {
         owner: { meta: { type: 'employee', href: msHref(msBase, `entity/employee/${targetEmployeeId}`) } },
         rate: { currency: { meta: { type: 'currency', href: msHref(msBase, `entity/currency/${currency.moyskladId}`) } } },
         positions: rowsPrepared,
+        ...(vatIncluded === null ? {} : { vatIncluded }),
         ...(preparedAttributes.attributes.length ? { attributes: preparedAttributes.attributes } : {}),
         ...preparedAttributes.nativeFields,
       },

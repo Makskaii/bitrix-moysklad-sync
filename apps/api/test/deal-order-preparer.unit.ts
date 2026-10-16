@@ -96,18 +96,20 @@ test('a row with an unmapped unit is skipped while other confirmed rows remain e
   if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 1);
 });
 
-test('rows with unsupported discount or tax are skipped rather than silently changing their totals', async () => {
+test('discount and VAT convert from explicit source net price; missing net value is skipped', async () => {
   reset();
-  rows = [{ ...productRow(10, 1), discountTypeId: 1, discountSum: 1 }];
+  rows = [
+    { ...productRow(9, 1), priceNetto: 10, discountTypeId: 1, discountSum: 1 },
+    { ...productRow(12, 1), priceNetto: 10, taxRate: 20, taxIncluded: 'N' },
+    { ...productRow(9, 1), discountTypeId: 1, discountSum: 1 },
+  ];
   const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-3', eventConfig: eventConfig() });
   assert.equal(result.status, 'READY');
-  if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 0);
-
-  reset();
-  rows = [{ ...productRow(10, 1), taxRate: 20 }];
-  const taxed = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-4', eventConfig: eventConfig() });
-  assert.equal(taxed.status, 'READY');
-  if (taxed.status === 'READY') assert.equal(taxed.input.payload.positions.length, 0);
+  if (result.status === 'READY') {
+    assert.deepEqual(result.input.payload.positions.map((position) => [position.price, position.discount, position.vat, position.vatEnabled]), [[1000, 10, 0, false], [1000, 0, 20, true]]);
+    assert.equal(result.input.payload.vatIncluded, false);
+    assert.deepEqual(result.input.skippedRows, [{ sourceRowId: '7003', reason: 'DISCOUNT_OR_VAT_TRANSFORM_UNSUPPORTED' }]);
+  }
 });
 
 test('a later unsupported row is omitted without suppressing the other valid row', async () => {
@@ -161,7 +163,7 @@ function eventConfig(): any {
 }
 
 function productRow(price: number, quantity: number) {
-  return { id: String(7000 + nextRowId++), productId: 300, measureCode: 796, price, quantity, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null };
+  return { id: String(7000 + nextRowId++), productId: 300, measureCode: 796, price, quantity, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' };
 }
 
 function reset() {

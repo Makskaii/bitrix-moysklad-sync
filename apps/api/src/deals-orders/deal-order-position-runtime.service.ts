@@ -5,11 +5,12 @@ import { DatabaseService } from '../database.service';
 import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { DealOrderPairLease, withDealOrderPairLock } from './deal-order-pair-lock';
+import { bitrixMoneyToMoySklad, moySkladMoneyToBitrix } from './deal-order-money';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type Result = { status: 'SYNCED' } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
 type Row = Record<string, unknown>;
-type Position = { id: string; quantity: number; price: number; discount?: number; vat?: number; vatEnabled?: boolean; assortment?: Row };
+type Position = { id: string; quantity: number; price: number; discount?: number; vat?: number; vatEnabled?: boolean; vatIncluded?: boolean | null; assortment?: Row };
 const logger = new Logger('DealOrderPositionRuntimeService');
 
 class InvalidPositionSetError extends Error {}
@@ -47,6 +48,18 @@ export class DealOrderPositionRuntimeService {
       }
       return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READ_FAILED' };
     }
+    const hasVat = b24Rows.some((row) => row.taxRate !== null && row.taxRate !== undefined) || msRows.some((row) => row.vatEnabled === true);
+    let msVatIncluded: boolean | null = null;
+    if (hasVat) {
+      try { msVatIncluded = await readMoySkladVatIncluded(pair.moyskladId); }
+      catch { return { status: 'RETRY', reason: 'DEAL_ORDER_VAT_HEADER_READ_FAILED' }; }
+      if (msVatIncluded === null) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_HEADER_UNAVAILABLE' };
+      const sourceVatModes = new Set(b24Rows.filter((row) => row.taxRate !== null && row.taxRate !== undefined).map((row) => row.taxIncluded));
+      if (sourceVatModes.size > 1) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_INCLUSION_CONFLICT' };
+      if ([...sourceVatModes].some((mode) => mode !== 'Y' && mode !== 'N')) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_INCLUSION_CONFLICT' };
+      if (sourceVatModes.size === 1 && (sourceVatModes.has('Y') !== msVatIncluded)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_INCLUSION_CONFLICT' };
+      msRows = msRows.map((row) => ({ ...row, vatIncluded: msVatIncluded }));
+    }
     if (!links.length) return this.bootstrapHistoricalLinks(pair.id, pair.moyskladId, input.eventId, input.eventConfig, b24Rows, msRows, lease);
     const linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
     const linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
@@ -62,7 +75,7 @@ export class DealOrderPositionRuntimeService {
     });
     const sourceById = new Map(b24Rows.map((row) => [String(row.id), row]));
     const targetById = new Map(msRows.map((row) => [row.id, row]));
-    const plans: Array<{ linkId: string; source: Row; target: Position; quantity: number; price: number; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'ECHO' }> = [];
+    const plans: Array<{ linkId: string; source: Row; target: Position; quantity: number; price: number; discount: number; vat: number; vatEnabled: boolean; bitrixPrice: number; bitrixDiscountRate: number; bitrixTaxRate: number | null; bitrixTaxIncluded: 'Y' | 'N'; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'ECHO' }> = [];
     const deletions: Array<{ linkId: string; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24'; target?: Position; source?: Row }> = [];
     const alreadyDeleted: string[] = [];
     for (const link of links) {
@@ -91,7 +104,8 @@ export class DealOrderPositionRuntimeService {
         continue;
       }
       const desired = sourceValues(source);
-      if (!desired) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_VALUE_UNSUPPORTED' };
+      const targetMoney = moySkladMoneyToBitrix({ price: target.price, discount: target.discount ?? 0, vat: target.vat ?? 0, vatEnabled: target.vatEnabled ?? false, vatIncluded: target.vatIncluded ?? msVatIncluded });
+      if (!desired || !targetMoney) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_VALUE_UNSUPPORTED' };
       if (!sameProductAndUnit(source, link.bitrix24Values) || !sameProductTarget(target, link.moyskladValues)) {
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_IDENTITY_CHANGED' };
       }
@@ -109,16 +123,14 @@ export class DealOrderPositionRuntimeService {
       } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_READ_FAILED' }; }
       const sourceChanged = !sameSourceValue(source, link.bitrix24Values);
       const targetChanged = !sameTargetValue(target, link.moyskladValues);
-      if (targetChanged && (target.discount ?? 0) !== 0 || targetChanged && ((target.vatEnabled ?? false) || (target.vat ?? 0) !== 0)) {
-        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_VALUE_UNSUPPORTED' };
-      }
       const direction = targetChanged ? 'MOYSKLAD_TO_BITRIX24' : sourceChanged ? 'BITRIX24_TO_MOYSKLAD' : 'ECHO';
       const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
       if (direction === 'MOYSKLAD_TO_BITRIX24' && !(directionSetting?.moyskladToBitrix24 ?? true) ||
           direction === 'BITRIX24_TO_MOYSKLAD' && !(directionSetting?.bitrix24ToMoysklad ?? true)) {
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
       }
-      plans.push({ linkId: link.id, source, target, ...desired, direction });
+      plans.push({ linkId: link.id, source, target, quantity: desired.quantity, price: desired.price, discount: desired.discount, vat: desired.vat, vatEnabled: desired.vatEnabled,
+        bitrixPrice: targetMoney.price, bitrixDiscountRate: targetMoney.discountRate, bitrixTaxRate: targetMoney.taxRate, bitrixTaxIncluded: targetMoney.taxIncluded, direction });
     }
     if (b24Rows.some((row) => !links.some((link) => link.bitrix24ProductRowId === String(row.id)))) {
       if (!newRows.length) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_CHANGED' };
@@ -141,14 +153,14 @@ export class DealOrderPositionRuntimeService {
         if (plan.direction === 'BITRIX24_TO_MOYSKLAD') {
           const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
           if (!sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
-          if (plan.target.quantity !== plan.quantity || plan.target.price !== plan.price) {
+          if (plan.target.quantity !== plan.quantity || plan.target.price !== plan.price || plan.target.discount !== plan.discount || plan.target.vat !== plan.vat || plan.target.vatEnabled !== plan.vatEnabled) {
             if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
             await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
-              method: 'PUT', headers: msHeaders(), body: JSON.stringify({ quantity: plan.quantity, price: plan.price }),
+              method: 'PUT', headers: msHeaders(), body: JSON.stringify({ quantity: plan.quantity, price: plan.price, discount: plan.discount, vat: plan.vat, vatEnabled: plan.vatEnabled }),
             });
           }
           const verified = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-          if (!isRecord(verified) || verified.id !== plan.target.id || verified.quantity !== plan.quantity || verified.price !== plan.price) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
+          if (!isRecord(verified) || verified.id !== plan.target.id || verified.quantity !== plan.quantity || verified.price !== plan.price || verified.discount !== plan.discount || verified.vat !== plan.vat || verified.vatEnabled !== plan.vatEnabled) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
           verifiedB24 = sourceSnapshot(plan.source);
           verifiedMs = targetSnapshot(verified);
         } else {
@@ -159,12 +171,12 @@ export class DealOrderPositionRuntimeService {
             return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           }
           const quantity = plan.target.quantity;
-          const price = plan.target.price / 100;
+          const price = plan.bitrixPrice;
           if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
-          await updateBitrixRow(plan.source.id, quantity, price);
+          await updateBitrixRow(plan.source.id, quantity, price, plan.bitrixDiscountRate, plan.bitrixTaxRate, plan.bitrixTaxIncluded);
           const rows = await readAllBitrixRows(pair.bitrix24Id);
           const verified = rows.find((row) => String(row.id) === String(plan.source.id));
-          if (!verified || verified.quantity !== quantity || verified.price !== price) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
+          if (!verified || verified.quantity !== quantity || verified.price !== price || verified.discountRate !== plan.bitrixDiscountRate || verified.taxRate !== plan.bitrixTaxRate || verified.taxIncluded !== plan.bitrixTaxIncluded) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
           verifiedB24 = sourceSnapshot(verified);
           verifiedMs = targetSnapshot(plan.target);
         }
@@ -317,7 +329,7 @@ export class DealOrderPositionRuntimeService {
       }
       const payload = {
         assortment: { meta: { type: 'product', href: new URL(`entity/product/${encodeURIComponent(product.id)}`, withSlash(moyskladBase())).href } },
-        quantity: desired.quantity, price: desired.price, discount: 0, vat: 0, vatEnabled: false,
+        quantity: desired.quantity, price: desired.price, discount: desired.discount, vat: desired.vat, vatEnabled: desired.vatEnabled,
       };
       let operation;
       try {
@@ -412,17 +424,11 @@ export function classifyPositionAddRecovery(attempted: boolean, matchingUnlinked
   return null;
 }
 
-function sourceValues(row: Row): { quantity: number; price: number } | null {
+function sourceValues(row: Row): { quantity: number; price: number; discount: number; vat: number; vatEnabled: boolean; vatIncluded: boolean | null } | null {
   const quantity = row.quantity;
-  const price = row.price;
-  const discountType = row.discountTypeId;
-  const discountRate = row.discountRate;
-  const discountSum = row.discountSum;
-  const taxRate = row.taxRate;
-  if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 || typeof price !== 'number' || !Number.isFinite(price) || price < 0 ||
-      (discountType !== 1 && discountType !== 2) || discountRate !== 0 || discountSum !== 0 || (taxRate !== null && taxRate !== 0)) return null;
-  const cents = String(price).match(/^\d+(?:\.\d{1,2})?$/) ? Math.round(price * 100) : NaN;
-  return Number.isSafeInteger(cents) ? { quantity, price: cents } : null;
+  if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0) return null;
+  const money = bitrixMoneyToMoySklad(row);
+  return money ? { quantity, price: money.price, discount: money.discount, vat: money.vat, vatEnabled: money.vatEnabled, vatIncluded: money.vatIncluded } : null;
 }
 
 function sameProductAndUnit(source: Row, old: unknown): boolean {
@@ -440,7 +446,10 @@ function assortmentId(value: unknown): string | null {
 }
 function sameSourceValue(row: Row, old: unknown): boolean {
   if (!isRecord(old)) return false;
-  return row.quantity === old.quantity && row.price === old.price && row.discountTypeId === old.discountTypeId && row.discountRate === old.discountRate && row.discountSum === old.discountSum && row.taxRate === old.taxRate;
+  const usesNetPrice = row.discountRate !== 0 || row.discountSum !== 0 || row.taxRate !== null && row.taxRate !== undefined;
+  return row.quantity === old.quantity && row.price === old.price && (!usesNetPrice || row.priceNetto === old.priceNetto) &&
+    row.discountTypeId === old.discountTypeId && row.discountRate === old.discountRate && row.discountSum === old.discountSum &&
+    row.taxRate === old.taxRate && ((row.taxRate === null || row.taxRate === undefined) || row.taxIncluded === old.taxIncluded);
 }
 function sameTargetValue(row: Position, old: unknown): boolean {
   return isRecord(old) && row.quantity === old.quantity && row.price === old.price && row.discount === old.discount && row.vat === old.vat && row.vatEnabled === old.vatEnabled;
@@ -451,7 +460,7 @@ function positionMatches(value: unknown, expected: Row): boolean {
     value.quantity === expected.quantity && value.price === expected.price && value.discount === expected.discount && value.vat === expected.vat && value.vatEnabled === expected.vatEnabled;
 }
 function stableJson(value: unknown): string { return JSON.stringify(value, (_key, child) => child && typeof child === 'object' && !Array.isArray(child) ? Object.fromEntries(Object.entries(child).sort(([a], [b]) => a.localeCompare(b))) : child); }
-function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate }; }
+function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
 function targetSnapshot(row: Row): Row { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
 
 async function readAllBitrixRows(id: string): Promise<Row[]> {
@@ -495,17 +504,23 @@ async function readAllMoySkladPositions(orderId: string): Promise<Position[]> {
   return rows;
 }
 
+async function readMoySkladVatIncluded(orderId: string): Promise<boolean | null> {
+  const value = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+  if (!isRecord(value) || value.id !== orderId || typeof value.vatIncluded !== 'boolean') return null;
+  return value.vatIncluded;
+}
+
 async function readMoySkladPosition(orderId: string, positionId: string): Promise<Position> {
   const value = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
   if (!isRecord(value) || value.id !== positionId || typeof value.quantity !== 'number' || typeof value.price !== 'number') throw new Error();
   return value as Position;
 }
 
-async function updateBitrixRow(rowId: unknown, quantity: number, price: number): Promise<void> {
+async function updateBitrixRow(rowId: unknown, quantity: number, price: number, discountRate: number, taxRate: number | null, taxIncluded: 'Y' | 'N'): Promise<void> {
   if (!/^\d{1,20}$/.test(String(rowId))) throw new Error();
-  const body = new URLSearchParams({ id: String(rowId), 'fields[quantity]': String(quantity), 'fields[price]': String(price) });
+  const body = JSON.stringify({ id: String(rowId), fields: { quantity, price, discountTypeId: 2, discountRate, discountSum: 0, taxRate, taxIncluded } });
   const result = await requestJson(new URL('crm.item.productrow.update', withSlash(bitrixBase())), {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
+    method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
   if (!isRecord(result) || !isRecord(result.result) || !isRecord(result.result.productRow) || String(result.result.productRow.id) !== String(rowId)) throw new Error();
 }

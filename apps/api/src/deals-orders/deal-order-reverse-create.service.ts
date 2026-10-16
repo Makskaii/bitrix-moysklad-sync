@@ -8,12 +8,13 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { resolveDictionaryValue } from './deal-order-field-runtime.service';
+import { moySkladMoneyToBitrix } from './deal-order-money';
 
 type Row = Record<string, unknown>;
-type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: 0; discountSum: 0; taxRate: null; taxIncluded: 'N'; measureCode: number; sort: number } };
-type Prepared = { orderId: string; eventId: string; settingsVersion: number; sourceSnapshot: Row; fields: Row; rows: PreparedRow[]; companyPairId: string | null; companyId: string | null };
+type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
+type Prepared = { orderId: string; eventId: string; settingsVersion: number; sourceSnapshot: Row; fields: Row; rows: PreparedRow[]; skippedRows: Array<{ sourceRowId: string; reason: string }>; companyPairId: string | null; companyId: string | null };
 
-export type ReverseCreateResult = { status: 'CREATED' | 'ALREADY_PAIRED'; bitrix24DealId: string };
+export type ReverseCreateResult = { status: 'CREATED' | 'PARTIAL' | 'ALREADY_PAIRED'; bitrix24DealId: string; skippedRows?: Array<{ sourceRowId: string; reason: string }> };
 export class DealOrderReverseManualReviewError extends Error {}
 
 /** Durable new-MySklad-order to new-Bitrix24-deal exchange. Every provider
@@ -32,20 +33,20 @@ export class DealOrderReverseCreateService {
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) {
       throw new Error('Reverse deal creation is disabled');
     }
-    const existingPair = await this.database.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: input.moyskladOrderId, active: true }, select: { bitrix24Id: true } });
-    if (existingPair) return { status: 'ALREADY_PAIRED', bitrix24DealId: existingPair.bitrix24Id };
     if (!this.clients) throw new Error('Client dependency resolver is unavailable');
 
     let operation = await this.database.dealOrderReverseCreateOperation.findUnique({ where: { moyskladOrderId: input.moyskladOrderId }, include: { positions: { orderBy: { moyskladPositionId: 'asc' } } } });
-    if (operation?.status === 'SUCCEEDED' && operation.bitrix24DealId) return { status: 'CREATED', bitrix24DealId: operation.bitrix24DealId };
+    if ((operation?.status === 'SUCCEEDED' || operation?.status === 'PARTIAL') && operation.bitrix24DealId) return { status: operation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: operation.bitrix24DealId, skippedRows: readSkippedRows(operation.skippedRows) };
+    const existingPair = await this.database.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: input.moyskladOrderId, active: true }, select: { bitrix24Id: true } });
+    if (existingPair) return { status: 'ALREADY_PAIRED', bitrix24DealId: existingPair.bitrix24Id };
     if (!operation || operation.status === 'WAITING') {
       const prepared = await this.prepare(input);
       const payload = serializePrepared(prepared);
       if (operation) {
-        operation = await this.database.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: input.moyskladOrderId }, data: { payload: payload as Prisma.InputJsonValue, settingsVersion: input.eventConfig.version, status: 'PENDING', lastErrorCategory: null }, include: { positions: true } });
+          operation = await this.database.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: input.moyskladOrderId }, data: { payload: payload as Prisma.InputJsonValue, skippedRows: prepared.skippedRows as Prisma.InputJsonValue, settingsVersion: input.eventConfig.version, status: 'PENDING', lastErrorCategory: null }, include: { positions: true } });
       } else {
         try {
-          operation = await this.database.dealOrderReverseCreateOperation.create({ data: { moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, syncId: randomUUID(), payload: payload as Prisma.InputJsonValue, settingsVersion: input.eventConfig.version, status: 'PENDING' }, include: { positions: true } });
+          operation = await this.database.dealOrderReverseCreateOperation.create({ data: { moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, syncId: randomUUID(), payload: payload as Prisma.InputJsonValue, skippedRows: prepared.skippedRows as Prisma.InputJsonValue, settingsVersion: input.eventConfig.version, status: 'PENDING' }, include: { positions: true } });
         } catch (error) {
           if (!isUniqueViolation(error)) throw error;
           operation = await this.database.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: input.moyskladOrderId }, include: { positions: { orderBy: { moyskladPositionId: 'asc' } } } });
@@ -57,6 +58,13 @@ export class DealOrderReverseCreateService {
           where: { moyskladOrderId_moyskladPositionId: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: row.msPositionId } },
           create: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: row.msPositionId, payload: row as unknown as Prisma.InputJsonValue },
           update: {},
+        });
+      }
+      for (const skipped of prepared.skippedRows) {
+        await this.database.dealOrderReversePositionOperation.upsert({
+          where: { moyskladOrderId_moyskladPositionId: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: skipped.sourceRowId } },
+          create: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: skipped.sourceRowId, payload: { sourceRowId: skipped.sourceRowId, reason: skipped.reason } as Prisma.InputJsonValue, status: 'SKIPPED', skipReason: skipped.reason },
+          update: { status: 'SKIPPED', skipReason: skipped.reason },
         });
       }
       operation = await this.database.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: input.moyskladOrderId }, include: { positions: { orderBy: { moyskladPositionId: 'asc' } } } });
@@ -107,6 +115,11 @@ export class DealOrderReverseCreateService {
     const sourceIds = positions.map((position) => readId(position.id)).filter((id): id is string => !!id);
     if (sourceIds.length !== positions.length || new Set(sourceIds).size !== sourceIds.length) throw new DealOrderReverseManualReviewError('Customer-order position identity is incomplete or ambiguous');
     const rows: PreparedRow[] = [];
+    const skippedRows: Array<{ sourceRowId: string; reason: string }> = [];
+    const skip = async (sourceRowId: string, reason: string) => {
+      skippedRows.push({ sourceRowId, reason });
+      await writeOperationalLog(this.database, 'EVENT', `MySklad customer-order position ${sourceRowId} skipped; reason=${reason}`, input.eventId);
+    };
     const seenPair = new Set<string>();
     const resolvedProducts = new Map<string, { bitrix24Id: string; uomId: string }>();
     for (const position of positions) {
@@ -114,7 +127,7 @@ export class DealOrderReverseCreateService {
       const assortment = isRecord(position.assortment) ? position.assortment : {};
       const assortmentId = readId(assortment.id);
       if (!assortmentId || !isUuid(assortmentId)) {
-        await writeOperationalLog(this.database, 'EVENT', `MySklad customer-order position ${id} skipped; reason=PRODUCT_ID_MISSING`, input.eventId);
+        await skip(id, 'PRODUCT_ID_MISSING');
         continue;
       }
       let mappedProduct = resolvedProducts.get(assortmentId);
@@ -131,7 +144,7 @@ export class DealOrderReverseCreateService {
         const uomId = isRecord(product.uom) ? readId(product.uom.id) : null;
         const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === uomId);
         if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1) {
-          await writeOperationalLog(this.database, 'EVENT', `MySklad product ${assortmentId} skipped; reason=UNIT_UNMAPPED`, input.eventId);
+          await skip(id, 'UNIT_UNMAPPED');
           continue;
         }
         let bitrix24Id = productPairs[0]?.bitrix24Id;
@@ -146,12 +159,17 @@ export class DealOrderReverseCreateService {
       const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === mappedProduct!.uomId);
       const price = typeof position.price === 'number' && Number.isFinite(position.price) && position.price >= 0 ? position.price / 100 : null;
       const quantity = typeof position.quantity === 'number' && Number.isFinite(position.quantity) && position.quantity > 0 ? position.quantity : null;
-      const hasUnsupportedDiscount = typeof position.discount === 'number' && position.discount !== 0;
-      const hasUnsupportedTax = position.vatEnabled === true || (typeof position.vat === 'number' && position.vat !== 0);
+      const discount = typeof position.discount === 'number' && Number.isFinite(position.discount) && position.discount >= 0 && position.discount <= 100 ? position.discount : null;
+      const vatEnabled = position.vatEnabled === true;
+      const vat = typeof position.vat === 'number' && Number.isFinite(position.vat) && position.vat >= 0 && position.vat <= 100 ? position.vat : null;
+      const vatIncluded = vatEnabled ? order.vatIncluded : false;
+      const bitrixMoney = price === null || discount === null ? null : moySkladMoneyToBitrix({
+        price: typeof position.price === 'number' ? position.price : null, discount, vat, vatEnabled, vatIncluded,
+      });
       const rowKey = `${input.moyskladOrderId}:${id}`;
-      if (unit.length !== 1 || price === null || quantity === null || hasUnsupportedDiscount || hasUnsupportedTax) {
-        const reason = unit.length !== 1 ? 'UNIT_UNMAPPED' : price === null ? 'DOCUMENT_PRICE_MISSING' : quantity === null ? 'QUANTITY_INVALID' : hasUnsupportedDiscount ? 'DISCOUNT_MAPPING_UNSUPPORTED' : 'VAT_MAPPING_UNSUPPORTED';
-        await writeOperationalLog(this.database, 'EVENT', `MySklad customer-order position ${id} skipped; reason=${reason}`, input.eventId);
+      if (unit.length !== 1 || price === null || quantity === null || discount === null || !bitrixMoney || (vatEnabled && (vat === null || typeof vatIncluded !== 'boolean'))) {
+        const reason = unit.length !== 1 ? 'UNIT_UNMAPPED' : price === null ? 'DOCUMENT_PRICE_MISSING' : quantity === null ? 'QUANTITY_INVALID' : discount === null ? 'DISCOUNT_MAPPING_UNSUPPORTED' : 'VAT_MAPPING_UNSUPPORTED';
+        await skip(id, reason);
         continue;
       }
       if (seenPair.has(rowKey)) throw new Error('Customer-order position was duplicated');
@@ -160,7 +178,7 @@ export class DealOrderReverseCreateService {
       rows.push({
         msPositionId: id,
         snapshot: position,
-        fields: { ownerId: 0, ownerType: 'D', productId: Number(mappedProduct.bitrix24Id), price, quantity, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N', measureCode, sort: rows.length + 1 },
+        fields: { ownerId: 0, ownerType: 'D', productId: Number(mappedProduct.bitrix24Id), ...bitrixMoney, quantity, measureCode, sort: rows.length + 1 },
       });
     }
     const dealFields: Row = {
@@ -177,7 +195,7 @@ export class DealOrderReverseCreateService {
       ...(typeof order.description === 'string' ? { comments: order.description } : {}),
     };
     const fields = mapConfiguredFields(input.eventConfig, order, dealFields);
-    return { orderId: input.moyskladOrderId, eventId: input.eventId, settingsVersion: input.eventConfig.version, sourceSnapshot: order, fields, rows, companyPairId, companyId };
+    return { orderId: input.moyskladOrderId, eventId: input.eventId, settingsVersion: input.eventConfig.version, sourceSnapshot: order, fields, rows, skippedRows, companyPairId, companyId };
   }
 
   private async createOrRecoverDeal(prepared: Prepared, leaseToken: string): Promise<string> {
@@ -363,6 +381,7 @@ export class DealOrderReverseCreateService {
       }
       const existingLinks = await transaction.dealOrderPositionPair.findMany({ where: { pairId: pair.id }, select: { moyskladPositionId: true } });
       for (const positionOperation of operation.positions) {
+        if (positionOperation.status === 'SKIPPED') continue;
         if (!positionOperation.bitrix24ProductRowId) throw new Error('Bitrix24 product row has not been persisted');
         const existing = existingLinks.find((link) => link.moyskladPositionId === positionOperation.moyskladPositionId);
         const payload = isRecord(positionOperation.payload) ? positionOperation.payload as unknown as Row : null;
@@ -377,14 +396,19 @@ export class DealOrderReverseCreateService {
           } });
         } else if (existing.moyskladPositionId !== positionOperation.moyskladPositionId) throw new Error('Reverse row link conflicts');
       }
-      await transaction.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: prepared.orderId }, data: { status: 'SUCCEEDED', leaseToken: null, leaseUntil: null, lastErrorCategory: null } });
+      const partial = prepared.skippedRows.length > 0;
+      await transaction.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: prepared.orderId }, data: { status: partial ? 'PARTIAL' : 'SUCCEEDED', leaseToken: null, leaseUntil: null, lastErrorCategory: partial ? 'ROWS_SKIPPED' : null } });
       await transaction.pairReviewCase.updateMany({ where: { entityType: 'DEAL', sourceSystem: 'MOYSKLAD', sourceEntityId: prepared.orderId, status: 'OPEN' }, data: { status: 'RESOLVED', resolvedAt: new Date() } });
-      return { status: 'CREATED', bitrix24DealId: dealId };
+      return { status: partial ? 'PARTIAL' : 'CREATED', bitrix24DealId: dealId, ...(partial ? { skippedRows: prepared.skippedRows } : {}) };
     }, { timeout: 30_000 });
   }
 }
 
 function serializePrepared(value: Prepared): Row { return JSON.parse(JSON.stringify(value)) as Row; }
+function readSkippedRows(value: unknown): Array<{ sourceRowId: string; reason: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((row): row is { sourceRowId: string; reason: string } => isRecord(row) && typeof row.sourceRowId === 'string' && typeof row.reason === 'string');
+}
 function deserializePrepared(value: Prisma.JsonValue): Prepared {
   const parsed = isRecord(value) ? value as unknown as Row : null;
   if (!parsed || !isRecord(parsed.fields) || !Array.isArray(parsed.rows) || !isRecord(parsed.sourceSnapshot)) throw new Error('Stored reverse deal payload is malformed');

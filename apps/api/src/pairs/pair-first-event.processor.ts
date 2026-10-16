@@ -186,6 +186,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       result = { status: 'unavailable', reason: 'PAIR_STORE_UNAVAILABLE' };
     }
 
+    let partialDealOrderCreation = false;
     // A post-boundary, unpaired Bitrix deal is eligible to create exactly one
     // customer order. The operation is durable and provider-idempotent; all
     // other unresolved cases retain the ordinary manual-review behavior.
@@ -207,7 +208,8 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           return null;
         }
         await workerLease?.assertOwned();
-        await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
+        const creation = await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
+        partialDealOrderCreation = creation.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
         const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
@@ -224,7 +226,8 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig });
+        const reverseResult = await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig });
+        partialDealOrderCreation = reverseResult.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
         const reason = error instanceof Error ? error.message : 'REVERSE_DEAL_CREATE_FAILED';
@@ -315,7 +318,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             await this.finish(event.id, 'RETRYABLE_FAILURE', 'DEAL_ORDER_HEADER_RETRY', workerLease, headerResult.retryAfter);
           } else {
             const holdReason = headerHoldReason(headerResult as string);
-            const positions = process.env.SYNC_MODE === 'apply' && this.positionRuntime
+            const positions = headerResult !== 'DISABLED' && process.env.SYNC_MODE === 'apply' && this.positionRuntime
               ? await this.positionRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
               : { status: 'SYNCED' as const };
             const fields = process.env.SYNC_MODE === 'apply' && this.fieldRuntime
@@ -324,7 +327,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             const runtimeHold = [positions, fields].find((item) => item.status === 'MANUAL_REVIEW') as { status: 'MANUAL_REVIEW'; reason: string } | undefined;
             const runtimeRetry = [positions, fields].find((item) => item.status === 'RETRY') as { status: 'RETRY'; reason: string } | undefined;
             if (runtimeRetry) await this.finish(event.id, 'RETRYABLE_FAILURE', runtimeRetry.reason, workerLease, retryAtForFailure(new Error(runtimeRetry.reason), attempt));
-            else if (holdReason || runtimeHold) await this.finish(event.id, 'MANUAL_REVIEW', holdReason ?? runtimeHold!.reason, workerLease);
+            else if (holdReason || runtimeHold || partialDealOrderCreation) await this.finish(event.id, 'MANUAL_REVIEW', holdReason ?? runtimeHold?.reason ?? 'DEAL_ORDER_PARTIAL_ROWS', workerLease);
             else await this.finish(event.id, headerResult === 'DISABLED' ? 'SKIPPED_DISABLED' : 'SUCCEEDED', headerResult === 'DISABLED' ? 'DEAL_ORDER_HEADER_DISABLED' : null, workerLease);
           }
         } else {
@@ -340,7 +343,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         });
       }
     } else {
-      await this.finish(event.id, 'SUCCEEDED', null, workerLease);
+      await this.finish(event.id, partialDealOrderCreation ? 'MANUAL_REVIEW' : 'SUCCEEDED', partialDealOrderCreation ? 'DEAL_ORDER_PARTIAL_ROWS' : null, workerLease);
     }
 
     logger.log(JSON.stringify({ eventId: event.id, source: event.source, entityType: 'DEAL', resolution: result.status }));

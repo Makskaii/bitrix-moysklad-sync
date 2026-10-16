@@ -62,6 +62,7 @@ after(async () => {
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
   posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
   const input = preparedInput();
+  input.skippedRows = [{ sourceRowId: '302', reason: 'UNIT_UNMAPPED' }];
   const firstError = await service.createAndPair(input).then(() => null, (error: unknown) => error);
   assert.ok(firstError instanceof Error);
   assert.match(firstError.message, /customer-order number read failed/i);
@@ -70,12 +71,14 @@ test('MySklad order ID persists after remote create and retry reuses it rather t
   assert.equal(afterLoss.status, 'PENDING');
 
   const result = await service.createAndPair(input);
-  assert.deepEqual(result, { status: 'CREATED', bitrix24DealId: '901', moyskladOrderId: ids.order });
+  assert.deepEqual(result, { status: 'PARTIAL', bitrix24DealId: '901', moyskladOrderId: ids.order, skippedRows: input.skippedRows });
   assert.equal(posts, 1, 'MySklad customer order is never duplicated');
   const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: '901', active: true } });
   const links = await db.dealOrderPositionPair.findMany({ where: { pairId: pair.id } });
   assert.equal(links.length, 1);
-  assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '901' } })).status, 'SUCCEEDED');
+  const operation = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '901' } });
+  assert.equal(operation.status, 'PARTIAL');
+  assert.deepEqual(operation.skippedRows, input.skippedRows);
   assert.equal(b24OrderNumber, 'SO-54');
 });
 

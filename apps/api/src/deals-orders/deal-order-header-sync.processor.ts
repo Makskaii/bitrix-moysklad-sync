@@ -64,6 +64,9 @@ export class DealOrderHeaderSyncProcessor {
     const b24Value = scalar(b24.COMMENTS);
     const msValue = scalar(ms.description);
     if (b24Value === null || msValue === null) return 'HOLD_CONFLICT';
+    const clientResult = await this.syncCompanyClient({ transaction, pairId: pair.id, eventId: input.eventId, settingsVersion: baseline.settingsVersion, serviceCounterpartyId: input.eventConfig.config.serviceCounterpartyId,
+      bitrix24DealId: input.pair.bitrix24Id, moyskladOrderId: input.pair.moyskladId, b24, ms, previous, baseline, assertWorkerLease: input.assertWorkerLease });
+    if (clientResult !== 'UPDATED' && clientResult !== 'NOOP') return clientResult;
     const lastB24 = scalar((previous.bitrix24Values as Record<string, unknown>)[FIELD]);
     const lastMs = scalar((previous.moyskladValues as Record<string, unknown>)[FIELD]);
     if (lastB24 === null || lastMs === null) return 'HOLD_CONFLICT';
@@ -131,6 +134,115 @@ export class DealOrderHeaderSyncProcessor {
     }, { timeout: 60_000 });
   }
 
+  private async syncCompanyClient(input: {
+    transaction: Prisma.TransactionClient; pairId: string; eventId: string; settingsVersion: number; serviceCounterpartyId?: string | null;
+    bitrix24DealId: string; moyskladOrderId: string; b24: Record<string, unknown>; ms: Record<string, unknown>;
+    previous: { bitrix24Values: Prisma.JsonValue; moyskladValues: Prisma.JsonValue };
+    baseline: { bitrix24Values: Prisma.JsonValue; moyskladValues: Prisma.JsonValue };
+    assertWorkerLease?: () => Promise<void>;
+  }): Promise<HeaderResult> {
+    const b24ClientId = documentCompanyId(input.b24.COMPANY_ID);
+    const msClientId = referenceCompanyId(input.ms.agent);
+    if (input.b24.COMPANY_ID !== null && input.b24.COMPANY_ID !== undefined && input.b24.COMPANY_ID !== '' && input.b24.COMPANY_ID !== 0 && input.b24.COMPANY_ID !== '0' && b24ClientId === null) return 'HOLD_CONFLICT';
+    const previousB24 = jsonRecord(input.previous.bitrix24Values);
+    const baselineB24 = jsonRecord(input.baseline.bitrix24Values);
+    const previousMs = jsonRecord(input.previous.moyskladValues);
+    const baselineMs = jsonRecord(input.baseline.moyskladValues);
+    const hasOldB24 = Object.prototype.hasOwnProperty.call(previousB24, 'client:companyId') || Object.prototype.hasOwnProperty.call(baselineB24, 'client:companyId');
+    const hasOldMs = Object.prototype.hasOwnProperty.call(previousMs, 'client:agentId') || Object.prototype.hasOwnProperty.call(baselineMs, 'client:agentId');
+    const oldB24Value = Object.prototype.hasOwnProperty.call(previousB24, 'client:companyId') ? previousB24['client:companyId'] : baselineB24['client:companyId'];
+    const oldMsValue = Object.prototype.hasOwnProperty.call(previousMs, 'client:agentId') ? previousMs['client:agentId'] : baselineMs['client:agentId'];
+    const oldB24 = documentCompanyId(oldB24Value);
+    const oldMs = referenceCompanyId({ id: oldMsValue });
+    if (!hasOldB24 || !hasOldMs) return 'HOLD_CONFLICT';
+    const b24Changed = b24ClientId !== oldB24;
+    const msChanged = msClientId !== oldMs;
+    if (!b24Changed && !msChanged) {
+      await this.persistClientState(input.transaction, input.pairId, input.settingsVersion, b24ClientId, msClientId);
+      return 'NOOP';
+    }
+    // Simultaneous changes always resolve from the current MySklad company pair.
+    const source = msChanged ? 'MOYSKLAD' : 'BITRIX24';
+    if (!await this.mode.isDirectionEnabled('deals-orders', source === 'MOYSKLAD' ? 'moyskladToBitrix24' : 'bitrix24ToMoysklad')) return 'HOLD_CONFLICT';
+    let targetCompanyId: string;
+    let targetAgentId: string;
+    if (source === 'MOYSKLAD') {
+      if (msClientId === null) return 'HOLD_CONFLICT';
+      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', moyskladId: msClientId, active: true }, select: { bitrix24Id: true }, take: 2 });
+      if (candidates.length !== 1) return 'HOLD_CONFLICT';
+      targetCompanyId = String(candidates[0].bitrix24Id);
+      targetAgentId = msClientId;
+    } else if (b24ClientId === null) {
+      if (!input.serviceCounterpartyId) return 'HOLD_CONFLICT';
+      targetCompanyId = '';
+      targetAgentId = input.serviceCounterpartyId;
+    } else {
+      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', bitrix24Id: b24ClientId, active: true }, select: { moyskladId: true }, take: 2 });
+      if (candidates.length !== 1) return 'HOLD_CONFLICT';
+      targetCompanyId = b24ClientId;
+      targetAgentId = String(candidates[0].moyskladId);
+    }
+    const base24 = localEndpoint(process.env.BITRIX24_REST_BASE_URL);
+    const baseMs = localEndpoint(process.env.MOYSKLAD_API_BASE_URL);
+    if (!base24 || !baseMs) return 'DISABLED';
+    await input.assertWorkerLease?.();
+    if (source === 'MOYSKLAD') {
+      if (!/^\d{1,20}$/.test(targetCompanyId)) return 'HOLD_CONFLICT';
+      if (b24ClientId !== targetCompanyId) {
+        const proposed = process.env.SYNC_MODE === 'dry' && this.dryWrites
+          ? await this.dryWrites.propose({ eventId: input.eventId, provider: 'BITRIX24', entityType: 'deal', entityId: input.bitrix24DealId, operation: 'UPDATE', fields: { COMPANY_ID: targetCompanyId } })
+          : false;
+        let verified: Record<string, unknown>;
+        try {
+          if (!proposed) await this.writeBitrixCompany(base24, input.bitrix24DealId, targetCompanyId);
+          verified = await this.reader.readBitrix24DealForBaseline(input.bitrix24DealId);
+        } catch (error) { return providerResult(error); }
+        if (documentCompanyId(verified.COMPANY_ID) !== targetCompanyId) return 'HOLD_WRITE_FAILED';
+      }
+      await this.persistClientState(input.transaction, input.pairId, input.settingsVersion, targetCompanyId, msClientId);
+    } else {
+      if (!isUuid(targetAgentId)) return 'HOLD_CONFLICT';
+      if (msClientId !== targetAgentId) {
+        const agent = { meta: { href: new URL(`entity/counterparty/${encodeURIComponent(targetAgentId)}`, withSlash(baseMs)).href, type: 'counterparty', mediaType: 'application/json' } };
+        const proposed = process.env.SYNC_MODE === 'dry' && this.dryWrites
+          ? await this.dryWrites.propose({ eventId: input.eventId, provider: 'MOYSKLAD', entityType: 'customerorder', entityId: input.moyskladOrderId, operation: 'UPDATE', fields: { agent } })
+          : false;
+        let verified: Record<string, unknown>;
+        try {
+          if (!proposed) await this.writeMoySkladAgent(baseMs, input.moyskladOrderId, agent);
+          verified = await this.reader.readMoySkladCustomerOrderForBaseline(input.moyskladOrderId);
+        } catch (error) { return providerResult(error); }
+        if (referenceCompanyId(verified.agent) !== targetAgentId) return 'HOLD_WRITE_FAILED';
+      }
+      await this.persistClientState(input.transaction, input.pairId, input.settingsVersion, targetCompanyId || null, targetAgentId);
+    }
+    return 'UPDATED';
+  }
+
+  private async writeBitrixCompany(base: URL, dealId: string, companyId: string) {
+    assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_CLIENT_UPDATE');
+    const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ id: dealId, 'fields[COMPANY_ID]': companyId }), redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+    const body: unknown = await response.json().catch(() => null);
+    if (!isRecord(body) || body.error || body.result !== true) throw new ProviderFailure('BITRIX24', 400);
+  }
+
+  private async writeMoySkladAgent(base: URL, orderId: string, agent: Record<string, unknown>) {
+    assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_CLIENT_UPDATE');
+    const token = process.env.MOYSKLAD_API_TOKEN;
+    if (!token) throw new Error('write token unavailable');
+    const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(base)), { method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ agent }), redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+  }
+
+  private async persistClientState(transaction: Prisma.TransactionClient, pairId: string, settingsVersion: number, b24: string | null, ms: string | null) {
+    const previous = await transaction.entityPairSyncState.findUnique({ where: { pairId }, select: { bitrix24Values: true, moyskladValues: true } });
+    await transaction.entityPairSyncState.upsert({ where: { pairId }, create: { pairId, settingsVersion, bitrix24Values: { 'client:companyId': b24 }, moyskladValues: { 'client:agentId': ms } },
+      update: { settingsVersion, bitrix24Values: { ...jsonRecord(previous?.bitrix24Values), 'client:companyId': b24 }, moyskladValues: { ...jsonRecord(previous?.moyskladValues), 'client:agentId': ms } } });
+  }
+
   private async writeMoySklad(base: URL, id: string, value: string) {
     assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_HEADER_UPDATE');
     const token = process.env.MOYSKLAD_API_TOKEN;
@@ -176,5 +288,22 @@ function localEndpoint(value?: string): URL | null {
 
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
 function scalar(value: unknown): string | null { return typeof value === 'string' ? value : null; }
+function documentCompanyId(value: unknown): string | null {
+  if (value === null || value === undefined || value === '' || value === 0 || value === '0') return null;
+  const id = typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+  return /^\d{1,20}$/.test(id) ? id : null;
+}
+function referenceCompanyId(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  const id = typeof value.id === 'string' ? value.id : null;
+  if (id && isUuid(id)) return id;
+  const href = isRecord(value.meta) && typeof value.meta.href === 'string' ? value.meta.href : '';
+  return /\/counterparty\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?(?:\?.*)?$/i.exec(href)?.[1] ?? null;
+}
+function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
+function providerResult(error: unknown): HeaderResult {
+  if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, 1) };
+  return 'HOLD_WRITE_FAILED';
+}
 function jsonRecord(value: Prisma.JsonValue | null | undefined): Record<string, unknown> { return isRecord(value) ? value : {}; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
