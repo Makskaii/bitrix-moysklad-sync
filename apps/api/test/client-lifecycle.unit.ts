@@ -2,6 +2,23 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
 
+test('delete processor supports each enabled durable pair entity and only explicit deletion events', () => {
+  const service = new ClientLifecycleService({} as never);
+  for (const [source, eventType, externalEntityType] of [
+    ['BITRIX24', 'ONCRMCOMPANYDELETE', 'company'],
+    ['BITRIX24', 'ONCRMCONTACTDELETE', 'contact'],
+    ['BITRIX24', 'ONCRMDEALDELETE', 'deal'],
+    ['BITRIX24', 'CATALOG.PRODUCT.ON.DELETE', 'product'],
+    ['MOYSKLAD', 'DELETE', 'counterparty'],
+    ['MOYSKLAD', 'DELETE', 'contactperson'],
+    ['MOYSKLAD', 'DELETE', 'customerorder'],
+    ['MOYSKLAD', 'DELETE', 'product'],
+  ] as const) {
+    assert.equal(service.supports({ id: 'event', source, eventType, externalEntityType, externalEntityId: 'native-id' }), true);
+  }
+  assert.equal(service.supports({ id: 'event', source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'product', externalEntityId: 'native-id' }), false);
+});
+
 test('tombstone targets one entity-type/native-ID pair and repeats idempotently', async () => {
   const records = [
     { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '42', moyskladId: 'ms-company', active: true, lifecycleStatus: 'ACTIVE' },
@@ -50,6 +67,32 @@ test('pair write gate refuses tombstoned pairs and leaves unrelated active pairs
   await assert.rejects(() => service.assertPairActive('live', 'CONTACT'), /PAIR_NOT_AVAILABLE/);
 });
 
+test('pair mutation lease uses the same three lifecycle keys and rechecks status before the write', async () => {
+  const leaseRows = new Map<string, string>();
+  const pair = { id: 'pair-deal', entityType: 'DEAL', bitrix24Id: '42', moyskladId: 'ms-deal', active: true, lifecycleStatus: 'ACTIVE' };
+  const database = {
+    entityPair: { findUnique: async () => pair },
+    inboundEntityLock: {
+      updateMany: async ({ where }: { where: { entityKey: string | { in?: string[] }; ownerToken?: string } }) => {
+        const keys = typeof where.entityKey === 'string' ? [where.entityKey] : where.entityKey.in ?? [];
+        return { count: where.ownerToken ? keys.filter((key) => leaseRows.has(key) && leaseRows.get(key) === where.ownerToken).length : 0 };
+      },
+      create: async ({ data }: { data: { entityKey: string; ownerToken: string } }) => { leaseRows.set(data.entityKey, data.ownerToken); },
+      deleteMany: async ({ where }: { where: { entityKey: { in: string[] }; ownerToken: string } }) => {
+        for (const key of where.entityKey.in) if (leaseRows.get(key) === where.ownerToken) leaseRows.delete(key);
+        return { count: 3 };
+      },
+    },
+  };
+  const service = new ClientLifecycleService(database as never);
+  const result = await service.withPairActiveLock('pair-deal', 'DEAL', async () => {
+    assert.equal(leaseRows.size, 3);
+    return 'provider-write';
+  });
+  assert.equal(result, 'provider-write');
+  assert.equal(leaseRows.size, 0);
+});
+
 test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 404', async () => {
   const oldFetch = globalThis.fetch;
   const oldMode = process.env.SYNC_MODE;
@@ -61,6 +104,7 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
   const updates: Record<string, unknown>[] = [];
   const pair = { id: 'pair-1', entityType: 'COMPANY', bitrix24Id: 'b24-1', moyskladId: 'ms-1', moyskladType: 'counterparty', moyskladParentId: null, active: true, lifecycleStatus: 'ACTIVE', deletionMarkerStatus: 'NOT_CONFIGURED', deletionTimelineStatus: 'NOT_REQUIRED', tombstoneSource: null, tombstonedAt: null };
   const event = { id: 'event-1', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', externalEntityId: 'ms-1', payload: {}, status: 'RECEIVED', attempts: 0 };
+  const leaseRows = new Map<string, string>();
   const tx = {
     $queryRaw: async () => [{ locked: 1 }],
     entityPair: {
@@ -79,7 +123,15 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
       update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return pair; },
     },
     inboundEntityLock: {
-      updateMany: async () => ({ count: 0 }), create: async () => ({}), deleteMany: async () => ({ count: 1 }),
+      updateMany: async ({ where }: { where: { entityKey: string | { in?: string[] }; ownerToken?: string } }) => {
+        const keys = typeof where.entityKey === 'string' ? [where.entityKey] : where.entityKey.in ?? [];
+        return { count: where.ownerToken ? keys.filter((key) => leaseRows.has(key) && leaseRows.get(key) === where.ownerToken).length : 0 };
+      },
+      create: async ({ data }: { data: { entityKey: string; ownerToken: string } }) => { leaseRows.set(data.entityKey, data.ownerToken); },
+      deleteMany: async ({ where }: { where: { entityKey: { in: string[] }; ownerToken: string } }) => {
+        for (const key of where.entityKey.in) if (leaseRows.get(key) === where.ownerToken) leaseRows.delete(key);
+        return { count: where.entityKey.in.length };
+      },
     },
     inboundEvent: {
       findUnique: async () => event,
@@ -166,6 +218,8 @@ test('restore keeps the same native IDs and requires verified provider identity 
   assert.equal(pair.moyskladId, 'ms-restore');
   assert.equal(pair.active, true);
   assert.equal(pair.lifecycleStatus, 'ACTIVE');
+  assert.deepEqual(await service.restore('pair-restore', true, 'BITRIX24_USER:42'), { status: 'ALREADY_ACTIVE', pairId: 'pair-restore' });
+  assert.equal(auditEntries.length, 1);
   assert.deepEqual(auditEntries[0], {
     actorId: 'BITRIX24_USER:42', action: 'CLIENT_LIFECYCLE_RESTORED', targetType: 'COMPANY', targetId: 'pair-restore',
     reason: 'VERIFIED_BOTH_NATIVE_IDS',

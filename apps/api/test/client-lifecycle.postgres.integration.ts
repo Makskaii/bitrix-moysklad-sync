@@ -9,9 +9,15 @@ import { ClientLifecycleService } from '../src/clients/client-lifecycle.service'
 const suffix = randomUUID();
 const companyPairId = `lifecycle-company-${suffix}`;
 const contactPairId = `lifecycle-contact-${suffix}`;
+const dealPairId = `lifecycle-deal-${suffix}`;
+const productPairId = `lifecycle-product-${suffix}`;
 const msId = randomUUID();
+const msOrderId = randomUUID();
+const msProductId = randomUUID();
 const b24CompanyId = `58${Date.now()}`;
 const b24ContactId = `59${Date.now()}`;
+const b24DealId = `60${Date.now()}`;
+const b24ProductId = `61${Date.now()}`;
 let database: DatabaseService;
 let service: ClientLifecycleService;
 let oldFetch: typeof fetch;
@@ -27,10 +33,17 @@ function makeGateway() {
   };
 }
 
-async function createDeleteEvent(id: string, status = 'RECEIVED') {
+async function createDeleteEvent(
+  id: string,
+  status = 'RECEIVED',
+  source = 'MOYSKLAD',
+  externalEntityType = 'counterparty',
+  externalEntityId: string = msId,
+  eventType: string = 'DELETE',
+) {
   return database.inboundEvent.create({ data: {
-    source: 'MOYSKLAD', deliveryKey: `lifecycle-${suffix}-${id}`, eventType: 'DELETE',
-    externalEntityId: msId, externalEntityType: 'counterparty', payload: {} as Prisma.InputJsonValue, status,
+    source, deliveryKey: `lifecycle-${suffix}-${id}`, eventType,
+    externalEntityId, externalEntityType, payload: {} as Prisma.InputJsonValue, status,
   } });
 }
 
@@ -56,6 +69,14 @@ before(async () => {
     moyskladType: 'counterparty', active: true,
   } });
   await database.entityPair.create({ data: {
+    id: dealPairId, entityType: 'DEAL', bitrix24Id: b24DealId, moyskladId: msOrderId,
+    moyskladType: 'customerorder', active: true,
+  } });
+  await database.entityPair.create({ data: {
+    id: productPairId, entityType: 'PRODUCT', bitrix24Id: b24ProductId, moyskladId: msProductId,
+    moyskladType: 'product', active: true,
+  } });
+  await database.entityPair.create({ data: {
     id: contactPairId, entityType: 'CONTACT', bitrix24Id: b24ContactId, moyskladId: msId,
     moyskladType: 'counterparty', active: true,
   } });
@@ -65,7 +86,7 @@ after(async () => {
   if (database) {
     await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `lifecycle-${suffix}-` } } });
     await database.inboundEntityLock.deleteMany({ where: { eventId: { startsWith: 'lifecycle:' } } });
-    await database.entityPair.deleteMany({ where: { id: { in: [companyPairId, contactPairId] } } });
+    await database.entityPair.deleteMany({ where: { id: { in: [companyPairId, contactPairId, dealPairId, productPairId] } } });
     await database.$disconnect();
   }
   globalThis.fetch = oldFetch;
@@ -110,4 +131,56 @@ test('PostgreSQL tombstone is idempotent, entity-type scoped, retryable on outag
   await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent(outage.id);
   assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: companyPairId } })).lifecycleStatus, 'ACTIVE');
   assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: outage.id } })).status, 'RETRYABLE_FAILURE');
+});
+
+test('PostgreSQL applies provider-confirmed lifecycle to deal/order and product pairs, then manually restores exact product identity', async () => {
+  let productReads = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes(`/entity/customerorder/${msOrderId}`)) return new Response(null, { status: 404 });
+    if (url.includes('crm.deal.get.json')) return Response.json({ result: { ID: b24DealId } });
+    if (url.includes('crm.timeline.comment.list.json')) return Response.json({ result: [{ COMMENT: `[sync-tombstone:${dealPairId}]` }] });
+    if (url.includes('catalog.product.get.json') && url.includes('/rest/test/')) {
+      productReads += 1;
+      if (productReads === 1) return Response.json({ error: 'NOT_FOUND', error_description: 'Product not found' });
+      return Response.json({ result: { product: { id: b24ProductId } } });
+    }
+    if (url.includes(`/entity/product/${msProductId}`)) return Response.json({ id: msProductId, meta: { type: 'product' } });
+    throw new Error('Unexpected provider request in fake-provider test');
+  };
+  const dealDelete = await createDeleteEvent('deal-delete', 'RECEIVED', 'MOYSKLAD', 'customerorder', msOrderId);
+  await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent(dealDelete.id);
+  assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: dealPairId } })).lifecycleStatus, 'TOMBSTONED');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: dealDelete.id } })).status, 'SUCCEEDED');
+
+  const productDelete = await createDeleteEvent('product-delete', 'RECEIVED', 'BITRIX24', 'product', b24ProductId, 'CATALOG.PRODUCT.ON.DELETE');
+  await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent(productDelete.id);
+  const deletedProduct = await database.entityPair.findUniqueOrThrow({ where: { id: productPairId } });
+  assert.equal(deletedProduct.lifecycleStatus, 'TOMBSTONED');
+  assert.equal(deletedProduct.moyskladId, msProductId);
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: productDelete.id } })).status, 'SUCCEEDED');
+
+  const restored = await service.restore(productPairId, true, 'BITRIX24_USER:42');
+  assert.deepEqual(restored, { status: 'RESTORED', pairId: productPairId });
+  const activeProduct = await database.entityPair.findUniqueOrThrow({ where: { id: productPairId } });
+  assert.equal(activeProduct.lifecycleStatus, 'ACTIVE');
+  assert.equal(activeProduct.bitrix24Id, b24ProductId);
+  assert.equal(activeProduct.moyskladId, msProductId);
+  assert.deepEqual(await service.restore(productPairId, true, 'BITRIX24_USER:42'), { status: 'ALREADY_ACTIVE', pairId: productPairId });
+  assert.equal(await database.adminAuditEntry.count({ where: { action: 'CLIENT_LIFECYCLE_RESTORED', targetId: productPairId } }), 1);
+
+  await database.entityPair.update({ where: { id: productPairId }, data: {
+    active: false, lifecycleStatus: 'TOMBSTONED', tombstonedAt: new Date(), tombstoneSource: 'BITRIX24', tombstoneReason: 'TEST_ROLLBACK',
+  } });
+  await database.$executeRawUnsafe(`CREATE FUNCTION reject_lifecycle_restore_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."action" = 'CLIENT_LIFECYCLE_RESTORED' THEN RAISE EXCEPTION 'forced lifecycle audit failure'; END IF; RETURN NEW; END; $$`);
+  await database.$executeRawUnsafe(`CREATE TRIGGER reject_lifecycle_restore_audit BEFORE INSERT ON "AdminAuditEntry" FOR EACH ROW EXECUTE FUNCTION reject_lifecycle_restore_audit()`);
+  try {
+    await assert.rejects(() => service.restore(productPairId, true, 'BITRIX24_USER:42'), /forced lifecycle audit failure/);
+    const rolledBack = await database.entityPair.findUniqueOrThrow({ where: { id: productPairId } });
+    assert.equal(rolledBack.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(rolledBack.active, false);
+  } finally {
+    await database.$executeRawUnsafe('DROP TRIGGER reject_lifecycle_restore_audit ON "AdminAuditEntry"');
+    await database.$executeRawUnsafe('DROP FUNCTION reject_lifecycle_restore_audit()');
+  }
 });
