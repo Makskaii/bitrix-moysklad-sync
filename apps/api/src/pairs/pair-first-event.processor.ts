@@ -412,17 +412,23 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         adapter: {
           readCurrent,
           writeBitrix24Opportunity: async (amount) => {
-            await this.syncMode?.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => {
+            const mutation = async () => {
+              await this.syncMode?.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => {
               await input.assertWorkerLease?.(); return lease.assertOwner();
-            });
-            assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_TOTAL_UPDATE');
-            const base = providerBase(process.env.BITRIX24_REST_BASE_URL);
-            if (!base || !/^\d{1,20}$/.test(input.pair.bitrix24Id)) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_NOT_CONFIGURED');
-            const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams({ id: input.pair.bitrix24Id, 'fields[OPPORTUNITY]': String(amount) }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
-            if (!response.ok) throw new Error(`DEAL_ORDER_TOTAL_PROVIDER_HTTP_${response.status}`);
-            const body: unknown = await response.json().catch(() => null);
-            if (!isRecord(body) || body.error || body.result !== true) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_REJECTED');
+              }, { id: input.pair.id, entityType: 'DEAL' });
+              assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_TOTAL_UPDATE');
+              const base = providerBase(process.env.BITRIX24_REST_BASE_URL);
+              if (!base || !/^\d{1,20}$/.test(input.pair.bitrix24Id)) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_NOT_CONFIGURED');
+              const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ id: input.pair.bitrix24Id, 'fields[OPPORTUNITY]': String(amount) }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
+              if (!response.ok) throw new Error(`DEAL_ORDER_TOTAL_PROVIDER_HTTP_${response.status}`);
+              const body: unknown = await response.json().catch(() => null);
+              if (!isRecord(body) || body.error || body.result !== true) throw new Error('DEAL_ORDER_TOTAL_PROVIDER_REJECTED');
+            };
+            if (this.syncMode) await this.syncMode.runDealOrderExternalWrite('moyskladToBitrix24', async () => {
+              await input.assertWorkerLease?.(); return lease.assertOwner();
+            }, { id: input.pair.id, entityType: 'DEAL' }, mutation);
+            else await mutation();
           },
           persistState: async (state) => {
             const saved = await lease.commit(async (transaction) => {

@@ -35,11 +35,11 @@ export class DealOrderFieldRuntimeService {
   async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
     if (process.env.SYNC_MODE !== 'apply') return { status: 'MANUAL_REVIEW', reason: 'SYNC_MODE_NOT_APPLY' };
-    return await withDealOrderPairLock(this.database, input.pair.id, input.eventId, (lease) => this.processLocked(input, lease.assertOwner, (direction) => this.mode.assertDealOrderExternalWriteAllowed(direction, lease.assertOwner))) ??
+    return await withDealOrderPairLock(this.database, input.pair.id, input.eventId, (lease) => this.processLocked(input, lease.assertOwner, (direction, mutation) => this.mode.runDealOrderExternalWrite(direction, lease.assertOwner, { id: input.pair.id, entityType: input.pair.entityType }, mutation))) ??
       { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_BUSY' };
   }
 
-  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, assertOwner: () => Promise<boolean>, assertMutationAllowed: (direction: DealOrderWriteDirection) => Promise<void>): Promise<Result> {
+  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, assertOwner: () => Promise<boolean>, runMutation: (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => Promise<unknown>): Promise<Result> {
     const pair = await this.database.entityPair.findFirst({
       where: { id: input.pair.id, entityType: 'DEAL', active: true, bitrix24Id: input.pair.bitrix24Id, moyskladId: input.pair.moyskladId },
       select: { id: true, bitrix24Id: true, moyskladId: true },
@@ -182,19 +182,18 @@ export class DealOrderFieldRuntimeService {
             return { status: 'RETRY', reason: 'DEAL_ORDER_FIELD_CHANGED_BEFORE_WRITE' };
           }
           if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
-          await assertMutationAllowed(direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24');
           if (dictionary) {
             const mapped = resolveDictionaryValue(dictionary, 'BITRIX24', desired);
             if (mapped.status !== 'MAPPED' && mapped.status !== 'EMPTY') return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_REFERENCE_VALUE_UNMAPPED' };
-            if (direction === 'BITRIX24_TO_MOYSKLAD') await writeMoySkladDictionaryAttribute(pair.moyskladId, dictionary, mapped.status === 'EMPTY' ? null : mapped.moyskladId);
-            else await writeBitrix24Field(pair.bitrix24Id, rule.sourceField, mapped.status === 'EMPTY' ? null : mapped.bitrix24Id);
+            if (direction === 'BITRIX24_TO_MOYSKLAD') await runMutation('bitrix24ToMoysklad', () => writeMoySkladDictionaryAttribute(pair.moyskladId, dictionary, mapped.status === 'EMPTY' ? null : mapped.moyskladId));
+            else await runMutation('moyskladToBitrix24', () => writeBitrix24Field(pair.bitrix24Id, rule.sourceField, mapped.status === 'EMPTY' ? null : mapped.bitrix24Id));
           } else if (direction === 'BITRIX24_TO_MOYSKLAD') {
             const writeValue = isPlannedDeliveryDateMapping(rule.sourceField, rule.targetField)
               ? toMoySkladPlannedDeliveryDate(desired as string | null)
               : desired;
-            await writeMoySkladAttribute(pair.moyskladId, rule.targetField, writeValue, rule.sourceField);
+            await runMutation('bitrix24ToMoysklad', () => writeMoySkladAttribute(pair.moyskladId, rule.targetField, writeValue, rule.sourceField));
           }
-          else await writeBitrix24Field(pair.bitrix24Id, rule.sourceField, desired);
+          else await runMutation('moyskladToBitrix24', () => writeBitrix24Field(pair.bitrix24Id, rule.sourceField, desired));
         } catch (error) {
           if (error instanceof DealOrderWriteGateError) return { status: 'RETRY', reason: error.message };
           return { status: 'RETRY', reason: 'DEAL_ORDER_FIELD_WRITE_FAILED' };
@@ -233,7 +232,7 @@ export class DealOrderFieldRuntimeService {
         state.moyskladValues = msSnapshot as Prisma.JsonValue;
       } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_FIELD_STATE_STORE_FAILED' }; }
     }
-        const stageResult = await this.processConfiguredStage(input, pair, state, directions, assertOwner, assertMutationAllowed);
+        const stageResult = await this.processConfiguredStage(input, pair, state, directions, assertOwner, runMutation);
     if (stageResult?.status === 'RETRY' || stageResult?.status === 'MANUAL_REVIEW') return stageResult;
     if (heldRules > 0) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_FIELD_RULES_HELD' };
     return { status: 'SYNCED', heldRules };
@@ -245,7 +244,7 @@ export class DealOrderFieldRuntimeService {
     state: NonNullable<Awaited<ReturnType<DatabaseService['entityPairSyncState']['findUnique']>>>,
     directions: { bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } | null,
     assertOwner: () => Promise<boolean>,
-    assertMutationAllowed: (direction: DealOrderWriteDirection) => Promise<void>,
+    runMutation: (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => Promise<unknown>,
   ): Promise<Result | null> {
     const stages = input.eventConfig.config.dealOrderRuntime?.stages;
     if (!Array.isArray(stages) || stages.length === 0) return null;
@@ -297,9 +296,8 @@ export class DealOrderFieldRuntimeService {
         return { status: 'RETRY', reason: 'DEAL_ORDER_STAGE_CHANGED_BEFORE_WRITE' };
       }
       if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
-      await assertMutationAllowed(direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24');
-      if (direction === 'BITRIX24_TO_MOYSKLAD') await writeMoySkladStage(pair.moyskladId, expectedMs);
-      else await writeBitrix24Field(pair.bitrix24Id, 'STAGE_ID', expectedB24);
+      if (direction === 'BITRIX24_TO_MOYSKLAD') await runMutation('bitrix24ToMoysklad', () => writeMoySkladStage(pair.moyskladId, expectedMs));
+      else await runMutation('moyskladToBitrix24', () => writeBitrix24Field(pair.bitrix24Id, 'STAGE_ID', expectedB24));
     } catch (error) { return { status: 'RETRY', reason: error instanceof DealOrderWriteGateError ? error.message : 'DEAL_ORDER_STAGE_WRITE_FAILED' }; }
 
     let verifiedB24: RecordValue;

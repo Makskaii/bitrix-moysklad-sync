@@ -33,7 +33,7 @@ export class DealOrderPositionRuntimeService {
 
   private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, lease: DealOrderPairLease): Promise<Result> {
     const assertOwner = lease.assertOwner;
-    const assertMutationAllowed = (direction: DealOrderWriteDirection) => this.mode.assertDealOrderExternalWriteAllowed(direction, assertOwner);
+    const runMutation = (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => this.mode.runDealOrderExternalWrite(direction, assertOwner, { id: input.pair.id, entityType: 'DEAL' }, mutation);
     const pair = await this.database.entityPair.findFirst({
       where: { id: input.pair.id, entityType: 'DEAL', active: true, bitrix24Id: input.pair.bitrix24Id, moyskladId: input.pair.moyskladId },
       select: { id: true, bitrix24Id: true, moyskladId: true },
@@ -178,7 +178,7 @@ export class DealOrderPositionRuntimeService {
     if (newRows.length) {
       const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { bitrix24ToMoysklad: true } });
       if (!(directionSetting?.bitrix24ToMoysklad ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
-      const added = await this.addRows(pair.id, pair.moyskladId, newRows, input.eventConfig, assertMutationAllowed, assertOwner, skippedRows, skipRow);
+      const added = await this.addRows(pair.id, pair.moyskladId, newRows, input.eventConfig, runMutation, assertOwner, skippedRows, skipRow);
       if (added.status !== 'SYNCED' && added.status !== 'PARTIAL') return added;
     }
 
@@ -191,10 +191,9 @@ export class DealOrderPositionRuntimeService {
           const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
           if (!sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           if (plan.target.quantity !== plan.quantity || plan.target.price !== plan.price || plan.target.discount !== plan.discount || plan.target.vat !== plan.vat || plan.target.vatEnabled !== plan.vatEnabled) {
-            await assertMutationAllowed('bitrix24ToMoysklad');
-            await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
+            await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
               method: 'PUT', headers: msHeaders(), body: JSON.stringify({ quantity: plan.quantity, price: plan.price, discount: plan.discount, vat: plan.vat, vatEnabled: plan.vatEnabled }),
-            });
+            }));
           }
           const verified = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
           if (!isRecord(verified) || verified.id !== plan.target.id || verified.quantity !== plan.quantity || verified.price !== plan.price || verified.discount !== plan.discount || verified.vat !== plan.vat || verified.vatEnabled !== plan.vatEnabled) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
@@ -209,8 +208,7 @@ export class DealOrderPositionRuntimeService {
           }
           const quantity = plan.target.quantity;
           const price = plan.bitrixPrice;
-          await assertMutationAllowed('moyskladToBitrix24');
-          await updateBitrixRow(plan.source.id, quantity, price, plan.bitrixDiscountRate, plan.bitrixTaxRate, plan.bitrixTaxIncluded);
+          await runMutation('moyskladToBitrix24', () => updateBitrixRow(plan.source.id, quantity, price, plan.bitrixDiscountRate, plan.bitrixTaxRate, plan.bitrixTaxIncluded));
           const rows = await readAllBitrixRows(pair.bitrix24Id);
           const verified = rows.find((row) => String(row.id) === String(plan.source.id));
           if (!verified || verified.quantity !== quantity || verified.price !== price || verified.discountRate !== plan.bitrixDiscountRate || verified.taxRate !== plan.bitrixTaxRate || verified.taxIncluded !== plan.bitrixTaxIncluded) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
@@ -236,8 +234,7 @@ export class DealOrderPositionRuntimeService {
           if (!currentSource || !sameSourceValue(currentSource, deletion.source) || latestTargetRows.some((row) => row.id === links.find((link) => link.id === deletion.linkId)?.moyskladPositionId)) {
             return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           }
-          await assertMutationAllowed('moyskladToBitrix24');
-          await deleteBitrixRow(deletion.source?.id);
+          await runMutation('moyskladToBitrix24', () => deleteBitrixRow(deletion.source?.id));
           const afterDelete = await readAllBitrixRows(pair.bitrix24Id);
           if (afterDelete.some((row) => String(row.id) === String(deletion.source?.id))) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
           const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
@@ -252,10 +249,9 @@ export class DealOrderPositionRuntimeService {
             !sameTargetValue(latestTarget, target) || !sameProductTarget(latestTarget, target)) {
           return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
         }
-        await assertMutationAllowed('bitrix24ToMoysklad');
-        await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(target.id)}`, withSlash(moyskladBase())), {
+        await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(target.id)}`, withSlash(moyskladBase())), {
           method: 'DELETE', headers: msHeaders(),
-        });
+        }));
         const afterDelete = await readAllMoySkladPositions(pair.moyskladId);
         if (afterDelete.some((row) => row.id === target.id)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
         const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
@@ -350,7 +346,7 @@ export class DealOrderPositionRuntimeService {
     } catch { return hold('DEAL_ORDER_POSITION_BOOTSTRAP_STORE_FAILED'); }
   }
 
-  private async addRows(pairId: string, orderId: string, rows: Row[], eventConfig: VersionedFieldSettingsDto, assertMutationAllowed: (direction: DealOrderWriteDirection) => Promise<void>, assertOwner: () => Promise<boolean>, skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }>, skipRow: (sourceSystem: 'BITRIX24' | 'MOYSKLAD', sourceRowId: string, reason: string) => Promise<void>): Promise<Result> {
+  private async addRows(pairId: string, orderId: string, rows: Row[], eventConfig: VersionedFieldSettingsDto, runMutation: (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => Promise<unknown>, assertOwner: () => Promise<boolean>, skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }>, skipRow: (sourceSystem: 'BITRIX24' | 'MOYSKLAD', sourceRowId: string, reason: string) => Promise<void>): Promise<Result> {
     const units = eventConfig.config.references.units;
     for (const row of rows) {
       const rowId = String(row.id);
@@ -413,10 +409,9 @@ export class DealOrderPositionRuntimeService {
         const exact = unlinked.filter((position) => positionMatches(position, payload));
         const recoveryError = classifyPositionAddRecovery(isRetryAfterAttempt, exact.length);
         if (recoveryError) return this.addUncertain(operation.id, leaseToken, recoveryError);
-        await assertMutationAllowed('bitrix24ToMoysklad');
-        const created = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
+        const created = await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
           method: 'POST', headers: msHeaders(), body: JSON.stringify(payload),
-        });
+        }));
         if (!isRecord(created) || !isUuid(created.id)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
         const savedPositionId = await this.database.dealOrderPositionAddOperation.updateMany({
           where: { id: operation.id, leaseToken }, data: { moyskladPositionId: created.id },

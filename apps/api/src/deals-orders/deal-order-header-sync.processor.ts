@@ -152,9 +152,9 @@ export class DealOrderHeaderSyncProcessor {
         : false;
       if (!proposed) {
         try {
-          await this.mode.assertDealOrderExternalWriteAllowed(writeTo === 'MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; });
-          if (writeTo === 'MOYSKLAD') await this.writeMoySklad(baseMs, input.pair.moyskladId, value);
-          else await this.writeBitrix24(base24, input.pair.bitrix24Id, value);
+          await this.mode.runDealOrderExternalWrite(writeTo === 'MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; }, { id: input.pair.id, entityType: 'DEAL' }, () => writeTo === 'MOYSKLAD'
+            ? this.writeMoySklad(baseMs, input.pair.moyskladId, value)
+            : this.writeBitrix24(base24, input.pair.bitrix24Id, value));
         } catch (error) {
           if (!(error instanceof ProviderFailure)) throw error;
           if (!isRetryableFailure(error)) return 'HOLD_WRITE_FAILED';
@@ -213,21 +213,24 @@ export class DealOrderHeaderSyncProcessor {
     if (!await this.mode.isDirectionEnabled('deals-orders', source === 'MOYSKLAD' ? 'moyskladToBitrix24' : 'bitrix24ToMoysklad')) return 'HOLD_CONFLICT';
     let targetCompanyId: string;
     let targetAgentId: string;
+    let targetCompanyPairId: string | null = null;
     if (source === 'MOYSKLAD') {
       if (msClientId === null) return 'HOLD_CONFLICT';
-      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', moyskladId: msClientId, active: true }, select: { bitrix24Id: true }, take: 2 });
+      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', moyskladId: msClientId, active: true }, select: { id: true, bitrix24Id: true }, take: 2 });
       if (candidates.length !== 1) return 'HOLD_CONFLICT';
       targetCompanyId = String(candidates[0].bitrix24Id);
       targetAgentId = msClientId;
+      targetCompanyPairId = candidates[0].id;
     } else if (b24ClientId === null) {
       if (!input.serviceCounterpartyId) return 'HOLD_CONFLICT';
       targetCompanyId = '';
       targetAgentId = input.serviceCounterpartyId;
     } else {
-      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', bitrix24Id: b24ClientId, active: true }, select: { moyskladId: true }, take: 2 });
+      const candidates = await input.transaction.entityPair.findMany({ where: { entityType: 'COMPANY', bitrix24Id: b24ClientId, active: true }, select: { id: true, moyskladId: true }, take: 2 });
       if (candidates.length !== 1) return 'HOLD_CONFLICT';
       targetCompanyId = b24ClientId;
       targetAgentId = String(candidates[0].moyskladId);
+      targetCompanyPairId = candidates[0].id;
     }
     const base24 = providerEndpoint(process.env.BITRIX24_REST_BASE_URL);
     const baseMs = providerEndpoint(process.env.MOYSKLAD_API_BASE_URL);
@@ -241,8 +244,7 @@ export class DealOrderHeaderSyncProcessor {
           : false;
         let verified: Record<string, unknown>;
         try {
-          if (!proposed) await this.mode.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; });
-          if (!proposed) await this.writeBitrixCompany(base24, input.bitrix24DealId, targetCompanyId);
+          if (!proposed) await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; }, [{ id: input.pairId, entityType: 'DEAL' }, ...(targetCompanyPairId ? [{ id: targetCompanyPairId, entityType: 'COMPANY' }] : [])], () => this.writeBitrixCompany(base24, input.bitrix24DealId, targetCompanyId));
           verified = await this.reader.readBitrix24DealForBaseline(input.bitrix24DealId);
         } catch (error) { return providerResult(error); }
         if (documentCompanyId(verified.COMPANY_ID) !== targetCompanyId) return 'HOLD_WRITE_FAILED';
@@ -257,8 +259,7 @@ export class DealOrderHeaderSyncProcessor {
           : false;
         let verified: Record<string, unknown>;
         try {
-          if (!proposed) await this.mode.assertDealOrderExternalWriteAllowed('bitrix24ToMoysklad', async () => { await input.assertWorkerLease?.(); return true; });
-          if (!proposed) await this.writeMoySkladAgent(baseMs, input.moyskladOrderId, agent);
+          if (!proposed) await this.mode.runDealOrderExternalWrite('bitrix24ToMoysklad', async () => { await input.assertWorkerLease?.(); return true; }, [{ id: input.pairId, entityType: 'DEAL' }, ...(targetCompanyPairId ? [{ id: targetCompanyPairId, entityType: 'COMPANY' }] : [])], () => this.writeMoySkladAgent(baseMs, input.moyskladOrderId, agent));
           verified = await this.reader.readMoySkladCustomerOrderForBaseline(input.moyskladOrderId);
         } catch (error) { return providerResult(error); }
         if (referenceCompanyId(verified.agent) !== targetAgentId) return 'HOLD_WRITE_FAILED';

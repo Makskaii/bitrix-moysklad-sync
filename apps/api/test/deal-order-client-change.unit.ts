@@ -99,6 +99,10 @@ function fixture(input: { b24: string | null; ms: string; oldB24: string | null;
     async assertDealOrderExternalWriteAllowed(_direction: string, assertLease?: () => Promise<boolean>) {
       if (assertLease && !await assertLease()) throw new Error('test lease lost');
     },
+    async runDealOrderExternalWrite(_direction: string, assertLease: (() => Promise<boolean>) | undefined, _pair: unknown, mutation: () => Promise<unknown>) {
+      await this.assertDealOrderExternalWriteAllowed(_direction, assertLease);
+      return mutation();
+    },
   } as never;
   const processor = new DealOrderHeaderSyncProcessor(database, reader, mode);
   return { processor, tx, state };

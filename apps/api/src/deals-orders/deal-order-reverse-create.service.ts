@@ -111,7 +111,7 @@ export class DealOrderReverseCreateService {
     } else {
       const existingB24Rows = await b24AllRows(input.bitrix24DealId);
       const nextSort = existingB24Rows.reduce((highest, row) => Math.max(highest, Number(row.sort) || 0), 0) + 1;
-      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease });
+      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, writePair: { id: pair.id, entityType: 'DEAL' } });
       frozen = { ...prepared, rows: prepared.rows.map((row, index) => ({ ...row, fields: { ...row.fields, sort: nextSort + index } })), skippedRows: prepared.skippedRows.filter((row) => input.positionIds.includes(row.sourceRowId)) };
     }
     const existingLinks = await this.database.dealOrderPositionPair.findMany({ where: { pairId: input.pairId }, select: { moyskladPositionId: true } });
@@ -146,7 +146,7 @@ export class DealOrderReverseCreateService {
       data: { attemptedAt: operation.attemptedAt ?? now, leaseToken, leaseUntil: new Date(now.getTime() + 60_000) } });
     if (claim.count !== 1) throw new Error('Reverse row-add lease was lost');
     try {
-      await this.createRows(frozen, leaseToken, input.assertPairLease);
+      await this.createRows(frozen, leaseToken, input.assertPairLease, { id: pair.id, entityType: 'DEAL' });
       const operations = await this.database.dealOrderReversePositionOperation.findMany({ where: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: { in: frozen.rows.map((row) => row.msPositionId) } } });
       const liveRows = await b24AllRows(input.bitrix24DealId);
       await this.database.$transaction(async (transaction) => {
@@ -173,7 +173,7 @@ export class DealOrderReverseCreateService {
     }
   }
 
-  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void> }): Promise<Prepared> {
+  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
     const config = input.eventConfig.config.dealOrderRuntime;
     if (!config || !config.nativeOrderNumberingVerified) throw new DealOrderReverseManualReviewError('Deal-order runtime settings or native numbering confirmation are missing');
     const order = await msGet(`entity/customerorder/${input.moyskladOrderId}?expand=agent,state,rate.currency`);
@@ -234,7 +234,7 @@ export class DealOrderReverseCreateService {
         }
         let bitrix24Id = productPairs[0]?.bitrix24Id;
         if (!bitrix24Id) {
-          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined) });
+          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined), writePair: input.writePair });
           productPairs = [{ bitrix24Id, moyskladId: assortmentId }];
         }
         if (!/^\d{1,20}$/.test(bitrix24Id)) throw new DealOrderReverseManualReviewError(`MySklad product ${assortmentId} has an invalid Bitrix24 pair`);
@@ -289,8 +289,7 @@ export class DealOrderReverseCreateService {
     let dealId = items.length === 1 ? readNumericId(items[0].id) : null;
     if (items.length === 1 && (items[0].originId !== prepared.orderId || items[0].originatorId !== 'MOYSKLAD')) throw new DealOrderReverseManualReviewError('Bitrix24 deal recovery identity is ambiguous');
     if (!dealId) {
-    await this.mode.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; });
-      const created = await b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true });
+      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true }));
       const item = isRecord(created) && isRecord(created.item) ? created.item : null;
       dealId = item ? readNumericId(item.id) : null;
       if (!dealId) throw new Error('Bitrix24 deal create response did not include a numeric ID');
@@ -303,7 +302,7 @@ export class DealOrderReverseCreateService {
   /** Create only the missing Bitrix24 prerequisite product, using an explicitly
    * confirmed catalog/unit and a stable external key. MySklad product records
    * are read-only in this path. */
-  private async createOrRecoverProductPair(input: { productId: string; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean> }): Promise<string> {
+  private async createOrRecoverProductPair(input: { productId: string; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean>; writePair?: { id: string; entityType: string } }): Promise<string> {
     const runtime = input.eventConfig.config.dealOrderRuntime;
     const catalogId = runtime?.bitrix24ProductCatalogId;
     const allowedFields = runtime?.moyskladProductFields;
@@ -353,8 +352,7 @@ export class DealOrderReverseCreateService {
         throw new DealOrderReverseManualReviewError('Bitrix24 product recovery identity or fields are ambiguous');
       }
       if (!bitrix24Id) {
-        await this.mode.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => { await this.assertProductLease(input.productId, leaseToken); return !input.assertPairLease || await input.assertPairLease(); });
-        const result = await b24('catalog.product.add', { fields: frozen.fields });
+        const result = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await this.assertProductLease(input.productId, leaseToken); return !input.assertPairLease || await input.assertPairLease(); }, input.writePair, () => b24('catalog.product.add', { fields: frozen.fields }));
         const created = isRecord(result) && isRecord(result.element) ? result.element : null;
         bitrix24Id = created ? readNumericId(created.id) : null;
         if (!bitrix24Id || !productReadbackMatches(created!, frozen.fields)) throw new Error('Bitrix24 product create response was incomplete');
@@ -414,7 +412,7 @@ export class DealOrderReverseCreateService {
     }
   }
 
-  private async createRows(prepared: Prepared, leaseToken: string, assertPairLease?: () => Promise<boolean>) {
+  private async createRows(prepared: Prepared, leaseToken: string, assertPairLease?: () => Promise<boolean>, writePair?: { id: string; entityType: string }) {
     const dealId = (await this.database.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: prepared.orderId }, select: { bitrix24DealId: true } })).bitrix24DealId;
     if (!dealId) throw new Error('Reverse deal ID is not persisted');
     const rows = await b24AllRows(dealId);
@@ -433,8 +431,7 @@ export class DealOrderReverseCreateService {
         if (!sameRow(bySort[0], preparedRow.fields, dealId)) throw new DealOrderReverseManualReviewError('Bitrix24 product row recovery slot has different values');
         rowId = String(bySort[0].id);
       } else {
-        await this.mode.assertDealOrderExternalWriteAllowed('moyskladToBitrix24', async () => { await this.assertOperationLease(prepared.orderId, leaseToken); return !assertPairLease || await assertPairLease(); });
-        const created = await b24('crm.item.productrow.add', { fields: { ...preparedRow.fields, ownerId: Number(dealId) } });
+        const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await this.assertOperationLease(prepared.orderId, leaseToken); return !assertPairLease || await assertPairLease(); }, writePair, () => b24('crm.item.productrow.add', { fields: { ...preparedRow.fields, ownerId: Number(dealId) } }));
         const row = isRecord(created) && isRecord(created.productRow) ? created.productRow : null;
         const id = row && readNumericId(row.id);
         if (!id) throw new Error('Bitrix24 product row create response did not include an ID');

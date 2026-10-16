@@ -2,6 +2,7 @@ import { ConflictException, Inject, Injectable, Optional } from '@nestjs/common'
 import { DatabaseService } from './database.service';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { assertApplyExternalWrite } from './external-write-guard';
+import { ClientLifecycleService } from './clients/client-lifecycle.service';
 
 export type ServiceMode = 'on' | 'pause' | 'off';
 export type DealOrderWriteDirection = 'bitrix24ToMoysklad' | 'moyskladToBitrix24';
@@ -52,6 +53,7 @@ export class SyncModeService {
   constructor(
     private readonly database: DatabaseService,
     @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
+    @Optional() @Inject(ClientLifecycleService) private readonly clientLifecycle?: ClientLifecycleService,
   ) {}
 
   async read() {
@@ -181,7 +183,7 @@ export class SyncModeService {
 
   /** Re-read durable global/direction/recovery state immediately before each
    * provider mutation; callers supply their current worker/pair lease check. */
-  async assertDealOrderExternalWriteAllowed(direction: DealOrderWriteDirection, assertLease?: () => Promise<boolean>): Promise<void> {
+  async assertDealOrderExternalWriteAllowed(direction: DealOrderWriteDirection, assertLease?: () => Promise<boolean>, pair?: { id: string; entityType: string } | Array<{ id: string; entityType: string }>): Promise<void> {
     const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { serviceMode: true } });
     if (!setting) throw new DealOrderWriteGateError('RECOVERY');
     if (setting.serviceMode !== 'on') throw new DealOrderWriteGateError(setting.serviceMode === 'off' ? 'OFF' : 'PAUSE');
@@ -189,8 +191,33 @@ export class SyncModeService {
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' } });
     if (directions?.[direction] === false) throw new DealOrderWriteGateError('DIRECTION');
     if (assertLease && !await assertLease()) throw new DealOrderWriteGateError('LEASE');
+    if (pair && this.clientLifecycle) {
+      for (const item of Array.isArray(pair) ? pair : [pair]) await this.clientLifecycle.assertPairActive(item.id, item.entityType);
+    }
     if (process.env.SYNC_MODE !== 'apply') throw new DealOrderWriteGateError('NOT_APPLY');
     assertApplyExternalWrite('DEAL_ORDER', 'PROVIDER_MUTATION');
+  }
+
+  /** Hold lifecycle leases over the provider mutation so a confirmed delete cannot
+   * tombstone the pair between our final active-state check and the API call. */
+  async runDealOrderExternalWrite<T>(
+    direction: DealOrderWriteDirection,
+    assertLease: (() => Promise<boolean>) | undefined,
+    pair: { id: string; entityType: string } | Array<{ id: string; entityType: string }> | undefined,
+    mutation: () => Promise<T>,
+  ): Promise<T> {
+    const run = async () => {
+      await this.assertDealOrderExternalWriteAllowed(direction, assertLease, pair);
+      return mutation();
+    };
+    const pairs = (pair ? (Array.isArray(pair) ? pair : [pair]) : [])
+      .filter((item) => ['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'].includes(item.entityType))
+      .sort((a, b) => `${a.entityType}:${a.id}`.localeCompare(`${b.entityType}:${b.id}`));
+    if (!this.clientLifecycle || pairs.length === 0) return run();
+    const withLocks = (index: number): Promise<T> => index >= pairs.length
+      ? run()
+      : this.clientLifecycle!.withPairActiveLock(pairs[index].id, pairs[index].entityType as 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT', () => withLocks(index + 1));
+    return withLocks(0);
   }
 
 }

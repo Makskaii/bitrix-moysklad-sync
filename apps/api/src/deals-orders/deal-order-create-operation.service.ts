@@ -146,11 +146,10 @@ export class DealOrderCreateOperationService {
       if (!token) throw new Error('Customer-order create is not configured');
       let orderId = operation.moyskladOrderId;
       if (!orderId) {
-        await this.assertCreateMutationAllowed(input.bitrix24DealId, leaseToken, assertWorkerLease);
-        const created = await requestJson(new URL('entity/customerorder', withSlash(base)), {
+        const created = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('entity/customerorder', withSlash(base)), {
           method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' },
           body: JSON.stringify({ ...payload, syncId: operation.syncId }),
-        });
+        }));
         if (!isRecord(created) || !isUuid(created.id) || !isRecord(created.meta) || created.meta.type !== 'customerorder') {
           throw new Error('Customer-order create response was invalid');
         }
@@ -173,8 +172,7 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
-      await this.assertCreateMutationAllowed(input.bitrix24DealId, leaseToken, assertWorkerLease);
-      await writeBitrixOrderNumber(input.bitrix24DealId, order.name);
+      await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => writeBitrixOrderNumber(input.bitrix24DealId, order.name));
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
     } catch (error) {
@@ -279,12 +277,17 @@ export class DealOrderCreateOperationService {
     }
   }
 
-  private async assertCreateMutationAllowed(bitrix24DealId: string, leaseToken: string, assertWorkerLease?: () => Promise<boolean>) {
-    await this.mode.assertDealOrderExternalWriteAllowed('bitrix24ToMoysklad', async () => {
+  private async runCreateMutationAllowed<T>(input: DealOrderPreparedInput, leaseToken: string, assertWorkerLease: (() => Promise<boolean>) | undefined, mutation: () => Promise<T>): Promise<T> {
+    const bitrix24DealId = input.bitrix24DealId;
+    const pairs = input.confirmedCustomerPairIds?.length ? await this.database.entityPair.findMany({
+      where: { id: { in: input.confirmedCustomerPairIds }, entityType: { in: ['COMPANY', 'CONTACT'] } }, select: { id: true, entityType: true },
+    }) : [];
+    if (pairs.length !== (input.confirmedCustomerPairIds?.length ?? 0)) throw new Error('Confirmed customer lifecycle pairs changed before provider write');
+    return this.mode.runDealOrderExternalWrite('bitrix24ToMoysklad', async () => {
       if (assertWorkerLease && !await assertWorkerLease()) return false;
       const operation = await this.database.dealOrderCreateOperation.findUnique({ where: { bitrix24DealId }, select: { leaseToken: true, leaseUntil: true } });
       return operation?.leaseToken === leaseToken && !!operation.leaseUntil && operation.leaseUntil > new Date();
-    });
+    }, pairs, mutation);
   }
 
   private async getOrCreateOperation(input: DealOrderPreparedInput) {
