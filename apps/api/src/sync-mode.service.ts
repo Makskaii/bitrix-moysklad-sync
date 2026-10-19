@@ -207,7 +207,9 @@ export class SyncModeService {
           applicableStages = catalogs.stages;
           applicableCurrencies = catalogs.currencies;
           optionalEndpointWarnings = await this.fieldData.optionalDealOrderReferenceWarnings(bitrixAccessToken);
-          unverifiedRequiredReferences = await this.fieldData.verifyRequiredDealOrderReferences(settings?.config);
+          if (direction === 'bitrix24ToMoysklad') {
+            unverifiedRequiredReferences = await this.fieldData.verifyRequiredDealOrderReferences(settings?.config);
+          }
         } else if (entityKey === 'products-variations') {
           const catalogs = await this.fieldData.productCatalogReadiness(bitrixAccessToken);
           applicableUnits = catalogs.units;

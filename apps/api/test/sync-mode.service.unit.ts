@@ -176,21 +176,25 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
       dealOrderCatalogs: async (_token: string, direction: string) => {
         requestedDirection = direction;
         if (failRequiredCatalogs) throw new Error('required stage/currency endpoint failed');
-        return { stages: ['ms-stage-uuid'], currencies: ['ms-currency-uuid'] };
+        return direction === 'bitrix24ToMoysklad'
+          ? { stages: ['0:NEW'], currencies: ['USD'] }
+          : { stages: ['ms-stage-uuid'], currencies: ['ms-currency-uuid'] };
       },
       optionalDealOrderReferenceWarnings: async () => ['projects'],
       verifyRequiredDealOrderReferences: async () => failSelectedReference ? ['default store'] : [],
     } as never,
   );
   const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  const oldB24Secret = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
   process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'test-only-b24-secret';
   try {
     const report = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
     assert.equal(requestedDirection, 'moyskladToBitrix24');
     assert.equal(report.canEnable, true);
     assert.deepEqual(report.warnings.map((warning) => warning.code), ['OPTIONAL_REFERENCE_UNAVAILABLE']);
     failSelectedReference = true;
-    const invalidSelectedReference = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
+    const invalidSelectedReference = await service.preflightEntityDirection('deals-orders', 'bitrix24ToMoysklad', 'admin-token');
     assert.equal(invalidSelectedReference.canEnable, false);
     assert.ok(invalidSelectedReference.blockers.some((blocker) => blocker.code === 'REQUIRED_REFERENCE_UNAVAILABLE'));
     failSelectedReference = false;
@@ -198,6 +202,44 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
     const blocked = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
     assert.equal(blocked.canEnable, false);
     assert.ok(blocked.blockers.some((blocker) => blocker.code === 'API_ACCESS_UNAVAILABLE'));
+  } finally {
+    if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
+    else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
+    if (oldB24Secret === undefined) delete process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
+    else process.env.BITRIX24_EVENT_APPLICATION_TOKEN = oldB24Secret;
+  }
+});
+
+test('reverse deal preflight ignores unavailable MySklad order-creation fallbacks', async () => {
+  let referenceReads = 0;
+  const configuration = {
+    rules: [],
+    references: { namedPairs: [
+      { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'ms-stage-uuid', status: 'confirmed' },
+      { kind: 'currencies', bitrix24Id: 'USD', moyskladId: 'ms-currency-uuid', status: 'confirmed' },
+    ] },
+    dealOrderRuntime: {
+      nativeOrderNumberingVerified: false,
+      defaultOrganizationId: 'deleted-org', defaultStoreId: 'deleted-store', defaultEmployeeId: 'deleted-employee',
+      stages: [{ bitrix24StageId: '0:NEW', moyskladId: 'ms-stage-uuid' }],
+      currencies: [{ bitrix24Code: 'USD', moyskladId: 'ms-currency-uuid' }],
+    },
+  };
+  const service = new SyncModeService({} as never, undefined, undefined,
+    { active: async () => ({ version: 7, config: configuration }) } as never,
+    {
+      dealOrderCatalogs: async () => ({ stages: ['ms-stage-uuid'], currencies: ['ms-currency-uuid'] }),
+      optionalDealOrderReferenceWarnings: async () => [],
+      verifyRequiredDealOrderReferences: async () => { referenceReads += 1; return ['default organization', 'default store', 'default employee']; },
+    } as never,
+  );
+  const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  try {
+    const report = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(report.canEnable, true);
+    assert.deepEqual(report.blockers, []);
+    assert.equal(referenceReads, 0);
   } finally {
     if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
     else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;

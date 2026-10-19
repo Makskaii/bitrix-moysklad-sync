@@ -70,13 +70,17 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
       const runtime = object(config.dealOrderRuntime);
       if (!runtime) blockers.push(finding('DEAL_ORDER_RUNTIME_UNCONFIGURED', 'Настройки создания и сопоставления заказов не заполнены.'));
       else {
-        if (runtime.nativeOrderNumberingVerified !== true) blockers.push(finding('NATIVE_ORDER_NUMBERING_UNCONFIRMED', 'Не подтверждена схема нумерации заказов МойСклад.'));
-        for (const [field, label] of [['defaultOrganizationId', 'организация'], ['defaultStoreId', 'склад'], ['defaultEmployeeId', 'сотрудник']] as const) {
-          if (!nonEmpty(runtime[field])) blockers.push(finding(`DEAL_ORDER_${field.replace('default', '').toUpperCase()}_REQUIRED`, `Не выбрано значение «${label}», которое обработчик будет использовать при создании заказа.`));
+        if (input.direction === 'bitrix24ToMoysklad') {
+          if (runtime.nativeOrderNumberingVerified !== true) blockers.push(finding('NATIVE_ORDER_NUMBERING_UNCONFIRMED', 'Не подтверждена схема нумерации заказов МойСклад.'));
+          for (const [field, label] of [['defaultOrganizationId', 'организация'], ['defaultStoreId', 'склад'], ['defaultEmployeeId', 'сотрудник']] as const) {
+            if (!nonEmpty(runtime[field])) blockers.push(finding(`DEAL_ORDER_${field.replace('default', '').toUpperCase()}_REQUIRED`, `Не выбрано значение «${label}», которое обработчик будет использовать при создании заказа.`));
+          }
         }
       }
-      for (const reference of input.unverifiedRequiredReferences ?? []) {
-        blockers.push(finding('REQUIRED_REFERENCE_UNAVAILABLE', `Выбранная ссылка «${reference}» для создаваемого заказа недоступна или не подтверждена.`));
+      if (input.direction === 'bitrix24ToMoysklad') {
+        for (const reference of input.unverifiedRequiredReferences ?? []) {
+          blockers.push(finding('REQUIRED_REFERENCE_UNAVAILABLE', `Выбранная ссылка «${reference}» для создаваемого заказа недоступна или не подтверждена.`));
+        }
       }
       if (!input.applicableStages?.length) blockers.push(finding('DEAL_STAGES_UNAVAILABLE', 'API не вернул применимые стадии сделок для проверки подтверждённых пар.'));
       if (!input.applicableCurrencies?.length) blockers.push(finding('DEAL_CURRENCIES_UNAVAILABLE', 'API не вернул применимые валюты для проверки подтверждённых пар.'));
