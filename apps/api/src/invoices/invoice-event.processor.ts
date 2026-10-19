@@ -164,7 +164,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       if (invoicePair.status === 'TOMBSTONED') return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_PAIR_TOMBSTONED', null, lease);
       if (invoicePair.status === 'NONE') {
         if (process.env.SYNC_MODE === 'dry') return this.finish(event, 'SKIPPED_DISABLED', 'INVOICE_CREATE_REQUIRES_APPLY_MODE', null, lease);
-        return this.withInvoiceIdentityLease(source, sourceId, async () => {
+        return await this.withInvoiceIdentityLease(source, sourceId, async () => {
           const created = await this.createCounterpart({ source, sourceId, sourceRecord, orderId: order.pair.moyskladId, dealId: order.pair.bitrix24Id, rules, settings, lease });
           if (created.status !== 'CREATED') return this.finish(event, created.status, created.reason, created.retryAfter ?? null, lease);
           const bitrix24Id = source === 'BITRIX24' ? sourceId : created.partnerId;

@@ -40,7 +40,9 @@ const orders = new Map<string, InvoiceRecord>();
 before(async () => {
   const connection = new URL(process.env.INVOICE_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '');
   assert.match(connection.hostname, /^(127\.0\.0\.1|localhost)$/i, 'invoice integration tests require local PostgreSQL');
-  assert.equal(connection.searchParams.get('schema'), 'issue55_invoices_test', 'refusing to use any schema except the dedicated issue-55 schema');
+  const testSchema = process.env.INVOICE_TEST_SCHEMA ?? 'issue55_invoices_test';
+  assert.match(testSchema, /^issue55_[a-z0-9_]*_test$/i, 'invoice integration tests require a dedicated issue-55 test schema');
+  assert.equal(connection.searchParams.get('schema'), testSchema, 'refusing to use any schema except the explicitly selected issue-55 test schema');
   assert.equal(process.env.INVOICE_TEST_ISOLATED, '1', 'set INVOICE_TEST_ISOLATED=1 only for the disposable issue-55 schema');
   oldMode = process.env.SYNC_MODE;
   oldBitrixBase = process.env.BITRIX24_REST_BASE_URL;
@@ -241,7 +243,8 @@ test('relationship mappings are rejected and post-write reads confirm both invoi
     const event = await createEvent(`relationship-guard-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
     assert.equal((await processor.process(event.id))?.status, 'MANUAL_REVIEW');
     assert.equal(moyskladWrites, beforeWrites);
-  assert.equal((target.customerOrder as { meta?: { href?: string } }).meta?.href, `${base}api/remap/1.2/entity/customerorder/${orderId}`);
+    assert.equal(((target.customerOrder as Record<string, unknown>).meta as Record<string, unknown>).href,
+      `${base}api/remap/1.2/entity/customerorder/${orderId}`);
   } finally {
     activeFieldConfig = fieldConfig;
   }
