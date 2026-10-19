@@ -37,6 +37,42 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
   assert.equal(state.lastInactiveAt, lastInactiveAt);
 });
 
+test('implemented scopes stay visible to readiness checks but remain disabled until preflight is complete', async () => {
+  const settings = new Map<string, { bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean }>();
+  const database = {
+    syncDirectionSetting: {
+      upsert: async ({ where, create }: { where: { entityKey: string }; create: { entityKey: string } }) => {
+        const current = settings.get(where.entityKey) ?? { bitrix24ToMoysklad: true, moyskladToBitrix24: true };
+        settings.set(where.entityKey, current);
+        return current;
+      },
+      findUnique: async ({ where }: { where: { entityKey: string } }) => settings.get(where.entityKey) ?? null,
+      update: async ({ where, data }: { where: { entityKey: string }; data: { bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } }) => {
+        settings.set(where.entityKey, data);
+        return data;
+      },
+    },
+  };
+  const service = new SyncModeService(database as never);
+
+  const scopes = await service.readEntitySettings();
+  const invoices = scopes.find((scope) => scope.key === 'invoices')!;
+  const products = scopes.find((scope) => scope.key === 'products-variations')!;
+  const deals = scopes.find((scope) => scope.key === 'deals-orders')!;
+
+  assert.equal(invoices.implementation, 'implemented');
+  assert.equal(products.implementation, 'implemented');
+  assert.equal(deals.implementation, 'implemented');
+  assert.ok(products.directionScope);
+  assert.ok(deals.directionScope);
+  assert.equal(products.ready, false);
+  assert.equal(products.bitrix24ToMoysklad, false);
+  assert.equal(products.moyskladToBitrix24, false);
+  await assert.rejects(service.setEntityDirections('products-variations', {
+    bitrix24ToMoysklad: false, moyskladToBitrix24: true,
+  }), /not ready/i);
+});
+
 test('PAUSE timestamps the recovery window without scheduling an OFF replay', async () => {
   const state: Record<string, unknown> = {
     serviceMode: 'on', offSince: null, resumeStatus: 'idle',
