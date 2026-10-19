@@ -10,6 +10,7 @@
     "test:sync-mode-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode.service.unit.js",
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
+    "test:event-reliability:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-reliability.postgres.integration.js",
     "test:provider-failure-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/provider-failure.unit.js",
     "test:database-recovery": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/database-recovery.unit.js ../../dist/apps/api-test/test/database-recovery.postgres.integration.js",
     "test:product-runtime-gate-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-runtime-gate.unit.js",
