@@ -53,11 +53,13 @@ export class ProductCardHttpApi implements ProductCardApi {
       return { priceId: idValue, typeId, value, currency };
     })) : [];
     const proposed = await this.dryWrites?.readback('BITRIX24', kind, id);
+    const scalarFields = primitiveFields({ ...product, ...(proposed ?? {}) });
     const values = {
       name: nullableString(proposed?.name ?? product.name),
       code: nullableString(proposed?.code ?? product.code),
       detailText: nullableString(proposed?.detailText ?? product.detailText),
       unitId: proposed?.measure === null ? null : proposed?.measure === undefined ? (product.measure === null || product.measure === undefined ? null : scalarId(product.measure)) : scalarId(proposed.measure),
+      fields: scalarFields,
       prices,
       updatedAt: nullableString(product.dateModify ?? product.dateCreate),
     };
@@ -89,11 +91,13 @@ export class ProductCardHttpApi implements ProductCardApi {
       return { priceId: typeId, typeId, value, currency: currencyCode ?? '', currencyRef };
     })) : [];
     const proposed = await this.dryWrites?.readback('MOYSKLAD', kind, id);
+    const scalarFields = primitiveFields({ ...product, ...(proposed ?? {}) });
     const values = {
       name: nullableString(proposed?.name ?? product.name),
       code: nullableString(proposed?.code ?? product.code),
       detailText: nullableString(proposed?.description ?? product.description),
       unitId: isRecord(proposed?.uom) && isRecord(proposed.uom.meta) ? idFromHref(proposed.uom.meta.href) : uom,
+      fields: scalarFields,
       prices,
       updatedAt: nullableString(product.updated),
     };
@@ -123,7 +127,7 @@ export class ProductCardHttpApi implements ProductCardApi {
 
   async updateBitrix24(id: string, fields: Record<string, unknown>, kind: 'product' | 'service' = 'product'): Promise<void> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
-    if (Object.keys(fields).some((key) => !['name', 'code', 'detailText', 'measure'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (Object.keys(fields).some((key) => key === 'measure' ? !isSafeUnitValue(fields[key]) : !isSafeCatalogScalarField(key, fields[key]))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: kind, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('BITRIX24', 'PRODUCT_UPDATE');
     await this.bitrixCall(kind === 'service' ? 'catalog.product.service.update' : 'catalog.product.update', { id, fields });
@@ -195,6 +199,20 @@ function ensureSlash(value: string): string {
   return url.href.endsWith('/') ? url.href : `${url.href}/`;
 }
 function nullableString(value: unknown): string | null { return value === null || value === undefined ? null : typeof value === 'string' ? value : null; }
+function primitiveFields(value: Record<string, unknown>): Record<string, string | number | boolean | null> {
+  return Object.fromEntries(Object.entries(value).filter(([, child]) => child === null || typeof child === 'string' || typeof child === 'boolean' || typeof child === 'number' && Number.isFinite(child))) as Record<string, string | number | boolean | null>;
+}
+function isSafeCatalogScalarField(key: string, value: unknown): boolean {
+  const blocked = new Set([
+    'id', 'meta', 'type', 'iblockId', 'iblockSection', 'iblockSectionId',
+    'detailPicture', 'previewPicture', 'quantity', 'quantityReserved', 'quantityTrace',
+    'available', 'active', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
+    'dateActiveFrom', 'dateActiveTo', 'priceType', 'purchasingPrice', 'purchasingCurrency',
+  ]);
+  return /^[A-Za-z][A-Za-z0-9]*$/.test(key) && !blocked.has(key) &&
+    (value === null || typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value));
+}
+function isSafeUnitValue(value: unknown): boolean { return Number.isInteger(value) && Number(value) > 0; }
 function scalarId(value: unknown): string | null { return typeof value === 'string' || typeof value === 'number' ? String(value) : null; }
 function finiteNumber(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
 function explicitIsoCode(value: Record<string, any> | undefined): string | null {

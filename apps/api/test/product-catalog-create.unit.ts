@@ -52,6 +52,8 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     const method = url.slice(url.lastIndexOf('/') + 1);
     calls.push(method);
     const request = JSON.parse(String(init?.body)) as { fields?: Record<string, unknown> };
+    if (method === 'catalog.product.getFieldsByFilter') return Response.json({ result: { product: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, weight: { type: 'double', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false } } } });
+    if (method === 'catalog.product.service.getFieldsByFilter') return Response.json({ result: { service: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false } } } });
     if (method === 'catalog.product.list') return Response.json({ result: { products: [...cards.values()].filter((card) => card.xmlId === (request as any).filter?.xmlId), total: cards.size }, total: cards.size });
     if (method === 'catalog.product.add') {
       const id = '821';
@@ -89,8 +91,8 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     const service = new ProductCatalogCreateService(db, mode);
     const input: any = {
       productId: '12345678-1234-1234-1234-123456789abc', eventId: 'event-new-product',
-      eventConfig: { version: 4, config: { productCatalogRuntime: { bitrix24CatalogId: '12', moyskladFields: ['name', 'code', 'description'] }, dealOrderRuntime: null } },
-      product: { id: '12345678-1234-1234-1234-123456789abc', meta: { type: 'product' }, name: 'Rotor', code: 'R-1', description: 'Rotor body' },
+      eventConfig: { version: 4, config: { productCatalogRuntime: { bitrix24CatalogId: '12', moyskladFields: ['name', 'code', 'description'] }, rules: [{ id: 'weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }], dealOrderRuntime: null } },
+      product: { id: '12345678-1234-1234-1234-123456789abc', meta: { type: 'product' }, name: 'Rotor', code: 'R-1', description: 'Rotor body', weight: 0 },
       prices: [],
     };
     assert.equal(await service.createOrRecover(input), '821');
@@ -102,6 +104,7 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     assert.equal((cards.get('821') as any).name, 'Rotor');
     assert.equal((cards.get('821') as any).code, 'R-1');
     assert.equal((cards.get('821') as any).detailText, 'Rotor body');
+    assert.equal((cards.get('821') as any).weight, 0, 'explicitly mapped numeric zero is included in durable create and readback');
 
     const serviceInput: any = {
       productId: '22345678-1234-1234-1234-123456789abc', moyskladType: 'service', eventId: 'event-new-service',
@@ -122,6 +125,20 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     assert.equal(calls.filter((name) => name === 'catalog.price.add').length, 1, 'retry reads the applied service price and does not duplicate it');
     assert.deepEqual(prices, [{ id: 1, productId: 822, catalogGroupId: 2, price: 42, currency: 'RUB' }]);
     assert.equal(operations.get(serviceInput.productId)?.status, 'SUCCEEDED');
+
+    const unsupportedServiceWeight = {
+      ...serviceInput,
+      productId: '32345678-1234-1234-1234-123456789abc',
+      eventId: 'event-unsupported-service-weight',
+      product: { ...serviceInput.product, id: '32345678-1234-1234-1234-123456789abc', weight: 1.5 },
+    };
+    await assert.rejects(
+      () => service.createOrRecover(unsupportedServiceWeight),
+      (error: unknown) => error instanceof Error && error.message === 'PRODUCT_CREATE_FIELD_NOT_CONFIRMED_WRITABLE',
+      'product-only fields are not written to service cards even when a stored generic rule selects them',
+    );
+    assert.equal(calls.filter((name) => name === 'catalog.product.service.add').length, 1);
+    assert.equal(operations.has(unsupportedServiceWeight.productId), false, 'schema rejection precedes durable create journal and provider write');
   } finally {
     globalThis.fetch = oldFetch;
     if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL;

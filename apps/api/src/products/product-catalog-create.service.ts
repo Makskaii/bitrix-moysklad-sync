@@ -52,6 +52,11 @@ export class ProductCatalogCreateService {
     }
     if (allowedFields.includes('code') && typeof input.product.code === 'string' && input.product.code.trim()) fields.code = input.product.code.trim();
     if (allowedFields.includes('description') && typeof input.product.description === 'string' && input.product.description.trim()) fields.detailText = input.product.description;
+    for (const rule of configuredCatalogCreateRules(input.eventConfig.config.rules, input.product)) {
+      if (['name', 'iblockId', 'active', 'xmlId', 'measure', 'detailPicture', 'previewPicture', 'iblockSection', 'iblockSectionId'].includes(rule.bitrix24Field)) continue;
+      fields[rule.bitrix24Field] = rule.value;
+    }
+    await assertCatalogCreateFieldsWritable(catalogId, kind, fields);
     const prices = input.prices ?? [];
     if (!Array.isArray(prices) || prices.some((price) => !Number.isInteger(price.catalogGroupId) || price.catalogGroupId < 1 || !Number.isFinite(price.value) || price.value < 0 || !/^[A-Z]{3}$/.test(price.currency))) {
       throw new ProductCatalogManualReviewError('PRODUCT_CREATE_PRICE_MAPPING_INVALID');
@@ -85,7 +90,7 @@ export class ProductCatalogCreateService {
     });
     if (claimed.count !== 1) throw new Error('PRODUCT_CREATE_OPERATION_BUSY');
     try {
-      const products = await findProducts(catalogId, xmlId, kind);
+      const products = await findProducts(catalogId, xmlId, kind, Object.keys(frozen.fields));
       if (products.length > 1) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_DUPLICATE_EXTERNAL_ID');
       let b24Id = operation.bitrix24ProductId ?? (products.length === 1 ? numericId(products[0].id) : null);
       if (products.length === 1 && !readbackMatches(products[0], frozen.fields, kind)) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_RECOVERY_MISMATCH');
@@ -103,7 +108,7 @@ export class ProductCatalogCreateService {
       }
       const frozenPrices = Array.isArray(frozen.prices) ? frozen.prices.filter(isRecord) : [];
       for (const price of frozenPrices) await this.createOrRecoverPrice(b24Id, price, input.productId, leaseToken, input);
-      const verified = await findProducts(catalogId, xmlId, kind);
+      const verified = await findProducts(catalogId, xmlId, kind, Object.keys(frozen.fields));
       if (verified.length !== 1 || String(verified[0].id) !== b24Id || !readbackMatches(verified[0], frozen.fields, kind)) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_READBACK_MISMATCH');
       await this.persistPair(input.productId, b24Id, leaseToken, input.eventId, kind);
       return b24Id;
@@ -187,12 +192,12 @@ function samePrice(actual: Row, productId: string, catalogGroupId: number, value
   return String(actual.productId) === productId && String(actual.catalogGroupId) === String(catalogGroupId) && Number(actual.price) === value && actual.currency === currency;
 }
 
-async function findProducts(catalogId: string, xmlId: string, kind: 'product' | 'service' = 'product'): Promise<Row[]> {
+async function findProducts(catalogId: string, xmlId: string, kind: 'product' | 'service' = 'product', configuredFields: string[] = []): Promise<Row[]> {
   const rows: Row[] = [];
   let start = 0;
   let total: number | null = null;
   for (let page = 0; page < 200; page += 1) {
-    const value = await bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', { select: ['id', 'iblockId', 'iblockSectionId', 'name', 'code', 'detailText', 'measure', 'xmlId', 'type'], filter: { iblockId: Number(catalogId), xmlId }, order: { id: 'ASC' }, start });
+    const value = await bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', { select: [...new Set(['id', 'iblockId', 'iblockSectionId', 'name', 'code', 'detailText', 'measure', 'xmlId', 'type', ...configuredFields])], filter: { iblockId: Number(catalogId), xmlId }, order: { id: 'ASC' }, start });
     const root = isRecord(value) ? value : null;
     const pageRows = root && Array.isArray(root[kind === 'service' ? 'services' : 'products']) ? (root[kind === 'service' ? 'services' : 'products'] as unknown[]).filter(isRecord) : null;
     if (!root || !pageRows || typeof root.total !== 'number') throw new Error('PRODUCT_CREATE_RECOVERY_SEARCH_INVALID');
@@ -221,6 +226,42 @@ function readbackMatches(actual: Row, expected: Row, kind: 'product' | 'service'
   if (!numericId(actual.id) || String(actual.iblockId) !== String(expected.iblockId)) return false;
   if (Number(actual.type) !== (kind === 'service' ? 7 : 1)) return false;
   return Object.entries(expected).every(([key, value]) => key === 'iblockId' ? String(actual[key]) === String(value) : actual[key] === value);
+}
+function configuredCatalogCreateRules(value: unknown, product: Row): Array<{ bitrix24Field: string; value: string | number | boolean }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    if (!isRecord(candidate) || candidate.entity !== 'catalog' || typeof candidate.sourceField !== 'string' || typeof candidate.targetField !== 'string') return [];
+    const mapping = isRecord(candidate.moyskladToBitrix24) ? candidate.moyskladToBitrix24 : null;
+    const transform = mapping && isRecord(mapping.transform) ? mapping.transform : null;
+    if (mapping?.enabled !== true || transform?.kind !== 'copy') return [];
+    const value = product[candidate.targetField];
+    if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return [];
+    if (candidate.sourceField === 'name' || candidate.sourceField === 'xmlId') return [];
+    return [{ bitrix24Field: candidate.sourceField, value }];
+  });
+}
+
+async function assertCatalogCreateFieldsWritable(catalogId: string, kind: 'product' | 'service', fields: Row) {
+  const method = kind === 'service' ? 'catalog.product.service.getFieldsByFilter' : 'catalog.product.getFieldsByFilter';
+  const result = await bitrixCall(method, { filter: { iblockId: Number(catalogId) } });
+  const root = isRecord(result) ? result : {};
+  const definitions = isRecord(root[kind]) ? root[kind] as Row : {};
+  const neverWrite = new Set(['id', 'type', 'iblockSection', 'iblockSectionId', 'detailPicture', 'previewPicture', 'quantity', 'quantityReserved', 'quantityTrace', 'available', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX', 'dateActiveFrom', 'dateActiveTo', 'priceType', 'purchasingPrice', 'purchasingCurrency']);
+  for (const key of Object.keys(fields)) {
+    if (['iblockId', 'active', 'xmlId'].includes(key)) continue;
+    const definition = definitions[key];
+    const fieldValue = fields[key];
+    if (neverWrite.has(key) || !isRecord(definition) || definition.isReadOnly !== false || !['string', 'char', 'integer', 'double', 'datetime'].includes(String(definition.type)) || !compatibleCreateScalar(String(definition.type), fieldValue)) {
+      throw new ProductCatalogManualReviewError('PRODUCT_CREATE_FIELD_NOT_CONFIRMED_WRITABLE');
+    }
+  }
+}
+
+function compatibleCreateScalar(fieldType: string, value: unknown) {
+  if (fieldType === 'string' || fieldType === 'datetime') return typeof value === 'string';
+  if (fieldType === 'char') return typeof value === 'string' || typeof value === 'boolean';
+  if (fieldType === 'integer' || fieldType === 'double') return typeof value === 'number' && Number.isFinite(value);
+  return false;
 }
 function numericId(value: unknown): string | null { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^\d{1,20}$/.test(value)) ? String(value) : null; }
 function isUniqueViolation(error: unknown): boolean { return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'; }

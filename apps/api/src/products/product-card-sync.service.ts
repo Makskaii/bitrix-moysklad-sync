@@ -19,6 +19,8 @@ export type ProductCardSnapshot = {
   detailText: string | null;
   unitId: string | null;
   prices: ProductCardPrice[];
+  /** Primitive values only; complex references, files and collections stay on dedicated paths. */
+  fields?: Record<string, string | number | boolean | null>;
   updatedAt: string | null;
 };
 
@@ -50,6 +52,8 @@ type Direction = {
   field: string;
   bitrix24Key?: string;
   moyskladKey?: string;
+  bitrix24Field?: string;
+  moyskladField?: string;
 };
 
 export class ProductCardManualReviewError extends Error {
@@ -122,7 +126,18 @@ export class ProductCardSyncService {
         previous.bitrix24Values.code, previous.moyskladValues.code, rules.code, false) : null;
       const unit = chooseUnit(bitrix24.unitId, moysklad.unitId,
         previous.bitrix24Values.unitId, previous.moyskladValues.unitId, settings.references.units);
-      directions = [name, description, code, unit].filter((value): value is Direction => value !== null);
+      const generic = rules.fields.flatMap((rule) => {
+        if (!rule.moyskladToBitrix24 || isDedicatedFieldRule(rule)) return [];
+        const mapped = chooseMappedScalar(
+          rule,
+          bitrix24.fields?.[rule.source],
+          moysklad.fields?.[rule.target],
+          record(previous.bitrix24Values.fields) ? previous.bitrix24Values.fields[rule.source] : undefined,
+          record(previous.moyskladValues.fields) ? previous.moyskladValues.fields[rule.target] : undefined,
+        );
+        return mapped ? [mapped] : [];
+      });
+      directions = [name, description, code, unit, ...generic].filter((value): value is Direction => value !== null);
     } catch (error) {
       return review(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_FIELD_UNAVAILABLE');
     }
@@ -166,10 +181,10 @@ export class ProductCardSyncService {
 
       if (verified) {
         try {
-          setState(next, direction.field, 'BITRIX24', direction.bitrix24Key,
-            direction.target === 'BITRIX24' ? direction.value : readField(bitrix24, direction.field));
-          setState(next, direction.field, 'MOYSKLAD', direction.moyskladKey,
-            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field));
+          setState(next, direction, 'BITRIX24', direction.bitrix24Key,
+            direction.target === 'BITRIX24' ? direction.value : readField(bitrix24, direction.field, direction));
+          setState(next, direction, 'MOYSKLAD', direction.moyskladKey,
+            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction));
           await this.state.write(pair.id, settingsVersion, next);
           changedFields.push(direction.field);
         } catch (error) {
@@ -190,7 +205,7 @@ export class ProductCardSyncService {
     pair: ProductCardPair,
     bitrix24: ProductCardSnapshot,
     moysklad: ProductCardSnapshot,
-    rules: { name?: FieldRule; description?: FieldRule; code?: FieldRule },
+    rules: ProductRules,
     settings: ProductCardSettings,
   ) {
     if (direction.field === 'name') {
@@ -210,6 +225,16 @@ export class ProductCardSyncService {
       if (!rules.code) throw new ProductCardManualReviewError('PRODUCT_CODE_MAPPING_MISSING');
       if (direction.target !== 'BITRIX24') throw new ProductCardManualReviewError('PRODUCT_CODE_DIRECTION_UNSUPPORTED');
       await this.api.updateBitrix24(pair.bitrix24Id, { code: direction.value }, pair.moyskladType === 'service' ? 'service' : 'product');
+      return;
+    }
+    if (direction.field.startsWith('field:')) {
+      if (direction.target !== 'BITRIX24' || !direction.bitrix24Field) {
+        throw new ProductCardManualReviewError('PRODUCT_FIELD_DIRECTION_UNSUPPORTED');
+      }
+      if (!isWritableScalarField(direction.bitrix24Field) || !isScalarValue(direction.value)) {
+        throw new ProductCardManualReviewError('PRODUCT_FIELD_UNSUPPORTED');
+      }
+      await this.api.updateBitrix24(pair.bitrix24Id, { [direction.bitrix24Field]: direction.value }, pair.moyskladType === 'service' ? 'service' : 'product');
       return;
     }
     if (direction.field === 'unit') {
@@ -264,6 +289,7 @@ export class ProductCardSyncService {
     if (field === 'description') return snapshot.detailText;
     if (field === 'code') return snapshot.code;
     if (field === 'unit') return snapshot.unitId;
+    if (field.startsWith('field:') && direction.bitrix24Field) return snapshot.fields?.[direction.bitrix24Field];
     const typeId = side === 'BITRIX24' ? direction.bitrix24Key : direction.moyskladKey;
     return snapshot.prices.find((price) => price.typeId === typeId)?.value;
   }
@@ -273,14 +299,16 @@ function isRuntimeGateError(error: unknown): error is Error & { productCardRunti
   return error instanceof Error && 'productCardRuntimeGate' in error;
 }
 
-function productRules(settings: ProductCardSettings): { name?: FieldRule; description?: FieldRule; code?: FieldRule } {
-  const result: { name?: FieldRule; description?: FieldRule; code?: FieldRule } = {};
+type ProductRules = { name?: FieldRule; description?: FieldRule; code?: FieldRule; fields: FieldRule[] };
+
+function productRules(settings: ProductCardSettings): ProductRules {
+  const result: ProductRules = { fields: [] };
   for (const candidate of settings.rules) {
     if (!record(candidate) || candidate.entity !== 'catalog' || typeof candidate.sourceField !== 'string' || typeof candidate.targetField !== 'string') continue;
     const forward = record(candidate.bitrix24ToMoysklad) ? candidate.bitrix24ToMoysklad : null;
     const reverse = record(candidate.moyskladToBitrix24) ? candidate.moyskladToBitrix24 : null;
-    if ((forward && record(forward.transform) && forward.transform.kind !== 'copy') ||
-      (reverse && record(reverse.transform) && reverse.transform.kind !== 'copy')) continue;
+    if ((forward?.enabled === true && record(forward.transform) && forward.transform.kind !== 'copy') ||
+      (reverse?.enabled === true && record(reverse.transform) && reverse.transform.kind !== 'copy')) continue;
     const rule: FieldRule = {
       source: candidate.sourceField,
       target: candidate.targetField,
@@ -288,10 +316,52 @@ function productRules(settings: ProductCardSettings): { name?: FieldRule; descri
       moyskladToBitrix24: reverse?.enabled === true,
     };
     if (candidate.sourceField === 'name' && candidate.targetField === 'name') result.name = rule;
-    if (candidate.sourceField === 'detailText' && candidate.targetField === 'description') result.description = rule;
-    if (candidate.sourceField === 'code' && candidate.targetField === 'code') result.code = rule;
+    else if (candidate.sourceField === 'detailText' && candidate.targetField === 'description') result.description = rule;
+    else if (candidate.sourceField === 'code' && candidate.targetField === 'code') result.code = rule;
+    else result.fields.push(rule);
   }
   return result;
+}
+
+function isDedicatedFieldRule(rule: FieldRule) {
+  return (rule.source === 'name' && rule.target === 'name') ||
+    (rule.source === 'detailText' && rule.target === 'description') ||
+    (rule.source === 'code' && rule.target === 'code') ||
+    (rule.source === 'measure' && rule.target === 'uom');
+}
+
+function chooseMappedScalar(rule: FieldRule, b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown): Direction | null {
+  if (b24 === undefined || ms === undefined || oldB24 === undefined || oldMs === undefined) return null;
+  if (b24 === null || ms === null) return null;
+  if (!isScalarValue(b24) || !isScalarValue(ms) || !sameScalarType(b24, ms)) return null;
+  if (!isScalarValue(oldB24) || !isScalarValue(oldMs) || !sameScalarType(oldB24, oldMs)) return null;
+  if (same(b24, ms) || same(b24, oldB24) && same(ms, oldMs)) return null;
+  return {
+    field: `field:${rule.source}:${rule.target}`,
+    target: 'BITRIX24',
+    value: ms,
+    bitrix24Field: rule.source,
+    moyskladField: rule.target,
+  };
+}
+
+function sameScalarType(left: unknown, right: unknown) {
+  if (left === null || right === null) return true;
+  return typeof left === typeof right;
+}
+
+function isScalarValue(value: unknown): value is string | number | boolean | null {
+  return value === null || typeof value === 'string' || typeof value === 'number' && Number.isFinite(value) || typeof value === 'boolean';
+}
+
+function isWritableScalarField(field: string) {
+  const protectedFields = new Set([
+    'id', 'meta', 'type', 'iblockId', 'iblockSection', 'iblockSectionId',
+    'detailPicture', 'previewPicture', 'quantity', 'quantityReserved', 'quantityTrace',
+    'available', 'active', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
+    'dateActiveFrom', 'dateActiveTo', 'priceType', 'purchasingPrice', 'purchasingCurrency',
+  ]);
+  return /^[A-Za-z][A-Za-z0-9]*$/.test(field) && !protectedFields.has(field);
 }
 
 function chooseField(field: string, b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, rule: FieldRule, required: boolean): Direction | null {
@@ -351,9 +421,11 @@ function findUnit(mappings: unknown[], b24: unknown, ms: unknown, value: unknown
 
 function snapshotValues(b24: ProductCardSnapshot, ms: ProductCardSnapshot, settings: ProductCardSettings): ProductCardSyncState {
   const prices = settings.references.priceTypes.filter((item) => record(item) && item.status === 'configured' && typeof item.moyskladId === 'string');
+  const rules = productRules(settings);
   return {
     bitrix24Values: {
       name: b24.name, description: b24.detailText, code: b24.code, unitId: b24.unitId,
+      fields: Object.fromEntries(rules.fields.flatMap((rule) => isScalarValue(b24.fields?.[rule.source]) ? [[rule.source, b24.fields![rule.source]]] : [])),
       prices: prices.map((item) => {
         const typeId = String((item as Record<string, unknown>).bitrix24Id);
         return { typeId, value: b24.prices.find((price) => price.typeId === typeId)?.value };
@@ -361,6 +433,7 @@ function snapshotValues(b24: ProductCardSnapshot, ms: ProductCardSnapshot, setti
     },
     moyskladValues: {
       name: ms.name, description: ms.detailText, code: ms.code, unitId: ms.unitId,
+      fields: Object.fromEntries(rules.fields.flatMap((rule) => isScalarValue(ms.fields?.[rule.target]) ? [[rule.target, ms.fields![rule.target]]] : [])),
       prices: prices.map((item) => {
         const typeId = String((item as Record<string, unknown>).moyskladId);
         return { typeId, value: ms.prices.find((price) => price.typeId === typeId)?.value };
@@ -369,23 +442,32 @@ function snapshotValues(b24: ProductCardSnapshot, ms: ProductCardSnapshot, setti
   };
 }
 
-function setState(state: ProductCardSyncState, field: string, side: Side, typeId: string | undefined, value: unknown) {
+function setState(state: ProductCardSyncState, direction: Direction, side: Side, typeId: string | undefined, value: unknown) {
+  const field = direction.field;
   const values = side === 'BITRIX24' ? state.bitrix24Values : state.moyskladValues;
   if (field.startsWith('price:')) {
     if (!typeId) return;
     const prices = Array.isArray(values.prices) ? values.prices as Record<string, unknown>[] : [];
     const row = prices.find((candidate) => candidate.typeId === typeId);
     if (row) row.value = value;
+  } else if (field.startsWith('field:')) {
+    if (!isScalarValue(value)) return;
+    const key = side === 'BITRIX24' ? direction.bitrix24Field : direction.moyskladField;
+    if (!key) return;
+    const fields = record(values.fields) ? values.fields : {};
+    fields[key] = value;
+    values.fields = fields;
   } else {
     values[field === 'description' ? 'description' : field === 'unit' ? 'unitId' : field === 'code' ? 'code' : 'name'] = value;
   }
 }
 
-function readField(snapshot: ProductCardSnapshot, field: string): unknown {
+function readField(snapshot: ProductCardSnapshot, field: string, direction?: Direction): unknown {
   if (field === 'name') return snapshot.name;
   if (field === 'description') return snapshot.detailText;
   if (field === 'code') return snapshot.code;
   if (field === 'unit') return snapshot.unitId;
+  if (field.startsWith('field:')) return direction?.moyskladField ? snapshot.fields?.[direction.moyskladField] : undefined;
   return undefined;
 }
 function cloneState(state: ProductCardSyncState): ProductCardSyncState { return structuredClone(state); }
