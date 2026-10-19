@@ -299,6 +299,7 @@ function fieldMetadataContract(entity: string): { bitrixFieldsMethod: string; bi
     case 'contacts-companies': return { bitrixFieldsMethod: 'crm.contact.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.contact.userfield.list', moyskladResource: 'entity/counterparty' };
     case 'companies': return { bitrixFieldsMethod: 'crm.company.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.company.userfield.list', moyskladResource: 'entity/counterparty' };
     case 'deals-orders': return { bitrixFieldsMethod: 'crm.deal.fields', bitrixFieldsParams: {}, bitrixUserFieldsMethod: 'crm.deal.userfield.list', moyskladResource: 'entity/customerorder' };
+    case 'smart-invoices': return { bitrixFieldsMethod: 'crm.item.fields', bitrixFieldsParams: { entityTypeId: 31 }, moyskladResource: 'entity/invoiceout' };
     case 'catalog': return { bitrixFieldsMethod: 'catalog.product.getFieldsByFilter', bitrixFieldsParams: {}, moyskladResource: 'entity/product' };
     default: throw new ServiceUnavailableException('This entity type has no read-only field metadata provider');
   }
@@ -310,6 +311,7 @@ function moyskladStandardFields(entity: string): FieldCandidate[] {
     'contacts-companies': [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
     companies: [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
     'deals-orders': [['name', 'Наименование заказа', 'string', true], ['code', 'Код заказа', 'string', true], ['moment', 'Момент заказа', 'datetime', true], ['deliveryPlannedMoment', 'Плановая отгрузка/доставка', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
+    'smart-invoices': [['name', 'Наименование счёта', 'string', true], ['code', 'Код счёта', 'string', true], ['moment', 'Момент счёта', 'datetime', true], ['paymentPlannedMoment', 'Срок оплаты', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
     catalog: [['name', 'Наименование товара', 'string', true], ['code', 'Код товара', 'string', true], ['article', 'Артикул', 'string', true], ['description', 'Описание', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['vat', 'Ставка НДС', 'number', true]],
   };
   return (fields[entity] ?? []).map(([code, title, type, writable]) => ({ code, title, type, writable, category: 'standard' }));
@@ -415,6 +417,10 @@ function moyskladStandardFieldTitle(entity: string, code: string): string {
     'deals-orders': {
       name: 'Наименование заказа', code: 'Код заказа', moment: 'Момент заказа',
       deliveryPlannedMoment: 'Плановая отгрузка/доставка', state: 'Статус', sum: 'Сумма', description: 'Описание',
+    },
+    'smart-invoices': {
+      name: 'Наименование счёта', code: 'Код счёта', moment: 'Момент счёта',
+      paymentPlannedMoment: 'Срок оплаты', state: 'Статус', sum: 'Сумма', description: 'Описание',
     },
     catalog: {
       name: 'Наименование товара', code: 'Код товара', article: 'Артикул', description: 'Описание',

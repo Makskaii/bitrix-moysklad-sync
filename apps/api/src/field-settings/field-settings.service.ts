@@ -198,8 +198,11 @@ export class FieldSettingsService {
       if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
       return entry.entity;
     });
-    const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'catalog']);
+    const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'smart-invoices', 'catalog']);
     for (const entity of ruleEntities) if (!supported.has(entity)) throw new BadRequestException(`Entity ${entity} is not supported for field mappings`);
+    if (config.groups.some((group) => group.entity === 'smart-invoices')) {
+      throw new BadRequestException('Composite field mappings are not supported for smart invoices');
+    }
     const entities = [...new Set(ruleEntities)];
     const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null }>; moysklad: Array<{ code: string; writable: boolean | null }> }>>();
     for (const entity of entities) {
@@ -851,6 +854,7 @@ function entityTypeForFieldEntity(entity: string): EntityType {
     case 'contacts-companies': return 'CONTACT';
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
+    case 'smart-invoices': return 'INVOICE';
     case 'catalog': return 'PRODUCT';
     default: throw new BadRequestException('This entity type has no field metadata provider');
   }
