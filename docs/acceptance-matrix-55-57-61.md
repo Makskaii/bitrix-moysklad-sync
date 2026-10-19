@@ -15,7 +15,7 @@ Candidate base: `fd9109a` (`origin/main`). Candidate feature sources: #55 `69e02
 | Check | Result |
 | --- | --- |
 | Build | Pass: `npm run build` (API TypeScript and web production bundle) |
-| Unit and fake HTTP intake/dispatch | Pass: 82 checks across event intake/dispatch, invoices, product cards/catalog creation, sync mode/readiness, lifecycle, provider retry and nightly/review diagnostics; includes new two-case enabled/disabled invoice lifecycle webhook suite |
+| Unit and fake HTTP intake/dispatch | Pass by slices: the earlier 80-check combined suite plus 2 invoice lifecycle cases produced 82 checks at the prior gate; the imported #57 nightly-service slice adds 6 more (all 6 pass separately at current candidate HEAD). The aggregate was not rerun as one command. |
 | Fake-provider end-to-end | Pass: 2 apply/dry fake-provider scenarios |
 | Local isolated PostgreSQL runtime, schema and migrations | Pending: Docker Desktop did not start; engine service/pipe unavailable. No database, schema, migration or role was created or modified. |
 | Local preview dependency injection | Pass: isolated apply and dry schema module boots without external requests |
