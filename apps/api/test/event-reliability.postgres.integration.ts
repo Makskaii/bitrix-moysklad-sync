@@ -22,7 +22,10 @@ test('PostgreSQL shares worker fencing slots across instances and dispatches a d
   const eventId = `issue57-acceptance-${randomUUID()}`;
   let active = 0;
   let maximum = 0;
+  let deniedByCapacity = 0;
   let release!: () => void;
+  let releaseOldLease = () => {};
+  let releaseNewLease = () => {};
   const barrier = new Promise<void>((resolve) => { release = resolve; });
   const work = async (id: string) => {
     active++;
@@ -51,17 +54,31 @@ test('PostgreSQL shares worker fencing slots across instances and dispatches a d
     await dispatcher.dispatch(eventId);
     assert.deepEqual(deliveries, [eventId]);
 
-    const tasks = [
-      firstLeaseService.run('pg-1', () => work('pg-1')),
-      secondLeaseService.run('pg-2', () => work('pg-2')),
-      firstLeaseService.run('pg-3', () => work('pg-3')),
-      secondLeaseService.run('pg-4', () => work('pg-4')),
-    ];
-    for (let attempt = 0; attempt < 100 && active < 4; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(active, 4, 'four PostgreSQL leases should be concurrently held');
+    const tasks = Array.from({ length: 12 }, (_, index) => {
+      const eventId = `pg-concurrent-${index + 1}`;
+      const service = index % 2 === 0 ? firstLeaseService : secondLeaseService;
+      return service.run(eventId, () => work(eventId)).then((result) => {
+        if (result === null) deniedByCapacity++;
+        return result;
+      });
+    });
+    const settledTasks = Promise.allSettled(tasks);
+    for (let attempt = 0; attempt < 100 && deniedByCapacity < 8; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+    const heldSlots = await firstDatabase.eventWorkerLease.findMany({
+      where: { ownerToken: { not: '' } }, select: { slot: true, eventId: true, leaseExpiresAt: true },
+    });
+    assert.equal(active, 4, `four PostgreSQL leases should be concurrently held; callbacks=${active}, slots=${JSON.stringify(heldSlots)}`);
+    assert.equal(heldSlots.length, 4, 'each active callback must correspond to one persisted lease slot');
+    const ownerTokens = await firstDatabase.eventWorkerLease.findMany({
+      where: { ownerToken: { not: '' } }, select: { ownerToken: true },
+    });
+    assert.equal(new Set(ownerTokens.map((slot) => slot.ownerToken)).size, 4, 'each held slot must have a distinct current owner token');
     assert.equal(await secondLeaseService.run('pg-5', () => work('pg-5')), null, 'a fifth worker must not exceed the shared DB semaphore');
     release();
-    assert.deepEqual(await Promise.all(tasks), ['pg-1', 'pg-2', 'pg-3', 'pg-4']);
+    const outcomes = await settledTasks;
+    assert.equal(outcomes.filter((outcome) => outcome.status === 'rejected').length, 0, 'concurrent first claims must not leak unique-slot conflicts');
+    assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled' && outcome.value !== null).length, 4);
+    assert.equal(maximum, 4, 'only one worker may own each of the four slots');
 
     let externalWriteReached = false;
     await assert.rejects(firstLeaseService.run('pg-fenced', async (lease) => {
@@ -73,8 +90,59 @@ test('PostgreSQL shares worker fencing slots across instances and dispatches a d
       externalWriteReached = true;
     }), /EVENT_WORKER_LEASE_LOST/);
     assert.equal(externalWriteReached, false, 'a stale worker cannot pass its persisted owner-token fence');
+
+    let expiredOwnerWriteReached = false;
+    await assert.rejects(firstLeaseService.run('pg-expired-owner', async (lease) => {
+      const ownedRow = await firstDatabase.eventWorkerLease.findFirst({ where: { eventId: 'pg-expired-owner' } });
+      assert.ok(ownedRow);
+      await secondDatabase.eventWorkerLease.updateMany({
+        where: { slot: ownedRow.slot, ownerToken: ownedRow.ownerToken }, data: { leaseExpiresAt: new Date(0) },
+      });
+      await lease.assertOwned();
+      expiredOwnerWriteReached = true;
+    }), /EVENT_WORKER_LEASE_LOST/);
+    assert.equal(expiredOwnerWriteReached, false, 'an expired lease cannot be revived before a side effect');
+
+    let oldLeaseStarted!: () => void;
+    const oldStarted = new Promise<void>((resolve) => { oldLeaseStarted = resolve; });
+    const holdOld = new Promise<void>((resolve) => { releaseOldLease = resolve; });
+    const oldRun = firstLeaseService.run('pg-stale-old', async () => {
+      oldLeaseStarted();
+      await holdOld;
+      return 'old-owner';
+    });
+    const oldOutcome = Promise.allSettled([oldRun]);
+    await oldStarted;
+    const oldRow = await firstDatabase.eventWorkerLease.findFirst({ where: { eventId: 'pg-stale-old' } });
+    assert.ok(oldRow);
+    await secondDatabase.eventWorkerLease.updateMany({
+      where: { slot: oldRow.slot, ownerToken: oldRow.ownerToken }, data: { leaseExpiresAt: new Date(0) },
+    });
+
+    let newLeaseStarted!: () => void;
+    const newStarted = new Promise<void>((resolve) => { newLeaseStarted = resolve; });
+    const holdNew = new Promise<void>((resolve) => { releaseNewLease = resolve; });
+    const newRun = secondLeaseService.run('pg-stale-new', async () => {
+      newLeaseStarted();
+      await holdNew;
+      return 'new-owner';
+    });
+    const newOutcome = Promise.allSettled([newRun]);
+    await newStarted;
+    releaseOldLease();
+    const [oldResult] = await oldOutcome;
+    assert.equal(oldResult.status, 'rejected');
+    assert.match(String(oldResult.status === 'rejected' ? oldResult.reason : ''), /EVENT_WORKER_LEASE_LOST/);
+    const currentOwner = await firstDatabase.eventWorkerLease.findUnique({ where: { slot: oldRow.slot } });
+    assert.equal(currentOwner?.ownerToken === oldRow.ownerToken, false, 'expired ownership can be reclaimed by a fresh worker');
+    assert.equal(currentOwner?.eventId, 'pg-stale-new', 'the stale owner cannot release or overwrite the replacement lease');
+    releaseNewLease();
+    const [newResult] = await newOutcome;
+    assert.deepEqual(newResult, { status: 'fulfilled', value: 'new-owner' });
   } finally {
     release();
+    releaseOldLease();
+    releaseNewLease();
     await firstDatabase.eventWorkerLease.updateMany({
       where: { eventId: 'pg-fenced' }, data: { ownerToken: '', eventId: '', leaseExpiresAt: new Date(0) },
     });

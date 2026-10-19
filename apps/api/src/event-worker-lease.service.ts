@@ -56,11 +56,11 @@ export class EventWorkerLeaseService {
     const now = new Date();
     const ownerToken = randomUUID();
     for (let slot = 0; slot < MAX_CONCURRENT_EVENT_WORKERS; slot++) {
-      await this.database.eventWorkerLease.upsert({
-        where: { slot },
-        create: { slot, ownerToken: '', eventId: '', leaseExpiresAt: new Date(0) },
-        update: {},
-      });
+      await this.database.$executeRaw`
+        INSERT INTO "EventWorkerLease" ("slot", "ownerToken", "eventId", "leaseExpiresAt", "updatedAt")
+        VALUES (${slot}, '', '', ${new Date(0)}, NOW())
+        ON CONFLICT ("slot") DO NOTHING
+      `;
       const claimed = await this.database.eventWorkerLease.updateMany({
         where: { slot, leaseExpiresAt: { lte: now } },
         data: { ownerToken, eventId, leaseExpiresAt: new Date(now.getTime() + EVENT_WORKER_LEASE_MS) },
@@ -71,9 +71,10 @@ export class EventWorkerLeaseService {
   }
 
   private async renew(lease: Lease): Promise<boolean> {
+    const now = new Date();
     const renewed = await this.database.eventWorkerLease.updateMany({
-      where: { slot: lease.slot, ownerToken: lease.ownerToken },
-      data: { leaseExpiresAt: new Date(Date.now() + EVENT_WORKER_LEASE_MS) },
+      where: { slot: lease.slot, ownerToken: lease.ownerToken, leaseExpiresAt: { gt: now } },
+      data: { leaseExpiresAt: new Date(now.getTime() + EVENT_WORKER_LEASE_MS) },
     });
     return renewed.count === 1;
   }
