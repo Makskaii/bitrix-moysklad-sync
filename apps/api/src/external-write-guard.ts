@@ -1,12 +1,12 @@
 let databaseRecoveryReady = true;
-let controlledWriteCheck: ((provider: string, operation: string, nativeId?: string | null) => void) | null = null;
+let controlledWriteCheck: ((provider: string, operation: string, nativeId?: string | null, entity?: string) => void) | null = null;
 
 /** Closed by bootstrap before the server starts accepting requests. */
 export function setDatabaseRecoveryReady(ready: boolean): void {
   databaseRecoveryReady = ready;
 }
 
-export function assertApplyExternalWrite(provider: string, operation: string, nativeId?: string | null): void {
+export function assertApplyExternalWrite(provider: string, operation: string, nativeId?: string | null, entity?: string): void {
   if (process.env.SYNC_MODE === 'dry') {
     throw new Error(`${provider}_${operation}_WRITE_REQUIRES_APPLY_MODE`);
   }
@@ -17,12 +17,12 @@ export function assertApplyExternalWrite(provider: string, operation: string, na
     if (!controlledWriteCheck) throw new Error('CONTROLLED_LIVE_TEST_POLICY_NOT_INITIALIZED');
     // Missing IDs are denied: a per-call guard without the exact resource ID
     // must never inherit permission from a manifest-scoped event.
-    controlledWriteCheck(provider, operation, nativeId);
+    controlledWriteCheck(provider, operation, nativeId, entity);
   }
 }
 
 /** Installs the manifest-backed policy. Enabling test mode without this policy fails closed. */
-export function setControlledLiveTestWriteCheck(check: ((provider: string, operation: string, nativeId?: string | null) => void) | null): void {
+export function setControlledLiveTestWriteCheck(check: ((provider: string, operation: string, nativeId?: string | null, entity?: string) => void) | null): void {
   controlledWriteCheck = check;
 }
 
@@ -42,19 +42,20 @@ export function installControlledLiveFetchGuard(): void {
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const request = new Request(input, init);
     const method = request.method.toUpperCase();
+    const url = new URL(request.url);
+    const match = configured.find((entry) => url.origin === entry.origin && url.pathname.startsWith(entry.prefix));
+    if (!match) throw new Error('CONTROLLED_LIVE_TEST_UNCLASSIFIED_EXTERNAL_REQUEST');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-      const url = new URL(request.url);
-      const match = configured.find((entry) => url.origin === entry.origin && url.pathname.startsWith(entry.prefix));
-      if (!match) throw new Error('CONTROLLED_LIVE_TEST_UNCLASSIFIED_EXTERNAL_MUTATION');
       const relativePath = url.pathname.slice(match.prefix.length);
       if (match.provider === 'BITRIX24' && isBitrixReadMethod(relativePath)) return originalFetch(input, init);
       const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
         : typeof init?.body === 'string' ? init.body
         : input instanceof Request ? await input.clone().text() : '';
       const nativeId = extractMutationTarget(match.provider, relativePath, bodyText);
-      assertApplyExternalWrite(match.provider, mutationOperation(match.provider, method, relativePath), nativeId);
+      const requestEntity = mutationEntity(match.provider, relativePath, bodyText);
+      assertApplyExternalWrite(match.provider, mutationOperation(match.provider, method, relativePath), nativeId, requestEntity);
     }
-    return originalFetch(input, init);
+    return originalFetch(input, { ...init, redirect: 'error' });
   }) as typeof fetch;
 }
 
@@ -72,6 +73,28 @@ function mutationOperation(provider: string, method: string, path: string): stri
 function isBitrixReadMethod(path: string): boolean {
   const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
   return /\.(?:get|list|fields|types|available|current|count|methods)$/.test(method) || method === 'user.current';
+}
+
+function mutationEntity(provider: string, path: string, bodyText: string): string | undefined {
+  if (provider === 'BITRIX24') {
+    const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
+    if (method.startsWith('crm.company.')) return 'client:COMPANY';
+    if (method.startsWith('crm.contact.')) return 'client:CONTACT';
+    if (method.startsWith('crm.deal.') || method.startsWith('crm.item.productrow.')) return 'deal-order';
+    if (method.startsWith('crm.product.') || method.startsWith('catalog.product.') || method.startsWith('catalog.price.')) return 'product';
+    if (method.startsWith('crm.invoice.')) return 'invoice';
+    return undefined;
+  }
+  const segments = path.split('/').filter(Boolean);
+  if (segments[0] !== 'entity') return undefined;
+  if (segments[1] === 'counterparty') {
+    if (segments.includes('contactpersons') || /(?:^|&)companyType=individual(?:&|$)/.test(bodyText)) return 'client:CONTACT';
+    return 'client:COMPANY';
+  }
+  if (segments[1] === 'customerorder') return 'deal-order';
+  if (segments[1] === 'invoiceout') return 'invoice';
+  if (segments[1] === 'product' || segments[1] === 'service') return 'product';
+  return undefined;
 }
 
 function extractMutationTarget(provider: string, path: string, bodyText: string): string | null {

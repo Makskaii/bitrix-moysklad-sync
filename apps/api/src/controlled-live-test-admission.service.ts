@@ -30,22 +30,27 @@ export class ControlledLiveTestAdmissionService {
     const scopedEntity = source.entity.startsWith('client:') ? source.entity : `client:${source.entity}`;
     if (!source.currentNativeId || source.currentNativeId !== source.sourceNativeId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_ID_MISMATCH');
     const priorAdmissions = await this.database.controlledTestAdmission.findMany({ where: { runId: this.manifest.runId, entity: scopedEntity } });
-    const record = this.manifest.records.find((candidate: any) => candidate.entity === scopedEntity &&
-      ((candidate.sourceSystem === source.sourceSystem &&
-        (candidate.sourceNativeId === null || candidate.sourceNativeId === source.sourceNativeId)) ||
-       (candidate.targetSystem === source.sourceSystem && priorAdmissions.some((prior: any) =>
-        prior.sourceSystem === candidate.sourceSystem && prior.sourceNativeId === candidate.sourceNativeId &&
-        prior.targetSystem === source.sourceSystem && prior.targetNativeId === source.sourceNativeId))) &&
-      candidate.syntheticOnly === true && candidate.name === source.currentName &&
-      source.currentName.includes('тест') && source.currentName.includes(this.manifest.runId) &&
-      source.sourceCreatedAt.getTime() >= new Date(candidate.createdAfterUtc).getTime() && source.sourceCreatedAt.getTime() <= Date.now());
-    if (!record) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_NOT_ADMITTED');
-    const reversed = record.sourceSystem !== source.sourceSystem;
+    const match = this.manifest.records.map((candidate: any) => {
+      if (candidate.entity !== scopedEntity || candidate.syntheticOnly !== true || candidate.name !== source.currentName ||
+          !source.currentName.includes('тест') || !source.currentName.includes(this.manifest.runId) ||
+          source.sourceCreatedAt.getTime() < new Date(candidate.createdAfterUtc).getTime() || source.sourceCreatedAt.getTime() > Date.now()) return null;
+      if (candidate.sourceSystem === source.sourceSystem &&
+          (candidate.sourceNativeId === null || candidate.sourceNativeId === source.sourceNativeId)) return { record: candidate, reversed: false, prior: null };
+      if (candidate.targetSystem === source.sourceSystem) {
+        const prior = priorAdmissions.find((row: any) => row.sourceSystem === candidate.sourceSystem &&
+          (candidate.sourceNativeId === null || row.sourceNativeId === candidate.sourceNativeId) &&
+          row.targetSystem === source.sourceSystem && row.targetNativeId === source.sourceNativeId);
+        if (prior) return { record: candidate, reversed: true, prior };
+      }
+      return null;
+    }).find((item: any) => item !== null);
+    if (!match) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_NOT_ADMITTED');
+    const { record, reversed, prior } = match;
     await this.database.controlledTestAdmission.upsert({
       where: { eventId },
       create: { eventId, runId: this.manifest.runId, entity: scopedEntity, sourceSystem: source.sourceSystem,
         sourceNativeId: source.sourceNativeId, targetSystem: reversed ? record.sourceSystem : record.targetSystem,
-        targetNativeId: reversed ? record.sourceNativeId : record.targetNativeId,
+        targetNativeId: reversed ? prior.sourceNativeId : record.targetNativeId,
         sourceName: source.currentName, sourceCreatedAt: source.sourceCreatedAt },
       update: {},
     });
@@ -53,7 +58,7 @@ export class ControlledLiveTestAdmissionService {
     if (!existing || existing.runId !== this.manifest.runId || existing.entity !== scopedEntity ||
         existing.sourceSystem !== source.sourceSystem || existing.sourceNativeId !== source.sourceNativeId ||
         existing.targetSystem !== (reversed ? record.sourceSystem : record.targetSystem) ||
-        existing.targetNativeId !== (reversed ? record.sourceNativeId : record.targetNativeId) ||
+        existing.targetNativeId !== (reversed ? prior.sourceNativeId : record.targetNativeId) ||
         existing.sourceName !== source.currentName || existing.sourceCreatedAt.getTime() !== source.sourceCreatedAt.getTime()) {
       throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_CONFLICT');
     }
@@ -64,7 +69,7 @@ export class ControlledLiveTestAdmissionService {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && (
-      candidate.sourceSystem === admission.sourceSystem && candidate.sourceNativeId === admission.sourceNativeId && candidate.targetSystem === admission.targetSystem ||
+      candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) && candidate.targetSystem === admission.targetSystem ||
       candidate.targetSystem === admission.sourceSystem && candidate.targetNativeId === admission.sourceNativeId && candidate.sourceSystem === admission.targetSystem));
     if (!admission || !record || !targetNativeId || verifiedTargetNativeId !== targetNativeId || verifiedTargetName !== admission.sourceName ||
         !Number.isFinite(targetCreatedAt.getTime()) || targetCreatedAt.getTime() < new Date(record.createdAfterUtc).getTime() || targetCreatedAt.getTime() > Date.now()) {

@@ -13,10 +13,10 @@ import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
 const manifest = {
   runId: 'LIVE-TEST-20261019T120000Z-a1b2c3',
   testDatabaseName: 'sync_issue60_test',
-  records: [{ entity: 'client', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261019T120000Z-a1b2c3 client', syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: 'b24-17', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-29', createdAfterUtc: '2026-10-19T00:00:00Z' }],
+  records: [{ entity: 'client:COMPANY', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261019T120000Z-a1b2c3 client', syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: 'b24-17', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-29', createdAfterUtc: '2026-10-19T00:00:00Z' }],
 };
 const scope = {
-  eventId: 'evt-1', runId: manifest.runId, entity: 'client', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-17',
+  eventId: 'evt-1', runId: manifest.runId, entity: 'client:COMPANY', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-17',
   targetSystem: 'MOYSKLAD' as const, targetNativeId: 'ms-29', admittedSourceName: manifest.records[0].name, admittedSourceCreatedAt: '2026-10-19T01:00:00Z',
 };
 
@@ -37,25 +37,25 @@ test('malformed manifests, duplicate targets and omitted policy data fail closed
 
 test('a mutation is allowed only for the exact current run, source, entity, provider and target ID', () => {
   const assertWrite = createControlledLiveTestPolicy(manifest, 'postgres://localhost/sync_issue60_test');
-  assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE'), /EVENT_SCOPE_REQUIRED/);
-  withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29')));
-  withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE'), /TARGET_NOT_IN_MANIFEST/));
+  assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /EVENT_SCOPE_REQUIRED/);
+  withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY')));
+  withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', undefined, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope({ ...scope, targetNativeId: 'shared-customer-1' }, () =>
-    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE'), /TARGET_NOT_IN_MANIFEST/));
+    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope({ ...scope, runId: 'LIVE-TEST-20261019T120000Z-xxxxxx' }, () =>
-    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE'), /RUN_ID_MISMATCH/));
-  withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('BITRIX24', 'CLIENT_UPDATE'), /TARGET_NOT_IN_MANIFEST/));
+    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /RUN_ID_MISMATCH/));
+  withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('BITRIX24', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
 });
 
 test('manifest-reserved creation can proceed only from the exact synthetic source within the run window', () => {
   const creationManifest = { ...manifest, records: [{ ...manifest.records[0], targetNativeId: null }] };
   const assertWrite = createControlledLiveTestPolicy(creationManifest, 'postgres://localhost/sync_issue60_test');
   const pendingScope = { ...scope, targetNativeId: null };
-  withControlledLiveEventScope(pendingScope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null)));
+  withControlledLiveEventScope(pendingScope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null, 'client:COMPANY')));
   withControlledLiveEventScope({ ...scope, admittedSourceName: 'тест forged LIVE-TEST-20261019T120000Z-a1b2c3' }, () =>
-    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE'), /TARGET_NOT_IN_MANIFEST/));
+    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope({ ...scope, admittedSourceCreatedAt: '2026-10-18T23:59:59Z' }, () =>
-    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE'), /TARGET_NOT_IN_MANIFEST/));
+    assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
 });
 
 test('async event scopes remain isolated when concurrent events overlap', async () => {
@@ -63,12 +63,12 @@ test('async event scopes remain isolated when concurrent events overlap', async 
   const outcomes = await Promise.all([
     withControlledLiveEventScope(scope, async () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
-      assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29');
+      assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY');
       return 'allowed';
     }),
     withControlledLiveEventScope({ ...scope, targetNativeId: 'other' }, async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
-      assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29'), /TARGET_NOT_IN_MANIFEST/);
+      assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/);
       return 'rejected';
     }),
   ]);
@@ -82,9 +82,9 @@ test('the existing provider-write seam blocks missing controlled-test policy and
     setControlledLiveTestWriteCheck(null);
     assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE'), /POLICY_NOT_INITIALIZED/);
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, 'postgres://localhost/sync_issue60_test'));
-    withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'ms-29')));
+    withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'ms-29', 'client:COMPANY')));
     withControlledLiveEventScope({ ...scope, targetNativeId: 'work-record-9' }, () =>
-      assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'work-record-9'), /TARGET_NOT_IN_MANIFEST/));
+      assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'work-record-9', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   } finally {
     setControlledLiveTestWriteCheck(null);
     if (previousMode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE;
@@ -95,7 +95,7 @@ test('the existing provider-write seam blocks missing controlled-test policy and
 test('client source admission, target readback binding and restart scope are durable and exact', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-controlled-'));
   const manifestPath = join(directory, 'manifest.json');
-  const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], entity: 'client:COMPANY', targetNativeId: null }] };
+  const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], targetNativeId: null }] };
   const records = new Map<string, any>();
   const fakeDatabase = {
     controlledTestAdmission: {
@@ -119,13 +119,13 @@ test('client source admission, target readback binding and restart scope are dur
     await admission.runForEvent('evt-1', async () => {
       await admission.admit('evt-1', source);
       enterControlledLiveEventScope(await admission.scopeForEvent('evt-1'));
-      assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE'), /TARGET_NOT_IN_MANIFEST/);
+      assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/);
       await admission.bindCreatedTarget('evt-1', 'ms-29', 'ms-29', source.currentName, new Date('2026-10-19T02:00:00Z'));
-      assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29'));
+      assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'));
     });
     const restartedAdmission = new ControlledLiveTestAdmissionService(fakeDatabase as any);
     await restartedAdmission.admit('evt-2', { entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: 'ms-29', currentNativeId: 'ms-29', currentName: source.currentName, sourceCreatedAt: new Date('2026-10-19T02:00:00Z') });
-    await restartedAdmission.runForEvent('evt-2', async () => assert.doesNotThrow(() => assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE', 'b24-17')));
+    await restartedAdmission.runForEvent('evt-2', async () => assert.doesNotThrow(() => assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY')));
     await assert.rejects(restartedAdmission.admit('evt-wrong-readback', { ...source, currentNativeId: 'different', currentName: source.currentName }), /SOURCE_ID_MISMATCH/);
     await assert.rejects(restartedAdmission.admit('evt-3', { ...source, sourceNativeId: 'shared-real-company', currentNativeId: 'shared-real-company', currentName: source.currentName }), /SOURCE_NOT_ADMITTED/);
   } finally {
@@ -140,7 +140,7 @@ test('client source admission, target readback binding and restart scope are dur
 test('manifest-admitted synthetic client can create, read back, bind, then accept its exact reverse update', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-client-e2e-'));
   const manifestPath = join(directory, 'manifest.json');
-  const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], entity: 'client:COMPANY', targetNativeId: null }] };
+  const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], targetNativeId: null }] };
   const rows = new Map<string, any>();
   const fakeDatabase = { controlledTestAdmission: {
     findMany: async () => [...rows.values()],
@@ -208,7 +208,7 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
     await withControlledLiveEventScope(reverseScope, async () => {
       await fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) });
       await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', { method: 'POST', body: new URLSearchParams({ id: 'shared-real-id' }) }), /TARGET_NOT_IN_MANIFEST/);
-      await assert.rejects(fetch('https://unknown.invalid/anything', { method: 'POST', body: '{}' }), /UNCLASSIFIED_EXTERNAL_MUTATION/);
+      await assert.rejects(fetch('https://unknown.invalid/anything', { method: 'POST', body: '{}' }), /UNCLASSIFIED_EXTERNAL_REQUEST/);
     });
     assert.equal(calls, 1);
   } finally {

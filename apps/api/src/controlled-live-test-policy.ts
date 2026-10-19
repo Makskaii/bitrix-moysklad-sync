@@ -38,7 +38,7 @@ const scopeStorage = new AsyncLocalStorage<ControlledLiveEventScope>();
 export function createControlledLiveTestPolicy(
   manifestValue: unknown,
   databaseUrl: string | undefined,
-): (provider: string, operation: string, nativeId?: string | null) => void {
+): (provider: string, operation: string, nativeId?: string | null, entity?: string) => void {
   const manifest = parseManifest(manifestValue);
   const target = databaseTarget(databaseUrl);
   const actualDatabaseName = target.name;
@@ -47,17 +47,18 @@ export function createControlledLiveTestPolicy(
     throw new Error('CONTROLLED_LIVE_TEST_DATABASE_IS_NOT_DEDICATED');
   }
 
-  return (providerValue, operation, nativeId) => {
+  return (providerValue, operation, nativeId, requestEntity) => {
     const scope = scopeStorage.getStore();
     if (!scope) throw new Error('CONTROLLED_LIVE_TEST_EVENT_SCOPE_REQUIRED');
     if (scope.runId !== manifest.runId) throw new Error('CONTROLLED_LIVE_TEST_RUN_ID_MISMATCH');
     if (!isProvider(providerValue)) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_INVALID');
+    if (!requestEntity || requestEntity !== scope.entity) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
     const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation);
     const allowed = manifest.records.some((record) => record.entity === scope.entity &&
       ((record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
         record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId)) ||
        (record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
-        record.sourceSystem === scope.targetSystem && record.sourceNativeId === scope.targetNativeId)) &&
+        record.sourceSystem === scope.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.targetNativeId))) &&
       scope.targetSystem === providerValue && scope.admittedSourceName === record.name &&
       new Date(scope.admittedSourceCreatedAt).getTime() >= new Date(record.createdAfterUtc).getTime() &&
       (isCreate ? record.sourceSystem === scope.sourceSystem && record.targetNativeId === null && scope.targetNativeId === null && nativeId === null :
