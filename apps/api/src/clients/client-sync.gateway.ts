@@ -37,7 +37,7 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
 
   async updateBitrix(entity: 'COMPANY' | 'CONTACT', id: string, fields: Record<string, unknown>, eventId?: string): Promise<void> {
     if (await this.dryWrites?.propose({ eventId, provider: 'BITRIX24', entityType: entity === 'COMPANY' ? 'company' : 'contact', entityId: id, operation: 'UPDATE', fields })) return;
-    assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE');
+    assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE', id);
     const method = entity === 'COMPANY' ? 'crm.company.update.json' : 'crm.contact.update.json';
     const form = new URLSearchParams({ id });
     for (const [field, value] of Object.entries(fields)) appendFormValue(form, `fields[${field}]`, value);
@@ -47,12 +47,16 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
 
   async updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>, eventId?: string): Promise<void> {
     if (await this.dryWrites?.propose({ eventId, provider: 'MOYSKLAD', entityType: type, entityId: id, operation: 'UPDATE', fields })) return;
-    assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE');
+    assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', id);
     await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'PUT', fields);
   }
 
   private async bitrixRequest(method: string, body: URLSearchParams | Record<string, string>): Promise<unknown> {
-    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CLIENT_REQUEST');
+    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) {
+      const form = body instanceof URLSearchParams ? body : new URLSearchParams(body);
+      const nativeId = /\.add(?:\.json)?$/i.test(method) ? null : form.get('id');
+      assertApplyExternalWrite('BITRIX24', 'CLIENT_REQUEST', nativeId);
+    }
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
     const form = body instanceof URLSearchParams ? body : new URLSearchParams(body);
@@ -67,7 +71,10 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'PUT', body?: Record<string, unknown>): Promise<unknown> {
-    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CLIENT_REQUEST');
+    if (method !== 'GET') {
+      const nativeId = new URL(path, 'https://local.invalid').pathname.match(/\/(?:counterparty|contactpersons)\/([^/]+)$/)?.[1] ?? null;
+      assertApplyExternalWrite('MOYSKLAD', 'CLIENT_REQUEST', nativeId ? decodeURIComponent(nativeId) : null);
+    }
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');

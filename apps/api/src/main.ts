@@ -61,8 +61,9 @@ import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
 import { readFileSync } from 'node:fs';
-import { setControlledLiveTestWriteCheck } from './external-write-guard';
+import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from './external-write-guard';
 import { createControlledLiveTestPolicy } from './controlled-live-test-policy';
+import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
 import { InvoiceHttpApi } from './invoices/invoice-http-api';
 import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 
@@ -92,7 +93,7 @@ class AppController {
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
     { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
-    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, ClientLifecycleService,
+    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ControlledLiveTestAdmissionService, ClientSyncProcessor, ClientLifecycleService,
     { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
@@ -110,6 +111,7 @@ async function bootstrap() {
     }
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown;
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, process.env.DATABASE_URL));
+    installControlledLiveFetchGuard();
   }
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
