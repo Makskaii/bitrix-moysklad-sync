@@ -5,7 +5,7 @@ import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { SyncModeService } from '../sync-mode.service';
 import { ClientRecord, ClientSyncGateway } from './client-sync.gateway';
-import { chooseCandidate, ClientRuntimeResolver, ClientSource, ClientSystem } from './client-runtime-resolver';
+import { chooseCandidate, ClientResolution, ClientRuntimeResolver, ClientSource, ClientSystem } from './client-runtime-resolver';
 import { CLIENT_CANDIDATE_GATEWAY, WritableClientCandidateGateway } from './client-candidate.gateway';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyResolver } from './client-dependency-resolver';
@@ -423,7 +423,10 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       let bitrixSourceRecord: ClientRecord | null = null;
       let moyskladSourceRecord: ClientRecord | null = null;
       if (sourceSystem === 'BITRIX24') {
-        bitrixSourceRecord = await this.gateway.readBitrix(entity, event.externalEntityId);
+        const read = () => this.gateway!.readBitrix(entity, event.externalEntityId!);
+        bitrixSourceRecord = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+          ? await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, event.externalEntityId, `client:${entity}`, read)
+          : await read();
         await this.admitControlledSource(event.id, event, entity, sourceSystem, bitrixSourceRecord);
         if (entity === 'COMPANY' && isMarkedDuplicate(bitrixSourceRecord.UF_CRM_1789126724375)) {
           await this.skipDuplicateEvent(event, 'DUPLICATE_COMPANY_EXCLUDED_FROM_ORDINARY_SYNC', fence);
@@ -441,7 +444,11 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       else {
         const parentId = event.externalEntityType === 'contactperson' ? parentIdFromEvent(event) : null;
         const type = event.externalEntityType === 'contactperson' ? 'contactperson' : 'counterparty';
-        moyskladSourceRecord = await this.gateway.readMoysklad(type, event.externalEntityId, parentId);
+        const sourceEntityHint = type === 'contactperson' ? 'client:CONTACT' : null;
+        const read = () => this.gateway!.readMoysklad(type, event.externalEntityId!, parentId);
+        moyskladSourceRecord = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+          ? await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, event.externalEntityId, sourceEntityHint, read)
+          : await read();
         if (type === 'counterparty' && stringValue(moyskladSourceRecord.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
         await this.admitControlledSource(event.id, event, entity, sourceSystem, moyskladSourceRecord);
       }
@@ -795,7 +802,17 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       phone: firstValue(record.PHONE ?? record.phone), email: firstValue(record.EMAIL ?? record.email),
       companyId: primaryCompanySourceId,
     };
-    const resolution = await new ClientRuntimeResolver(candidateGateway).resolve(source, primaryCompanyTargetId);
+    let resolution: ClientResolution;
+    if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+      const targetSystem: ClientSystem = sourceSystem === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24';
+      if (!this.controlledAdmission) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_SERVICE_UNAVAILABLE');
+      if (primaryCompanyTargetId) throw new Error('CONTROLLED_LIVE_TEST_SHARED_COMPANY_DEPENDENCY_NOT_ALLOWED');
+      await this.controlledAdmission.assertCreateReserved(event.id, `client:${entity}`, targetSystem);
+      resolution = { action: 'CREATE', targetSystem, reason: entity === 'CONTACT' ? 'NO_CONTACT_KEYS' : 'NO_CANDIDATE',
+        targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : entity === 'CONTACT' ? 'contact' : 'company' };
+    } else {
+      resolution = await new ClientRuntimeResolver(candidateGateway).resolve(source, primaryCompanyTargetId);
+    }
     if (resolution.action === 'MANUAL_REVIEW') {
       await this.hold(event, `CLIENT_${resolution.reason}`, { entity, sourceSystem, sourceId, primaryCompanySourceId, candidates: resolution.candidates }, fence);
       return null;
@@ -817,6 +834,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         parentId: primaryCompanyTargetId, source: record, configuredFields, eventId: event.id,
       });
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        this.controlledAdmission.allowTargetReadback(resolution.targetSystem, targetId);
         const readback = await candidateGateway.readRecord(resolution.targetSystem, entity, targetId, contactPairParentId);
         const targetCreatedValue = resolution.targetSystem === 'BITRIX24' ? readback.DATE_CREATE : readback.created;
         const targetCreatedAt = targetCreatedValue instanceof Date ? targetCreatedValue : new Date(String(targetCreatedValue ?? ''));

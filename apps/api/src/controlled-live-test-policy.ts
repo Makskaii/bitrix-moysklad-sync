@@ -27,6 +27,9 @@ export interface ControlledLiveEventScope {
   targetNativeId: string | null;
   admittedSourceName: string;
   admittedSourceCreatedAt: string;
+  phase?: 'SOURCE_READ' | 'ADMITTED';
+  pendingTargetNativeId?: string | null;
+  pendingTargetSystem?: ControlledProvider | null;
 }
 
 const scopeStorage = new AsyncLocalStorage<ControlledLiveEventScope>();
@@ -52,8 +55,21 @@ export function createControlledLiveTestPolicy(
     if (!scope) throw new Error('CONTROLLED_LIVE_TEST_EVENT_SCOPE_REQUIRED');
     if (scope.runId !== manifest.runId) throw new Error('CONTROLLED_LIVE_TEST_RUN_ID_MISMATCH');
     if (!isProvider(providerValue)) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_INVALID');
+    if (operation === 'CONTROLLED_READ') {
+      const entityMatches = requestEntity === scope.entity || (requestEntity === 'client:COUNTERPARTY' && ['client:COMPANY', 'client:CONTACT'].includes(scope.entity));
+      if (!entityMatches || !nativeId) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
+      const directRead = providerValue === scope.sourceSystem && nativeId === scope.sourceNativeId ||
+        providerValue === scope.targetSystem && nativeId === scope.targetNativeId ||
+        providerValue === scope.pendingTargetSystem && nativeId === scope.pendingTargetNativeId;
+      if (!directRead) throw new Error('CONTROLLED_LIVE_TEST_READ_ID_NOT_APPROVED');
+      const sourceAllowed = manifest.records.some((record) => record.entity === scope.entity &&
+        ((record.sourceSystem === providerValue && (record.sourceNativeId === null || record.sourceNativeId === nativeId)) ||
+         (record.targetSystem === providerValue && (record.targetNativeId === null || record.targetNativeId === nativeId))));
+      if (!sourceAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_NOT_IN_MANIFEST');
+      return;
+    }
     if (!requestEntity || requestEntity !== scope.entity) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
-    const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation);
+    const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation) && !/CHILD/i.test(operation);
     const allowed = manifest.records.some((record) => record.entity === scope.entity &&
       ((record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
         record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId)) ||
@@ -87,6 +103,17 @@ export function bindControlledLiveTarget(targetNativeId: string): void {
   const scope = scopeStorage.getStore();
   if (!scope || !targetNativeId) throw new Error('CONTROLLED_LIVE_TEST_SCOPE_REQUIRED_FOR_TARGET_BIND');
   scope.targetNativeId = targetNativeId;
+  scope.pendingTargetNativeId = null;
+  scope.pendingTargetSystem = null;
+}
+
+export function registerControlledTargetReadback(provider: ControlledProvider, targetNativeId: string): void {
+  const scope = scopeStorage.getStore();
+  if (!scope || scope.phase === 'SOURCE_READ' || scope.targetNativeId !== null || !targetNativeId || provider !== scope.targetSystem) {
+    throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_SCOPE_INVALID');
+  }
+  scope.pendingTargetNativeId = targetNativeId;
+  scope.pendingTargetSystem = provider;
 }
 
 function parseManifest(value: unknown): ControlledLiveManifest {

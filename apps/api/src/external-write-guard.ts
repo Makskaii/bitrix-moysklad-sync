@@ -21,6 +21,12 @@ export function assertApplyExternalWrite(provider: string, operation: string, na
   }
 }
 
+export function assertControlledExternalRead(provider: string, nativeId: string | null, entity?: string): void {
+  if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+  if (!controlledWriteCheck) throw new Error('CONTROLLED_LIVE_TEST_POLICY_NOT_INITIALIZED');
+  controlledWriteCheck(provider, 'CONTROLLED_READ', nativeId, entity);
+}
+
 /** Installs the manifest-backed policy. Enabling test mode without this policy fails closed. */
 export function setControlledLiveTestWriteCheck(check: ((provider: string, operation: string, nativeId?: string | null, entity?: string) => void) | null): void {
   controlledWriteCheck = check;
@@ -40,39 +46,56 @@ export function installControlledLiveFetchGuard(): void {
     return { provider, origin: url.origin, prefix: url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/` };
   });
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const request = new Request(input, init);
+    const request = new Request(input, { ...init, redirect: 'error' });
     const method = request.method.toUpperCase();
     const url = new URL(request.url);
     const match = configured.find((entry) => url.origin === entry.origin && url.pathname.startsWith(entry.prefix));
     if (!match) throw new Error('CONTROLLED_LIVE_TEST_UNCLASSIFIED_EXTERNAL_REQUEST');
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-      const relativePath = url.pathname.slice(match.prefix.length);
-      if (match.provider === 'BITRIX24' && isBitrixReadMethod(relativePath)) return originalFetch(input, init);
+    const relativePath = url.pathname.slice(match.prefix.length);
+    if (['GET', 'HEAD', 'OPTIONS'].includes(method) || match.provider === 'BITRIX24' && isBitrixReadMethod(relativePath)) {
+      if (!isUnscopedMetadataRead(match.provider, relativePath)) {
+        const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
+          : typeof init?.body === 'string' ? init.body
+          : await request.clone().text();
+        assertControlledExternalRead(match.provider, extractMutationTarget(match.provider, relativePath, bodyText), mutationEntity(match.provider, relativePath, bodyText));
+      }
+    } else {
       const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
         : typeof init?.body === 'string' ? init.body
-        : input instanceof Request ? await input.clone().text() : '';
+        : await request.clone().text();
       const nativeId = extractMutationTarget(match.provider, relativePath, bodyText);
       const requestEntity = mutationEntity(match.provider, relativePath, bodyText);
       assertApplyExternalWrite(match.provider, mutationOperation(match.provider, method, relativePath), nativeId, requestEntity);
     }
-    return originalFetch(input, { ...init, redirect: 'error' });
+    return originalFetch(request);
   }) as typeof fetch;
 }
 
 function mutationOperation(provider: string, method: string, path: string): string {
   if (provider === 'BITRIX24') {
     const restMethod = path.split('/').pop()?.replace(/\.json$/i, '') ?? '';
-    if (/\.(?:add|create)$/i.test(restMethod)) return 'CONTROLLED_CREATE';
+    if (/\.(?:add|create)$/i.test(restMethod)) {
+      return /^(?:crm\.(?:company|contact|deal|item)\.add|catalog\.product\.add|crm\.product\.add)$/i.test(restMethod)
+        ? 'CONTROLLED_CREATE' : 'CONTROLLED_CHILD_CREATE';
+    }
     return 'CONTROLLED_UPDATE';
   }
   const segments = path.split('/').filter(Boolean);
-  return method === 'POST' && (segments.length === 2 || ['contactpersons', 'positions', 'prices', 'accounts'].includes(segments.at(-1) ?? ''))
-    ? 'CONTROLLED_CREATE' : 'CONTROLLED_UPDATE';
+  if (method === 'POST' && ['contactpersons', 'positions', 'prices', 'accounts', 'attributes'].includes(segments.at(-1) ?? '')) return 'CONTROLLED_CHILD_CREATE';
+  return method === 'POST' && segments.length === 2 ? 'CONTROLLED_CREATE' : 'CONTROLLED_UPDATE';
 }
 
 function isBitrixReadMethod(path: string): boolean {
   const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
   return /\.(?:get|list|fields|types|available|current|count|methods)$/.test(method) || method === 'user.current';
+}
+
+function isUnscopedMetadataRead(provider: string, path: string): boolean {
+  if (provider === 'BITRIX24') {
+    const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
+    return /\.(?:fields|types|available|methods)$/.test(method) || method === 'user.current';
+  }
+  return /^entity\/metadata(?:\/|$)/.test(path);
 }
 
 function mutationEntity(provider: string, path: string, bodyText: string): string | undefined {
@@ -81,19 +104,34 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
     if (method.startsWith('crm.company.')) return 'client:COMPANY';
     if (method.startsWith('crm.contact.')) return 'client:CONTACT';
     if (method.startsWith('crm.deal.') || method.startsWith('crm.item.productrow.')) return 'deal-order';
-    if (method.startsWith('crm.product.') || method.startsWith('catalog.product.') || method.startsWith('catalog.price.')) return 'product';
-    if (method.startsWith('crm.invoice.')) return 'invoice';
+    if (method.startsWith('crm.product.') || method.startsWith('catalog.product.') || method.startsWith('catalog.price.')) return 'catalog-product';
+    if (method.startsWith('crm.invoice.') || method.startsWith('crm.item.')) {
+      const form = new URLSearchParams(bodyText);
+      return form.get('entityTypeId') === '31' || form.get('fields[entityTypeId]') === '31' ? 'invoice' : undefined;
+    }
+    if (method.startsWith('crm.requisite.') || method.startsWith('crm.timeline.comment.')) {
+      const form = new URLSearchParams(bodyText);
+      const entityType = form.get('ENTITY_TYPE_ID') ?? form.get('fields[ENTITY_TYPE_ID]') ?? form.get('filter[ENTITY_TYPE_ID]') ?? form.get('fields[ENTITY_TYPE]') ?? '';
+      if (/^(?:4|COMPANY)$/i.test(entityType)) return 'client:COMPANY';
+      if (/^(?:3|CONTACT)$/i.test(entityType)) return 'client:CONTACT';
+      if (/^DEAL$/i.test(entityType)) return 'deal-order';
+      if (/^PRODUCT$/i.test(entityType)) return 'catalog-product';
+      if (/^INVOICE$/i.test(entityType)) return 'invoice';
+      return undefined;
+    }
     return undefined;
   }
   const segments = path.split('/').filter(Boolean);
   if (segments[0] !== 'entity') return undefined;
   if (segments[1] === 'counterparty') {
+    if (!segments.includes('contactpersons') && !/"companyType"\s*:\s*"individual"/.test(bodyText)) return 'client:COUNTERPARTY';
     if (segments.includes('contactpersons') || /(?:^|&)companyType=individual(?:&|$)/.test(bodyText)) return 'client:CONTACT';
     return 'client:COMPANY';
   }
   if (segments[1] === 'customerorder') return 'deal-order';
   if (segments[1] === 'invoiceout') return 'invoice';
-  if (segments[1] === 'product' || segments[1] === 'service') return 'product';
+  if (segments[1] === 'product') return 'catalog-product';
+  if (segments[1] === 'service') return 'catalog-service';
   return undefined;
 }
 
@@ -110,7 +148,7 @@ function extractMutationTarget(provider: string, path: string, bodyText: string)
   const form = new URLSearchParams(bodyText);
   const method = path.split('/').pop()?.replace(/\.json$/i, '') ?? '';
   if (/\.(?:add|create)$/i.test(method)) return null;
-  for (const key of ['id', 'fields[ENTITY_ID]', 'entityId', 'ownerId', 'fields[ownerId]', 'productId', 'fields[productId]', 'catalogProductId']) {
+  for (const key of ['id', 'fields[ENTITY_ID]', 'filter[ENTITY_ID]', 'ENTITY_ID', 'entityId', 'ownerId', 'fields[ownerId]', 'productId', 'fields[productId]', 'catalogProductId']) {
     const value = form.get(key);
     if (value) return value;
   }

@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createControlledLiveTestPolicy, enterControlledLiveEventScope, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
-import { assertApplyExternalWrite, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
+import { assertApplyExternalWrite, assertControlledExternalRead, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
 import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
@@ -56,6 +56,30 @@ test('manifest-reserved creation can proceed only from the exact synthetic sourc
     assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope({ ...scope, admittedSourceCreatedAt: '2026-10-18T23:59:59Z' }, () =>
     assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_CREATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
+});
+
+test('pre-admission reads and create readback are exact-ID scoped; shared record reads are refused', () => {
+  const assertWrite = createControlledLiveTestPolicy(manifest, 'postgres://localhost/sync_issue60_test');
+  const previousMode = process.env.CONTROLLED_LIVE_TEST_MODE;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  setControlledLiveTestWriteCheck(assertWrite);
+  try {
+    const sourceReadScope = { ...scope, phase: 'SOURCE_READ' as const, targetNativeId: null, admittedSourceName: '', admittedSourceCreatedAt: '2026-10-19T00:00:00Z' };
+    withControlledLiveEventScope(sourceReadScope, () => {
+      assert.doesNotThrow(() => assertControlledExternalRead('BITRIX24', 'b24-17', 'client:COMPANY'));
+      assert.throws(() => assertControlledExternalRead('BITRIX24', 'shared-real-id', 'client:COMPANY'), /READ_ID_NOT_APPROVED/);
+    });
+    const createScope = { ...scope, targetNativeId: null };
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], targetNativeId: null }] }, 'postgres://localhost/sync_issue60_test'));
+    withControlledLiveEventScope(createScope, () => {
+      registerControlledTargetReadback('MOYSKLAD', 'ms-new-29');
+      assert.doesNotThrow(() => assertControlledExternalRead('MOYSKLAD', 'ms-new-29', 'client:COMPANY'));
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', 'ms-other-30', 'client:COMPANY'), /READ_ID_NOT_APPROVED/);
+    });
+  } finally {
+    setControlledLiveTestWriteCheck(null);
+    if (previousMode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE; else process.env.CONTROLLED_LIVE_TEST_MODE = previousMode;
+  }
 });
 
 test('async event scopes remain isolated when concurrent events overlap', async () => {
@@ -208,9 +232,20 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
     await withControlledLiveEventScope(reverseScope, async () => {
       await fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) });
       await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', { method: 'POST', body: new URLSearchParams({ id: 'shared-real-id' }) }), /TARGET_NOT_IN_MANIFEST/);
+      await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.contact.update.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) }), /ENTITY_MISMATCH/);
+      const request = new Request('https://guarded-bitrix.invalid/rest/crm.company.update.json', {
+        method: 'POST', body: new URLSearchParams({ id: 'b24-17' }),
+      });
+      await fetch(request);
+      await fetch('https://guarded-bitrix.invalid/rest/crm.company.get.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) });
+      await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.company.get.json', { method: 'POST', body: new URLSearchParams({ id: 'shared-real-id' }) }), /READ_ID_NOT_APPROVED/);
+      await fetch('https://guarded-bitrix.invalid/rest/crm.company.fields.json', { method: 'POST' });
+      await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', {
+        method: 'POST', body: new FormData(),
+      }), /TARGET_NOT_IN_MANIFEST/);
       await assert.rejects(fetch('https://unknown.invalid/anything', { method: 'POST', body: '{}' }), /UNCLASSIFIED_EXTERNAL_REQUEST/);
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 4);
   } finally {
     globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
-import { bindControlledLiveTarget, ControlledLiveEventScope, createControlledLiveTestPolicy, enterControlledLiveEventScope, withControlledLiveEventScope } from './controlled-live-test-policy';
+import { bindControlledLiveTarget, ControlledLiveEventScope, createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from './controlled-live-test-policy';
 import { setControlledLiveTestWriteCheck } from './external-write-guard';
 
 export interface VerifiedControlledSource {
@@ -99,11 +99,41 @@ export class ControlledLiveTestAdmissionService {
     }
   }
 
+  async assertCreateReserved(eventId: string, entity: string, targetSystem: 'BITRIX24' | 'MOYSKLAD'): Promise<void> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+    const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === entity && candidate.name === admission.sourceName &&
+      candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) &&
+      candidate.targetSystem === targetSystem && candidate.targetNativeId === null);
+    if (!admission || !record || admission.targetNativeId !== null || admission.targetSystem !== targetSystem || admission.entity !== entity) {
+      throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
+    }
+  }
+
   async runForEvent<T>(eventId: string, action: () => Promise<T>): Promise<T> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     if (!admission) return action();
     return withControlledLiveEventScope(this.scope(eventId, admission), action);
+  }
+
+  async withCurrentSourceRead<T>(eventId: string, sourceSystem: 'BITRIX24' | 'MOYSKLAD', sourceNativeId: string, entityHint: string | null, action: () => Promise<T>): Promise<T> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    const candidates = this.manifest.records.filter((record: any) => {
+      if (entityHint && record.entity !== entityHint) return false;
+      return record.syntheticOnly === true && (
+        record.sourceSystem === sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === sourceNativeId) ||
+        record.targetSystem === sourceSystem && (record.targetNativeId === null || record.targetNativeId === sourceNativeId));
+    });
+    if (candidates.length !== 1) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_READ_NOT_UNIQUELY_MANIFESTED');
+    const record = candidates[0];
+    const reversed = record.sourceSystem !== sourceSystem;
+    const scope: ControlledLiveEventScope = {
+      eventId, runId: this.manifest.runId, entity: record.entity, sourceSystem, sourceNativeId,
+      targetSystem: (reversed ? record.sourceSystem : record.targetSystem) as ControlledLiveEventScope['targetSystem'],
+      targetNativeId: null, admittedSourceName: '', admittedSourceCreatedAt: record.createdAfterUtc, phase: 'SOURCE_READ',
+    };
+    return withControlledLiveEventScope(scope, action);
   }
 
   private enterScope(admission: any): void {
@@ -121,6 +151,11 @@ export class ControlledLiveTestAdmissionService {
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     if (!admission) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_REQUIRED');
     return this.scope(eventId, admission);
+  }
+
+  allowTargetReadback(provider: 'BITRIX24' | 'MOYSKLAD', nativeId: string): void {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+    registerControlledTargetReadback(provider, nativeId);
   }
 
   private scope(eventId: string, admission: any): ControlledLiveEventScope {
