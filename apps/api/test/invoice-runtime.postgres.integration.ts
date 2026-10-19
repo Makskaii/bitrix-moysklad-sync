@@ -32,6 +32,7 @@ let invoiceCounter = 5000;
 let failNextInvoiceCreate = false;
 let reparentOnNextMoyskladWrite = false;
 let moyskladWrites = 0;
+let processorStarted = false;
 const bitrixInvoices = new Map<string, InvoiceRecord>();
 const moyskladInvoices = new Map<string, InvoiceRecord>();
 const deals = new Map<string, InvoiceRecord>();
@@ -72,6 +73,7 @@ before(async () => {
 });
 
 after(async () => {
+  if (processorStarted) await processor.onModuleDestroy();
   await db.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
   await db.pairReviewCase.deleteMany({ where: { id: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
   await db.entityPair.deleteMany({ where: { id: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
@@ -121,19 +123,30 @@ test('invoice processor creates one independently paired invoiceout, then update
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
 });
 
-test('invoice worker defers a new linked deal until its exact deal/order pair exists, then resumes', async () => {
+test('invoice worker durably defers before the deal/order pair exists, then automatically resumes against that exact order', async () => {
   const nextDeal = `${Date.now()}91`;
   const nextOrder = randomUUID();
   deals.set(nextDeal, { ID: nextDeal, DATE_CREATE: createdAfterBoundary });
   orders.set(nextOrder, { id: nextOrder, meta: { type: 'customerorder' }, created: createdAfterBoundary });
   const sourceId = String(++invoiceCounter);
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice Beta', parentId2: Number(nextDeal), createdTime: createdAfterBoundary });
+  const writesBeforeInvoiceEvent = moyskladWrites;
   const event = await createEvent(`wait-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
   assert.equal((await processor.process(event.id))?.status, 'WAITING_FOR_ORDER');
+  const waiting = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(waiting.status, 'WAITING_FOR_ORDER');
+  assert.equal(waiting.lastErrorCategory, 'INVOICE_LINKED_ORDER_PAIR_PENDING');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 0);
+  const writesBeforeOrderPair = moyskladWrites;
+  assert.equal(writesBeforeOrderPair, writesBeforeInvoiceEvent, 'the waiting invoice must not create an invoiceout or bypass the order-pair gate');
   await db.entityPair.create({ data: { id: `invoice55-${suffix}-deal-${nextDeal}`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
-  assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
+  processorStarted = true;
+  processor.onApplicationBootstrap();
+  await waitForEventStatus(event.id, 'SUCCEEDED');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId, moyskladParentId: nextOrder } }), 1);
+  const invoicePair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+  assert.equal((moyskladInvoices.get(invoicePair.moyskladId)?.customerOrder as any)?.meta?.href, `${base}api/remap/1.2/entity/customerorder/${nextOrder}`);
+  assert.equal(moyskladWrites, writesBeforeOrderPair + 1, 'automatic resume creates exactly one invoice linked to the paired order');
 });
 
 test('MySklad invoiceout creates a linked smart invoice, and multiple invoices on one order stay independent', async () => {
@@ -170,6 +183,36 @@ test('invoice field conflicts use the configured MySklad-wins baseline policy an
   const tombstoneEvent = await createEvent(`tombstone-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
   assert.equal((await processor.process(tombstoneEvent.id))?.status, 'MANUAL_REVIEW');
   assert.equal(moyskladWrites, beforeTombstone);
+});
+
+test('invoice processor applies every configured field rule in each enabled direction', async () => {
+  activeFieldConfig = { rules: [...fieldConfig.rules, {
+    id: 'invoice-description', entity: 'smart-invoices', sourceField: 'description', targetField: 'description',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }], groups: [] };
+  try {
+    const sourceId = String(++invoiceCounter);
+    bitrixInvoices.set(sourceId, { id: sourceId, title: 'Configured title', description: 'Initial note', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    const create = await createEvent(`configured-fields-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+    assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    const moysklad = moyskladInvoices.get(pair.moyskladId)!;
+    assert.equal(moysklad.name, 'Configured title');
+    assert.equal(moysklad.description, 'Initial note');
+
+    bitrixInvoices.get(sourceId)!.description = 'Updated in Bitrix';
+    const bitrixUpdate = await createEvent(`configured-fields-b24-update-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(bitrixUpdate.id))?.status, 'SUCCEEDED');
+    assert.equal(moysklad.description, 'Updated in Bitrix');
+
+    moysklad.description = 'Updated in MySklad';
+    const moyskladUpdate = await createEvent(`configured-fields-ms-update-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
+    assert.equal((await processor.process(moyskladUpdate.id))?.status, 'SUCCEEDED');
+    assert.equal(bitrixInvoices.get(sourceId)?.description, 'Updated in MySklad');
+  } finally {
+    activeFieldConfig = fieldConfig;
+  }
 });
 
 test('MySklad invoices with missing/ambiguous order or historical order never create a smart invoice', async () => {
@@ -328,7 +371,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     if (method === 'crm.item.add.json') {
       const id = String(++invoiceCounter);
-      const item = { id, title: form.get('fields[title]') ?? '', parentId2: Number(form.get('fields[parentId2]')),
+      const item = { id, title: form.get('fields[title]') ?? '', description: form.get('fields[description]') ?? '', parentId2: Number(form.get('fields[parentId2]')),
         originatorId: form.get('fields[originatorId]'), originId: form.get('fields[originId]'), createdTime: createdAfterBoundary };
       bitrixInvoices.set(id, item);
       return send(response, { result: { item: { id } } });
@@ -340,7 +383,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     if (method === 'crm.item.update.json') {
       const item = bitrixInvoices.get(form.get('id') ?? '');
-      if (item) { const title = form.get('fields[title]'); if (title !== null) item.title = title; }
+      if (item) {
+        const title = form.get('fields[title]'); if (title !== null) item.title = title;
+        const description = form.get('fields[description]'); if (description !== null) item.description = description;
+      }
       return send(response, { result: { item } });
     }
   }
@@ -386,4 +432,16 @@ function send(response: ServerResponse, value: unknown, status = 200) {
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name]; else process.env[name] = value;
+}
+
+async function waitForEventStatus(eventId: string, expected: string) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const event = await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+    if (event.status === expected) return event;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const event = await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+  assert.equal(event.status, expected, `expected invoice event ${eventId} to reach ${expected}`);
+  return event;
 }
