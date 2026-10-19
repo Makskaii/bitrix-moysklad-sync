@@ -616,6 +616,76 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
   }
 });
 
+test('nightly rechecks accepted events only for an enabled scope with an active exact-ID pair', async () => {
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const activeId = `accepted-contact-${suffix}`;
+  const inactiveId = `inactive-contact-${suffix}`;
+  const directionSkippedId = `skipped-contact-${suffix}`;
+  const unreadyProductId = `accepted-product-${suffix}`;
+  const activePair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: activeId, moyskladId: `accepted-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  const inactivePair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: inactiveId, moyskladId: `inactive-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: false,
+  } });
+  const skippedPair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: directionSkippedId, moyskladId: `skipped-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  const productPair = await database.entityPair.create({ data: {
+    entityType: 'PRODUCT', bitrix24Id: unreadyProductId, moyskladId: `accepted-product-ms-${suffix}`,
+    moyskladType: 'product', active: true,
+  } });
+  await database.syncDirectionSetting.upsert({
+    where: { entityKey: 'contacts-companies' },
+    create: { entityKey: 'contacts-companies', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+  });
+  const acceptedAt = new Date('2026-10-18T23:00:00.000Z');
+  const originalEvents = await database.inboundEvent.createMany({ data: [activeId, inactiveId].map((id) => ({
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${id}`, eventType: 'ONCRMCONTACTUPDATE',
+    externalEntityType: 'contact', externalEntityId: id, payload: { event: 'ONCRMCONTACTUPDATE' },
+    status: 'SUCCEEDED', receivedAt: acceptedAt,
+  })) .concat([{
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${directionSkippedId}`, eventType: 'ONCRMCONTACTUPDATE',
+    externalEntityType: 'contact', externalEntityId: directionSkippedId, payload: { event: 'ONCRMCONTACTUPDATE' },
+    status: 'SKIPPED_DIRECTION_DISABLED', receivedAt: acceptedAt,
+  }, {
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${unreadyProductId}`, eventType: 'CATALOG.PRODUCT.ON.UPDATE',
+    externalEntityType: 'product', externalEntityId: unreadyProductId, payload: { event: 'CATALOG.PRODUCT.ON.UPDATE' },
+    status: 'SUCCEEDED', receivedAt: acceptedAt,
+  }]) });
+  assert.equal(originalEvents.count, 4);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+    nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending', nightlyRetryAfter: null,
+  } });
+  nightlyBitrixCompanyIds = [];
+  nightlyBitrixSecondPageIds = [];
+  nightlyMoyskladMetaSize = 0;
+  try {
+    freezeTime('2026-10-18T22:00:00.000Z');
+    await waitForNightlyStatus('awaiting_processing');
+    const rechecks = await database.inboundEvent.findMany({
+      where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } },
+      select: { externalEntityId: true, eventType: true, status: true, payload: true },
+    });
+    assert.deepEqual(rechecks.map((event) => event.externalEntityId), [activeId]);
+    assert.equal(rechecks[0]?.eventType, 'ONCRMCONTACTUPDATE');
+    assert.equal(rechecks[0]?.status, 'RECEIVED');
+    assert.equal((rechecks[0]?.payload as { recovery?: string }).recovery, 'nightly');
+  } finally {
+    restoreTime();
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `accepted-recheck:` } } });
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } } });
+    await database.entityPair.deleteMany({ where: { id: { in: [activePair.id, inactivePair.id, skippedPair.id, productPair.id] } } });
+  }
+});
+
 test('nightly schedule is skipped while Off', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
