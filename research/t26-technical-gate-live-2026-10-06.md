@@ -1,4 +1,6 @@
-# T26 live technical gate — 2026-10-06
+# T26 live technical gate — 2026-10-06 (decision update 2026-10-08)
+
+Owner clarification dated 2026-10-08: product cards and their catalog prices may be created/updated only MySklad → Bitrix24. No Bitrix24 event may create/update a MySklad product or catalog price, including while resolving an order dependency. If the required MySklad product is absent, record why exchange cannot proceed. This applies to catalog cards/prices; order-row quantity and price remain governed separately by deal/order rules. This policy does not change the GET-only observations or prove implementation.
 
 This supplement records a bounded, read-only live check for the field-mapping gate. It does not replace the product decisions recorded in the accepted Q26.58–61 review, and it does not claim a complete approved runtime map.
 
@@ -14,22 +16,22 @@ This is a point-in-time observation of the accessible account schema and referen
 
 Bitrix24 returned 12 measures. IDs and API codes were:
 
-| B24 ID | Code | MySklad exact-code candidate UUID |
-| ---: | ---: | --- |
-| 1 | 6 | — |
-| 3 | 112 | `250d5161-f815-4524-85b6-fd6afebc1ad6` |
-| 5 | 163 | `8e2eb543-99e9-4077-bc31-93b1359de9c4` |
-| 7 | 166 | `2ec1170c-3f69-4409-87bb-c68e0011b275` |
-| 9 | 796 | `19f1edc0-fc42-4001-94cb-c9ec9c62ec10` |
-| 10 | 778 | `605a1781-b652-11e3-feb0-002590a28eca` |
-| 12 | 839 | `f5611dc2-1acd-11e7-7a31-d0fd001085d2` |
-| 14 | 1720010507 | — |
-| 16 | 1720532980 | — |
-| 18 | 55 | — |
-| 20 | 1762891510 | — |
-| 22 | 736 | `647775b2-3b57-409b-910e-8b17940b279f` |
+| B24 ID | Code | B24 label/symbol | MySklad code | MySklad UUID | Owner decision |
+| ---: | ---: | --- | ---: | --- | --- |
+| 1 | 6 | `m` | 006 | `dfe54549-ec98-4fd7-ad1b-215162a9199a` | Approved Q26.63 |
+| 3 | 112 | `l` | 112 | `250d5161-f815-4524-85b6-fd6afebc1ad6` | Approved Q26.62 exact-code |
+| 5 | 163 | `g` | 163 | `8e2eb543-99e9-4077-bc31-93b1359de9c4` | Approved Q26.62 exact-code |
+| 7 | 166 | `kg` | 166 | `2ec1170c-3f69-4409-87bb-c68e0011b275` | Approved Q26.62 exact-code |
+| 9 | 796 | `pc. 1` | 796 | `19f1edc0-fc42-4001-94cb-c9ec9c62ec10` | Approved Q26.62 exact-code |
+| 10 | 778 | упак. | 778 | `605a1781-b652-11e3-feb0-002590a28eca` | Approved Q26.62 exact-code |
+| 12 | 839 | компл. | 839 | `f5611dc2-1acd-11e7-7a31-d0fd001085d2` | Approved Q26.62 exact-code |
+| 14 | 1720010507 | шт. | — | — | Intentionally unmapped Q26.63 |
+| 16 | 1720532980 | к-т | — | — | Intentionally unmapped Q26.63 |
+| 18 | 55 | м2 | 055 | `7cfd013f-33d0-448a-a4aa-1c8bb2e05417` | Approved Q26.63 |
+| 20 | 1762891510 | км | — | — | Intentionally unmapped Q26.63 |
+| 22 | 736 | Рулон | 736 | `647775b2-3b57-409b-910e-8b17940b279f` | Approved Q26.62 exact-code |
 
-MySklad returned 66 UOM references. Seven B24 rows have a unique exact-code candidate among them; these are candidates, not approved mappings. Five B24 codes had no exact match. Similar labels or zero-padded codes (for example `6`/`006`, `55`/`055`) are not sufficient evidence to map. The owner-approved Q26.53 workflow permits admin UI automatic matching plus manual persisted assignment, but it does not authorize guessing, creating missing units, or inventing pack factors. Product `uom` and document-row `pack` are separate concepts; row-level UOM mapping remains unverified.
+MySklad returned 66 UOM references. Q26.62 owner-approved the seven unique exact-code pairs; Q26.63 separately approved B24 code `6` ↔ MySklad `006` and B24 `55` ↔ `055`, and intentionally left B24 measure IDs `14`, `16`, and `20` unmapped. The 9 pairs are approved map inputs, not proof that a service has persisted them or can use them in production. Similar labels alone do not create any other mapping. Q26.53 allows an admin UI to suggest matches and manually assign/reassign pairs, but does not authorize creating units or inventing pack factors. Product `uom` and document-row `pack` are separate concepts; row-level pack mapping remains unverified.
 
 The documented B24 product update schema has a writable `measure` reference field, and B24 exposes measure list/get/add/update/delete methods ([product update](https://apidocs.bitrix24.com/api-reference/catalog/product/catalog-product-update.html), [measure methods](https://apidocs.bitrix24.com/api-reference/catalog/measure/index.html)). MySklad's official Product/Uom models document the product UOM reference ([Product](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/Product.md), [Uom](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/Uom.md)). This documents the shape, not successful writes in this account.
 
@@ -52,7 +54,19 @@ Bitrix24 returned 11 price-type IDs: `2`, `4`, `6`, `8`, `10`, `12`, `14`, `16`,
 | `138eeb4d-82c0-11ed-0a80-0ffb0028e290` | РРЦ |
 | `a88d2683-3e1f-11f1-0a80-185000073e51` | Минимальная цена Ozon |
 
-The two lists establish actual catalogue IDs, not configured B24↔MySklad correspondence. No current mapping table was exposed by these APIs; the previously used HTMLStudio URL was unavailable (parked page), so no configured pairs are verified here. Do not infer pairs by name, ordering, or position. Currency is carried by price records; the price-type list does not establish each record's currency.
+The two live lists establish actual catalogue IDs. The APIs did not expose a current saved cross-system mapping table, and the earlier HTMLStudio URL was unavailable (parked page). The owner subsequently approved the following explicit map under Q26.64; it is a product decision for future configuration, not an observed saved mapping:
+
+| B24 ID | B24 code | MySklad UUID | MySklad label |
+| ---: | --- | --- | --- |
+| 2 | `BASE` | `02b04e92-d515-11e2-e753-7054d21a8d1e` | Розница |
+| 4 | `opt` | `f2ead8ce-de34-11e5-7a69-8f550015ae90` | Опт |
+| 6 | `vip` | `78a9ffa3-0712-11e6-7a69-8f5500119e54` | VIP |
+| 8 | `dil` | `1b4623d2-2857-11eb-0a80-044e00021305` | Дилер |
+| 12 | `ozon` | `5c8a8396-b503-11ee-0a80-0d3e00059f64` | Ozon |
+| 14 | `mdo` | `61161db9-7f0b-11ee-0a80-0b350015853e` | М. До скидки |
+| 16 | `rrc` | `138eeb4d-82c0-11ed-0a80-0ffb0028e290` | РРЦ |
+
+Under Q26.65, B24 price types `10 mark`, `18 ali`, `20 MIN`, and `22 ZAKUP` are excluded until explicitly configured; preserve their values. Preserve MySklad price types without an approved pair as well: ВБ (`181fccd0-7736-11ed-0a80-080900027768`), ВБ ВентМаркет (`47e91e27-ad13-11f1-0a80-144700177791`), Ozon ВентМаркет (`7c45db73-7b9e-11f1-0a80-182500121f3e`), ЯМ (`e4a858d7-e190-11f0-0a80-1059000f9c17`), and Минимальная цена Ozon (`a88d2683-3e1f-11f1-0a80-185000073e51`). Do not infer any pair by name, ordering, or position. These are catalog-card price types only; order-row prices remain separate. Currency is carried by price records; the price-type list does not establish each record's currency.
 
 Official docs describe B24 price-type and price APIs ([price types](https://apidocs.bitrix24.com/api-reference/catalog/price-type/index.html), [prices](https://apidocs.bitrix24.com/api-reference/catalog/price/index.html)). MySklad documents the product sale-price collection and the configured price-type directory ([Product](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/Product.md), [PriceType API](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/PriceTypesApi.md), [PriceType](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/PriceType.md), [SalePrice](https://github.com/moysklad/remap-1.2-java-sdk/blob/master/docs/SalePrice.md)). Documentation supports a writable shape; it does not prove which paired IDs the former integration used or account permissions.
 
@@ -107,9 +121,10 @@ MySklad's API describes custom-entity references in metadata and supports entity
 
 This evidence supports a scoped static schema/identifier map for the two named dictionaries and the currently observed UOM and price-type catalogs. It does **not** satisfy a claim that every field in #26 has a verified mapping or is successfully writable. In particular:
 
-- UOM: 7 exact-code candidates; 5 unmatched; owner confirmation/manual mapping is still required, and document-row `pack` mapping is open.
-- Prices: catalogue IDs are known but actual configured B24↔MySklad price-type pairs are not evidenced; require a readable current settings source or owner-confirmed ID pairs.
+- UOM: 9 pairs are owner-approved configuration inputs (seven exact-code plus two explicitly confirmed zero-padded codes); B24 measure IDs `14`, `16`, and `20` remain intentionally unmapped. Persisting/using these pairs is not verified; document-row `pack` remains open.
+- Prices: seven catalog price-type pairs are owner-approved configuration inputs, now with MySklad → Bitrix24-only direction per the 2026-10-08 owner update. Four B24 types are excluded until explicit future configuration; five additional MySklad types remain unpaired and preserved. No API-exposed saved settings table or runtime pair persistence was verified.
+- Product cards: the 2026-10-08 policy prohibits B24-origin creation/update in MySklad, including order-dependency resolution. It does not constrain order-row quantity/price sync. Runtime enforcement remains unverified.
 - Writes: documentation supports reference-field update shapes, but account permissions and production roundtrip remain unverified and intentionally untested.
 - Dictionary values: ID coverage is complete for the current 46/46 and 5/5 lists; archival/active state, semantic labels, and write success are not established.
 
-Therefore do not mark #26 fully complete or close it based on this check alone. A truthful completion claim is limited to the live schema/catalogue inventory and current ID coverage above. Preserve accepted Q26.58–61 as product decisions, not evidence of implementation or runtime success. No downstream #10/#15/#16 work is part of this artifact.
+Therefore do not mark #26 fully complete or close it based on this check alone. A truthful completion claim is limited to the live schema/catalogue inventory, owner-approved catalog map inputs/directions, and current ID coverage above. Preserve Q26.58–65 and the 2026-10-08 clarification as product decisions, not evidence of implementation or runtime success. The approved map is an input for #10; row-ID/update proof and per-order readiness remain downstream #16 gates. No production write or roundtrip was attempted.
