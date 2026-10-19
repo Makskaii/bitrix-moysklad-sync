@@ -33,6 +33,7 @@ class FakeApi implements ProductCardApi {
   moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }]);
   writes: Array<{ side: string; fields: string }> = [];
   ambiguousBitrixUpdate = false;
+  ambiguousBitrixPriceUpdate = false;
   async readBitrix24() { return structuredClone(this.bitrix24); }
   async readMoysklad() { return structuredClone(this.moysklad); }
   async updateBitrix24(_id: string, fields: Record<string, unknown>) {
@@ -50,6 +51,10 @@ class FakeApi implements ProductCardApi {
     this.writes.push({ side: 'BITRIX24', fields: `price:${priceId}` });
     const price = this.bitrix24.prices.find((item) => item.priceId === priceId)!;
     price.value = value;
+    if (this.ambiguousBitrixPriceUpdate) {
+      this.ambiguousBitrixPriceUpdate = false;
+      throw new ProviderFailure('BITRIX24', null);
+    }
   }
   async updateMoysklad(_id: string, fields: Record<string, unknown>) {
     this.writes.push({ side: 'MOYSKLAD', fields: Object.keys(fields).join(',') });
@@ -155,14 +160,16 @@ test('configured writable catalog code updates Bitrix24 from MySklad without ena
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
 });
 
-test('service price changes are held for manual review until Bitrix24 service-price write semantics are confirmed', async () => {
+test('configured service price changes update Bitrix24 and an applied write with lost response is read back, not repeated', async () => {
   const api = new FakeApi();
   const servicePair = { ...pair, moyskladType: 'service' };
   const sync = new ProductCardSyncService(api, new MemoryState());
   await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
   api.moysklad.prices[0]!.value = 11;
+  api.ambiguousBitrixPriceUpdate = true;
   const result = await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
-  assert.deepEqual(result, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_SERVICE_PRICE_WRITE_UNCONFIRMED', changedFields: [] });
-  assert.equal(api.bitrix24.prices[0]!.value, 10);
-  assert.ok(api.writes.every((write) => !write.fields.startsWith('price:')));
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.prices[0]!.value, 11);
+  assert.equal(api.writes.filter((write) => write.fields.startsWith('price:')).length, 1);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
 });

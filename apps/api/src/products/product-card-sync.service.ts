@@ -127,12 +127,8 @@ export class ProductCardSyncService {
       return review(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_FIELD_UNAVAILABLE');
     }
     try {
-      if (pair.moyskladType === 'service' && moysklad.prices.some((price) => settings.references.priceTypes.some((mapping) => record(mapping) && mapping.status === 'configured' && String(mapping.moyskladId) === price.typeId))) {
-        optionalReasons.push('PRODUCT_SERVICE_PRICE_WRITE_UNCONFIRMED');
-      } else {
-        priceDirections = choosePrices(bitrix24.prices, moysklad.prices,
-          previous.bitrix24Values.prices, previous.moyskladValues.prices, settings.references.priceTypes);
-      }
+      priceDirections = choosePrices(bitrix24.prices, moysklad.prices,
+        previous.bitrix24Values.prices, previous.moyskladValues.prices, settings.references.priceTypes);
     } catch (error) {
       optionalReasons.push(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_PRICE_FIELD_UNAVAILABLE');
     }
