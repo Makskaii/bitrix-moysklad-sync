@@ -77,7 +77,7 @@ test('product API adapter reads only addressed cards and issues partial field an
   assert.equal(await api.readBitrix24PriceProductId('51'), '101');
   const b24 = await api.readBitrix24('101');
   assert.deepEqual(b24, {
-    name: 'Starter', code: 'S-1', detailText: 'HTML detail', unitId: '3', fields: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' }, prices: [{ priceId: '51', typeId: '2', value: 12.5, currency: 'RUB' }], updatedAt: '2026-10-07T10:00:00Z',
+    name: 'Starter', code: 'S-1', detailText: 'HTML detail', unitId: '3', fields: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' }, prices: [{ priceId: '51', typeId: '2', value: 12.5, currency: 'RUB' }], updatedAt: '2026-10-07T10:00:00Z', createdAt: null,
   });
   const ms = await api.readMoysklad(productId);
   assert.equal(ms.unitId, 'abcdefab-cdef-abcd-efab-cdefabcdefab');
