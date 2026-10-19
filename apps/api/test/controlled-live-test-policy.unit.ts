@@ -103,6 +103,35 @@ test('pre-admission reads and create readback are exact-ID scoped; shared record
   }
 });
 
+test('deferred invoice recovery reads require the exact admitted cross-system source ID and run boundary', () => {
+  const invoiceName = `тест ${manifest.runId} invoice`;
+  const invoiceManifest = { ...manifest, records: [{ entity: 'invoice', direction: 'BITRIX24_TO_MOYSKLAD', name: invoiceName,
+    syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: '123456789', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-invoice-1',
+    createdAfterUtc: '2026-10-19T00:00:00Z' }] };
+  const assertWrite = createControlledLiveTestPolicy(invoiceManifest, testDatabaseUrl);
+  const recoveryScope = { ...scope, runId: invoiceManifest.runId, entity: 'invoice', sourceSystem: 'BITRIX24' as const,
+    sourceNativeId: '123456789', targetSystem: 'MOYSKLAD' as const, targetNativeId: 'ms-invoice-1',
+    admittedSourceName: invoiceName, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' };
+  const previousMode = process.env.CONTROLLED_LIVE_TEST_MODE;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  setControlledLiveTestWriteCheck(assertWrite);
+  try {
+    withControlledLiveEventScope(recoveryScope, () => {
+      assert.doesNotThrow(() => assertControlledExternalRead('MOYSKLAD', '123456789', 'invoice', 'CONTROLLED_RECOVERY_READ'));
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', '123456780', 'invoice', 'CONTROLLED_RECOVERY_READ'), /RECOVERY_READ_SCOPE_INVALID/);
+      assert.throws(() => assertControlledExternalRead('BITRIX24', '123456789', 'invoice', 'CONTROLLED_RECOVERY_READ'), /RECOVERY_READ_SCOPE_INVALID/);
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', '123456789', 'deal-order', 'CONTROLLED_RECOVERY_READ'), /RECOVERY_READ_SCOPE_INVALID/);
+    });
+    withControlledLiveEventScope({ ...recoveryScope, admittedSourceCreatedAt: '2026-10-18T23:59:59Z' }, () =>
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', '123456789', 'invoice', 'CONTROLLED_RECOVERY_READ'), /RECOVERY_READ_SCOPE_INVALID/));
+    withControlledLiveEventScope({ ...recoveryScope, admittedSourceName: 'ordinary invoice' }, () =>
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', '123456789', 'invoice', 'CONTROLLED_RECOVERY_READ'), /RECOVERY_READ_SCOPE_INVALID/));
+  } finally {
+    setControlledLiveTestWriteCheck(null);
+    if (previousMode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE; else process.env.CONTROLLED_LIVE_TEST_MODE = previousMode;
+  }
+});
+
 test('manifest-approved dependencies are read-only and match exact provider, entity and native ID', () => {
   const previousMode = process.env.CONTROLLED_LIVE_TEST_MODE;
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
