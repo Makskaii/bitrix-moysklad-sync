@@ -5,6 +5,7 @@ export type ProductCardPair = {
   entityType: string;
   bitrix24Id: string;
   moyskladId: string;
+  moyskladType?: string | null;
   active: boolean;
   source: string;
   reason: string | null;
@@ -14,6 +15,7 @@ export type ProductCardPair = {
 export type ProductCardPrice = { priceId: string; typeId: string; value: number; currency: string; currencyRef?: Record<string, unknown> };
 export type ProductCardSnapshot = {
   name: string | null;
+  code?: string | null;
   detailText: string | null;
   unitId: string | null;
   prices: ProductCardPrice[];
@@ -21,11 +23,11 @@ export type ProductCardSnapshot = {
 };
 
 export type ProductCardApi = {
-  readBitrix24(id: string): Promise<ProductCardSnapshot>;
-  readMoysklad(id: string): Promise<ProductCardSnapshot>;
-  updateBitrix24(id: string, fields: Record<string, unknown>): Promise<void>;
+  readBitrix24(id: string, kind?: 'product' | 'service'): Promise<ProductCardSnapshot>;
+  readMoysklad(id: string, kind?: 'product' | 'service'): Promise<ProductCardSnapshot>;
+  updateBitrix24(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service'): Promise<void>;
   updateBitrix24Price(priceId: string, value: number, currency: string): Promise<void>;
-  updateMoysklad(id: string, fields: Record<string, unknown>): Promise<void>;
+  updateMoysklad(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service'): Promise<void>;
 };
 
 export type ProductCardSyncState = { bitrix24Values: Record<string, unknown>; moyskladValues: Record<string, unknown> };
@@ -83,8 +85,8 @@ export class ProductCardSyncService {
     let previous: ProductCardSyncState | null;
     try {
       [bitrix24, moysklad, previous] = await Promise.all([
-        this.api.readBitrix24(pair.bitrix24Id),
-        this.api.readMoysklad(pair.moyskladId),
+        this.api.readBitrix24(pair.bitrix24Id, pair.moyskladType === 'service' ? 'service' : 'product'),
+        this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product'),
         this.state.read(pair.id),
       ]);
     } catch (error) {
@@ -116,15 +118,21 @@ export class ProductCardSyncService {
         previous.bitrix24Values.name, previous.moyskladValues.name, rules.name, true);
       const description = rules.description ? chooseField('description', bitrix24.detailText, moysklad.detailText,
         previous.bitrix24Values.description, previous.moyskladValues.description, rules.description, false) : null;
+      const code = rules.code ? chooseField('code', bitrix24.code, moysklad.code,
+        previous.bitrix24Values.code, previous.moyskladValues.code, rules.code, false) : null;
       const unit = chooseUnit(bitrix24.unitId, moysklad.unitId,
         previous.bitrix24Values.unitId, previous.moyskladValues.unitId, settings.references.units);
-      directions = [name, description, unit].filter((value): value is Direction => value !== null);
+      directions = [name, description, code, unit].filter((value): value is Direction => value !== null);
     } catch (error) {
       return review(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_FIELD_UNAVAILABLE');
     }
     try {
-      priceDirections = choosePrices(bitrix24.prices, moysklad.prices,
-        previous.bitrix24Values.prices, previous.moyskladValues.prices, settings.references.priceTypes);
+      if (pair.moyskladType === 'service' && moysklad.prices.some((price) => settings.references.priceTypes.some((mapping) => record(mapping) && mapping.status === 'configured' && String(mapping.moyskladId) === price.typeId))) {
+        optionalReasons.push('PRODUCT_SERVICE_PRICE_WRITE_UNCONFIRMED');
+      } else {
+        priceDirections = choosePrices(bitrix24.prices, moysklad.prices,
+          previous.bitrix24Values.prices, previous.moyskladValues.prices, settings.references.priceTypes);
+      }
     } catch (error) {
       optionalReasons.push(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_PRICE_FIELD_UNAVAILABLE');
     }
@@ -186,18 +194,26 @@ export class ProductCardSyncService {
     pair: ProductCardPair,
     bitrix24: ProductCardSnapshot,
     moysklad: ProductCardSnapshot,
-    rules: { name?: FieldRule; description?: FieldRule },
+    rules: { name?: FieldRule; description?: FieldRule; code?: FieldRule },
     settings: ProductCardSettings,
   ) {
     if (direction.field === 'name') {
-      if (direction.target === 'MOYSKLAD') await this.api.updateMoysklad(pair.moyskladId, { name: direction.value });
-      else await this.api.updateBitrix24(pair.bitrix24Id, { [rules.name!.source]: direction.value });
+      const kind = pair.moyskladType === 'service' ? 'service' : 'product';
+      if (direction.target === 'MOYSKLAD') await this.api.updateMoysklad(pair.moyskladId, { name: direction.value }, kind);
+      else await this.api.updateBitrix24(pair.bitrix24Id, { [rules.name!.source]: direction.value }, kind);
       return;
     }
     if (direction.field === 'description') {
       if (!rules.description) throw new ProductCardManualReviewError('PRODUCT_DESCRIPTION_MAPPING_MISSING');
-      if (direction.target === 'MOYSKLAD') await this.api.updateMoysklad(pair.moyskladId, { description: direction.value });
-      else await this.api.updateBitrix24(pair.bitrix24Id, { [rules.description.source]: direction.value });
+      const kind = pair.moyskladType === 'service' ? 'service' : 'product';
+      if (direction.target === 'MOYSKLAD') await this.api.updateMoysklad(pair.moyskladId, { description: direction.value }, kind);
+      else await this.api.updateBitrix24(pair.bitrix24Id, { [rules.description.source]: direction.value }, kind);
+      return;
+    }
+    if (direction.field === 'code') {
+      if (!rules.code) throw new ProductCardManualReviewError('PRODUCT_CODE_MAPPING_MISSING');
+      if (direction.target !== 'BITRIX24') throw new ProductCardManualReviewError('PRODUCT_CODE_DIRECTION_UNSUPPORTED');
+      await this.api.updateBitrix24(pair.bitrix24Id, { code: direction.value }, pair.moyskladType === 'service' ? 'service' : 'product');
       return;
     }
     if (direction.field === 'unit') {
@@ -207,9 +223,9 @@ export class ProductCardSyncService {
         await this.api.updateMoysklad(pair.moyskladId, { uom: { meta: {
           href: `https://api.moysklad.ru/api/remap/1.2/entity/uom/${unit.moyskladId}`,
           type: 'uom', mediaType: 'application/json',
-        } } });
+        } } }, pair.moyskladType === 'service' ? 'service' : 'product');
       } else {
-        await this.api.updateBitrix24(pair.bitrix24Id, { measure: unit.bitrix24Id });
+        await this.api.updateBitrix24(pair.bitrix24Id, { measure: unit.bitrix24Id }, pair.moyskladType === 'service' ? 'service' : 'product');
       }
       return;
     }
@@ -234,7 +250,7 @@ export class ProductCardSyncService {
               type: 'pricetype', mediaType: 'application/json',
             } },
           })),
-        });
+        }, pair.moyskladType === 'service' ? 'service' : 'product');
         // A second configured price can be applied in this same pass. Keep
         // the local salePrices snapshot current so that its partial payload
         // cannot roll the first verified price back to the pre-pass value.
@@ -246,10 +262,11 @@ export class ProductCardSyncService {
 
   private async readTarget(side: Side, pair: ProductCardPair, field: string, direction: Direction): Promise<unknown> {
     const snapshot = side === 'BITRIX24'
-      ? await this.api.readBitrix24(pair.bitrix24Id)
-      : await this.api.readMoysklad(pair.moyskladId);
+      ? await this.api.readBitrix24(pair.bitrix24Id, pair.moyskladType === 'service' ? 'service' : 'product')
+      : await this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product');
     if (field === 'name') return snapshot.name;
     if (field === 'description') return snapshot.detailText;
+    if (field === 'code') return snapshot.code;
     if (field === 'unit') return snapshot.unitId;
     const typeId = side === 'BITRIX24' ? direction.bitrix24Key : direction.moyskladKey;
     return snapshot.prices.find((price) => price.typeId === typeId)?.value;
@@ -260,8 +277,8 @@ function isRuntimeGateError(error: unknown): error is Error & { productCardRunti
   return error instanceof Error && 'productCardRuntimeGate' in error;
 }
 
-function productRules(settings: ProductCardSettings): { name?: FieldRule; description?: FieldRule } {
-  const result: { name?: FieldRule; description?: FieldRule } = {};
+function productRules(settings: ProductCardSettings): { name?: FieldRule; description?: FieldRule; code?: FieldRule } {
+  const result: { name?: FieldRule; description?: FieldRule; code?: FieldRule } = {};
   for (const candidate of settings.rules) {
     if (!record(candidate) || candidate.entity !== 'catalog' || typeof candidate.sourceField !== 'string' || typeof candidate.targetField !== 'string') continue;
     const forward = record(candidate.bitrix24ToMoysklad) ? candidate.bitrix24ToMoysklad : null;
@@ -276,6 +293,7 @@ function productRules(settings: ProductCardSettings): { name?: FieldRule; descri
     };
     if (candidate.sourceField === 'name' && candidate.targetField === 'name') result.name = rule;
     if (candidate.sourceField === 'detailText' && candidate.targetField === 'description') result.description = rule;
+    if (candidate.sourceField === 'code' && candidate.targetField === 'code') result.code = rule;
   }
   return result;
 }
@@ -339,14 +357,14 @@ function snapshotValues(b24: ProductCardSnapshot, ms: ProductCardSnapshot, setti
   const prices = settings.references.priceTypes.filter((item) => record(item) && item.status === 'configured' && typeof item.moyskladId === 'string');
   return {
     bitrix24Values: {
-      name: b24.name, description: b24.detailText, unitId: b24.unitId,
+      name: b24.name, description: b24.detailText, code: b24.code, unitId: b24.unitId,
       prices: prices.map((item) => {
         const typeId = String((item as Record<string, unknown>).bitrix24Id);
         return { typeId, value: b24.prices.find((price) => price.typeId === typeId)?.value };
       }),
     },
     moyskladValues: {
-      name: ms.name, description: ms.detailText, unitId: ms.unitId,
+      name: ms.name, description: ms.detailText, code: ms.code, unitId: ms.unitId,
       prices: prices.map((item) => {
         const typeId = String((item as Record<string, unknown>).moyskladId);
         return { typeId, value: ms.prices.find((price) => price.typeId === typeId)?.value };
@@ -363,13 +381,14 @@ function setState(state: ProductCardSyncState, field: string, side: Side, typeId
     const row = prices.find((candidate) => candidate.typeId === typeId);
     if (row) row.value = value;
   } else {
-    values[field === 'description' ? 'description' : field === 'unit' ? 'unitId' : 'name'] = value;
+    values[field === 'description' ? 'description' : field === 'unit' ? 'unitId' : field === 'code' ? 'code' : 'name'] = value;
   }
 }
 
 function readField(snapshot: ProductCardSnapshot, field: string): unknown {
   if (field === 'name') return snapshot.name;
   if (field === 'description') return snapshot.detailText;
+  if (field === 'code') return snapshot.code;
   if (field === 'unit') return snapshot.unitId;
   return undefined;
 }

@@ -220,6 +220,26 @@ export class SyncModeService {
     return withLocks(0);
   }
 
+  /** Catalog creation has its own direction gate and durable operation lease. */
+  async runProductCatalogExternalWrite<T>(assertLease: (() => Promise<boolean>) | undefined, mutation: () => Promise<T>): Promise<T> {
+    return this.database.$transaction(async (transaction) => {
+      const setting = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
+        SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+      `;
+      if (!setting[0]) throw new DealOrderWriteGateError('RECOVERY');
+      if (setting[0].serviceMode !== 'on') throw new DealOrderWriteGateError(setting[0].serviceMode === 'off' ? 'OFF' : 'PAUSE');
+      const direction = await transaction.$queryRaw<Array<{ moyskladToBitrix24: boolean }>>`
+        SELECT "moyskladToBitrix24" FROM "SyncDirectionSetting" WHERE "entityKey" = 'products-variations' FOR SHARE
+      `;
+      if (direction[0] && !direction[0].moyskladToBitrix24) throw new DealOrderWriteGateError('DIRECTION');
+      if (this.databaseRecovery && !await this.databaseRecovery.assertReady()) throw new DealOrderWriteGateError('RECOVERY');
+      if (process.env.SYNC_MODE !== 'apply') throw new DealOrderWriteGateError('NOT_APPLY');
+      if (assertLease && !await assertLease()) throw new DealOrderWriteGateError('LEASE');
+      assertApplyExternalWrite('BITRIX24', 'PRODUCT_CREATE');
+      return mutation();
+    });
+  }
+
 }
 
 function isUniqueConstraintViolation(error: unknown): boolean {

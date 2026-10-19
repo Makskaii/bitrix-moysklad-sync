@@ -50,6 +50,15 @@ test('product event dispatches only to an exact active PRODUCT pair and uses pin
   assert.equal(storedEvent.status, 'SUCCEEDED');
 });
 
+test('catalog service events use the same one-way product processor dispatch contract', () => {
+  const { processor } = harness({
+    source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'service', externalEntityId: productId,
+  });
+  assert.equal(processor.supports({
+    id: 'service-event', source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'service', externalEntityId: productId,
+  }), true);
+});
+
 test('Bitrix24 product update is skipped before pair lookup or reconciliation', async () => {
   const { processor, storedEvent, runtimeCalls } = harness({
     eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',

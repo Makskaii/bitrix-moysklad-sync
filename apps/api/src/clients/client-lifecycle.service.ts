@@ -44,7 +44,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
        (event.externalEntityType === 'invoice' && event.eventType === 'ONCRMDYNAMICITEMDELETE') ||
        (event.externalEntityType === 'product' && event.eventType === 'CATALOG.PRODUCT.ON.DELETE'))) ||
       (event.source === 'MOYSKLAD' && event.eventType === 'DELETE' &&
-        (event.externalEntityType === 'counterparty' || event.externalEntityType === 'contactperson' || event.externalEntityType === 'customerorder' || event.externalEntityType === 'product' || event.externalEntityType === 'invoiceout'));
+        (event.externalEntityType === 'counterparty' || event.externalEntityType === 'contactperson' || event.externalEntityType === 'customerorder' || event.externalEntityType === 'product' || event.externalEntityType === 'service' || event.externalEntityType === 'invoiceout'));
   }
 
   enqueue(eventId: string) {
@@ -88,7 +88,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         AND: [
           { OR: [
             { source: 'BITRIX24', eventType: { in: ['ONCRMCOMPANYDELETE', 'ONCRMCONTACTDELETE', 'ONCRMDEALDELETE', 'ONCRMDYNAMICITEMDELETE', 'CATALOG.PRODUCT.ON.DELETE'] } },
-            { source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'product', 'invoiceout'] } },
+            { source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'product', 'service', 'invoiceout'] } },
           ] },
           { OR: [
             { status: 'RECEIVED' },
@@ -150,10 +150,12 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       const pair = await this.database.entityPair.findFirst({ where: event.source === 'BITRIX24'
         ? { entityType, bitrix24Id: event.externalEntityId }
         : { entityType, moyskladId: event.externalEntityId },
-        select: { id: true, bitrix24Id: true, moyskladId: true },
+        select: { id: true, bitrix24Id: true, moyskladId: true, moyskladType: true },
       });
       if (pair) pairLease = await this.acquireEntityPairLease(pair, event.source as LifecycleSource, entityType, event.externalEntityId);
-      const state = await this.readDeletionState(event.source as LifecycleSource, entityType, event.externalEntityType!, event.externalEntityId, event.payload);
+      const nativeType = event.source === 'BITRIX24' && entityType === 'PRODUCT' && pair?.moyskladType === 'service'
+        ? 'service' : event.externalEntityType!;
+      const state = await this.readDeletionState(event.source as LifecycleSource, entityType, nativeType, event.externalEntityId, event.payload);
       if (state === 'PRESENT') {
         await this.database.inboundEvent.update({ where: { id: eventId }, data: { status: 'UNCHANGED', processingStartedAt: null, lastErrorCategory: null } });
         return;
@@ -290,7 +292,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
 
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new ProviderFailure('BITRIX24', null);
-    const method = bitrixGetMethod(entityType);
+    const method = bitrixGetMethod(entityType, nativeType);
     let response: Response;
     try {
       response = await fetch(new URL(method, withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(entityType === 'INVOICE' ? { id: nativeId, entityTypeId: '31' } : { id: nativeId }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
@@ -300,11 +302,12 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     if (!isRecord(result)) return 'UNCERTAIN';
     if (!response.ok) {
       const description = typeof result.error_description === 'string' ? result.error_description.trim().toLowerCase() : '';
-      const notFound = new Set(['not found', 'element not found', 'item not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'company not found', 'contact not found', 'deal not found', 'product not found']);
+      const notFound = new Set(['not found', 'element not found', 'item not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'service is not found', 'company not found', 'contact not found', 'deal not found', 'product not found', 'service not found']);
       if (result.error === 'NOT_FOUND' || (typeof result.error !== 'string' && notFound.has(description))) return 'DELETED';
       return 'UNCERTAIN';
     }
     const nativeResult = isRecord(result.result) && isRecord(result.result.product) ? result.result.product
+      : isRecord(result.result) && isRecord(result.result.service) ? result.result.service
       : entityType === 'INVOICE' && isRecord(result.result) && isRecord(result.result.item) ? result.result.item : result.result;
     if (isRecord(nativeResult) && String(nativeResult.ID ?? nativeResult.id ?? '') === nativeId) return 'PRESENT';
     return 'UNCERTAIN';
@@ -365,7 +368,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         return;
       }
       assertApplyExternalWrite('BITRIX24', 'CLIENT_DELETION_MARKER');
-      const result = await this.bitrixRest(bitrixUpdateMethod(entityType), {
+      const result = await this.bitrixRest(bitrixUpdateMethod(entityType, pair.moyskladType === 'service' ? 'service' : undefined), {
         ...(entityType === 'INVOICE' ? { entityTypeId: '31' } : {}),
         id: pair.bitrix24Id, [`fields[${fieldCode}]`]: 'Удалён',
       });
@@ -541,7 +544,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         identityVerified = String(bitrix.ID ?? bitrix.id ?? '') === pair.bitrix24Id && String(moysklad.id ?? '') === pair.moyskladId;
       } else {
         const [bitrix, moysklad] = await Promise.all([
-          this.readDeletionState('BITRIX24', entity, bitrixNativeType(entity), pair.bitrix24Id, {}),
+          this.readDeletionState('BITRIX24', entity, entity === 'PRODUCT' && pair.moyskladType === 'service' ? 'service' : bitrixNativeType(entity), pair.bitrix24Id, {}),
           this.readDeletionState('MOYSKLAD', entity, msNativeType, pair.moyskladId, {}, pair.moyskladParentId),
         ]);
         identityVerified = bitrix === 'PRESENT' && moysklad === 'PRESENT';
@@ -562,7 +565,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
           throw new ServiceUnavailableException('Apply mode is required to clear the Bitrix24 deletion marker');
         }
         assertApplyExternalWrite('BITRIX24', 'CLIENT_DELETION_MARKER_CLEAR');
-        const clear = await this.bitrixRest(bitrixUpdateMethod(entity), {
+        const clear = await this.bitrixRest(bitrixUpdateMethod(entity, entity === 'PRODUCT' && pair.moyskladType === 'service' ? 'service' : undefined), {
           ...(entity === 'INVOICE' ? { entityTypeId: '31' } : {}),
           id: pair.bitrix24Id, [`fields[${markerField}]`]: '',
         });
@@ -626,6 +629,7 @@ function lifecycleEntityForEvent(source: string, nativeType: string): LifecycleE
     if (nativeType === 'deal') return 'DEAL';
     if (nativeType === 'product') return 'PRODUCT';
     if (nativeType === 'invoice') return 'INVOICE';
+    if (nativeType === 'service') return 'PRODUCT';
   }
   if (source === 'MOYSKLAD') {
     if (nativeType === 'counterparty') return 'COMPANY';
@@ -633,6 +637,7 @@ function lifecycleEntityForEvent(source: string, nativeType: string): LifecycleE
     if (nativeType === 'customerorder') return 'DEAL';
     if (nativeType === 'product') return 'PRODUCT';
     if (nativeType === 'invoiceout') return 'INVOICE';
+    if (nativeType === 'service') return 'PRODUCT';
   }
   return null;
 }
@@ -655,23 +660,25 @@ function bitrixNativeType(entity: LifecycleEntityType): string {
   }
 }
 
-function bitrixGetMethod(entity: LifecycleEntityType): string {
+function bitrixGetMethod(entity: LifecycleEntityType, nativeType?: string): string {
   switch (entity) {
     case 'COMPANY': return 'crm.company.get.json';
     case 'CONTACT': return 'crm.contact.get.json';
     case 'DEAL': return 'crm.deal.get.json';
     case 'PRODUCT': return 'catalog.product.get.json';
     case 'INVOICE': return 'crm.item.get.json';
+    case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.get.json' : 'catalog.product.get.json';
   }
 }
 
-function bitrixUpdateMethod(entity: LifecycleEntityType): string {
+function bitrixUpdateMethod(entity: LifecycleEntityType, nativeType?: string): string {
   switch (entity) {
     case 'COMPANY': return 'crm.company.update.json';
     case 'CONTACT': return 'crm.contact.update.json';
     case 'DEAL': return 'crm.deal.update.json';
     case 'PRODUCT': return 'catalog.product.update.json';
     case 'INVOICE': return 'crm.item.update.json';
+    case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.update.json' : 'catalog.product.update.json';
   }
 }
 
@@ -681,6 +688,7 @@ function moyskladNativeType(entity: LifecycleEntityType, configuredType: string 
   if (entity === 'DEAL' && configuredType === 'customerorder') return configuredType;
   if (entity === 'PRODUCT' && configuredType === 'product') return configuredType;
   if (entity === 'INVOICE' && configuredType === 'invoiceout') return configuredType;
+  if (entity === 'PRODUCT' && configuredType === 'service') return configuredType;
   return null;
 }
 

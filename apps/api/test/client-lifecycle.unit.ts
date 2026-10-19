@@ -33,6 +33,7 @@ test('delete processor supports each enabled durable pair entity and only explic
     ['MOYSKLAD', 'DELETE', 'customerorder'],
     ['MOYSKLAD', 'DELETE', 'product'],
     ['MOYSKLAD', 'DELETE', 'invoiceout'],
+    ['MOYSKLAD', 'DELETE', 'service'],
   ] as const) {
     assert.equal(service.supports({ id: 'event', source, eventType, externalEntityType, externalEntityId: 'native-id' }), true);
   }

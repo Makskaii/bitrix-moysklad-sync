@@ -468,6 +468,16 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   });
   const accepted = await save(config);
   assert.equal(accepted.status, 200);
+  const configuredSection = structuredClone(config);
+  configuredSection.dealOrderRuntime.bitrix24DefaultProductSectionId = '42';
+  assert.equal((await save(configuredSection)).status, 200, 'an explicitly configured numeric Bitrix24 section is accepted independently of MySklad product groups');
+  const invalidProductSection = structuredClone(config);
+  invalidProductSection.dealOrderRuntime.bitrix24DefaultProductSectionId = 'not-a-number';
+  assert.equal((await save(invalidProductSection)).status, 400, 'non-numeric Bitrix24 section IDs are rejected');
+  const sectionWithoutCatalog = structuredClone(config);
+  sectionWithoutCatalog.dealOrderRuntime.bitrix24ProductCatalogId = null;
+  sectionWithoutCatalog.dealOrderRuntime.bitrix24DefaultProductSectionId = '42';
+  assert.equal((await save(sectionWithoutCatalog)).status, 400, 'a default section cannot be configured without its target catalog');
   const duplicate = structuredClone(config);
   duplicate.dealOrderRuntime.stages.push({ ...duplicate.dealOrderRuntime.stages[0] });
   assert.equal((await save(duplicate)).status, 400, 'duplicate stage source IDs are rejected');
