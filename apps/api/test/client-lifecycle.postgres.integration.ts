@@ -11,13 +11,18 @@ const companyPairId = `lifecycle-company-${suffix}`;
 const contactPairId = `lifecycle-contact-${suffix}`;
 const dealPairId = `lifecycle-deal-${suffix}`;
 const productPairId = `lifecycle-product-${suffix}`;
+const sameUuidProductPairId = `lifecycle-same-uuid-product-${suffix}`;
+const sameUuidServicePairId = `lifecycle-same-uuid-service-${suffix}`;
 const msId = randomUUID();
 const msOrderId = randomUUID();
 const msProductId = randomUUID();
+const sameUuidMsId = randomUUID();
 const b24CompanyId = `58${Date.now()}`;
 const b24ContactId = `59${Date.now()}`;
 const b24DealId = `60${Date.now()}`;
 const b24ProductId = `61${Date.now()}`;
+const b24SameUuidProductId = `63${Date.now()}`;
+const b24SameUuidServiceId = `64${Date.now()}`;
 let database: DatabaseService;
 let service: ClientLifecycleService;
 let oldFetch: typeof fetch;
@@ -86,7 +91,7 @@ after(async () => {
   if (database) {
     await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `lifecycle-${suffix}-` } } });
     await database.inboundEntityLock.deleteMany({ where: { eventId: { startsWith: 'lifecycle:' } } });
-    await database.entityPair.deleteMany({ where: { id: { in: [companyPairId, contactPairId, dealPairId, productPairId] } } });
+    await database.entityPair.deleteMany({ where: { id: { in: [companyPairId, contactPairId, dealPairId, productPairId, sameUuidProductPairId, sameUuidServicePairId] } } });
     await database.$disconnect();
   }
   globalThis.fetch = oldFetch;
@@ -142,7 +147,7 @@ test('PostgreSQL applies provider-confirmed lifecycle to deal/order and product 
     if (url.includes('crm.timeline.comment.list.json')) return Response.json({ result: [{ COMMENT: `[sync-tombstone:${dealPairId}]` }] });
     if (url.includes('catalog.product.get.json') && url.includes('/rest/test/')) {
       productReads += 1;
-      if (productReads === 1) return Response.json({ error: 'NOT_FOUND', error_description: 'Product not found' });
+      if (productReads === 1) return Response.json({ error: '0', error_description: 'The product does not exist' });
       return Response.json({ result: { product: { id: b24ProductId } } });
     }
     if (url.includes(`/entity/product/${msProductId}`)) return Response.json({ id: msProductId, meta: { type: 'product' } });
@@ -183,4 +188,37 @@ test('PostgreSQL applies provider-confirmed lifecycle to deal/order and product 
     await database.$executeRawUnsafe('DROP TRIGGER reject_lifecycle_restore_audit ON "AdminAuditEntry"');
     await database.$executeRawUnsafe('DROP FUNCTION reject_lifecycle_restore_audit()');
   }
+});
+
+test('MoySklad service DELETE selects the native-kind pair when product and service share one UUID', async () => {
+  await database.entityPair.create({ data: {
+    id: sameUuidProductPairId, entityType: 'PRODUCT', bitrix24Id: b24SameUuidProductId, moyskladId: sameUuidMsId,
+    moyskladType: 'product', active: false, lifecycleStatus: 'TOMBSTONED', tombstonedAt: new Date('2026-10-01T00:00:00.000Z'),
+    tombstoneSource: 'BITRIX24', tombstoneReason: 'HISTORICAL_PRODUCT',
+  } });
+  await database.entityPair.create({ data: {
+    id: sameUuidServicePairId, entityType: 'PRODUCT', bitrix24Id: b24SameUuidServiceId, moyskladId: sameUuidMsId,
+    moyskladType: 'service', active: true,
+  } });
+  const providerPaths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    providerPaths.push(new URL(url).pathname);
+    if (url.includes(`/entity/service/${sameUuidMsId}`)) return new Response(null, { status: 404 });
+    throw new Error(`Unexpected provider request for the same-UUID service deletion: ${new URL(url).pathname}`);
+  };
+  const event = await createDeleteEvent('same-uuid-service-delete', 'RECEIVED', 'MOYSKLAD', 'service', sameUuidMsId);
+  await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent(event.id);
+
+  const deletedService = await database.entityPair.findUniqueOrThrow({ where: { id: sameUuidServicePairId } });
+  const preservedProduct = await database.entityPair.findUniqueOrThrow({ where: { id: sameUuidProductPairId } });
+  assert.equal(deletedService.lifecycleStatus, 'TOMBSTONED');
+  assert.equal(deletedService.active, false);
+  assert.equal(preservedProduct.lifecycleStatus, 'TOMBSTONED');
+  assert.equal(preservedProduct.active, false);
+  assert.equal(preservedProduct.tombstoneSource, 'BITRIX24');
+  assert.equal(preservedProduct.tombstoneReason, 'HISTORICAL_PRODUCT');
+  assert.deepEqual(providerPaths, [`/api/remap/1.2/entity/service/${sameUuidMsId}`], 'the provider read uses the service endpoint and does not probe/tombstone the product counterpart');
+  const terminal = await database.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(terminal.status, 'SUCCEEDED');
 });

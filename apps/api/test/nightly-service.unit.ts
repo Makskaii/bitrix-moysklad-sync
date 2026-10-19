@@ -14,6 +14,7 @@ class NightlyStore {
   readonly accepted: Array<Record<string, unknown>> = [];
   readonly dispatched: string[] = [];
   readonly providerCalls: string[] = [];
+  readonly acceptedQueryTypes: string[][] = [];
   loseLeaseAfterProviderResponse = false;
   leaseLost = false;
   acceptedRows: Array<Record<string, any>> = [];
@@ -66,6 +67,7 @@ class NightlyStore {
     count: async ({ where }: { where: { deliveryKey: { startsWith: string }; status: { in: string[] } } }) => [...this.queued.values()]
       .filter((row) => row.deliveryKey.startsWith(where.deliveryKey.startsWith) && where.status.in.includes(row.status)).length,
     findMany: async ({ where, take }: { where: Record<string, any>; take: number }) => {
+      this.acceptedQueryTypes.push(where.OR?.[1]?.externalEntityType?.in ?? []);
       const cursor = where.AND?.flatMap((condition: Record<string, any>) => condition.OR ?? []) ?? [];
       const afterDate = cursor.find((condition: Record<string, any>) => condition.receivedAt?.gt)?.receivedAt.gt ??
         cursor.find((condition: Record<string, any>) => condition.receivedAt instanceof Date)?.receivedAt;
@@ -94,7 +96,8 @@ class NightlyStore {
       return ids.includes('contact-1') ? [{ entityType: 'CONTACT', bitrix24Id: 'contact-1', moyskladId: 'ms-contact-1', moyskladType: 'counterparty' }] : [];
     },
     findFirst: async ({ where }: { where: Record<string, any> }) => where.entityType === this.pairEntityType &&
-      (where.bitrix24Id === this.pairBitrixId || where.moyskladId === this.pairMoyskladId)
+      (where.bitrix24Id === this.pairBitrixId || where.moyskladId === this.pairMoyskladId) &&
+      (!where.moyskladType || where.moyskladType === this.pairMoyskladType)
       ? { id: 'pair-1', entityType: this.pairEntityType, bitrix24Id: this.pairBitrixId, moyskladId: this.pairMoyskladId, moyskladType: this.pairMoyskladType, lifecycleStatus: this.pairLifecycleStatus }
       : null,
     findUnique: async () => ({ moyskladParentId: 'parent-1' }),
@@ -161,7 +164,7 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
   const service = new SyncRecoveryService(store as never, syncMode, {} as ContactSyncProcessor,
     undefined, fieldSettings as unknown as FieldSettingsService, dispatcher as unknown as EventDispatcherService);
   return {
-    store, service,
+    store, service, syncMode,
     close: () => {
       service.onModuleDestroy();
       mock.timers.reset();
@@ -376,6 +379,44 @@ test('nightly accepted DELETE rechecks active and tombstoned pairs using the exa
       }
       });
     }
+  }
+});
+
+test('nightly accepted invoice DELETE and MoySklad service events retain native type and exact source ID', async (context) => {
+  const cases = [
+    { name: 'Bitrix24 invoice DELETE', source: 'BITRIX24', eventType: 'ONCRMDYNAMICITEMDELETE', externalEntityType: 'invoice', entity: 'INVOICE', sourceId: 'invoice-b24-1', partnerId: 'invoice-ms-1', partnerType: 'invoiceout' },
+    { name: 'MoySklad service DELETE', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'service', entity: 'PRODUCT', sourceId: 'service-ms-1', partnerId: 'service-b24-1', partnerType: 'service' },
+  ];
+  for (const candidate of cases) {
+    await context.test(candidate.name, async () => {
+      const harness = await createHarness('on');
+      harness.store.pairEntityType = candidate.entity;
+      harness.store.pairBitrixId = candidate.source === 'BITRIX24' ? candidate.sourceId : candidate.partnerId;
+      harness.store.pairMoyskladId = candidate.source === 'MOYSKLAD' ? candidate.sourceId : candidate.partnerId;
+      harness.store.pairMoyskladType = candidate.partnerType;
+      harness.store.acceptedRows = [
+        { id: `accepted-${candidate.sourceId}`, source: candidate.source, eventType: candidate.eventType, externalEntityType: candidate.externalEntityType, externalEntityId: candidate.sourceId },
+      ];
+      harness.syncMode.readEntitySettings = async () => [
+        { key: 'contacts-companies', ready: true, bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+        { key: 'invoices', ready: true, bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+        { key: 'products-variations', ready: true, bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+      ] as never;
+      try {
+        harness.service.onApplicationBootstrap();
+        await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+        assert.equal(harness.store.accepted.length, 1);
+        assert.equal(harness.store.accepted[0].eventType, candidate.eventType);
+        assert.equal(harness.store.accepted[0].externalEntityType, candidate.externalEntityType);
+        assert.equal(harness.store.accepted[0].externalEntityId, candidate.sourceId);
+        assert.ok(harness.store.acceptedQueryTypes.every((types) => types.includes('service')));
+        assert.equal((harness.store.accepted[0].payload as Record<string, unknown>).acceptedEventId, `accepted-${candidate.sourceId}`);
+        assert.equal(harness.store.dispatched.length, 1);
+      } finally {
+        harness.close();
+      }
+    });
   }
 });
 

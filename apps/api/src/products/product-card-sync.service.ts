@@ -154,7 +154,7 @@ export class ProductCardSyncService {
       try {
         await this.apply(direction, pair, bitrix24, moysklad, rules, settings);
         const actual = await this.readTarget(direction.target, pair, direction.field, direction);
-        if (!same(actual, direction.value)) throw new Error('PRODUCT_CARD_READBACK_MISMATCH');
+        if (!sameDirectionValue(direction.field, actual, direction.value)) throw new Error('PRODUCT_CARD_READBACK_MISMATCH');
         verified = true;
       } catch (error) {
         if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
@@ -170,7 +170,7 @@ export class ProductCardSyncService {
         // Read the target again before committing state; never blindly replay a write.
         try {
           const actual = await this.readTarget(direction.target, pair, direction.field, direction);
-          verified = same(actual, direction.value);
+          verified = sameDirectionValue(direction.field, actual, direction.value);
         } catch (readError) {
           if (readError instanceof ProductCardLeaseError) throw readError;
         }
@@ -182,7 +182,7 @@ export class ProductCardSyncService {
       if (verified) {
         try {
           setState(next, direction, 'BITRIX24', direction.bitrix24Key,
-            direction.target === 'BITRIX24' ? direction.value : readField(bitrix24, direction.field, direction));
+            direction.target === 'BITRIX24' ? normalizeDirectionState(direction.field, direction.value) : readField(bitrix24, direction.field, direction));
           setState(next, direction, 'MOYSKLAD', direction.moyskladKey,
             direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction));
           await this.state.write(pair.id, settingsVersion, next);
@@ -376,15 +376,48 @@ function chooseField(field: string, b24: unknown, ms: unknown, oldB24: unknown, 
 }
 
 function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, mappings: unknown[]): Direction | null {
-  if (same(b24, ms)) return null;
+  // Unit is optional in both catalogs. Preserve a genuinely absent value instead of
+  // treating it like a malformed provider ID; present but invalid IDs still fail closed.
+  if (isAbsentUnit(b24) && isAbsentUnit(ms) && isAbsentUnit(oldB24) && isAbsentUnit(oldMs)) return null;
   if (b24 === undefined || ms === undefined || oldB24 === undefined || oldMs === undefined) {
     throw new ProductCardManualReviewError('PRODUCT_UNIT_VALUE_UNAVAILABLE');
   }
-  if (same(b24, oldB24) && same(ms, oldMs)) return null;
+  if (!isValidBitrixUnitId(b24) || !isValidBitrixUnitId(oldB24) || typeof ms !== 'string' || !ms || typeof oldMs !== 'string' || !oldMs) {
+    throw new ProductCardManualReviewError('PRODUCT_UNIT_VALUE_INVALID');
+  }
+  if (sameIdentifier(b24, oldB24) && same(ms, oldMs)) return null;
   const target: Side = 'BITRIX24';
-  const row = mappings.filter((item) => record(item) && String(item.moyskladId) === String(ms) && item.status === 'configured' && Number.isInteger(item.bitrix24Id));
+  const row = mappings.filter((item) => record(item) && String(item.moyskladId) === ms && item.status === 'configured' && Number.isInteger(item.bitrix24Id) && Number(item.bitrix24Id) > 0);
   if (row.length !== 1 || !record(row[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
   return { field: 'unit', target, value: row[0].bitrix24Id };
+}
+
+function isAbsentUnit(value: unknown): boolean {
+  return value === null || value === undefined;
+}
+
+function sameDirectionValue(field: string, actual: unknown, expected: unknown): boolean {
+  return field === 'unit' ? sameIdentifier(actual, expected) : same(actual, expected);
+}
+
+function normalizeDirectionState(field: string, value: unknown): unknown {
+  return field === 'unit' ? normalizeUnitIdentifier(value) : value;
+}
+
+function isValidBitrixUnitId(value: unknown): boolean {
+  return normalizeUnitIdentifier(value) !== null;
+}
+
+function normalizeUnitIdentifier(value: unknown): string | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  if (typeof value === 'string' && /^\d{1,20}$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0) return String(Number(value));
+  return null;
+}
+
+function sameIdentifier(left: unknown, right: unknown): boolean {
+  const normalizedLeft = normalizeUnitIdentifier(left);
+  const normalizedRight = normalizeUnitIdentifier(right);
+  return normalizedLeft !== null && normalizedRight !== null ? normalizedLeft === normalizedRight : typeof left === 'string' && typeof right === 'string' && left === right;
 }
 
 function choosePrices(b24: ProductCardPrice[], ms: ProductCardPrice[], oldB24: unknown, oldMs: unknown, mappings: unknown[]): Direction[] {
