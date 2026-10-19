@@ -214,6 +214,23 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
     assert.equal(pair.moyskladId, 'ms-1');
     assert.equal(event.status, 'SUCCEEDED');
     assert.equal(updates.length, 1);
+
+    // A later exact-ID read that finds the native record present does not
+    // silently restore the tombstoned pair.
+    event.status = 'RECEIVED';
+    globalThis.fetch = async () => Response.json({ id: 'ms-1' });
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-1');
+    assert.equal(event.status, 'UNCHANGED');
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.active, false);
+    assert.equal(updates.length, 1);
+
+    event.status = 'RECEIVED';
+    globalThis.fetch = async () => { throw new Error('provider temporarily unavailable'); };
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-1');
+    assert.equal(event.status, 'RETRYABLE_FAILURE');
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.active, false);
   } finally {
     globalThis.fetch = oldFetch;
     if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;

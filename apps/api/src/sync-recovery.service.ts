@@ -343,22 +343,30 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
   }
 
-  /** Recheck only durable events accepted in this window and already attached
-   * to an active pair. This is not a provider history scan: each synthetic
-   * update asks the registered processor to reread current state by exact ID. */
+  /** Recheck durable events accepted in this window and attached to a pair.
+   * Delete events retain their lifecycle type so the lifecycle processor can
+   * reread current state by exact native ID before changing pair state. */
   private async runAcceptedEventRecheck(from: Date | null, through: Date | null, jobKey: string, leaseToken: string) {
     if (!from || !through || !this.fieldSettings) return;
-    const scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
     const take = 500;
-    let cursor: string | undefined;
+    let cursor: { receivedAt: Date; id: string } | undefined;
+    type CandidateEvent = {
+      id: string; source: string; eventType: string | null;
+      externalEntityType: string | null; externalEntityId: string | null; receivedAt: Date;
+    };
+    const candidates = new Map<string, { event: CandidateEvent; entity: string; scope: NightlyScope; directionEnabled: boolean }>();
     while (true) {
       await this.renewNightlyLease(leaseToken);
       const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (!setting || await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
+      const scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
       const events = await this.database.inboundEvent.findMany({
         where: {
           receivedAt: { gte: from, lte: through },
-          ...(cursor ? { id: { gt: cursor } } : {}),
+          ...(cursor ? { AND: [{ OR: [
+            { receivedAt: { gt: cursor.receivedAt } },
+            { receivedAt: cursor.receivedAt, id: { gt: cursor.id } },
+          ] }] } : {}),
           NOT: { deliveryKey: { startsWith: 'nightly:' } },
           status: { in: ['SUCCEEDED', 'UNCHANGED', 'SYNCED'] },
           OR: [
@@ -366,65 +374,89 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
             { source: 'MOYSKLAD', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'invoiceout', 'product'] } },
           ],
         },
-        orderBy: { id: 'asc' }, take,
-        select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
+        orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }], take,
+        select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, receivedAt: true },
       });
       if (!events.length) break;
-      cursor = events[events.length - 1].id;
-      const candidates = new Map<string, { event: typeof events[number]; entity: string; scope: NightlyScope }>();
+      cursor = { receivedAt: events[events.length - 1].receivedAt, id: events[events.length - 1].id };
       for (const event of events) {
         if (!event.externalEntityId) continue;
         const direction = event.source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
         for (const mapped of acceptedRecheckEntities(event.source, event.eventType, event.externalEntityType)) {
           const control = scopes.get(mapped.scope);
-          if (!control?.ready || !control[direction]) continue;
-          candidates.set(`${mapped.entity}:${event.source}:${event.externalEntityId}`, { event, ...mapped });
+          const identity = `${mapped.entity}:${event.source}:${event.externalEntityType}:${event.externalEntityId}`;
+          const previous = candidates.get(identity);
+          if (!previous || isLaterAcceptedEvent(event, previous.event)) {
+            candidates.set(identity, { event, ...mapped, directionEnabled: Boolean(control?.ready && control[direction]) });
+          }
         }
-      }
-      for (const candidate of candidates.values()) {
-        const { event, entity } = candidate;
-        const sourceId = event.externalEntityId!;
-        const pair = await this.database.entityPair.findFirst({
-          where: {
-            entityType: entity, active: true, lifecycleStatus: 'ACTIVE',
-            ...(event.source === 'BITRIX24' ? { bitrix24Id: sourceId } : {
-              moyskladId: sourceId, moyskladType: event.externalEntityType,
-            }),
-          },
-          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true },
-        });
-        if (!pair) {
-          if (entity !== 'CONTACT' || event.source === 'MOYSKLAD' && event.externalEntityType === 'contactperson') continue;
-          const legacy = await this.database.contactPair.findFirst({
-            where: event.source === 'BITRIX24'
-              ? { active: true, bitrix24ContactId: sourceId }
-              : { active: true, moyskladCounterpartyId: sourceId, moyskladType: 'COUNTERPARTY' },
-            select: { id: true, bitrix24ContactId: true, moyskladCounterpartyId: true },
-          });
-          if (!legacy) continue;
-          const externalEntityId = event.source === 'BITRIX24' ? legacy.bitrix24ContactId : legacy.moyskladCounterpartyId;
-          await this.enqueueAcceptedRecheck({
-            event, entity, externalEntityId,
-            pairId: legacy.id, eventType: syntheticUpdateType(event.source, entity, event.externalEntityType)!, externalEntityType: event.externalEntityType,
-            jobKey, leaseToken,
-          });
-          continue;
-        }
-        const side = event.source === 'BITRIX24' ? 'bitrix24Id' : 'moyskladId';
-        const externalEntityId = pair[side];
-        const eventType = syntheticUpdateType(event.source, entity, event.externalEntityType);
-        if (!externalEntityId || !eventType) continue;
-        const payload: Prisma.InputJsonValue = event.source === 'BITRIX24' && entity === 'PRODUCT'
-          ? { recovery: 'nightly', entity, acceptedEventId: event.id, data: { FIELDS: { ID: externalEntityId, TYPE: 1 } } }
-          : event.source === 'BITRIX24' && entity === 'INVOICE'
-            ? { recovery: 'nightly', entity, acceptedEventId: event.id, data: { ENTITY_TYPE_ID: 31, FIELDS: { ID: externalEntityId } } }
-            : { recovery: 'nightly', entity, acceptedEventId: event.id };
-        await this.enqueueAcceptedRecheck({
-          event, entity, externalEntityId, pairId: pair.id, eventType,
-          externalEntityType: event.externalEntityType, payload, jobKey, leaseToken,
-        });
       }
       if (events.length < take) break;
+    }
+
+    // Do not enqueue while paging: a later accepted action may live on a later
+    // page. Recheck controls and the service mode after the complete scan.
+    await this.renewNightlyLease(leaseToken);
+    const latestSetting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+    if (!latestSetting || await this.nightlyMustSkip(latestSetting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
+    let scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
+    let processed = 0;
+    for (const candidate of candidates.values()) {
+      if (processed > 0 && processed % take === 0) {
+        await this.renewNightlyLease(leaseToken);
+        const currentSetting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+        if (!currentSetting || await this.nightlyMustSkip(currentSetting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
+        scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
+      }
+      processed++;
+      const direction = candidate.event.source === 'BITRIX24' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
+      const control = scopes.get(candidate.scope);
+      if (!candidate.directionEnabled || !control?.ready || !control[direction]) continue;
+      const { event, entity } = candidate;
+      const sourceId = event.externalEntityId!;
+      const isDelete = isAcceptedDelete(event.source, event.eventType);
+      const pair = await this.database.entityPair.findFirst({
+        where: {
+          entityType: entity,
+          ...(!isDelete ? { active: true, lifecycleStatus: 'ACTIVE' } : {}),
+          ...(event.source === 'BITRIX24' ? { bitrix24Id: sourceId } : {
+            moyskladId: sourceId, moyskladType: event.externalEntityType,
+          }),
+        },
+        select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, lifecycleStatus: true },
+      });
+      if (!pair) {
+        if (isDelete) continue;
+        if (entity !== 'CONTACT' || event.source === 'MOYSKLAD' && event.externalEntityType === 'contactperson') continue;
+        const legacy = await this.database.contactPair.findFirst({
+          where: event.source === 'BITRIX24'
+            ? { active: true, bitrix24ContactId: sourceId }
+            : { active: true, moyskladCounterpartyId: sourceId, moyskladType: 'COUNTERPARTY' },
+          select: { id: true, bitrix24ContactId: true, moyskladCounterpartyId: true },
+        });
+        if (!legacy) continue;
+        const externalEntityId = event.source === 'BITRIX24' ? legacy.bitrix24ContactId : legacy.moyskladCounterpartyId;
+        await this.enqueueAcceptedRecheck({
+          event, entity, externalEntityId,
+          pairId: legacy.id, eventType: syntheticUpdateType(event.source, entity, event.externalEntityType)!, externalEntityType: event.externalEntityType,
+          jobKey, leaseToken,
+        });
+        continue;
+      }
+      const side = event.source === 'BITRIX24' ? 'bitrix24Id' : 'moyskladId';
+      const externalEntityId = isDelete ? sourceId : pair[side];
+      const eventType = isDelete ? event.eventType : syntheticUpdateType(event.source, entity, event.externalEntityType);
+      if (!externalEntityId || !eventType) continue;
+      const payload: Prisma.InputJsonValue = event.source === 'BITRIX24' && entity === 'PRODUCT'
+        ? { recovery: 'nightly', entity, acceptedEventId: event.id, data: { FIELDS: { ID: externalEntityId, TYPE: 1 } } }
+        : event.source === 'BITRIX24' && entity === 'INVOICE'
+          ? { recovery: 'nightly', entity, acceptedEventId: event.id, data: { ENTITY_TYPE_ID: 31, FIELDS: { ID: externalEntityId } } }
+          : { recovery: 'nightly', entity, acceptedEventId: event.id };
+      await this.enqueueAcceptedRecheck({
+        event, entity, externalEntityId, pairId: pair.id, eventType,
+        externalEntityType: event.externalEntityType, payload, jobKey, leaseToken,
+        currentState: pair.lifecycleStatus,
+      });
     }
   }
 
@@ -436,6 +468,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     eventType: string;
     externalEntityType: string | null;
     payload?: Prisma.InputJsonValue;
+    currentState?: string;
     jobKey: string;
     leaseToken: string;
   }) {
@@ -453,7 +486,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     }
     const row = await this.fieldSettings.saveAcceptedEvent({
       source: input.event.source as 'BITRIX24' | 'MOYSKLAD',
-      deliveryKey: `${input.jobKey}:${input.entity}:${input.externalEntityId}`,
+      deliveryKey: `${input.jobKey}:${input.entity}:${input.eventType}:${input.currentState ?? 'ACTIVE'}:${input.externalEntityId}`,
       eventType: input.eventType, externalEntityId: input.externalEntityId,
       externalEntityType: input.externalEntityType, payload,
       directionDisabled: false, requireServiceNotOff: true, nightlyLeaseToken: input.leaseToken,
@@ -753,16 +786,21 @@ function readId(value: unknown): string | null {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : null;
 }
 
+function isLaterAcceptedEvent(candidate: { receivedAt: Date; id: string }, current: { receivedAt: Date; id: string }) {
+  return candidate.receivedAt.getTime() > current.receivedAt.getTime() ||
+    candidate.receivedAt.getTime() === current.receivedAt.getTime() && candidate.id > current.id;
+}
+
 export function acceptedRecheckEntities(source: string, eventType: string | null, externalEntityType: string | null): Array<{ entity: string; scope: NightlyScope }> {
   if (source === 'BITRIX24') {
-    if (externalEntityType === 'contact' && /^ONCRMCONTACT(?:ADD|UPDATE)$/.test(eventType ?? '')) return [{ entity: 'CONTACT', scope: 'contacts-companies' }];
-    if (externalEntityType === 'company' && /^ONCRMCOMPANY(?:ADD|UPDATE)$/.test(eventType ?? '')) return [{ entity: 'COMPANY', scope: 'contacts-companies' }];
-    if (externalEntityType === 'deal' && /^ONCRMDEAL(?:ADD|UPDATE)$/.test(eventType ?? '')) return [{ entity: 'DEAL', scope: 'deals-orders' }];
+    if (externalEntityType === 'contact' && /^ONCRMCONTACT(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'CONTACT', scope: 'contacts-companies' }];
+    if (externalEntityType === 'company' && /^ONCRMCOMPANY(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'COMPANY', scope: 'contacts-companies' }];
+    if (externalEntityType === 'deal' && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'DEAL', scope: 'deals-orders' }];
     if (externalEntityType === 'invoice' && /^ONCRMDYNAMICITEM(?:ADD|UPDATE)$/.test(eventType ?? '')) return [{ entity: 'INVOICE', scope: 'invoices' }];
-    if (externalEntityType === 'product' && eventType === 'CATALOG.PRODUCT.ON.UPDATE') return [{ entity: 'PRODUCT', scope: 'products-variations' }];
+    if (externalEntityType === 'product' && ['CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRODUCT.ON.DELETE'].includes(eventType ?? '')) return [{ entity: 'PRODUCT', scope: 'products-variations' }];
     return [];
   }
-  if (source !== 'MOYSKLAD' || !['CREATE', 'UPDATE'].includes(eventType ?? '')) return [];
+  if (source !== 'MOYSKLAD' || !['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) return [];
   if (externalEntityType === 'counterparty') return [
     { entity: 'COMPANY', scope: 'contacts-companies' }, { entity: 'CONTACT', scope: 'contacts-companies' },
   ];
@@ -771,6 +809,12 @@ export function acceptedRecheckEntities(source: string, eventType: string | null
   if (externalEntityType === 'invoiceout') return [{ entity: 'INVOICE', scope: 'invoices' }];
   if (externalEntityType === 'product') return [{ entity: 'PRODUCT', scope: 'products-variations' }];
   return [];
+}
+
+function isAcceptedDelete(source: string, eventType: string | null) {
+  return source === 'BITRIX24'
+    ? ['ONCRMCONTACTDELETE', 'ONCRMCOMPANYDELETE', 'ONCRMDEALDELETE', 'CATALOG.PRODUCT.ON.DELETE'].includes(eventType ?? '')
+    : source === 'MOYSKLAD' && eventType === 'DELETE';
 }
 
 function syntheticUpdateType(source: string, entity: string, externalEntityType: string | null): string | null {

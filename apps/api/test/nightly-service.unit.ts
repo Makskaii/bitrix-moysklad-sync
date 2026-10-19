@@ -19,6 +19,15 @@ class NightlyStore {
   acceptedRows: Array<Record<string, any>> = [];
   bitrixIds: string[] = [];
   failBitrix = false;
+  pairLifecycleStatus = 'ACTIVE';
+  pairEntityType = 'CONTACT';
+  pairBitrixId = 'contact-1';
+  pairMoyskladId = 'ms-contact-1';
+  pairMoyskladType = 'counterparty';
+  bitrixToMoyskladEnabled = true;
+  moyskladToBitrixEnabled = true;
+  directionReadCount = 0;
+  directionResults: boolean[] = [];
 
   constructor(mode: 'on' | 'pause' | 'off' = 'on') {
     this.state = {
@@ -47,15 +56,27 @@ class NightlyStore {
     },
   };
   readonly syncDirectionSetting = {
-    upsert: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
-    findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
+    upsert: async () => {
+      const result = this.directionResults[this.directionReadCount++] ?? this.bitrixToMoyskladEnabled;
+      return { bitrix24ToMoysklad: result, moyskladToBitrix24: this.moyskladToBitrixEnabled };
+    },
+    findUnique: async () => ({ bitrix24ToMoysklad: this.bitrixToMoyskladEnabled, moyskladToBitrix24: this.moyskladToBitrixEnabled }),
   };
   readonly inboundEvent = {
     count: async ({ where }: { where: { deliveryKey: { startsWith: string }; status: { in: string[] } } }) => [...this.queued.values()]
       .filter((row) => row.deliveryKey.startsWith(where.deliveryKey.startsWith) && where.status.in.includes(row.status)).length,
-    findMany: async ({ where }: { where: Record<string, any> }) => {
-      const cursor = where.id?.gt;
-      return cursor ? [] : this.acceptedRows;
+    findMany: async ({ where, take }: { where: Record<string, any>; take: number }) => {
+      const cursor = where.AND?.flatMap((condition: Record<string, any>) => condition.OR ?? []) ?? [];
+      const afterDate = cursor.find((condition: Record<string, any>) => condition.receivedAt?.gt)?.receivedAt.gt ??
+        cursor.find((condition: Record<string, any>) => condition.receivedAt instanceof Date)?.receivedAt;
+      const afterId = cursor.find((condition: Record<string, any>) => condition.id?.gt)?.id.gt ?? where.id?.gt;
+      const rows: Array<Record<string, any>> = this.acceptedRows
+        .map((row) => ({ ...row, receivedAt: row.receivedAt ?? new Date('2026-10-20T20:00:00.000Z') }));
+      return rows
+        .filter((row) => !afterDate || row.receivedAt > afterDate || row.receivedAt.getTime() === afterDate.getTime() && row.id > afterId)
+        .filter((row) => !where.id?.gt || row.id > where.id.gt)
+        .sort((left, right) => left.receivedAt.getTime() - right.receivedAt.getTime() || left.id.localeCompare(right.id))
+        .slice(0, take);
     },
     upsert: async ({ where, create }: { where: { source_deliveryKey: { source: string; deliveryKey: string } }; create: Record<string, any> }) => {
       const key = `${where.source_deliveryKey.source}:${where.source_deliveryKey.deliveryKey}`;
@@ -72,8 +93,9 @@ class NightlyStore {
       const ids: string[] = where.bitrix24Id?.in ?? where.moyskladId?.in ?? [];
       return ids.includes('contact-1') ? [{ entityType: 'CONTACT', bitrix24Id: 'contact-1', moyskladId: 'ms-contact-1', moyskladType: 'counterparty' }] : [];
     },
-    findFirst: async ({ where }: { where: Record<string, any> }) => where.bitrix24Id === 'contact-1' || where.moyskladId === 'ms-contact-1'
-      ? { id: 'pair-1', entityType: 'CONTACT', bitrix24Id: 'contact-1', moyskladId: 'ms-contact-1', moyskladType: 'counterparty' }
+    findFirst: async ({ where }: { where: Record<string, any> }) => where.entityType === this.pairEntityType &&
+      (where.bitrix24Id === this.pairBitrixId || where.moyskladId === this.pairMoyskladId)
+      ? { id: 'pair-1', entityType: this.pairEntityType, bitrix24Id: this.pairBitrixId, moyskladId: this.pairMoyskladId, moyskladType: this.pairMoyskladType, lifecycleStatus: this.pairLifecycleStatus }
       : null,
     findUnique: async () => ({ moyskladParentId: 'parent-1' }),
   };
@@ -234,11 +256,126 @@ test('nightly accepted-event recheck deduplicates one entity represented by mult
     await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
 
     assert.equal(harness.store.accepted.length, 1);
-    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:CONTACT:contact-1');
+    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:CONTACT:ONCRMCONTACTUPDATE:ACTIVE:contact-1');
     assert.equal(harness.store.dispatched.length, 1);
     assert.equal(harness.store.state.nightlyStatus, 'awaiting_processing');
   } finally {
     harness.close();
+  }
+});
+
+test('nightly accepted-event recheck keeps the latest action when an identity crosses the 500-row page boundary', async (context) => {
+  const cases = [
+    { name: 'update then delete with timestamp tie', earlierType: 'ONCRMCONTACTUPDATE', laterType: 'ONCRMCONTACTDELETE', earlierId: 'accepted-0000', laterId: 'accepted-0500', earlierAt: new Date('2026-10-20T21:00:00.000Z'), laterAt: new Date('2026-10-20T21:00:00.000Z') },
+    { name: 'delete then update with timestamp tie', earlierType: 'ONCRMCONTACTDELETE', laterType: 'ONCRMCONTACTUPDATE', earlierId: 'accepted-0000', laterId: 'accepted-0500', earlierAt: new Date('2026-10-20T21:00:00.000Z'), laterAt: new Date('2026-10-20T21:00:00.000Z') },
+    { name: 'timestamp outranks lexical ID', earlierType: 'ONCRMCONTACTUPDATE', laterType: 'ONCRMCONTACTDELETE', earlierId: 'zz-earlier', laterId: 'aa-later', earlierAt: new Date('2026-10-20T21:00:00.000Z'), laterAt: new Date('2026-10-20T21:01:00.000Z') },
+  ];
+  for (const scenario of cases) {
+    await context.test(scenario.name, async () => {
+      const harness = await createHarness('on');
+      harness.store.acceptedRows = [
+        { id: scenario.earlierId, source: 'BITRIX24', eventType: scenario.earlierType, externalEntityType: 'contact', externalEntityId: 'contact-1', receivedAt: scenario.earlierAt },
+        ...Array.from({ length: 499 }, (_, index) => ({
+          id: `accepted-${String(index + 1).padStart(4, '0')}`,
+          source: 'BITRIX24', eventType: 'ONCRMCONTACTUPDATE', externalEntityType: 'contact',
+          externalEntityId: `unpaired-${index}`, receivedAt: scenario.earlierAt,
+        })),
+        { id: scenario.laterId, source: 'BITRIX24', eventType: scenario.laterType, externalEntityType: 'contact', externalEntityId: 'contact-1', receivedAt: scenario.laterAt },
+      ];
+      try {
+        harness.service.onApplicationBootstrap();
+        await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+        assert.equal(harness.store.accepted.length, 1);
+        assert.equal(harness.store.accepted[0].eventType, scenario.laterType);
+        assert.equal(harness.store.accepted[0].externalEntityId, 'contact-1');
+        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:CONTACT:${scenario.laterType}:ACTIVE:contact-1`);
+        assert.equal((harness.store.accepted[0].payload as Record<string, unknown>).acceptedEventId, scenario.laterId);
+        assert.equal(harness.store.dispatched.length, 1);
+      } finally {
+        harness.close();
+      }
+    });
+  }
+});
+
+test('nightly accepted DELETE stays terminal when its canonical sync direction is disabled', async () => {
+  const harness = await createHarness('on');
+  harness.store.bitrixToMoyskladEnabled = false;
+  harness.store.acceptedRows = [
+    { id: 'accepted-delete-disabled', source: 'BITRIX24', eventType: 'ONCRMCONTACTDELETE', externalEntityType: 'contact', externalEntityId: 'contact-1' },
+  ];
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    assert.equal(harness.store.accepted.length, 0);
+    assert.equal(harness.store.dispatched.length, 0);
+    assert.equal(harness.store.queued.size, 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test('a latest accepted DELETE observed with its direction disabled suppresses an older enabled UPDATE', async () => {
+  const harness = await createHarness('on');
+  harness.store.directionResults = [true, true, false, true];
+  const receivedAt = new Date('2026-10-20T21:00:00.000Z');
+  harness.store.acceptedRows = [
+    { id: 'accepted-0000', source: 'BITRIX24', eventType: 'ONCRMCONTACTUPDATE', externalEntityType: 'contact', externalEntityId: 'contact-1', receivedAt },
+    ...Array.from({ length: 499 }, (_, index) => ({
+      id: `accepted-${String(index + 1).padStart(4, '0')}`,
+      source: 'BITRIX24', eventType: 'ONCRMCONTACTUPDATE', externalEntityType: 'contact',
+      externalEntityId: `unpaired-${index}`, receivedAt,
+    })),
+    { id: 'accepted-0500', source: 'BITRIX24', eventType: 'ONCRMCONTACTDELETE', externalEntityType: 'contact', externalEntityId: 'contact-1', receivedAt },
+  ];
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    assert.equal(harness.store.directionReadCount, 4);
+    assert.deepEqual(harness.store.accepted.map((event) => [event.eventType, event.payload]), []);
+    assert.equal(harness.store.dispatched.length, 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test('nightly accepted DELETE rechecks active and tombstoned pairs using the exact source ID and original event type', async (context) => {
+  const cases = [
+    { name: 'Bitrix24 contact', source: 'BITRIX24', eventType: 'ONCRMCONTACTDELETE', externalEntityType: 'contact', entity: 'CONTACT', sourceId: 'contact-1', partnerId: 'ms-contact-1', partnerType: 'counterparty' },
+    { name: 'MoySklad counterparty', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', entity: 'COMPANY', sourceId: 'ms-company-1', partnerId: 'b24-company-1', partnerType: 'counterparty' },
+  ];
+  for (const candidate of cases) {
+    for (const lifecycleStatus of ['ACTIVE', 'TOMBSTONED']) {
+      await context.test(`${candidate.name}, ${lifecycleStatus} pair`, async () => {
+      const harness = await createHarness('on');
+      harness.store.pairLifecycleStatus = lifecycleStatus;
+      harness.store.pairEntityType = candidate.entity;
+      harness.store.pairBitrixId = candidate.source === 'BITRIX24' ? candidate.sourceId : candidate.partnerId;
+      harness.store.pairMoyskladId = candidate.source === 'MOYSKLAD' ? candidate.sourceId : candidate.partnerId;
+      harness.store.pairMoyskladType = candidate.partnerType;
+      harness.store.acceptedRows = [
+        { id: `accepted-delete-${candidate.source}-${lifecycleStatus}`, source: candidate.source, eventType: candidate.eventType, externalEntityType: candidate.externalEntityType, externalEntityId: candidate.sourceId },
+      ];
+      try {
+        harness.service.onApplicationBootstrap();
+        await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+        assert.equal(harness.store.accepted.length, 1);
+        assert.equal(harness.store.accepted[0].eventType, candidate.eventType);
+        assert.equal(harness.store.accepted[0].externalEntityId, candidate.sourceId);
+        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:${candidate.entity}:${candidate.eventType}:${lifecycleStatus}:${candidate.sourceId}`);
+        assert.deepEqual(harness.store.accepted[0].payload, {
+          recovery: 'nightly', entity: candidate.entity, acceptedEventId: `accepted-delete-${candidate.source}-${lifecycleStatus}`,
+        });
+        assert.equal(harness.store.dispatched.length, 1);
+      } finally {
+        harness.close();
+      }
+      });
+    }
   }
 });
 
