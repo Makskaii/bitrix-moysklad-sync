@@ -15,6 +15,9 @@ test('accepted-event nightly scope routes supported non-delete events by entity'
   assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'UPDATE', 'product'), [
     { entity: 'PRODUCT', scope: 'products-variations' },
   ]);
+  assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'CREATE', 'service'), [
+    { entity: 'PRODUCT', scope: 'products-variations' },
+  ]);
 });
 
 test('accepted-event nightly scope routes deletes to their lifecycle entity', () => {
@@ -27,9 +30,15 @@ test('accepted-event nightly scope routes deletes to their lifecycle entity', ()
   assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'DELETE', 'counterparty'), [
     { entity: 'COMPANY', scope: 'contacts-companies' }, { entity: 'CONTACT', scope: 'contacts-companies' },
   ]);
+  assert.deepEqual(acceptedRecheckEntities('BITRIX24', 'ONCRMDYNAMICITEMDELETE', 'invoice'), [
+    { entity: 'INVOICE', scope: 'invoices' },
+  ]);
+  assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'DELETE', 'service'), [
+    { entity: 'PRODUCT', scope: 'products-variations' },
+  ]);
 });
 
 test('accepted-event nightly scope excludes unsupported product events', () => {
   assert.deepEqual(acceptedRecheckEntities('BITRIX24', 'CATALOG.PRICE.ON.UPDATE', 'catalogprice'), []);
-  assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'CREATE', 'service'), []);
+  assert.deepEqual(acceptedRecheckEntities('MOYSKLAD', 'CREATE', 'unknown'), []);
 });

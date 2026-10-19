@@ -371,7 +371,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           status: { in: ['SUCCEEDED', 'UNCHANGED', 'SYNCED'] },
           OR: [
             { source: 'BITRIX24', externalEntityType: { in: ['contact', 'company', 'deal', 'invoice', 'product'] } },
-            { source: 'MOYSKLAD', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'invoiceout', 'product'] } },
+            { source: 'MOYSKLAD', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'invoiceout', 'product', 'service'] } },
           ],
         },
         orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }], take,
@@ -796,7 +796,7 @@ export function acceptedRecheckEntities(source: string, eventType: string | null
     if (externalEntityType === 'contact' && /^ONCRMCONTACT(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'CONTACT', scope: 'contacts-companies' }];
     if (externalEntityType === 'company' && /^ONCRMCOMPANY(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'COMPANY', scope: 'contacts-companies' }];
     if (externalEntityType === 'deal' && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'DEAL', scope: 'deals-orders' }];
-    if (externalEntityType === 'invoice' && /^ONCRMDYNAMICITEM(?:ADD|UPDATE)$/.test(eventType ?? '')) return [{ entity: 'INVOICE', scope: 'invoices' }];
+    if (externalEntityType === 'invoice' && /^ONCRMDYNAMICITEM(?:ADD|UPDATE|DELETE)$/.test(eventType ?? '')) return [{ entity: 'INVOICE', scope: 'invoices' }];
     if (externalEntityType === 'product' && ['CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRODUCT.ON.DELETE'].includes(eventType ?? '')) return [{ entity: 'PRODUCT', scope: 'products-variations' }];
     return [];
   }
@@ -807,13 +807,13 @@ export function acceptedRecheckEntities(source: string, eventType: string | null
   if (externalEntityType === 'contactperson') return [{ entity: 'CONTACT', scope: 'contacts-companies' }];
   if (externalEntityType === 'customerorder') return [{ entity: 'DEAL', scope: 'deals-orders' }];
   if (externalEntityType === 'invoiceout') return [{ entity: 'INVOICE', scope: 'invoices' }];
-  if (externalEntityType === 'product') return [{ entity: 'PRODUCT', scope: 'products-variations' }];
+  if (externalEntityType === 'product' || externalEntityType === 'service') return [{ entity: 'PRODUCT', scope: 'products-variations' }];
   return [];
 }
 
 function isAcceptedDelete(source: string, eventType: string | null) {
   return source === 'BITRIX24'
-    ? ['ONCRMCONTACTDELETE', 'ONCRMCOMPANYDELETE', 'ONCRMDEALDELETE', 'CATALOG.PRODUCT.ON.DELETE'].includes(eventType ?? '')
+    ? ['ONCRMCONTACTDELETE', 'ONCRMCOMPANYDELETE', 'ONCRMDEALDELETE', 'ONCRMDYNAMICITEMDELETE', 'CATALOG.PRODUCT.ON.DELETE'].includes(eventType ?? '')
     : source === 'MOYSKLAD' && eventType === 'DELETE';
 }
 
@@ -828,7 +828,7 @@ function syntheticUpdateType(source: string, entity: string, externalEntityType:
   }
   if (entity === 'CONTACT' || entity === 'COMPANY' || entity === 'DEAL' || entity === 'INVOICE' || entity === 'PRODUCT') {
     return externalEntityType === 'contactperson' || externalEntityType === 'customerorder' || externalEntityType === 'invoiceout' ||
-      externalEntityType === 'product' || externalEntityType === 'counterparty' ? 'UPDATE' : null;
+      externalEntityType === 'product' || externalEntityType === 'service' || externalEntityType === 'counterparty' ? 'UPDATE' : null;
   }
   return null;
 }
