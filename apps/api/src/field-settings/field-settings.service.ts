@@ -226,6 +226,9 @@ export class FieldSettingsService {
     for (const candidate of config.rules) {
       const rule = candidate as unknown as JsonRecord;
       const entity = String(rule.entity);
+      if (entity === 'catalog' && rule.sourceField === 'xmlId') {
+        throw new BadRequestException('Catalog xmlId is reserved for durable product-create recovery and cannot be mapped');
+      }
       requireField(entity, 'bitrix24', rule.sourceField, false);
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
@@ -253,6 +256,9 @@ export class FieldSettingsService {
       const group = candidate as unknown as JsonRecord;
       const entity = String(group.entity);
       const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+      if (entity === 'catalog' && (b24ToMs ? (group.sourceFields as string[]).includes('xmlId') : group.targetField === 'xmlId')) {
+        throw new BadRequestException('Catalog xmlId is reserved for durable product-create recovery and cannot be mapped');
+      }
       if (entity === 'catalog' && b24ToMs) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }

@@ -85,7 +85,7 @@ before(async () => {
                 ? [{ FIELD_NAME: 'UF_DEAL_SAMPLE', EDIT_FORM_LABEL: 'Deal sample' }]
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
-                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, weight: { type: 'double', name: 'Weight', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
+                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, weight: { type: 'double', name: 'Weight', isReadOnly: false }, xmlId: { type: 'string', name: 'XML ID', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
                 : { product: {} }
             : method === 'catalog.product.service.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
@@ -343,7 +343,7 @@ test('catalog field metadata uses the product information block and API field na
   const body = await response.text();
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as {
-    bitrix24: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string }>;
+    bitrix24: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string; reserved?: string }>;
     moysklad: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string }>;
   };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
@@ -355,6 +355,7 @@ test('catalog field metadata uses the product information block and API field na
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.resource === 'product'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'xmlId' && field.writable === true && field.reserved === 'PRODUCT_CREATE_RECOVERY_IDENTITY'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'code' && field.title === 'Service code'), 'service schema contributes fields not present in product metadata');
   assert.ok(catalog.moysklad.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
   assert.ok(catalog.moysklad.some((field) => field.code === 'article' && field.writable === true));
@@ -650,6 +651,35 @@ test('catalog field settings reject Bitrix24-to-MySklad product writes for rules
     body: JSON.stringify({ config: customFieldConfig }),
   });
   assert.equal(customFieldResponse.status, 400, 'custom properties remain visible metadata but cannot be falsely configured as standard scalar copies');
+
+  const reservedIdentityConfig = {
+    ...active.config,
+    rules: [{
+      id: 'reserved-recovery-identity', entity: 'catalog', sourceField: 'xmlId', targetField: 'externalCode',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+    }],
+  };
+  const reservedIdentityResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: reservedIdentityConfig }),
+  });
+  assert.equal(reservedIdentityResponse.status, 400);
+  assert.match(await reservedIdentityResponse.text(), /xmlId is reserved for durable product-create recovery/);
+
+  const reservedIdentityGroup = {
+    ...active.config,
+    groups: [{
+      id: 'reserved-recovery-identity-group', entity: 'catalog', direction: 'MOYSKLAD_TO_BITRIX24',
+      sourceFields: ['externalCode'], targetField: 'xmlId', transform: { kind: 'join-non-empty', separator: ' ' },
+    }],
+  };
+  const reservedIdentityGroupResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: reservedIdentityGroup }),
+  });
+  assert.equal(reservedIdentityGroupResponse.status, 400);
+  assert.match(await reservedIdentityGroupResponse.text(), /xmlId is reserved for durable product-create recovery/);
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

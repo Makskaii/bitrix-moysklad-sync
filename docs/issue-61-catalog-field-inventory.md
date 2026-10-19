@@ -19,7 +19,7 @@ Snapshot date: 2026-10-19. This inventory distinguishes metadata/schema evidence
 | `code` | string / yes | `code` | string / yes | direct copy; exact-title suggestion | Supported when explicitly enabled; reverse write only |
 | `detailText` | string / yes | `description` | string / yes | direct copy; explicit pair required | Supported when explicitly enabled; reverse write only |
 | `weight` | double / yes | `weight` (product only) | double / yes | exact scalar analog; explicit pair required | Supported by generic typed mapping; product only |
-| `xmlId` | string / yes | `externalCode` | string / yes | likely external identifier analog; operator must confirm exact pair | Generic scalar update supported when explicitly selected; create-time `xmlId` remains reserved as durable recovery marker |
+| `xmlId` | string / yes | `externalCode` | string / yes | identity-like labels, but unsafe to map | Reserved: `xmlId` is the durable create/recovery key and is never selectable or writable by generic mappings |
 | `measure` | integer reference / yes | `uom` | object reference / yes | dedicated configured unit pair, never scalar copy | Dedicated; only approved unit-reference pairs resolve it |
 | `price` / `catalog.price` rows | catalog price collection | `salePrices` | array | configured price-type and currency reference pairs | Dedicated catalog price path; never existing deal/order rows |
 | `property118` (article property in observed catalog) | productproperty / yes | `article` | string / yes | no direct scalar type pairing | Unmapped: requires a separately defined extraction/transform; generic copy rejects it |
@@ -85,7 +85,7 @@ The provider field selector reads the actual target product and service schemas,
 | `weight` | double | yes |
 | `width` | double | yes |
 | `withoutOrder` | char | yes |
-| `xmlId` | string | yes |
+| `xmlId` | string | yes (integration-reserved) |
 
 Service fields were:
 
@@ -119,7 +119,7 @@ Service fields were:
 | `type` | integer | no |
 | `vatId` | integer | yes |
 | `vatIncluded` | char | yes |
-| `xmlId` | string | yes |
+| `xmlId` | string | yes (integration-reserved) |
 
 Provider metadata is account/catalog specific; these lists are a dated observed snapshot, not hardcoded schema truth. Fields absent from a selected resource or not writable there are rejected at save/create time. Custom `property*` fields are exposed with live metadata but have no generic scalar mapping because their API type is `productproperty`.
 
@@ -134,7 +134,7 @@ The field selector exposes schema-backed standard candidates with their localize
 | `accountId` | uuid | no | product/service | read-only; never a field mapping |
 | `name` | string | yes | product/service | explicit direct candidate; dedicated required-name behavior |
 | `code` | string | yes | product/service | explicit direct candidate |
-| `externalCode` | string | yes | product/service | suggested with `xmlId`; explicit selection required |
+| `externalCode` | string | yes | product/service | candidate identity field; never map to reserved `xmlId`; may only be selected with a separately confirmed non-identity B24 target |
 | `article` | string | yes | product only | candidate exists; B24 observed counterpart is complex `productproperty`, so no scalar mapping |
 | `description` | string | yes | product/service | explicit direct candidate with B24 `detailText` |
 | `archived` | boolean | yes | product/service | no direct counterpart (`active` is inverse) |

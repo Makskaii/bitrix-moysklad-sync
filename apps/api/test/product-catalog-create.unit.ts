@@ -12,6 +12,7 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
   const operations = new Map<string, Record<string, any>>();
   const pairs: Array<Record<string, unknown>> = [];
   let failAfterServicePriceWrite = true;
+  let failAfterProductCreateWrite = true;
   const operationModel = {
     findUnique: async ({ where }: { where: { moyskladProductId: string } }) => operations.get(where.moyskladProductId) ?? null,
     findUniqueOrThrow: async ({ where }: { where: { moyskladProductId: string } }) => operations.get(where.moyskladProductId),
@@ -59,6 +60,10 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
       const id = '821';
       const card = { id: Number(id), type: 1, ...request.fields };
       cards.set(id, card);
+      if (failAfterProductCreateWrite) {
+        failAfterProductCreateWrite = false;
+        return Response.json({ error: 'temporary timeout after applying write' }, { status: 503 });
+      }
       return Response.json({ result: { element: card } });
     }
     if (method === 'catalog.product.service.list') {
@@ -91,11 +96,15 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     const service = new ProductCatalogCreateService(db, mode);
     const input: any = {
       productId: '12345678-1234-1234-1234-123456789abc', eventId: 'event-new-product',
-      eventConfig: { version: 4, config: { productCatalogRuntime: { bitrix24CatalogId: '12', moyskladFields: ['name', 'code', 'description'] }, rules: [{ id: 'weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }], dealOrderRuntime: null } },
-      product: { id: '12345678-1234-1234-1234-123456789abc', meta: { type: 'product' }, name: 'Rotor', code: 'R-1', description: 'Rotor body', weight: 0 },
+      eventConfig: { version: 4, config: { productCatalogRuntime: { bitrix24CatalogId: '12', moyskladFields: ['name', 'code', 'description'] }, rules: [
+        { id: 'weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+        { id: 'reserved-xmlid', entity: 'catalog', sourceField: 'xmlId', targetField: 'externalCode', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+      ], dealOrderRuntime: null } },
+      product: { id: '12345678-1234-1234-1234-123456789abc', meta: { type: 'product' }, name: 'Rotor', code: 'R-1', description: 'Rotor body', weight: 0, externalCode: 'different-identity' },
       prices: [],
     };
-    assert.equal(await service.createOrRecover(input), '821');
+    await assert.rejects(() => service.createOrRecover(input), /BITRIX24_PRODUCT_API_503/);
+    assert.equal(await service.createOrRecover(input), '821', 'retry recovers the already-created card by its stable XML ID');
     assert.equal(await service.createOrRecover(input), '821');
     assert.equal(cards.size, 1);
     assert.deepEqual(pairs[0], { active: true, entityType: 'PRODUCT', bitrix24Id: '821', moyskladId: input.productId, moyskladType: 'product', source: 'AUTO' });
@@ -105,6 +114,10 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     assert.equal((cards.get('821') as any).code, 'R-1');
     assert.equal((cards.get('821') as any).detailText, 'Rotor body');
     assert.equal((cards.get('821') as any).weight, 0, 'explicitly mapped numeric zero is included in durable create and readback');
+    assert.equal((cards.get('821') as any).xmlId, 'MOYSKLAD_PRODUCT_12345678-1234-1234-1234-123456789abc', 'source externalCode never replaces the durable identity XML ID');
+    assert.equal((cards.get('821') as any).externalCode, undefined, 'unconfirmed externalCode is not copied to another identity field');
+    assert.equal(await service.createOrRecover(input), '821', 'retry finds the same card by its stable generated XML ID');
+    assert.equal(cards.size, 1, 'uncertain retry cannot create a duplicate after preserving the recovery identity');
 
     const serviceInput: any = {
       productId: '22345678-1234-1234-1234-123456789abc', moyskladType: 'service', eventId: 'event-new-service',
