@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { DatabaseService } from '../src/database.service';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { enterControlledLiveEventScope } from '../src/controlled-live-test-policy';
-import { setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { assertApplyExternalWrite, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 
 const isolated = process.env.CONTROLLED_LIVE_TEST_POSTGRES_ISOLATED === '1';
 test('controlled live source admission and target binding survive service restart in isolated PostgreSQL', { skip: !isolated }, async () => {
@@ -23,7 +23,13 @@ test('controlled live source admission and target binding survive service restar
   }
   const now = new Date();
   const runId = `LIVE-TEST-${now.toISOString().replace(/[-:.]/g, '').replace('T', 'T').replace('Z', 'Z')}-${randomUUID().replace(/-/g, '').slice(0, 8)}`;
-  const name = `тест ${runId} company`;
+  const entries = [
+    { entity: 'client:COMPANY', sourceId: 'b24-controlled-source', targetId: 'ms-controlled-target', name: `тест ${runId} company`, sourceType: 'COMPANY' },
+    { entity: 'deal-order', sourceId: 'b24-controlled-deal', targetId: 'ms-controlled-deal', name: `тест ${runId} deal`, sourceType: 'deal' },
+    { entity: 'invoice', sourceId: 'b24-controlled-invoice', targetId: 'ms-controlled-invoice', name: `тест ${runId} invoice`, sourceType: 'invoice' },
+    { entity: 'catalog-product', sourceId: 'b24-controlled-product', targetId: 'ms-controlled-product', name: `тест ${runId} product`, sourceType: 'catalogproduct' },
+  ] as const;
+  const name = entries[0]!.name;
   const directory = await mkdtemp(join(tmpdir(), 'issue60-admission-pg-'));
   const manifestPath = join(directory, 'manifest.json');
   const previous = {
@@ -36,28 +42,42 @@ test('controlled live source admission and target binding survive service restar
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, records: [{
-    entity: 'client:COMPANY', direction: 'BOTH', name, syntheticOnly: true,
-    sourceSystem: 'BITRIX24', sourceNativeId: null, targetSystem: 'MOYSKLAD', targetNativeId: null,
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, records: entries.map((entry, index) => ({
+    entity: entry.entity, direction: index === 0 ? 'BOTH' : 'BITRIX24_TO_MOYSKLAD', name: entry.name, syntheticOnly: true,
+    sourceSystem: 'BITRIX24', sourceNativeId: index === 0 ? null : entry.sourceId, targetSystem: 'MOYSKLAD', targetNativeId: index === 0 ? null : entry.targetId,
     createdAfterUtc: new Date(now.getTime() - 5_000).toISOString(),
-  }] }), 'utf8');
+  })) }), 'utf8');
   const database = new DatabaseService();
-  const eventIds = [`issue60-${randomUUID()}`, `issue60-${randomUUID()}`];
+  const eventIds = [...entries.map(() => `issue60-${randomUUID()}`), `issue60-${randomUUID()}`];
   try {
     const sourceEvent = await database.inboundEvent.create({ data: {
       id: eventIds[0], source: 'BITRIX24', deliveryKey: randomUUID(), eventType: 'ONCOMPANYADD',
-      externalEntityId: 'b24-controlled-source', externalEntityType: 'COMPANY', payload: {},
+      externalEntityId: entries[0]!.sourceId, externalEntityType: entries[0]!.sourceType, payload: {},
     } });
     const sourceAdmission = new ControlledLiveTestAdmissionService(database);
     await sourceAdmission.runForEvent(sourceEvent.id, async () => {
-      await sourceAdmission.admit(sourceEvent.id, { entity: 'client:COMPANY', sourceSystem: 'BITRIX24', sourceNativeId: 'b24-controlled-source', currentNativeId: 'b24-controlled-source', currentName: name, sourceCreatedAt: now });
+      await sourceAdmission.admit(sourceEvent.id, { entity: 'client:COMPANY', sourceSystem: 'BITRIX24', sourceNativeId: entries[0]!.sourceId, currentNativeId: entries[0]!.sourceId, currentName: name, sourceCreatedAt: now });
       enterControlledLiveEventScope(await sourceAdmission.scopeForEvent(sourceEvent.id));
       await sourceAdmission.bindCreatedTarget(sourceEvent.id, 'ms-controlled-target', 'ms-controlled-target', name, now);
     });
     const persisted = await database.controlledTestAdmission.findUnique({ where: { eventId: sourceEvent.id } });
     assert.equal(persisted?.targetNativeId, 'ms-controlled-target');
+    for (const [index, entry] of entries.slice(1).entries()) {
+      const eventId = eventIds[index + 1]!;
+      const event = await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: randomUUID(),
+        eventType: 'CONTROLLED_TEST', externalEntityId: entry.sourceId, externalEntityType: entry.sourceType, payload: {} } });
+      await sourceAdmission.withCurrentSourceRead(event.id, 'BITRIX24', entry.sourceId, entry.entity, async () => {
+        await sourceAdmission.admit(event.id, { entity: entry.entity, sourceSystem: 'BITRIX24', sourceNativeId: entry.sourceId,
+          currentNativeId: entry.sourceId, currentName: entry.name, sourceCreatedAt: now });
+      });
+      await sourceAdmission.runForEvent(event.id, async () => {
+        assertApplyExternalWrite('MOYSKLAD', 'CONTROLLED_TEST_UPDATE', entry.targetId, entry.entity);
+        assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CONTROLLED_TEST_UPDATE', 'shared-real-id', entry.entity), /TARGET_NOT_IN_MANIFEST/);
+      });
+      assert.equal((await database.controlledTestAdmission.findUnique({ where: { eventId } }))?.entity, entry.entity);
+    }
     const echoEvent = await database.inboundEvent.create({ data: {
-      id: eventIds[1], source: 'MOYSKLAD', deliveryKey: randomUUID(), eventType: 'counterparty',
+      id: eventIds[eventIds.length - 1]!, source: 'MOYSKLAD', deliveryKey: randomUUID(), eventType: 'counterparty',
       externalEntityId: 'ms-controlled-target', externalEntityType: 'counterparty', payload: {},
     } });
     const restarted = new ControlledLiveTestAdmissionService(database);

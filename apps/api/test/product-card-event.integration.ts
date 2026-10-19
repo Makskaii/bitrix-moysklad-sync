@@ -1,6 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ProductCardEventProcessor } from '../src/products/product-card-event.processor';
+import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
+import { assertApplyExternalWrite } from '../src/external-write-guard';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const productId = '12345678-1234-1234-1234-123456789abc';
 
@@ -159,4 +164,57 @@ test('product event rolls back terminal status when the worker lease is lost at 
   await assert.rejects(run('event-1', workerLease));
   assert.equal(storedEvent.status, 'PROCESSING');
   assert.equal(fenceCount, 2);
+});
+
+test('controlled product event admits a current synthetic source before allowing only its exact paired target write', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-product-event-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const runId = 'LIVE-TEST-20261019T120000Z-product01';
+  const name = `тест ${runId} product`;
+  const now = new Date();
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
+    manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath; process.env.DATABASE_URL = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test'; process.env.SYNC_MODE = 'apply';
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+    entity: 'catalog-product', direction: 'BITRIX24_TO_MOYSKLAD', name, syntheticOnly: true,
+    sourceSystem: 'BITRIX24', sourceNativeId: '101', targetSystem: 'MOYSKLAD', targetNativeId: productId,
+    createdAfterUtc: new Date(now.getTime() - 10_000).toISOString(),
+  }] }), 'utf8');
+  const event = { id: 'event-1', source: 'BITRIX24', eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
+    payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } }, status: 'RECEIVED', attempts: 0 } as Record<string, unknown>;
+  const admissions = new Map<string, any>();
+  const database: any = {
+    inboundEvent: { findUnique: async () => structuredClone(event), updateMany: async ({ data }: any) => { Object.assign(event, data); return { count: 1 }; } },
+    entityPair: { findMany: async () => [{ id: 'pair-product', entityType: 'PRODUCT', bitrix24Id: '101', moyskladId: productId, active: true, source: 'MANUAL', createdAt: now }] },
+    manualReviewCase: { upsert: async () => undefined, updateMany: async () => ({ count: 0 }) },
+    controlledTestAdmission: {
+      findMany: async ({ where }: any) => [...admissions.values()].filter((row) => row.runId === where.runId && row.entity === where.entity),
+      findUnique: async ({ where }: any) => admissions.get(where.eventId) ?? null,
+      findFirst: async () => null,
+      upsert: async ({ where, create }: any) => { if (!admissions.has(where.eventId)) admissions.set(where.eventId, { ...create }); return admissions.get(where.eventId); },
+      updateMany: async () => ({ count: 0 }),
+    },
+    $transaction: async (callback: (transaction: unknown) => Promise<unknown>) => callback(database),
+  };
+  try {
+    const admission = new ControlledLiveTestAdmissionService(database);
+    let writes = 0;
+    const runtime = { preflight: async () => ({ status: 'READY' }), process: async () => {
+      assertApplyExternalWrite('MOYSKLAD', 'PRODUCT_UPDATE', productId, 'catalog-product');
+      assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'PRODUCT_UPDATE', 'shared-product', 'catalog-product'), /TARGET_NOT_IN_MANIFEST/);
+      writes += 1; return { status: 'SYNCED', changedFields: ['name'] };
+    } };
+    const processor = new ProductCardEventProcessor(database, { readBitrix24PriceProductId: async () => '101', readBitrix24: async () => ({
+      name, detailText: null, unitId: null, prices: [], updatedAt: now.toISOString(), createdAt: now.toISOString(),
+    }) } as never, { eventConfig: async () => ({ version: 9 }) } as never, runtime as never, undefined, undefined, undefined, admission);
+    assert.equal((await processor.process('event-1'))?.status, 'SYNCED');
+    assert.equal(writes, 1);
+    assert.equal(admissions.get('event-1')?.targetNativeId, productId);
+  } finally {
+    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.manifest], ['DATABASE_URL', previous.database], ['SYNC_MODE', previous.sync]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
 });

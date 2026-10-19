@@ -62,6 +62,7 @@ export class ProductCardHttpApi implements ProductCardApi {
       fields: scalarFields,
       prices,
       updatedAt: nullableString(product.dateModify ?? product.dateCreate),
+      createdAt: nullableString(product.dateCreate),
     };
     return values;
   }
@@ -100,6 +101,7 @@ export class ProductCardHttpApi implements ProductCardApi {
       fields: scalarFields,
       prices,
       updatedAt: nullableString(product.updated),
+      createdAt: nullableString(product.created),
     };
     const proposedPrices = Array.isArray(proposed?.salePrices) ? proposed.salePrices.filter(isRecord).map((price) => {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};

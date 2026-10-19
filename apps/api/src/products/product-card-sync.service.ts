@@ -22,6 +22,8 @@ export type ProductCardSnapshot = {
   /** Primitive values only; complex references, files and collections stay on dedicated paths. */
   fields?: Record<string, string | number | boolean | null>;
   updatedAt: string | null;
+  /** Immutable provider creation timestamp used only by the controlled-test admission gate. */
+  createdAt?: string | null;
 };
 
 export type ProductCardApi = {

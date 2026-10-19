@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database.service';
@@ -7,6 +7,7 @@ import { writeOperationalLog } from '../monitoring-log';
 import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { SyncModeService } from '../sync-mode.service';
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 type Row = Record<string, any>;
 type ProductCreateInput = {
@@ -29,7 +30,7 @@ export class ProductCatalogManualReviewError extends Error {
 /** Durable MS→B24 product creation shared by catalog events and deal prerequisites. */
 @Injectable()
 export class ProductCatalogCreateService {
-  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService) {}
+  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
 
   async createOrRecover(input: ProductCreateInput): Promise<string> {
     const kind = input.moyskladType ?? 'product';
@@ -108,6 +109,14 @@ export class ProductCatalogCreateService {
         if (saved.count !== 1) throw new Error('PRODUCT_CREATE_LEASE_LOST');
       }
       const frozenPrices = Array.isArray(frozen.prices) ? frozen.prices.filter(isRecord) : [];
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('BITRIX24', b24Id);
+      const targetReadback = await findProducts(catalogId, xmlId, kind, Object.keys(frozen.fields));
+      if (targetReadback.length !== 1 || String(targetReadback[0]!.id) !== b24Id || !readbackMatches(targetReadback[0]!, frozen.fields, kind)) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_READBACK_MISMATCH');
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const targetCreatedAt = typeof targetReadback[0]!.dateCreate === 'string' ? new Date(targetReadback[0]!.dateCreate) : null;
+        if (!targetCreatedAt || !Number.isFinite(targetCreatedAt.getTime())) throw new ProductCatalogManualReviewError('CONTROLLED_LIVE_TEST_TARGET_CREATED_AT_UNAVAILABLE');
+        await this.controlledAdmission.bindCreatedTarget(input.eventId, b24Id, b24Id, String(targetReadback[0]!.name ?? ''), targetCreatedAt);
+      }
       for (const price of frozenPrices) await this.createOrRecoverPrice(b24Id, price, input.productId, leaseToken, input);
       const verified = await findProducts(catalogId, xmlId, kind, Object.keys(frozen.fields));
       if (verified.length !== 1 || String(verified[0].id) !== b24Id || !readbackMatches(verified[0], frozen.fields, kind)) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_READBACK_MISMATCH');
@@ -198,7 +207,7 @@ async function findProducts(catalogId: string, xmlId: string, kind: 'product' | 
   let start = 0;
   let total: number | null = null;
   for (let page = 0; page < 200; page += 1) {
-    const value = await bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', { select: [...new Set(['id', 'iblockId', 'iblockSectionId', 'name', 'code', 'detailText', 'measure', 'xmlId', 'type', ...configuredFields])], filter: { iblockId: Number(catalogId), xmlId }, order: { id: 'ASC' }, start });
+    const value = await bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', { select: [...new Set(['id', 'iblockId', 'iblockSectionId', 'name', 'code', 'detailText', 'measure', 'xmlId', 'type', 'dateCreate', ...configuredFields])], filter: { iblockId: Number(catalogId), xmlId }, order: { id: 'ASC' }, start });
     const root = isRecord(value) ? value : null;
     const pageRows = root && Array.isArray(root[kind === 'service' ? 'services' : 'products']) ? (root[kind === 'service' ? 'services' : 'products'] as unknown[]).filter(isRecord) : null;
     if (!root || !pageRows || typeof root.total !== 'number') throw new Error('PRODUCT_CREATE_RECOVERY_SEARCH_INVALID');

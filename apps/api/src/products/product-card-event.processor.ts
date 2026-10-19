@@ -10,6 +10,7 @@ import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worke
 import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { ProductCatalogCreateService, ProductCatalogManualReviewError } from './product-catalog-create.service';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -34,6 +35,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
     @Optional() private readonly catalogCreate?: ProductCatalogCreateService,
     @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
   supports(event: InboundEventMetadata): boolean {
@@ -185,14 +187,29 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     try {
       await workerLease?.assertOwned();
       const pinned = await this.fieldSettings.eventConfig(event.id);
-      const result = await this.runtime.process({
-        pairId: matches[0]!.id,
-        source: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
-        settingsVersion: pinned.version,
-        eventId: event.id,
-        attempt,
-        ...(workerLease ? { assertWorkerLease: workerLease.assertOwned } : {}),
-      });
+      const run = () => this.runtime.process({
+          pairId: matches[0]!.id,
+          source: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
+          settingsVersion: pinned.version,
+          eventId: event.id,
+          attempt,
+          ...(workerLease ? { assertWorkerLease: workerLease.assertOwned } : {}),
+        });
+      let result: ProductCardSyncResult;
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const entity = event.externalEntityType === 'service' ? 'catalog-service' : 'catalog-product';
+        const kind = entity === 'catalog-service' ? 'service' : 'product';
+        const sourceSystem = event.source as 'BITRIX24' | 'MOYSKLAD';
+        const sourceRecord = await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, supported.productId, entity, async () =>
+          sourceSystem === 'BITRIX24' ? this.bitrixApi.readBitrix24(supported.productId, kind) : this.bitrixApi.readMoysklad(supported.productId, kind));
+        const sourceCreatedAt = sourceRecord.createdAt ? new Date(sourceRecord.createdAt) : null;
+        if (!sourceRecord.name || !sourceCreatedAt || !Number.isFinite(sourceCreatedAt.getTime())) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+        await this.controlledAdmission.admit(event.id, { entity, sourceSystem, sourceNativeId: supported.productId, currentNativeId: supported.productId,
+          currentName: sourceRecord.name, sourceCreatedAt });
+        result = await this.controlledAdmission.runForEvent(event.id, run);
+      } else {
+        result = await run();
+      }
       await this.applyResult(event.id, event, result, workerLease);
       return result;
     } catch {
@@ -212,7 +229,10 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         await this.applyResult(input.eventId, pendingEvent, { ...gate, changedFields: [] }, input.workerLease);
         return false;
       }
-      const record = await this.bitrixApi.readMoyskladRecord(input.productId, input.kind);
+      const entity = input.kind === 'service' ? 'catalog-service' : 'catalog-product';
+      const record = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? await this.controlledAdmission.withCurrentSourceRead(input.eventId, 'MOYSKLAD', input.productId, entity, () => this.bitrixApi.readMoyskladRecord(input.productId, input.kind))
+        : await this.bitrixApi.readMoyskladRecord(input.productId, input.kind);
       const createdAt = typeof record.created === 'string' ? new Date(record.created) : null;
       const boundary = await this.databaseRecovery?.launchBoundary().catch(() => null);
       if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime())) {
@@ -223,6 +243,11 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         await this.finish(input.eventId, 'SKIPPED_PRE_LAUNCH', 'PRE_LAUNCH_PRODUCT', null, input.workerLease);
         return false;
       }
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        if (typeof record.name !== 'string' || !record.name) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+        await this.controlledAdmission.admit(input.eventId, { entity, sourceSystem: 'MOYSKLAD', sourceNativeId: input.productId,
+          currentNativeId: String(record.id ?? ''), currentName: record.name, sourceCreatedAt: createdAt });
+      }
       const pinned = await this.fieldSettings.eventConfig(input.eventId);
       const settings = pinned.config as unknown as ProductCardSettings;
       const snapshot = await this.bitrixApi.readMoysklad(input.productId, input.kind);
@@ -230,11 +255,13 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const prices = initialMappedPrices(snapshot.prices, settings);
       const creator = this.catalogCreate;
       if (!creator) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_RUNTIME_UNAVAILABLE');
-      await creator.createOrRecover({
+      const create = () => creator.createOrRecover({
         productId: input.productId, product: record, moyskladType: input.kind, eventId: input.eventId, eventConfig: pinned,
         ...(unitId === undefined ? {} : { bitrix24MeasureId: unitId }), prices, writeGate: 'PRODUCT_CATALOG',
         ...(input.workerLease ? { assertPairLease: async () => { await input.workerLease!.assertOwned(); return true; } } : {}),
       });
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') await this.controlledAdmission.runForEvent(input.eventId, create);
+      else await create();
       return true;
     } catch (error) {
       if (error instanceof ProductCatalogManualReviewError) {
