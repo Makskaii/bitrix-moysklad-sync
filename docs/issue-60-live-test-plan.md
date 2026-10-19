@@ -15,6 +15,12 @@ Do not schedule live actions until all are true:
 
 Current gate state: **BLOCKED for live acceptance**. Offline build, fake-HTTP/browser slices, and isolated PostgreSQL test schemas have run; these do not prove tenant readiness. A read-only live inventory found the required MySklad invoiceout/service/contactperson webhook subscriptions absent or disabled, Bitrix24 event API returning `WRONG_AUTH_TYPE`, SSH public-key access denied, and no native run-ID isolation. No live-test window is requested or scheduled here; no provider configuration or records were changed.
 
+## Local controlled-write guard implementation status
+
+The candidate includes a server-side manifest policy behind `CONTROLLED_LIVE_TEST_MODE=enabled`. Startup then requires `CONTROLLED_LIVE_TEST_INSTANCE=isolated`, an absolute manifest path, a valid unique run ID, exact manifest/database-name agreement, and a dedicated database name containing a `test` segment. Each allowed record must be explicitly synthetic and include `тест` plus the exact run ID in its name, direction, entity, source system/native ID and target system/native ID. The existing `assertApplyExternalWrite` seam delegates provider mutations to this policy. Missing policy, missing async event scope, wrong run/provider/record identity, and all create operations fail closed. The manifest contains only run and record identifiers; it must not contain credentials or secret URLs.
+
+This is a local guard prerequisite, not a runnable live harness yet: current event dispatch does not establish the required async manifest scope, the target creation/readback/transactional manifest-commit path is not installed, and all mutation adapters have not been audited against runtime instrumentation. Consequently controlled mode currently rejects writes, including synthetic writes. Do not enable it on a production service or treat passing unit tests as permission/readiness. A follow-up must establish scope only after authenticated incoming event validation plus current source read and must verify exact target identity at every provider mutation boundary before any end-to-end controlled run can be considered.
+
 ## Capability/scope restrictions
 
 | Scope | Planned test direction | Restriction |

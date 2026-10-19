@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { AdminController } from './admin/admin.controller';
 import { AdminAuditController } from './admin/admin-audit.controller';
 import { AdminAuditService } from './admin/admin-audit.service';
@@ -60,6 +60,9 @@ import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from './clients/clie
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
+import { readFileSync } from 'node:fs';
+import { setControlledLiveTestWriteCheck } from './external-write-guard';
+import { createControlledLiveTestPolicy } from './controlled-live-test-policy';
 import { InvoiceHttpApi } from './invoices/invoice-http-api';
 import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 
@@ -96,6 +99,18 @@ class AppController {
 class AppModule {}
 
 async function bootstrap() {
+  if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+    if (process.env.CONTROLLED_LIVE_TEST_INSTANCE !== 'isolated') {
+      throw new Error('CONTROLLED_LIVE_TEST_REQUIRES_ISOLATED_INSTANCE');
+    }
+    if (process.env.SYNC_MODE !== 'apply') throw new Error('CONTROLLED_LIVE_TEST_REQUIRES_APPLY_MODE');
+    const manifestPath = process.env.CONTROLLED_LIVE_TEST_MANIFEST;
+    if (!manifestPath || !isAbsolute(manifestPath)) {
+      throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_PATH_INVALID');
+    }
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown;
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, process.env.DATABASE_URL));
+  }
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
   await app.get(DatabaseRecoveryService).initialize();

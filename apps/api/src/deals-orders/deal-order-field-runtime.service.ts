@@ -5,6 +5,7 @@ import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { DictionaryReference, VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { writeOperationalLog } from '../monitoring-log';
+import { assertApplyExternalWrite } from '../external-write-guard';
 import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } from '../sync-mode.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
 import { isPlannedDeliveryDateMapping, normalizePlannedDeliveryDate, toMoySkladPlannedDeliveryDate, touchesPlannedDeliveryDateEndpoint } from './planned-delivery-date';
@@ -381,6 +382,7 @@ function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'BITRIX24
 }
 
 async function writeMoySkladAttribute(orderId: string, targetField: string, value: string | number | boolean | null, sourceField: string) {
+  assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_FIELD_UPDATE');
   const attributeId = targetField.match(/^attributes\.([0-9a-f-]{36})$/i)?.[1];
   const base = externalBase(process.env.MOYSKLAD_API_BASE_URL);
   const token = process.env.MOYSKLAD_API_TOKEN;
@@ -397,6 +399,7 @@ async function writeMoySkladAttribute(orderId: string, targetField: string, valu
 }
 
 async function writeMoySkladStage(orderId: string, stateId: string) {
+  assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_STAGE_UPDATE');
   const base = externalBase(process.env.MOYSKLAD_API_BASE_URL);
   const token = process.env.MOYSKLAD_API_TOKEN;
   if (!token || !isUuid(stateId)) throw new Error('unsupported customerorder state');
@@ -411,6 +414,7 @@ async function writeMoySkladStage(orderId: string, stateId: string) {
 }
 
 async function writeBitrix24Field(dealId: string, targetField: string, value: string | number | boolean | null) {
+  assertApplyExternalWrite('BITRIX24', 'DEAL_ORDER_FIELD_UPDATE');
   if (!/^[A-Z][A-Z0-9_]{0,119}$/i.test(targetField)) throw new Error('unsupported target');
   const base = externalBase(process.env.BITRIX24_REST_BASE_URL);
   const url = new URL('crm.deal.update.json', base);
@@ -498,6 +502,7 @@ function attributeIdFromValue(value: RecordValue): string | null {
 }
 
 async function writeMoySkladDictionaryAttribute(orderId: string, dictionary: DictionaryReference, valueId: string | null) {
+  assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_DICTIONARY_UPDATE');
   const base = externalBase(process.env.MOYSKLAD_API_BASE_URL);
   const token = process.env.MOYSKLAD_API_TOKEN;
   if (!token) throw new Error('external token missing');

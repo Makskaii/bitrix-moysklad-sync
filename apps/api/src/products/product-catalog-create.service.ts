@@ -6,6 +6,7 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { writeOperationalLog } from '../monitoring-log';
 import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { SyncModeService } from '../sync-mode.service';
+import { assertApplyExternalWrite } from '../external-write-guard';
 
 type Row = Record<string, any>;
 type ProductCreateInput = {
@@ -211,6 +212,10 @@ async function findProducts(catalogId: string, xmlId: string, kind: 'product' | 
   throw new ProductCatalogManualReviewError('PRODUCT_CREATE_RECOVERY_TOO_LARGE');
 }
 async function bitrixCall(method: string, params: Row): Promise<unknown> {
+  if (/\.(?:add|update|delete)$/i.test(method)) {
+    const operation = /\.add$/i.test(method) ? 'PRODUCT_CREATE' : 'PRODUCT_UPDATE';
+    assertApplyExternalWrite('BITRIX24', operation);
+  }
   const base = process.env.BITRIX24_REST_BASE_URL;
   if (!base) throw new Error('BITRIX24_PRODUCT_API_NOT_CONFIGURED');
   const url = new URL(method, base.endsWith('/') ? base : `${base}/`);
