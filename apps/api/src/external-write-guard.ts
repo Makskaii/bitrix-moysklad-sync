@@ -123,7 +123,7 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
     }
     if (method.startsWith('crm.requisite.') || method.startsWith('crm.timeline.comment.')) {
       const form = new URLSearchParams(bodyText);
-      const entityType = form.get('ENTITY_TYPE_ID') ?? form.get('fields[ENTITY_TYPE_ID]') ?? form.get('filter[ENTITY_TYPE_ID]') ?? form.get('fields[ENTITY_TYPE]') ?? '';
+      const entityType = form.get('ENTITY_TYPE_ID') ?? form.get('fields[ENTITY_TYPE_ID]') ?? form.get('filter[ENTITY_TYPE_ID]') ?? form.get('fields[ENTITY_TYPE]') ?? form.get('filter[ENTITY_TYPE]') ?? '';
       if (/^(?:4|COMPANY)$/i.test(entityType)) return 'client:COMPANY';
       if (/^(?:3|CONTACT)$/i.test(entityType)) return 'client:CONTACT';
       if (/^DEAL$/i.test(entityType)) return 'deal-order';

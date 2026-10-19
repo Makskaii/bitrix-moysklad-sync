@@ -261,6 +261,43 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
   }
 });
 
+test('lifecycle delete scope can only be reconstructed from a previously readback-bound manifest pair', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-lifecycle-scope-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const runRecord = { ...manifest.records[0], direction: 'BOTH', targetNativeId: null };
+  const admissions = new Map<string, any>();
+  const database = { controlledTestAdmission: {
+    findMany: async () => [...admissions.values()],
+    findUnique: async ({ where }: any) => admissions.get(where.eventId) ?? null,
+    findFirst: async () => null,
+    upsert: async ({ where, create }: any) => { if (!admissions.has(where.eventId)) admissions.set(where.eventId, { ...create }); return admissions.get(where.eventId); },
+    updateMany: async ({ where, data }: any) => { const row = admissions.get(where.eventId); if (!row || row.targetNativeId !== where.targetNativeId) return { count: 0 }; Object.assign(row, data); return { count: 1 }; },
+  } };
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE, path: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated'; process.env.DATABASE_URL = testDatabaseUrl; process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, records: [runRecord] }), 'utf8');
+  try {
+    const admission = new ControlledLiveTestAdmissionService(database as any);
+    const name = runRecord.name;
+    await admission.withCurrentSourceRead('origin', 'BITRIX24', 'b24-17', 'client:COMPANY', async () => {
+      await admission.admit('origin', { entity: 'client:COMPANY', sourceSystem: 'BITRIX24', sourceNativeId: 'b24-17', currentNativeId: 'b24-17', currentName: name, sourceCreatedAt: new Date('2026-10-19T01:00:00Z') });
+    });
+    await admission.runForEvent('origin', async () => {
+      await admission.bindCreatedTarget('origin', 'ms-29', 'ms-29', name, new Date('2026-10-19T02:00:00Z'));
+    });
+    await admission.withExistingManifestPairScope({ eventId: 'delete-ms', entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: 'ms-29', targetSystem: 'BITRIX24', targetNativeId: 'b24-17' }, async () => {
+      assert.doesNotThrow(() => assertApplyExternalWrite('BITRIX24', 'CLIENT_DELETION_MARKER', 'b24-17', 'client:COMPANY'));
+    });
+    await assert.rejects(admission.withExistingManifestPairScope({ eventId: 'delete-shared', entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: 'shared-ms', targetSystem: 'BITRIX24', targetNativeId: 'b24-17' }, async () => undefined), /LIFECYCLE_PAIR_NOT_ADMITTED/);
+  } finally {
+    setControlledLiveTestWriteCheck(null);
+    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.path], ['DATABASE_URL', previous.database]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('durable admissions preserve non-client manifest entities across current reads and writes', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-nonclient-'));
   const manifestPath = join(directory, 'manifest.json');

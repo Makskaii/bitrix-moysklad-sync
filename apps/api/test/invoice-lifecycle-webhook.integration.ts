@@ -2,6 +2,9 @@ import 'reflect-metadata';
 import { strict as assert } from 'node:assert';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { after, before, test } from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
@@ -9,13 +12,16 @@ import { DatabaseService } from '../src/database.service';
 import { EventDispatcherService } from '../src/event-dispatcher.service';
 import { EventIntakeService, EventsController } from '../src/events.controller';
 import { InvoiceEventProcessor } from '../src/invoices/invoice-event.processor';
+import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
+import { createControlledLiveTestPolicy } from '../src/controlled-live-test-policy';
+import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 
 type TestPair = {
   id: string;
-  entityType: 'INVOICE';
+  entityType: 'INVOICE' | 'DEAL';
   bitrix24Id: string;
   moyskladId: string;
-  moyskladType: 'invoiceout';
+  moyskladType: 'invoiceout' | 'customerorder';
   moyskladParentId: null;
   active: boolean;
   lifecycleStatus: 'ACTIVE' | 'TOMBSTONED';
@@ -39,6 +45,7 @@ type TestEvent = {
 
 const events = new Map<string, TestEvent>();
 const pairs = new Map<string, TestPair>();
+const controlledAdmissions: any[] = [];
 const leases = new Map<string, { ownerToken: string; leaseExpiresAt: Date }>();
 const directionsDisabled = new Set<string>();
 const providerReads = new Map<string, 'present' | 'deleted'>();
@@ -65,9 +72,9 @@ const inboundEvent = {
   },
   findUnique: async ({ where }: { where: { id: string } }) => events.get(where.id) ?? null,
   findMany: async () => [],
-  updateMany: async ({ where, data }: { where: { id: string; OR?: Array<{ status: string }> }; data: Record<string, unknown> }) => {
+  updateMany: async ({ where, data }: { where: { id: string; status?: string; OR?: Array<{ status: string }> }; data: Record<string, unknown> }) => {
     const event = events.get(where.id);
-    const allowedStatuses = where.OR?.map((condition) => condition.status) ?? [];
+    const allowedStatuses = where.OR?.map((condition) => condition.status) ?? (where.status ? [where.status] : []);
     if (!event || !allowedStatuses.includes(event.status)) return { count: 0 };
     Object.assign(event, data);
     return { count: 1 };
@@ -137,6 +144,7 @@ const inboundEntityLock = {
 const tx = {
   $queryRaw: async () => [{ locked: 1 }],
   entityPair,
+  pairReviewCase: { findFirst: async () => null, create: async () => ({}) },
   operationalLog: { create: async () => ({}) },
   inboundEvent,
 };
@@ -144,6 +152,13 @@ const database = {
   inboundEvent,
   entityPair,
   inboundEntityLock,
+  controlledTestAdmission: {
+    findMany: async () => controlledAdmissions,
+    findUnique: async ({ where }: { where: { eventId: string } }) => controlledAdmissions.find((row) => row.eventId === where.eventId) ?? null,
+    findFirst: async () => null,
+    upsert: async ({ create }: { create: any }) => create,
+    updateMany: async () => ({ count: 0 }),
+  },
   operationalLog: { create: async () => ({}) },
   syncSetting: { findUnique: async () => ({ clientDeletionMarkerFields: null }) },
   $transaction: async <T>(operation: (transaction: typeof tx) => Promise<T>) => operation(tx),
@@ -284,6 +299,64 @@ test('disabled invoice delete directions are terminal skips and never reach life
   assert.equal(msPair.lifecycleStatus, 'ACTIVE');
 });
 
+test('controlled MoySklad deal deletion admits only a readback-bound pair and scopes timeline marker writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-lifecycle-delete-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const previous = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'DATABASE_URL'].map((key) => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  const runId = 'LIVE-TEST-20261019T120000Z-life01';
+  const sourceName = `тест ${runId} deal`;
+  const moyskladId = 'MS-DEAL-CONTROLLED';
+  const bitrix24Id = 'B24-DEAL-CONTROLLED';
+  const pair: TestPair = { id: 'controlled-life-pair', entityType: 'DEAL', bitrix24Id, moyskladId, moyskladType: 'customerorder', moyskladParentId: null,
+    active: true, lifecycleStatus: 'ACTIVE', tombstoneSource: null, deletionMarkerStatus: 'NOT_REQUIRED', deletionTimelineStatus: 'NOT_REQUIRED' };
+  pairs.set(pair.id, pair);
+  providerReads.set(`MOYSKLAD:${moyskladId}`, 'deleted');
+  providerReads.set(`BITRIX24:${bitrix24Id}`, 'present');
+  const eventId = 'controlled-deal-delete-event';
+  events.set(eventId, { id: eventId, source: 'MOYSKLAD', deliveryKey: 'controlled-delete-key', eventType: 'DELETE', externalEntityType: 'customerorder',
+    externalEntityId: moyskladId, payload: {}, status: 'RECEIVED', attempts: 0, lastErrorCategory: null, processingStartedAt: null });
+  const sourceCreatedAt = new Date('2026-10-19T01:00:00Z');
+  controlledAdmissions.push({ eventId: 'origin-bound-pair', runId, entity: 'deal-order', sourceSystem: 'MOYSKLAD', sourceNativeId: moyskladId,
+    targetSystem: 'BITRIX24', targetNativeId: bitrix24Id, sourceName, sourceCreatedAt });
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  process.env.DATABASE_URL = 'postgresql://postgres@127.0.0.1:58341/sync_issue60_test?schema=issue60_harness_test';
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+    entity: 'deal-order', direction: 'MOYSKLAD_TO_BITRIX24', name: sourceName, syntheticOnly: true, sourceSystem: 'MOYSKLAD', sourceNativeId: moyskladId,
+    targetSystem: 'BITRIX24', targetNativeId: bitrix24Id, createdAfterUtc: '2026-10-19T00:00:00Z',
+  }] }), 'utf8');
+  try {
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(JSON.parse(await (await import('node:fs/promises')).readFile(manifestPath, 'utf8')), process.env.DATABASE_URL));
+    installControlledLiveFetchGuard();
+    const admission = new ControlledLiveTestAdmissionService(database as never);
+    const controlledLifecycle = new ClientLifecycleService(database as never, undefined, syncMode as never, admission);
+    controlledLifecycle.enqueue(eventId);
+    const event = await waitForEvent(eventId, 'SUCCEEDED');
+    assert.equal(event.lastErrorCategory, null);
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.deletionTimelineStatus, 'POSTED');
+    const commentAdd = providerCalls.find((call) => call.path === '/rest/crm.timeline.comment.add.json' && call.fields['fields[ENTITY_ID]'] === bitrix24Id);
+    assert.ok(commentAdd, 'the exact admitted synthetic deal receives its lifecycle timeline marker');
+    assert.equal(providerCalls.some((call) => call.method === 'DELETE'), false, 'the lifecycle event never physically deletes a counterpart');
+    const readsBeforeUnlisted = providerCalls.length;
+    const unlistedEventId = 'controlled-unlisted-delete-event';
+    events.set(unlistedEventId, { id: unlistedEventId, source: 'MOYSKLAD', deliveryKey: 'unlisted-delete-key', eventType: 'DELETE', externalEntityType: 'customerorder',
+      externalEntityId: 'MS-UNLISTED-DEAL', payload: {}, status: 'RECEIVED', attempts: 0, lastErrorCategory: null, processingStartedAt: null });
+    controlledLifecycle.enqueue(unlistedEventId);
+    await waitForEvent(unlistedEventId, 'MANUAL_REVIEW');
+    assert.equal(providerCalls.length, readsBeforeUnlisted, 'unmanifested delete IDs are rejected before any provider read');
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    for (const [key, value] of Object.entries(previous)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    controlledAdmissions.splice(controlledAdmissions.indexOf(controlledAdmissions.find((row) => row.eventId === 'origin-bound-pair')), 1);
+    events.delete(eventId); events.delete('controlled-unlisted-delete-event'); pairs.delete(pair.id); providerReads.delete(`MOYSKLAD:${moyskladId}`); providerReads.delete(`BITRIX24:${bitrix24Id}`);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function addPair(id: string, bitrix24Id: string, moyskladId: string): TestPair {
   const pair: TestPair = {
     id, entityType: 'INVOICE', bitrix24Id, moyskladId, moyskladType: 'invoiceout', moyskladParentId: null,
@@ -319,7 +392,7 @@ async function waitForEvent(eventId: string, status: string): Promise<TestEvent>
     if (event?.status === status) return event;
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
-  assert.fail(`event ${eventId} did not reach ${status}; current=${events.get(eventId)?.status}; providerCalls=${JSON.stringify(providerCalls)}`);
+  assert.fail(`event ${eventId} did not reach ${status}; current=${events.get(eventId)?.status}; error=${events.get(eventId)?.lastErrorCategory}; providerCalls=${JSON.stringify(providerCalls)}`);
 }
 
 async function respondToProvider(request: IncomingMessage, response: ServerResponse) {
@@ -338,6 +411,17 @@ async function respondToProvider(request: IncomingMessage, response: ServerRespo
     }
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ result: { item: { ID: fields.id } } }));
+    return;
+  }
+  if (request.method === 'POST' && path === '/rest/crm.deal.get.json') {
+    const state = providerReads.get(`BITRIX24:${fields.id}`);
+    if (state === 'deleted') {
+      response.writeHead(404, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: 'NOT_FOUND', error_description: 'Not found' }));
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ result: { ID: fields.id } }));
     return;
   }
   if (request.method === 'POST' && path === '/rest/crm.timeline.comment.list.json') {
@@ -360,6 +444,18 @@ async function respondToProvider(request: IncomingMessage, response: ServerRespo
     }
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ id }));
+    return;
+  }
+  const customerOrderMatch = /^\/api\/remap\/1\.2\/entity\/customerorder\/([^/]+)$/.exec(path);
+  if (request.method === 'GET' && customerOrderMatch) {
+    const id = decodeURIComponent(customerOrderMatch[1]);
+    if (providerReads.get(`MOYSKLAD:${id}`) === 'deleted') {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id, meta: { type: 'customerorder' } }));
     return;
   }
   response.writeHead(404, { 'content-type': 'application/json' });

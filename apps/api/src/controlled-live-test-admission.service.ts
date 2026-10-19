@@ -122,6 +122,42 @@ export class ControlledLiveTestAdmissionService {
     return withControlledLiveEventScope(this.scope(eventId, admission), action);
   }
 
+  /** Reconstructs an event scope from a previously admitted and readback-bound
+   * pair. Used for delete webhooks where the source record is expected to be
+   * absent, so a fresh source-name read is impossible by definition. */
+  async withExistingManifestPairScope<T>(input: {
+    eventId: string; entity: string; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceNativeId: string;
+    targetSystem: 'BITRIX24' | 'MOYSKLAD'; targetNativeId: string;
+  }, action: () => Promise<T>): Promise<T> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    const entity = controlledManifestEntity(input.entity);
+    if (!input.eventId || !input.sourceNativeId || !input.targetNativeId || input.sourceSystem === input.targetSystem) {
+      throw new Error('CONTROLLED_LIVE_TEST_LIFECYCLE_PAIR_INVALID');
+    }
+    const admissions = await this.database.controlledTestAdmission.findMany({ where: { runId: this.manifest.runId, entity } });
+    for (const record of this.manifest.records) {
+      if (record.entity !== entity || record.syntheticOnly !== true || !admissions.some((row: any) => row.sourceName === record.name)) continue;
+      const forward = record.sourceSystem === input.sourceSystem && record.targetSystem === input.targetSystem &&
+        (record.sourceNativeId === null || record.sourceNativeId === input.sourceNativeId) &&
+        (record.targetNativeId === null || record.targetNativeId === input.targetNativeId);
+      const reverse = record.direction === 'BOTH' && record.targetSystem === input.sourceSystem && record.sourceSystem === input.targetSystem &&
+        (record.targetNativeId === null || record.targetNativeId === input.sourceNativeId) &&
+        (record.sourceNativeId === null || record.sourceNativeId === input.targetNativeId);
+      if (!forward && !reverse) continue;
+      const prior = admissions.find((row: any) => row.sourceName === record.name && row.runId === this.manifest.runId && row.entity === entity &&
+        Number.isFinite(row.sourceCreatedAt?.getTime?.()) && row.sourceCreatedAt.getTime() >= new Date(record.createdAfterUtc).getTime() &&
+        (forward ? row.sourceSystem === record.sourceSystem && row.sourceNativeId === input.sourceNativeId && row.targetSystem === record.targetSystem && row.targetNativeId === input.targetNativeId
+          : row.sourceSystem === record.sourceSystem && row.sourceNativeId === input.targetNativeId && row.targetSystem === record.targetSystem && row.targetNativeId === input.sourceNativeId));
+      if (!prior) continue;
+      return withControlledLiveEventScope({
+        eventId: input.eventId, runId: this.manifest.runId, entity, sourceSystem: input.sourceSystem,
+        sourceNativeId: input.sourceNativeId, targetSystem: input.targetSystem, targetNativeId: input.targetNativeId,
+        admittedSourceName: record.name, admittedSourceCreatedAt: prior.sourceCreatedAt.toISOString(),
+      }, action);
+    }
+    throw new Error('CONTROLLED_LIVE_TEST_LIFECYCLE_PAIR_NOT_ADMITTED');
+  }
+
   async withCurrentSourceRead<T>(eventId: string, sourceSystem: 'BITRIX24' | 'MOYSKLAD', sourceNativeId: string, entityHint: string | null, action: () => Promise<T>): Promise<T> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
     const candidates = this.manifest.records.filter((record: any) => {
