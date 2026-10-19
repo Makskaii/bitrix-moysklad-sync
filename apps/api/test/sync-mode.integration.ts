@@ -243,7 +243,7 @@ test('administrator must explicitly confirm risky global mode transitions', asyn
   assert.deepEqual(await (await nativeFetch(`${apiUrl}/api/admin/sync-mode`, { headers: { authorization: 'Bearer admin-test-token' } })).json(), { mode: 'off' });
 });
 
-test('settings list v1 exchange pairs and identifies the partial contact email capability', async () => {
+test('settings list v1 exchange pairs and identifies configured contact/client capability scope', async () => {
   const restoreDirections = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH',
     headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
@@ -280,7 +280,7 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
   }, {
     key: 'contacts-companies',
     ready: true,
-    directionScope: 'CONTACT_EMAIL_EXISTING_PAIRS',
+    directionScope: 'CLIENT_CONFIGURED_FIELDS_GROUPS_CREATE_DEPENDENCIES',
     bitrix24ToMoysklad: true,
     moyskladToBitrix24: true,
   });
