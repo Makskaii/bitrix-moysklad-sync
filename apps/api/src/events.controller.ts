@@ -431,7 +431,7 @@ function getEventDirection(
   if (externalEntityType === 'invoiceout' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
     return 'invoices:moyskladToBitrix24';
   }
-  if (externalEntityType === 'product' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+  if (['product', 'service'].includes(externalEntityType ?? '') && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
     return 'products-variations:moyskladToBitrix24';
   }
   return null;
