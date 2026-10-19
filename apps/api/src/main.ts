@@ -55,6 +55,7 @@ import { EventWorkerLeaseService } from './event-worker-lease.service';
 import { ProductCardEventProcessor } from './products/product-card-event.processor';
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
+import { ProductCatalogCreateService } from './products/product-catalog-create.service';
 import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from './clients/client-lifecycle.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
@@ -81,7 +82,7 @@ class AppController {
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
     DryRunWriteJournal,
-    { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCardRuntimeService, ProductCardEventProcessor,
+    { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCatalogCreateService, ProductCardRuntimeService, ProductCardEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
     { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },

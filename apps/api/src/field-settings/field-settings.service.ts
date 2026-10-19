@@ -53,7 +53,8 @@ export class FieldSettingsService {
     const active = await this.active();
     const riskChanges = fieldRuleRiskChanges(active.config, config);
     const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references) ||
-      JSON.stringify(config.dealOrderRuntime) !== JSON.stringify(active.config.dealOrderRuntime);
+      JSON.stringify(config.dealOrderRuntime) !== JSON.stringify(active.config.dealOrderRuntime) ||
+      JSON.stringify(config.productCatalogRuntime) !== JSON.stringify(active.config.productCatalogRuntime);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const namedCatalogs = await this.readOnlyData.referenceCatalogs(bitrixAccessToken);
@@ -62,6 +63,10 @@ export class FieldSettingsService {
     const productCatalogId = config.dealOrderRuntime?.bitrix24ProductCatalogId ?? null;
     if (productCatalogId && !catalogs.productCatalogs.some((candidate) => candidate.id === productCatalogId)) {
       throw new BadRequestException(`Bitrix24 product catalog ${productCatalogId} no longer exists`);
+    }
+    const catalogRuntimeId = config.productCatalogRuntime?.bitrix24CatalogId ?? null;
+    if (catalogRuntimeId && !catalogs.productCatalogs.some((candidate) => candidate.id === catalogRuntimeId)) {
+      throw new BadRequestException(`Bitrix24 product catalog ${catalogRuntimeId} no longer exists`);
     }
     const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
     for (const mapping of config.references.dictionaries) {
@@ -472,13 +477,35 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
       ? value.serviceCounterpartyId
       : (() => { throw new BadRequestException('serviceCounterpartyId must be a MoySklad counterparty UUID or empty'); })();
   const dealOrderRuntime = value.dealOrderRuntime === undefined ? undefined : validateDealOrderRuntime(value.dealOrderRuntime, namedPairs);
+  const productCatalogRuntime = value.productCatalogRuntime === undefined ? undefined : validateProductCatalogRuntime(value.productCatalogRuntime);
   const rules = value.rules.map(validateRule);
   const groups = value.groups.map(validateGroup);
   const childBindingError = validateChildResourceBindings(value.childResourceBindings);
   if (childBindingError) throw new BadRequestException(childBindingError);
   assertUniqueIds(rules, 'Field rule');
   assertUniqueIds(groups, 'Field group');
-  return { ...value, serviceCounterpartyId, dealOrderRuntime, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  return { ...value, serviceCounterpartyId, productCatalogRuntime, dealOrderRuntime, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function validateProductCatalogRuntime(value: unknown): NonNullable<FieldSettingsConfigDto['productCatalogRuntime']> {
+  if (!isRecord(value)) throw new BadRequestException('productCatalogRuntime must be an object');
+  const catalogId = value.bitrix24CatalogId === undefined || value.bitrix24CatalogId === null || value.bitrix24CatalogId === ''
+    ? null
+    : isString(value.bitrix24CatalogId) && /^\d+$/.test(value.bitrix24CatalogId)
+      ? value.bitrix24CatalogId
+      : (() => { throw new BadRequestException('productCatalogRuntime.bitrix24CatalogId must be a numeric catalog ID or empty'); })();
+  const sectionId = value.bitrix24DefaultSectionId === undefined || value.bitrix24DefaultSectionId === null || value.bitrix24DefaultSectionId === ''
+    ? null
+    : isString(value.bitrix24DefaultSectionId) && /^\d+$/.test(value.bitrix24DefaultSectionId)
+      ? value.bitrix24DefaultSectionId
+      : (() => { throw new BadRequestException('productCatalogRuntime.bitrix24DefaultSectionId must be a numeric section ID or empty'); })();
+  const allowed = ['name', 'code', 'description'] as const;
+  const fields = value.moyskladFields === undefined ? ['name'] : value.moyskladFields;
+  if (!Array.isArray(fields) || fields.some((field) => !allowed.includes(field as typeof allowed[number])) || new Set(fields).size !== fields.length || (catalogId && !fields.includes('name'))) {
+    throw new BadRequestException('productCatalogRuntime.moyskladFields must be unique supported fields and include name when a catalog is selected');
+  }
+  if (sectionId && !catalogId) throw new BadRequestException('A Bitrix24 default product section requires an explicitly selected product catalog');
+  return { bitrix24CatalogId: catalogId, bitrix24DefaultSectionId: sectionId, moyskladFields: fields as Array<'name' | 'code' | 'description'> };
 }
 
 function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair[]): NonNullable<FieldSettingsConfigDto['dealOrderRuntime']> {
@@ -491,6 +518,12 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     : isString(value.bitrix24ProductCatalogId) && /^\d+$/.test(value.bitrix24ProductCatalogId)
       ? value.bitrix24ProductCatalogId
       : (() => { throw new BadRequestException('bitrix24ProductCatalogId must be a numeric Bitrix24 catalog ID or empty'); })();
+  const productSectionId = value.bitrix24DefaultProductSectionId === undefined || value.bitrix24DefaultProductSectionId === null || value.bitrix24DefaultProductSectionId === ''
+    ? null
+    : isString(value.bitrix24DefaultProductSectionId) && /^\d+$/.test(value.bitrix24DefaultProductSectionId)
+      ? value.bitrix24DefaultProductSectionId
+      : (() => { throw new BadRequestException('bitrix24DefaultProductSectionId must be a numeric Bitrix24 section ID or empty'); })();
+  if (productSectionId && !productCatalogId) throw new BadRequestException('A Bitrix24 default product section requires an explicitly selected product catalog');
   const allowedProductFields = ['name', 'code', 'description'] as const;
   const moyskladProductFields = value.moyskladProductFields === undefined ? ['name'] : value.moyskladProductFields;
   if (!Array.isArray(moyskladProductFields) || moyskladProductFields.some((field) => !allowedProductFields.includes(field as typeof allowedProductFields[number])) || new Set(moyskladProductFields).size !== moyskladProductFields.length || (productCatalogId && !moyskladProductFields.includes('name'))) {
@@ -537,7 +570,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

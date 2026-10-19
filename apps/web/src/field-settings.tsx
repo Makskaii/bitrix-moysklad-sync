@@ -35,6 +35,7 @@ type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Lab
 type DealOrderRuntime = {
   nativeOrderNumberingVerified: boolean;
   bitrix24ProductCatalogId?: string | null;
+  bitrix24DefaultProductSectionId?: string | null;
   moyskladProductFields?: Array<'name' | 'code' | 'description'>;
   defaultOrganizationId: string | null;
   defaultStoreId: string | null;
@@ -45,6 +46,7 @@ type DealOrderRuntime = {
   stores: Array<{ bitrix24Id: string; moyskladId: string }>;
   employees: Array<{ bitrix24Id: string; moyskladId: string }>;
 };
+type ProductCatalogRuntime = { bitrix24CatalogId: string | null; bitrix24DefaultSectionId?: string | null; moyskladFields: Array<'name' | 'code' | 'description'> };
 type DictionaryOption = { id: string; title: string; code: string };
 type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
@@ -55,7 +57,7 @@ type ChildResourceBinding = {
   bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: ChildFieldPair[] };
 };
 type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; productCatalogRuntime?: ProductCatalogRuntime; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
@@ -670,6 +672,27 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         })}</div>
       </section>
 
+      <section className="field-editor-section" aria-label="Настройки создания карточек каталога">
+        <div className="panel-heading"><div><p className="eyebrow">КАТАЛОГ МОЙСКЛАД → BITRIX24</p><h3>Новые карточки товаров</h3></div></div>
+        <p className="panel-description">Новая карточка создаётся в выбранном каталоге только для товара МойСклад, созданного после границы запуска. Сопоставленные типы цен переносятся без изменения строк уже созданных сделок и заказов. Раздел Bitrix24 необязателен.</p>
+        {(() => {
+          const runtime = draft.productCatalogRuntime ?? { bitrix24CatalogId: null, bitrix24DefaultSectionId: null, moyskladFields: ['name'] as Array<'name' | 'code' | 'description'> };
+          const setRuntime = (update: (current: ProductCatalogRuntime) => ProductCatalogRuntime) => changeDraft((current) => ({ ...current, productCatalogRuntime: update(current.productCatalogRuntime ?? runtime) }));
+          const toggle = (field: 'code' | 'description', checked: boolean) => setRuntime((current) => ({ ...current, moyskladFields: [...new Set(['name', ...(current.moyskladFields ?? ['name']).filter((item) => item !== field), ...(checked ? [field] : [])])] as Array<'name' | 'code' | 'description'> }));
+          return <div className="reference-map-list">
+            <label>Каталог Bitrix24 для новых карточек<select aria-label="Каталог Bitrix24 для новых карточек" value={runtime.bitrix24CatalogId ?? ''} onChange={(event) => setRuntime((current) => ({ ...current, bitrix24CatalogId: event.currentTarget.value || null, bitrix24DefaultSectionId: event.currentTarget.value ? current.bitrix24DefaultSectionId : null }))}>
+              <option value="">Выберите каталог вручную</option>{catalogs.productCatalogs.map((catalog) => <option key={catalog.id} value={catalog.id}>{catalog.label} · {catalog.id}</option>)}
+            </select></label>
+            <label>Раздел Bitrix24 по умолчанию (необязательно)<input aria-label="Раздел Bitrix24 по умолчанию для новых карточек" inputMode="numeric" pattern="[0-9]*" disabled={!runtime.bitrix24CatalogId} value={runtime.bitrix24DefaultSectionId ?? ''} onChange={(event) => setRuntime((current) => ({ ...current, bitrix24DefaultSectionId: event.currentTarget.value || null }))} /></label>
+            <fieldset><legend>Поля источника, разрешённые при создании карточки</legend>
+              <label><input type="checkbox" checked disabled />Наименование</label>
+              <label><input type="checkbox" checked={runtime.moyskladFields.includes('code')} onChange={(event) => toggle('code', event.currentTarget.checked)} />Код</label>
+              <label><input type="checkbox" checked={runtime.moyskladFields.includes('description')} onChange={(event) => toggle('description', event.currentTarget.checked)} />Описание</label>
+            </fieldset>
+          </div>;
+        })()}
+      </section>
+
       <section className="field-editor-section" aria-label="Типы цен каталога">
         <div className="panel-heading"><div><p className="eyebrow">ЦЕНЫ КАРТОЧКИ КАТАЛОГА</p><h3>Типы цен</h3></div><span className="event-status status-succeeded">{draft.references.priceTypes.filter((priceType) => priceType.moyskladId).length} пар</span></div>
         <p className="panel-description">Исключённые типы остаются без пары; имеющиеся значения в системах не изменяются. Цена строки заказа — отдельная настройка.</p>
@@ -749,6 +772,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             <label>Каталог товаров Bitrix24<select aria-label="Каталог товаров Bitrix24 для создания" value={runtime.bitrix24ProductCatalogId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, bitrix24ProductCatalogId: event.currentTarget.value || null }))}>
               <option value="">Выберите каталог вручную</option>{catalogs.productCatalogs.map((catalog) => <option key={catalog.id} value={catalog.id}>{catalog.label} · {catalog.id}</option>)}
             </select></label>
+            <label>Раздел товаров Bitrix24 по умолчанию (необязательно)<input aria-label="Раздел товаров Bitrix24 по умолчанию" inputMode="numeric" pattern="[0-9]*" value={runtime.bitrix24DefaultProductSectionId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, bitrix24DefaultProductSectionId: event.currentTarget.value || null }))} /></label>
             <fieldset><legend>Разрешённые поля из карточки товара MyСклад</legend>
               <label><input type="checkbox" checked disabled />Наименование (обязательное)</label>
               <label><input type="checkbox" checked={productFields.includes('code')} onChange={(event) => setProductField('code', event.currentTarget.checked)} />Код</label>
@@ -889,6 +913,7 @@ function runtimeFromConfirmedPairs(config: SettingsConfig, previous?: DealOrderR
   return {
     nativeOrderNumberingVerified: previous?.nativeOrderNumberingVerified ?? false,
     bitrix24ProductCatalogId: previous?.bitrix24ProductCatalogId ?? null,
+    bitrix24DefaultProductSectionId: previous?.bitrix24DefaultProductSectionId ?? null,
     moyskladProductFields: previous?.moyskladProductFields ?? ['name'],
     defaultOrganizationId: preserveOrChoose(previous?.defaultOrganizationId, 'organizations'),
     defaultStoreId: preserveOrChoose(previous?.defaultStoreId, 'warehouses'),

@@ -39,6 +39,7 @@ class FakeApi implements ProductCardApi {
     this.writes.push({ side: 'BITRIX24', fields: Object.keys(fields).join(',') });
     if ('name' in fields) this.bitrix24.name = String(fields.name);
     if ('detailText' in fields) this.bitrix24.detailText = String(fields.detailText);
+    if ('code' in fields) this.bitrix24.code = String(fields.code);
     if ('measure' in fields) this.bitrix24.unitId = String(fields.measure);
     if (this.ambiguousBitrixUpdate) {
       this.ambiguousBitrixUpdate = false;
@@ -135,4 +136,33 @@ test('applied product write with a lost response is read back instead of repeate
   assert.equal(result.status, 'SYNCED');
   assert.equal(api.bitrix24.name, 'Applied once');
   assert.deepEqual(api.writes, [{ side: 'BITRIX24', fields: 'name' }], 'target readback confirms the applied value before a retry can issue another write');
+});
+
+test('configured writable catalog code updates Bitrix24 from MySklad without enabling reverse writes', async () => {
+  const api = new FakeApi();
+  api.bitrix24.code = 'OLD';
+  api.moysklad.code = 'OLD';
+  const configured = { ...settings, rules: [...settings.rules, {
+    id: 'product-code', entity: 'catalog', sourceField: 'code', targetField: 'code',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }] };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured });
+  api.moysklad.code = 'NEW';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured })).status, 'SYNCED');
+  assert.equal(api.bitrix24.code, 'NEW');
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('service price changes are held for manual review until Bitrix24 service-price write semantics are confirmed', async () => {
+  const api = new FakeApi();
+  const servicePair = { ...pair, moyskladType: 'service' };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  api.moysklad.prices[0]!.value = 11;
+  const result = await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  assert.deepEqual(result, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_SERVICE_PRICE_WRITE_UNCONFIRMED', changedFields: [] });
+  assert.equal(api.bitrix24.prices[0]!.value, 10);
+  assert.ok(api.writes.every((write) => !write.fields.startsWith('price:')));
 });

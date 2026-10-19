@@ -29,12 +29,12 @@ export class ProductCardHttpApi implements ProductCardApi {
     return productId;
   }
 
-  async readBitrix24(id: string): Promise<ProductCardSnapshot> {
+  async readBitrix24(id: string, kind: 'product' | 'service' = 'product'): Promise<ProductCardSnapshot> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
-    const result = asRecord(await this.bitrixCall('catalog.product.get', { id }));
-    const product = isRecord(result.product) ? result.product : result;
+    const result = asRecord(await this.bitrixCall(kind === 'service' ? 'catalog.product.service.get' : 'catalog.product.get', { id }));
+    const product = isRecord(result[kind]) ? result[kind] : result;
     if (String(product.id ?? product.ID ?? '') !== id) throw new Error('PRODUCT_CARD_READ_INVALID');
-    if (Number(product.type) !== 1) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
+    if (Number(product.type) !== (kind === 'service' ? 7 : 1)) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
     const pricesResult = asRecord(await this.bitrixCall('catalog.price.list', {
       select: ['id', 'productId', 'catalogGroupId', 'price', 'currency'],
       filter: { productId: Number(id) },
@@ -43,6 +43,7 @@ export class ProductCardHttpApi implements ProductCardApi {
     }));
     const prices = Array.isArray(pricesResult.prices) ? await Promise.all(pricesResult.prices.filter(isRecord).map(async (price) => {
       const idValue = scalarId(price.id);
+      if (scalarId(price.productId) !== id) throw new ProductCardManualReviewError('PRODUCT_PRICE_PRODUCT_MISMATCH');
       const typeId = scalarId(price.catalogGroupId);
       const proposed = idValue ? await this.dryWrites?.readback('BITRIX24', 'price', idValue) : undefined;
       const value = finiteNumber(proposed?.value ?? price.price);
@@ -51,9 +52,10 @@ export class ProductCardHttpApi implements ProductCardApi {
       if (!idValue || !typeId || value === null) throw new Error('PRODUCT_PRICE_READ_INVALID');
       return { priceId: idValue, typeId, value, currency };
     })) : [];
-    const proposed = await this.dryWrites?.readback('BITRIX24', 'product', id);
+    const proposed = await this.dryWrites?.readback('BITRIX24', kind, id);
     const values = {
       name: nullableString(proposed?.name ?? product.name),
+      code: nullableString(proposed?.code ?? product.code),
       detailText: nullableString(proposed?.detailText ?? product.detailText),
       unitId: proposed?.measure === null ? null : proposed?.measure === undefined ? (product.measure === null || product.measure === undefined ? null : scalarId(product.measure)) : scalarId(proposed.measure),
       prices,
@@ -62,11 +64,11 @@ export class ProductCardHttpApi implements ProductCardApi {
     return values;
   }
 
-  async readMoysklad(id: string): Promise<ProductCardSnapshot> {
+  async readMoysklad(id: string, kind: 'product' | 'service' = 'product'): Promise<ProductCardSnapshot> {
     if (!isUuid(id)) throw new Error('PRODUCT_ID_INVALID');
-    const product = asRecord(await this.moyskladRequest(`entity/product/${encodeURIComponent(id)}`, 'GET'));
+    const product = asRecord(await this.moyskladRequest(`entity/${kind}/${encodeURIComponent(id)}`, 'GET'));
     if (product.id !== id || !isRecord(product.meta)) throw new Error('PRODUCT_CARD_READ_INVALID');
-    if (product.meta.type !== 'product') throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
+    if (product.meta.type !== kind) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
     const uom = isRecord(product.uom) && isRecord(product.uom.meta) ? idFromHref(product.uom.meta.href) : null;
     const prices = Array.isArray(product.salePrices) ? await Promise.all(product.salePrices.filter(isRecord).map(async (price) => {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
@@ -86,9 +88,10 @@ export class ProductCardHttpApi implements ProductCardApi {
       } } : undefined;
       return { priceId: typeId, typeId, value, currency: currencyCode ?? '', currencyRef };
     })) : [];
-    const proposed = await this.dryWrites?.readback('MOYSKLAD', 'product', id);
+    const proposed = await this.dryWrites?.readback('MOYSKLAD', kind, id);
     const values = {
       name: nullableString(proposed?.name ?? product.name),
+      code: nullableString(proposed?.code ?? product.code),
       detailText: nullableString(proposed?.description ?? product.description),
       unitId: isRecord(proposed?.uom) && isRecord(proposed.uom.meta) ? idFromHref(proposed.uom.meta.href) : uom,
       prices,
@@ -109,12 +112,21 @@ export class ProductCardHttpApi implements ProductCardApi {
     return { ...values, ...(proposedPrices ? { prices: proposedPrices } : {}) };
   }
 
-  async updateBitrix24(id: string, fields: Record<string, unknown>): Promise<void> {
+  async readMoyskladRecord(id: string, kind: 'product' | 'service' = 'product'): Promise<Record<string, unknown>> {
+    if (!isUuid(id)) throw new Error('PRODUCT_ID_INVALID');
+    const record = asRecord(await this.moyskladRequest(`entity/${kind}/${encodeURIComponent(id)}`, 'GET'));
+    if (record.id !== id || !isRecord(record.meta) || record.meta.type !== kind) {
+      throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
+    }
+    return record;
+  }
+
+  async updateBitrix24(id: string, fields: Record<string, unknown>, kind: 'product' | 'service' = 'product'): Promise<void> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
-    if (Object.keys(fields).some((key) => !['name', 'detailText', 'measure'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
-    if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'product', entityId: id, operation: 'UPDATE', fields })) return;
+    if (Object.keys(fields).some((key) => !['name', 'code', 'detailText', 'measure'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: kind, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('BITRIX24', 'PRODUCT_UPDATE');
-    await this.bitrixCall('catalog.product.update', { id, fields });
+    await this.bitrixCall(kind === 'service' ? 'catalog.product.service.update' : 'catalog.product.update', { id, fields });
   }
 
   async updateBitrix24Price(priceId: string, value: number, currency: string): Promise<void> {
@@ -124,12 +136,12 @@ export class ProductCardHttpApi implements ProductCardApi {
     await this.bitrixCall('catalog.price.update', { id: priceId, fields: { price: value, currency } });
   }
 
-  async updateMoysklad(id: string, fields: Record<string, unknown>): Promise<void> {
+  async updateMoysklad(id: string, fields: Record<string, unknown>, kind: 'product' | 'service' = 'product'): Promise<void> {
     if (!isUuid(id)) throw new Error('PRODUCT_ID_INVALID');
     if (Object.keys(fields).some((key) => !['name', 'description', 'uom', 'salePrices'].includes(key))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
-    if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'product', entityId: id, operation: 'UPDATE', fields })) return;
+    if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: kind, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('MOYSKLAD', 'PRODUCT_UPDATE');
-    await this.moyskladRequest(`entity/product/${encodeURIComponent(id)}`, 'PUT', fields);
+    await this.moyskladRequest(`entity/${kind}/${encodeURIComponent(id)}`, 'PUT', fields);
   }
 
   private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
