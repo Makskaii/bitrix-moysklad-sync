@@ -17,7 +17,7 @@ const settings: ProductCardSettings = {
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
   ],
   references: {
-    units: [{ bitrix24Id: 3, moyskladId: 'unit-uuid-3', status: 'configured' }],
+    units: [{ bitrix24Id: 3, moyskladId: 'unit-uuid-3', status: 'configured' }, { bitrix24Id: 4, moyskladId: 'unit-uuid-4', status: 'configured' }],
     priceTypes: [{ bitrix24Id: 2, moyskladId: 'price-type-2', status: 'configured' }],
   },
 };
@@ -112,6 +112,27 @@ test('mapped catalog prices flow from MySklad to Bitrix24 while unmapped prices 
   assert.equal(api.bitrix24.prices[0]!.value, 12);
   assert.equal(api.moysklad.prices[1]!.value, 77);
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('configured UOM ID compares numeric settings with string Bitrix24 readback and allows later price writes', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  const configured = { ...settings, references: {
+    ...settings.references,
+    units: [{ bitrix24Id: 4, moyskladId: 'unit-uuid-4', status: 'configured' }],
+  } };
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured })).status, 'BASELINED');
+  api.moysklad.unitId = 'unit-uuid-4';
+  api.moysklad.prices[0]!.value = 11;
+
+  const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.unitId, '4', 'adapter readback exposes the applied numeric measure ID as a string');
+  assert.equal(api.bitrix24.prices[0]!.value, 11, 'confirmed price mapping continues after unit readback');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['measure', 'price:b24-price-2']);
+  assert.equal(api.writes.filter((write) => write.fields === 'measure').length, 1, 'numeric/string unit ID equivalence prevents a second unit write');
 });
 
 test('product provider retries use the durable attempt number for bounded fallback backoff', async () => {
