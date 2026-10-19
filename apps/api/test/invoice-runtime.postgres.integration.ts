@@ -3,6 +3,9 @@ import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseService } from '../src/database.service';
 import { EventWorkerLeaseService } from '../src/event-worker-lease.service';
 import { InvoiceEventProcessor } from '../src/invoices/invoice-event.processor';
@@ -10,6 +13,8 @@ import { InvoiceHttpApi, InvoiceRecord } from '../src/invoices/invoice-http-api'
 import { SyncModeService } from '../src/sync-mode.service';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
+import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
+import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 
 const suffix = randomUUID();
 const orderId = randomUUID();
@@ -127,6 +132,76 @@ test('invoice processor creates one independently paired invoiceout, then update
   const replay = await createEvent(`replay-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
   assert.equal((await processor.process(replay.id))?.status, 'SUCCEEDED');
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
+});
+
+test('controlled invoice processor admits a synthetic source, creates and binds its target, then resumes an exact BOTH echo', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-invoice-processor-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const sourceId = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const runId = `LIVE-TEST-20261019T120000Z-${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+  const sourceName = `тест ${runId} invoice`;
+  let createdTargetId: string | null = null;
+  const originalFetch = globalThis.fetch;
+  const oldConfig = activeFieldConfig;
+  let echoEventId: string | null = null;
+  const savedEnv = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST'].map((key) => [key, process.env[key]]));
+  activeFieldConfig = { rules: [
+    ...fieldConfig.rules,
+    { id: 'invoice-description-controlled', entity: 'smart-invoices', sourceField: 'description', targetField: 'description',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+  ], groups: [] };
+  bitrixInvoices.set(sourceId, { id: sourceId, title: sourceName, description: 'before echo', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+  const created = await createEvent(`controlled-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+  const connection = new URL(process.env.DATABASE_URL!);
+  const runManifest = { runId, testDatabaseName: decodeURIComponent(connection.pathname.slice(1)), testSchemaName: connection.searchParams.get('schema'), records: [{
+    entity: 'invoice', direction: 'BOTH', name: sourceName, syntheticOnly: true,
+    sourceSystem: 'BITRIX24', sourceNativeId: sourceId, targetSystem: 'MOYSKLAD', targetNativeId: null,
+    createdAfterUtc: '2026-10-15T00:00:00.000Z', readOnlyDependencies: [
+      { provider: 'BITRIX24', entity: 'deal-order', nativeId: dealId },
+      { provider: 'MOYSKLAD', entity: 'deal-order', nativeId: orderId },
+    ],
+  }] };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  await writeFile(manifestPath, JSON.stringify(runManifest), 'utf8');
+  try {
+    const admission = new ControlledLiveTestAdmissionService(db);
+    installControlledLiveFetchGuard();
+    const controlledProcessor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db),
+      { launchBoundary: async () => launchBoundary, assertReady: async () => true } as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db), admission);
+    assert.equal((await controlledProcessor.process(created.id))?.status, 'SUCCEEDED', JSON.stringify(await db.inboundEvent.findUnique({ where: { id: created.id } })));
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId, active: true } });
+    createdTargetId = pair.moyskladId;
+    const target = moyskladInvoices.get(pair.moyskladId)!;
+    assert.equal(target.name, sourceName);
+    assert.equal((await db.controlledTestAdmission.findUnique({ where: { eventId: created.id } }))?.targetNativeId, pair.moyskladId);
+
+    target.description = 'synthetic echo value';
+    const echoed = await createEvent(`controlled-echo-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
+    echoEventId = echoed.id;
+    await admission.withCurrentSourceRead(echoed.id, 'MOYSKLAD', pair.moyskladId, 'invoice', async () => {
+      const current = await new InvoiceHttpApi().readMoysklad(pair.moyskladId);
+      await admission.admit(echoed.id, { entity: 'invoice', sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId,
+        currentNativeId: String(current.id), currentName: String(current.name), sourceCreatedAt: new Date(String(current.created)) });
+    });
+    await controlledProcessor.process(echoed.id);
+    const echoState = await db.inboundEvent.findUniqueOrThrow({ where: { id: echoed.id } });
+    assert.equal(echoState.status, 'SUCCEEDED', JSON.stringify(echoState));
+    assert.equal(bitrixInvoices.get(sourceId)?.description, 'synthetic echo value');
+    assert.equal((await db.controlledTestAdmission.findUnique({ where: { eventId: echoed.id } }))?.targetNativeId, sourceId);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    activeFieldConfig = oldConfig;
+    for (const [key, value] of Object.entries(savedEnv)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    await db.inboundEvent.deleteMany({ where: { id: { in: [created.id, ...(echoEventId ? [echoEventId] : [])] } } });
+    await db.entityPair.deleteMany({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    bitrixInvoices.delete(sourceId);
+    if (createdTargetId) moyskladInvoices.delete(createdTargetId);
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('invoice worker durably defers before the deal/order pair exists, then automatically resumes against that exact order', async () => {

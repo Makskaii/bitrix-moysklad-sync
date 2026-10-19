@@ -25,10 +25,10 @@ export function assertApplyExternalWrite(provider: string, operation: string, na
   }
 }
 
-export function assertControlledExternalRead(provider: string, nativeId: string | null, entity?: string): void {
+export function assertControlledExternalRead(provider: string, nativeId: string | null, entity?: string, operation: 'CONTROLLED_READ' | 'CONTROLLED_RECOVERY_READ' = 'CONTROLLED_READ'): void {
   if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
   if (!controlledWriteCheck) throw new Error('CONTROLLED_LIVE_TEST_POLICY_NOT_INITIALIZED');
-  controlledWriteCheck(provider, 'CONTROLLED_READ', nativeId, entity);
+  controlledWriteCheck(provider, operation, nativeId, entity);
 }
 
 /** Installs the manifest-backed policy. Enabling test mode without this policy fails closed. */
@@ -61,7 +61,8 @@ export function installControlledLiveFetchGuard(): void {
         const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
           : typeof init?.body === 'string' ? init.body
           : await request.clone().text();
-        assertControlledExternalRead(match.provider, extractMutationTarget(match.provider, relativePath, bodyText), mutationEntity(match.provider, relativePath, bodyText));
+        const recoverySourceId = exactRecoverySourceId(match.provider, relativePath, url, bodyText);
+        assertControlledExternalRead(match.provider, recoverySourceId ?? extractMutationTarget(match.provider, relativePath, bodyText), mutationEntity(match.provider, relativePath, bodyText), recoverySourceId ? 'CONTROLLED_RECOVERY_READ' : 'CONTROLLED_READ');
       }
     } else {
       const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
@@ -75,6 +76,21 @@ export function installControlledLiveFetchGuard(): void {
     }
     return originalFetch(request);
   }) as typeof fetch;
+}
+
+function exactRecoverySourceId(provider: string, path: string, url: URL, bodyText: string): string | null {
+  if (provider === 'MOYSKLAD' && path === 'entity/invoiceout') {
+    const match = /^externalCode=(\d{1,20})$/.exec(url.searchParams.get('filter') ?? '');
+    return match?.[1] ?? null;
+  }
+  if (provider === 'BITRIX24' && path.split('/').at(-1)?.replace(/\.json$/i, '') === 'crm.item.list') {
+    const form = new URLSearchParams(bodyText);
+    if (form.get('entityTypeId') === '31' && form.get('filter[originatorId]') === 'MOYSKLAD') {
+      const id = form.get('filter[originId]') ?? '';
+      return /^\d{1,20}$/.test(id) ? id : null;
+    }
+  }
+  return null;
 }
 
 function mutationOperation(provider: string, method: string, path: string): string {

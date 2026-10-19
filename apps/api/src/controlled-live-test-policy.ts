@@ -61,6 +61,14 @@ export function createControlledLiveTestPolicy(
     if (!scope) throw new Error('CONTROLLED_LIVE_TEST_EVENT_SCOPE_REQUIRED');
     if (scope.runId !== manifest.runId) throw new Error('CONTROLLED_LIVE_TEST_RUN_ID_MISMATCH');
     if (!isProvider(providerValue)) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_INVALID');
+    if (operation === 'CONTROLLED_RECOVERY_READ') {
+      const exactCrossSystemSource = providerValue === scope.targetSystem && nativeId === scope.sourceNativeId &&
+        entityMatchesScope(requestEntity, scope.entity) && manifest.records.some((record) => record.entity === scope.entity &&
+          record.name === scope.admittedSourceName && scopeMatchesManifestPair(record, scope) &&
+          new Date(scope.admittedSourceCreatedAt).getTime() >= new Date(record.createdAfterUtc).getTime());
+      if (!exactCrossSystemSource) throw new Error('CONTROLLED_LIVE_TEST_RECOVERY_READ_SCOPE_INVALID');
+      return;
+    }
     if (operation === 'CONTROLLED_READ') {
       if (!nativeId) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
       const directRead = providerValue === scope.sourceSystem && nativeId === scope.sourceNativeId ||
