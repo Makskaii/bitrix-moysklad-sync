@@ -7,9 +7,11 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
   const oldBase = process.env.BITRIX24_REST_BASE_URL;
   process.env.BITRIX24_REST_BASE_URL = 'https://fake.example/rest/';
   const cards = new Map<string, Record<string, unknown>>();
+  const prices: Array<Record<string, unknown>> = [];
   const calls: string[] = [];
   const operations = new Map<string, Record<string, any>>();
   const pairs: Array<Record<string, unknown>> = [];
+  let failAfterServicePriceWrite = true;
   const operationModel = {
     findUnique: async ({ where }: { where: { moyskladProductId: string } }) => operations.get(where.moyskladProductId) ?? null,
     findUniqueOrThrow: async ({ where }: { where: { moyskladProductId: string } }) => operations.get(where.moyskladProductId),
@@ -67,6 +69,20 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
       cards.set(id, card);
       return Response.json({ result: { service: card } });
     }
+    if (method === 'catalog.price.list') {
+      const filter = (request as any).filter ?? {};
+      const rows = prices.filter((price) => String(price.productId) === String(filter.productId) && String(price.catalogGroupId) === String(filter.catalogGroupId));
+      return Response.json({ result: { prices: rows, total: rows.length }, total: rows.length });
+    }
+    if (method === 'catalog.price.add') {
+      const price = { id: prices.length + 1, ...(request as any).fields };
+      prices.push(price);
+      if (price.productId === 822 && failAfterServicePriceWrite) {
+        failAfterServicePriceWrite = false;
+        return Response.json({ error: 'temporary timeout after applying write' }, { status: 503 });
+      }
+      return Response.json({ result: { price } });
+    }
     return Response.json({ error: 'unexpected method' }, { status: 404 });
   };
   try {
@@ -91,12 +107,20 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
       productId: '22345678-1234-1234-1234-123456789abc', moyskladType: 'service', eventId: 'event-new-service',
       eventConfig: input.eventConfig,
       product: { id: '22345678-1234-1234-1234-123456789abc', meta: { type: 'service' }, name: 'Installation', code: 'S-1', description: 'Install rotor' },
-      prices: [],
+      prices: [{ catalogGroupId: 2, value: 42, currency: 'RUB' }],
     };
+    await assert.rejects(
+      () => service.createOrRecover({ ...serviceInput, prices: [{ catalogGroupId: 2, value: 42, currency: 'rub' }] }),
+      (error: unknown) => error instanceof Error && error.message === 'PRODUCT_CREATE_PRICE_MAPPING_INVALID',
+    );
+    assert.equal(calls.filter((name) => name === 'catalog.product.service.add').length, 0, 'invalid service currency is rejected before any provider write');
+    await assert.rejects(() => service.createOrRecover(serviceInput), /BITRIX24_PRODUCT_API_503/);
     assert.equal(await service.createOrRecover(serviceInput), '822');
     assert.equal(await service.createOrRecover(serviceInput), '822');
     assert.deepEqual(pairs[1], { active: true, entityType: 'PRODUCT', bitrix24Id: '822', moyskladId: serviceInput.productId, moyskladType: 'service', source: 'AUTO' });
     assert.equal(calls.filter((name) => name === 'catalog.product.service.add').length, 1);
+    assert.equal(calls.filter((name) => name === 'catalog.price.add').length, 1, 'retry reads the applied service price and does not duplicate it');
+    assert.deepEqual(prices, [{ id: 1, productId: 822, catalogGroupId: 2, price: 42, currency: 'RUB' }]);
     assert.equal(operations.get(serviceInput.productId)?.status, 'SUCCEEDED');
   } finally {
     globalThis.fetch = oldFetch;

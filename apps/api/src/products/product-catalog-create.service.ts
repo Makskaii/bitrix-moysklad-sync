@@ -56,7 +56,6 @@ export class ProductCatalogCreateService {
     if (!Array.isArray(prices) || prices.some((price) => !Number.isInteger(price.catalogGroupId) || price.catalogGroupId < 1 || !Number.isFinite(price.value) || price.value < 0 || !/^[A-Z]{3}$/.test(price.currency))) {
       throw new ProductCatalogManualReviewError('PRODUCT_CREATE_PRICE_MAPPING_INVALID');
     }
-    if (kind === 'service' && prices.length) throw new ProductCatalogManualReviewError('PRODUCT_SERVICE_PRICE_WRITE_UNCONFIRMED');
     const payload = { fields, xmlId, catalogId, prices, kind };
 
     let operation = await this.database.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: input.productId } });
