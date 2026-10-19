@@ -145,7 +145,9 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_RELATIONSHIP_MAPPING_UNSUPPORTED', null, lease);
       }
       const rules = invoiceRules.filter((rule) => rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled);
-      if (config.groups.some((group) => group.entity === 'smart-invoices')) return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_FIELD_GROUPS_UNSUPPORTED', null, lease);
+      const groups = config.groups.filter((group) => group.entity === 'smart-invoices');
+      const groupError = validateInvoiceGroups(groups, rules);
+      if (groupError) return this.finish(event, 'MANUAL_REVIEW', groupError, null, lease);
 
       const sourceRecord = source === 'BITRIX24' ? await this.api.readBitrix24(sourceId) : await this.api.readMoysklad(sourceId);
       const createdAt = invoiceCreatedAt(sourceRecord);
@@ -165,7 +167,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       if (invoicePair.status === 'NONE') {
         if (process.env.SYNC_MODE === 'dry') return this.finish(event, 'SKIPPED_DISABLED', 'INVOICE_CREATE_REQUIRES_APPLY_MODE', null, lease);
         return await this.withInvoiceIdentityLease(source, sourceId, async () => {
-          const created = await this.createCounterpart({ source, sourceId, sourceRecord, orderId: order.pair.moyskladId, dealId: order.pair.bitrix24Id, rules, settings, lease });
+          const created = await this.createCounterpart({ source, sourceId, sourceRecord, orderId: order.pair.moyskladId, dealId: order.pair.bitrix24Id, rules, groups, settings, lease });
           if (created.status !== 'CREATED') return this.finish(event, created.status, created.reason, created.retryAfter ?? null, lease);
           const bitrix24Id = source === 'BITRIX24' ? sourceId : created.partnerId;
           const moyskladId = source === 'MOYSKLAD' ? sourceId : created.partnerId;
@@ -175,7 +177,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
           }
           const pair = await this.persistPair(source, sourceId, created.partnerId, order.pair.moyskladId, event.id, lease);
           if (!pair) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_PERSIST_FAILED', retryAtForFailure(new Error('INVOICE_PAIR_PERSIST_FAILED'), event.attempts + 1), lease);
-          await this.initializeBaseline(pair.id, event.id, settings, rules, bitrix, moysklad);
+          await this.initializeBaseline(pair.id, event.id, settings, rules, groups, bitrix, moysklad);
           return this.finish(event, 'SUCCEEDED', 'INVOICE_CREATED_AND_PAIRED', null, lease);
         });
       }
@@ -184,10 +186,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       }
       const [bitrix, moysklad] = await Promise.all([this.api.readBitrix24(invoicePair.pair.bitrix24Id), this.api.readMoysklad(invoicePair.pair.moyskladId)]);
       if (!invoicePairLinksMatchOrder(bitrix, moysklad, order.pair)) return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_PAIR_ORDER_LINK_MISMATCH', null, lease);
-      const baseline = await this.ensureBaseline(invoicePair.pair.id, event.id, settings, rules, bitrix, moysklad);
+      const baseline = await this.ensureBaseline(invoicePair.pair.id, event.id, settings, rules, groups, bitrix, moysklad);
       if (baseline === 'VERSION_MISMATCH') return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_SETTINGS_VERSION_MISMATCH', null, lease);
       const result = await this.lifecycle.withPairActiveLock(invoicePair.pair.id, 'INVOICE', () =>
-        this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, baseline, bitrix, moysklad, lease }));
+        this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline, bitrix, moysklad, lease }));
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
@@ -223,10 +225,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
   private async createCounterpart(input: {
     source: Source; sourceId: string; sourceRecord: InvoiceRecord; orderId: string; dealId: string;
-    rules: VersionedFieldSettingsDto['config']['rules']; settings: VersionedFieldSettingsDto; lease: EventWorkerLeaseContext;
+    rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; settings: VersionedFieldSettingsDto; lease: EventWorkerLeaseContext;
   }): Promise<{ status: 'CREATED'; partnerId: string } | { status: 'MANUAL_REVIEW' | 'RETRYABLE_FAILURE'; reason: string; retryAfter?: Date }> {
     const direction: InvoiceDirection = input.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : 'MOYSKLAD_TO_BITRIX24';
-    const fields = mappedFields(input.sourceRecord, input.rules, direction);
+    const fields = mappedFields(input.sourceRecord, input.rules, input.groups, direction, input.settings.config, this.fieldSettings);
     if (input.source === 'BITRIX24') {
       const existing = await this.api.findMoyskladByExternalCode(input.sourceId);
       if (existing.length > 1) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_AMBIGUOUS' };
@@ -304,9 +306,9 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     return { status: 'FOUND', pair };
   }
 
-  private async initializeBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
-    const bitrix24Values = baselineValues(bitrix, rules, 'BITRIX24');
-    const moyskladValues = baselineValues(moysklad, rules, 'MOYSKLAD');
+  private async initializeBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
+    const bitrix24Values = baselineValues(bitrix, rules, groups, 'BITRIX24');
+    const moyskladValues = baselineValues(moysklad, rules, groups, 'MOYSKLAD');
     await this.database.entityPairBaseline.createMany({ data: [{ pairId, eventId, settingsVersion: settings.version, bitrix24Values: bitrix24Values as unknown as Prisma.InputJsonValue, moyskladValues: moyskladValues as unknown as Prisma.InputJsonValue }], skipDuplicates: true });
     await this.database.entityPairSyncState.upsert({
       where: { pairId },
@@ -315,22 +317,23 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     });
   }
 
-  private async ensureBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
+  private async ensureBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
     const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId } });
     if (baseline && baseline.settingsVersion !== settings.version) return 'VERSION_MISMATCH' as const;
     if (!baseline) {
-      await this.initializeBaseline(pairId, eventId, settings, rules, bitrix, moysklad);
+      await this.initializeBaseline(pairId, eventId, settings, rules, groups, bitrix, moysklad);
       return this.database.entityPairBaseline.findUnique({ where: { pairId } });
     }
-    const state = await this.database.entityPairSyncState.findUnique({ where: { pairId } });
+    let state = await this.database.entityPairSyncState.findUnique({ where: { pairId } });
     if (state && state.settingsVersion !== settings.version) return 'VERSION_MISMATCH' as const;
     if (!state) await this.database.entityPairSyncState.create({ data: { pairId, settingsVersion: settings.version, bitrix24Values: baseline.bitrix24Values as Prisma.InputJsonValue, moyskladValues: baseline.moyskladValues as Prisma.InputJsonValue } });
-    return baseline;
+    state = await this.database.entityPairSyncState.findUnique({ where: { pairId } });
+    return state;
   }
 
   private async syncFields(input: {
     pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventConfig: VersionedFieldSettingsDto;
-    rules: VersionedFieldSettingsDto['config']['rules']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext;
+    rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext;
   }): Promise<{ status: ProcessStatus; reason?: string; retryAfter?: Date }> {
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
     const baselineB24 = jsonRecord(input.baseline.bitrix24Values);
@@ -368,12 +371,49 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_FIELD_WRITE_FAILED', retryAfter: retryAtForFailure(error, 1) };
       }
     }
+    for (const group of input.groups) {
+      const key = `group:${group.id}`;
+      const sourceSide = group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+      const targetSide = sourceSide === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24';
+      const source = sourceSide === 'BITRIX24' ? input.bitrix : input.moysklad;
+      const target = targetSide === 'BITRIX24' ? input.bitrix : input.moysklad;
+      const sourceBaseline = jsonRecord(baselineForSide(input.baseline, sourceSide))[key];
+      const targetBaseline = jsonRecord(baselineForSide(input.baseline, targetSide))[key];
+      if (!isRecord(sourceBaseline) || !('sourceFields' in sourceBaseline) || !isRecord(targetBaseline) || !('targetValue' in targetBaseline)) {
+        return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_NOT_IN_BASELINE' };
+      }
+      const originalFields = jsonRecord(sourceBaseline.sourceFields);
+      const sourceChanged = group.sourceFields.some((field) => !sameJson(jsonValue(readField(source, field, sourceSide)), originalFields[field]));
+      if (!sourceChanged) continue;
+      const currentTarget = readField(target, group.targetField, targetSide);
+      const targetChanged = !sameJson(jsonValue(currentTarget), jsonRecord(targetBaseline).targetValue);
+      if (targetChanged && sourceSide === 'BITRIX24') continue;
+      const transformed = this.fieldSettings.transformField(input.eventConfig.config, 'smart-invoices', group.direction, group.targetField, source);
+      if (!transformed || transformed.error || !isScalar(transformed.value) && !Array.isArray(transformed.value)) {
+        return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_TRANSFORM_FAILED' };
+      }
+      try {
+        await this.assertWriteAllowed(group.direction, input.pair.id, input.lease);
+        if (targetSide === 'MOYSKLAD') await this.api.updateMoysklad(input.pair.moyskladId, { [group.targetField]: transformed.value });
+        else await this.api.updateBitrix24(input.pair.bitrix24Id, { [group.targetField]: transformed.value });
+        const verified = targetSide === 'MOYSKLAD' ? await this.api.readMoysklad(input.pair.moyskladId) : await this.api.readBitrix24(input.pair.bitrix24Id);
+        const [verifiedB24, verifiedMs] = await Promise.all([this.api.readBitrix24(input.pair.bitrix24Id), this.api.readMoysklad(input.pair.moyskladId)]);
+        if (!invoicePairLinksMatchOrder(verifiedB24, verifiedMs, input.order)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_POST_WRITE_ORDER_LINK_MISMATCH' };
+        const actual = readField(verified, group.targetField, targetSide);
+        if (!sameJson(actual, transformed.value)) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_FIELD_GROUP_READBACK_MISMATCH', retryAfter: retryAtForFailure(new Error('INVOICE_FIELD_GROUP_READBACK_MISMATCH'), 1) };
+        if (targetSide === 'MOYSKLAD') msValueCache(input.moysklad, group.targetField, actual);
+        else msValueCache(input.bitrix, group.targetField, actual);
+      } catch (error) {
+        if (error instanceof ProviderFailure && !isRetryableFailure(error)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_PROVIDER_REJECTED' };
+        return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_FIELD_GROUP_WRITE_FAILED', retryAfter: retryAtForFailure(error, 1) };
+      }
+    }
     const [latestB24, latestMs] = await Promise.all([this.api.readBitrix24(input.pair.bitrix24Id), this.api.readMoysklad(input.pair.moyskladId)]);
     if (!invoicePairLinksMatchOrder(latestB24, latestMs, input.order)) {
       return { status: 'MANUAL_REVIEW', reason: 'INVOICE_POST_WRITE_ORDER_LINK_MISMATCH' };
     }
-    const bitrix24Values = baselineValues(latestB24, input.rules, 'BITRIX24');
-    const moyskladValues = baselineValues(latestMs, input.rules, 'MOYSKLAD');
+    const bitrix24Values = baselineValues(latestB24, input.rules, input.groups, 'BITRIX24');
+    const moyskladValues = baselineValues(latestMs, input.rules, input.groups, 'MOYSKLAD');
     await this.database.entityPairSyncState.upsert({
       where: { pairId: input.pair.id },
       create: { pairId: input.pair.id, settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues },
@@ -438,7 +478,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 }
 
-function mappedFields(source: InvoiceRecord, rules: VersionedFieldSettingsDto['config']['rules'], direction: InvoiceDirection): InvoiceRecord {
+function mappedFields(source: InvoiceRecord, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], direction: InvoiceDirection, config: VersionedFieldSettingsDto['config'], fieldSettings: FieldSettingsService): InvoiceRecord {
   const output: InvoiceRecord = {};
   for (const rule of rules) {
     const mapping = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.bitrix24ToMoysklad : rule.moyskladToBitrix24;
@@ -449,14 +489,47 @@ function mappedFields(source: InvoiceRecord, rules: VersionedFieldSettingsDto['c
     if (value !== undefined && isScalar(value) && !isExcludedField(sourceField, targetField) &&
       !isInvoiceRelationshipField(sourceField) && !isInvoiceRelationshipField(targetField)) output[targetField] = value;
   }
+  for (const group of groups.filter((candidate) => candidate.direction === direction)) {
+    const transformed = fieldSettings.transformField(config, 'smart-invoices', direction, group.targetField, source);
+    if (!transformed || transformed.error || !(isScalar(transformed.value) || Array.isArray(transformed.value))) throw new Error('INVOICE_FIELD_GROUP_TRANSFORM_FAILED');
+    output[group.targetField] = transformed.value;
+  }
   return output;
 }
 
-function baselineValues(value: InvoiceRecord, rules: VersionedFieldSettingsDto['config']['rules'], side: 'BITRIX24' | 'MOYSKLAD') {
-  return Object.fromEntries(rules.map((rule) => [
+function baselineValues(value: InvoiceRecord, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], side: 'BITRIX24' | 'MOYSKLAD') {
+  const values = Object.fromEntries(rules.map((rule) => [
     `rule:${rule.id}`,
     jsonValue(readField(value, side === 'BITRIX24' ? rule.sourceField : rule.targetField, side)),
   ]));
+  for (const group of groups) {
+    const sourceSide = group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+    values[`group:${group.id}`] = side === sourceSide
+      ? { sourceFields: Object.fromEntries(group.sourceFields.map((field) => [field, jsonValue(readField(value, field, side))])) }
+      : { targetValue: jsonValue(readField(value, group.targetField, side)) };
+  }
+  return values;
+}
+
+function baselineForSide(baseline: unknown, side: 'BITRIX24' | 'MOYSKLAD') {
+  const values = jsonRecord(baseline);
+  return side === 'BITRIX24' ? values.bitrix24Values : values.moyskladValues;
+}
+
+function validateInvoiceGroups(groups: VersionedFieldSettingsDto['config']['groups'], rules: VersionedFieldSettingsDto['config']['rules']): string | null {
+  const targets = new Set<string>();
+  for (const rule of rules) {
+    if (rule.bitrix24ToMoysklad.enabled) targets.add(`BITRIX24_TO_MOYSKLAD:${rule.targetField.toLowerCase()}`);
+    if (rule.moyskladToBitrix24.enabled) targets.add(`MOYSKLAD_TO_BITRIX24:${rule.sourceField.toLowerCase()}`);
+  }
+  for (const group of groups) {
+    if (group.transform.kind !== 'join-non-empty' || !group.transform.separator || group.sourceFields.length === 0) return 'INVOICE_FIELD_GROUP_UNSUPPORTED';
+    if (isInvoiceRelationshipField(group.targetField) || isExcludedField(group.targetField, group.targetField) || group.sourceFields.some((field) => isInvoiceRelationshipField(field) || isExcludedField(field, field))) return 'INVOICE_RELATIONSHIP_MAPPING_UNSUPPORTED';
+    const key = `${group.direction}:${group.targetField.toLowerCase()}`;
+    if (targets.has(key)) return 'INVOICE_FIELD_GROUP_TARGET_AMBIGUOUS';
+    targets.add(key);
+  }
+  return null;
 }
 
 function readField(record: InvoiceRecord, field: string, source: Source): unknown {
@@ -472,7 +545,7 @@ function isExcludedField(source: string, target: string) { return [source, targe
 function isInvoiceRelationshipField(field: string) { return ['parentid2', 'customerorder'].includes(field.toLowerCase()); }
 function isScalar(value: unknown): boolean { return value === null || ['string', 'number', 'boolean'].includes(typeof value); }
 function jsonValue(value: unknown): Prisma.InputJsonValue { return (value === undefined ? null : value) as Prisma.InputJsonValue; }
-function jsonRecord(value: Prisma.JsonValue): Record<string, unknown> { return isRecord(value) && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+function jsonRecord(value: unknown): Record<string, unknown> { return isRecord(value) && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 function recordId(value: unknown): string | null { if (!isRecord(value) || typeof value.href !== 'string') return null; return value.href.split('/').filter(Boolean).at(-1) ?? null; }
 function sameJson(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 function scalarId(value: unknown): string | null { return typeof value === 'string' || typeof value === 'number' ? String(value) : null; }
