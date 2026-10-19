@@ -1,6 +1,6 @@
 # Combined candidate acceptance matrix (#55, #57, #61)
 
-Candidate base: `fd9109a` (`origin/main`). Evidence refresh is on integration candidate `c321d69` plus the working-tree test/doc updates; resolve final SHA with `git rev-parse HEAD`. Feature sources: #55 `69e02a4`, #57 `eca9737` (excluding duplicate intake commit `2db1cec`), and #61 `68bde97fb694bc047d05b8b0a2914cde6b4ab412`. This is an isolated integration candidate; it is not a production activation or cutover approval.
+Candidate base: `fd9109a` (`origin/main`). Evidence refresh is committed on integration candidate `5167a117b3dfa423a9ea4e6d91eba927174ba020`. Feature sources: #55 `69e02a4`, #57 `eca9737` (excluding duplicate intake commit `2db1cec`), and #61 `68bde97fb694bc047d05b8b0a2914cde6b4ab412`. This is an isolated integration candidate; it is not a production activation or cutover approval.
 
 | Scope | Candidate coverage | Evidence still required / status |
 | --- | --- | --- |
