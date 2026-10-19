@@ -87,7 +87,7 @@ function exactRecoverySourceId(provider: string, path: string, url: URL, bodyTex
     const form = new URLSearchParams(bodyText);
     if (form.get('entityTypeId') === '31' && form.get('filter[originatorId]') === 'MOYSKLAD') {
       const id = form.get('filter[originId]') ?? '';
-      return /^\d{1,20}$/.test(id) ? id : null;
+      return /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : null;
     }
   }
   return null;

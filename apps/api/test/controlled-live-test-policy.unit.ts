@@ -132,6 +132,49 @@ test('deferred invoice recovery reads require the exact admitted cross-system so
   }
 });
 
+test('final fetch guard permits only exact invoice recovery filters, never a broad collection scan', async () => {
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, b24: process.env.BITRIX24_REST_BASE_URL, ms: process.env.MOYSKLAD_API_BASE_URL };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  const invoiceName = `тест ${manifest.runId} invoice`;
+  const invoiceManifest = { ...manifest, records: [{ entity: 'invoice', direction: 'BOTH', name: invoiceName,
+    syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: '123456789', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-invoice-1',
+    createdAfterUtc: '2026-10-19T00:00:00Z' }] };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.BITRIX24_REST_BASE_URL = 'https://recovery-bitrix.invalid/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://recovery-ms.invalid/api/';
+  globalThis.fetch = (async () => { calls++; return new Response('{}', { status: 200 }); }) as typeof fetch;
+  setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(invoiceManifest, testDatabaseUrl));
+  try {
+    installControlledLiveFetchGuard();
+    const recoveryScope = { ...scope, entity: 'invoice', sourceSystem: 'BITRIX24' as const, sourceNativeId: '123456789',
+      targetSystem: 'MOYSKLAD' as const, targetNativeId: 'ms-invoice-1', admittedSourceName: invoiceName, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' };
+    await withControlledLiveEventScope(recoveryScope, async () => {
+      await fetch('https://recovery-ms.invalid/api/entity/invoiceout?filter=externalCode%3D123456789');
+      await assert.rejects(fetch('https://recovery-ms.invalid/api/entity/invoiceout?filter=externalCode%3D123456780'), /RECOVERY_READ_SCOPE_INVALID/);
+      await assert.rejects(fetch('https://recovery-ms.invalid/api/entity/invoiceout?limit=100'), /CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID/);
+    });
+    const reverseScope = { ...recoveryScope, sourceSystem: 'MOYSKLAD' as const, sourceNativeId: 'ms-invoice-1',
+      targetSystem: 'BITRIX24' as const, targetNativeId: '123456789' };
+    await withControlledLiveEventScope(reverseScope, async () => {
+      await fetch('https://recovery-bitrix.invalid/rest/crm.item.list.json', { method: 'POST', body: new URLSearchParams({
+        entityTypeId: '31', 'filter[originatorId]': 'MOYSKLAD', 'filter[originId]': 'ms-invoice-1',
+      }) });
+      await assert.rejects(fetch('https://recovery-bitrix.invalid/rest/crm.item.list.json', { method: 'POST', body: new URLSearchParams({
+        entityTypeId: '31', 'filter[originatorId]': 'MOYSKLAD', 'filter[originId]': 'ms-invoice-2',
+      }) }), /RECOVERY_READ_SCOPE_INVALID/);
+      await assert.rejects(fetch('https://recovery-bitrix.invalid/rest/crm.item.list.json', { method: 'POST', body: new URLSearchParams({ entityTypeId: '31' }) }), /CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID/);
+    });
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    if (previous.mode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE; else process.env.CONTROLLED_LIVE_TEST_MODE = previous.mode;
+    if (previous.b24 === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = previous.b24;
+    if (previous.ms === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = previous.ms;
+  }
+});
+
 test('manifest-approved dependencies are read-only and match exact provider, entity and native ID', () => {
   const previousMode = process.env.CONTROLLED_LIVE_TEST_MODE;
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
