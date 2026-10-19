@@ -637,6 +637,26 @@ test('intake routes invoice events and terminally skips disabled entity directio
   disabledDirections.clear();
 });
 
+test('MoySklad service events obey the products direction gate', async () => {
+  rows.clear();
+  disabledDirections.add('products-variations:moyskladToBitrix24');
+  const response = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=service-direction`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'service', href: 'https://online.moysklad.ru/api/remap/1.2/entity/service/service-42' },
+      action: 'CREATE',
+    }] }),
+  });
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  const event = [...rows.values()].find((row) => row.id === eventId)!;
+  assert.equal(event.externalEntityType, 'service');
+  assert.equal(event.externalEntityId, 'service-42');
+  assert.equal(event.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(event.lastErrorCategory, 'DIRECTION_DISABLED');
+  disabledDirections.clear();
+});
+
 test('first-event intake recognizes persisted confirmed identity without conflating baseline readiness', async () => {
   rows.clear();
   resolvedPairInputs.length = 0;
