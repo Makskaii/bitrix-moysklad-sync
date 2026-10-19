@@ -302,7 +302,18 @@ test('final fetch guard binds invoice, deal rows, catalog prices and service mut
         await fetch(url, { method: item.provider === 'BITRIX24' ? 'POST' : 'PUT', body: item.provider === 'BITRIX24' ? form : JSON.stringify(item.body) });
       });
     }
-    assert.equal(calls, cases.length);
+    const createRun = 'LIVE-TEST-20261019T120000Z-createservice';
+    const createName = `тест ${createRun} service`;
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId: createRun, testDatabaseName: 'sync_issue60_test', records: [{
+      entity: 'catalog-service', direction: 'MOYSKLAD_TO_BITRIX24', name: createName, syntheticOnly: true,
+      sourceSystem: 'MOYSKLAD', sourceNativeId: 'source-service', targetSystem: 'BITRIX24', targetNativeId: null,
+      createdAfterUtc: '2026-10-19T00:00:00Z',
+    }] }, 'postgres://localhost/sync_issue60_test'));
+    await withControlledLiveEventScope({ eventId: 'matrix-service-create', runId: createRun, entity: 'catalog-service', sourceSystem: 'MOYSKLAD', sourceNativeId: 'source-service',
+      targetSystem: 'BITRIX24', targetNativeId: null, admittedSourceName: createName, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' }, async () => {
+      await fetch('https://matrix-bitrix.invalid/rest/catalog.product.service.add.json', { method: 'POST', body: new URLSearchParams({ 'fields[name]': createName }) });
+    });
+    assert.equal(calls, cases.length + 1);
   } finally {
     globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);
