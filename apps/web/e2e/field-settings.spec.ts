@@ -230,7 +230,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.locator('details.field-advanced-settings > summary').click();
   await page.getByLabel('Пара сущностей группы').selectOption('smart-invoices');
   const invoiceSources = page.getByLabel('Поля источники группы');
-  await expect(invoiceSources.locator('option[value="title"]')).toHaveText('Заголовок счёта · title · string');
+  await expect(invoiceSources.locator('option[value="title"]')).toHaveText('Заголовок счёта · title · string · запись разрешена');
   await expect(invoiceSources.locator('option[value="parentId2"]')).toHaveCount(0);
   await expect(page.getByLabel('Поле результат группы').locator('option[value="customerOrder"]')).toHaveCount(0);
   await invoiceSources.selectOption(['title', 'description']);

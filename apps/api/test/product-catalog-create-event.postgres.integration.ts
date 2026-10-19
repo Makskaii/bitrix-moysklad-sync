@@ -18,6 +18,9 @@ let apiUrl = '';
 let fakeBase = '';
 const requests: Array<{ method: string; path: string; body: string }> = [];
 const createdCards = new Map<string, Record<string, unknown>>();
+const priceRows = new Map<string, Array<{ id: string; productId: number; catalogGroupId: number; price: number; currency: string }>>();
+const fakeDocumentRows = [{ orderId: 'synthetic-existing-order', rowId: 'synthetic-existing-row', productId: 'seed-product', quantity: 2, price: 17.5 }];
+let documentWriteAttempts = 0;
 let sourceRecords = new Map<string, Record<string, unknown>>();
 let nextCardId = 80_000_000 + Math.floor(Math.random() * 10_000_000);
 const oldEnv = new Map<string, string | undefined>();
@@ -115,6 +118,20 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
     assert.equal((await database.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: id, active: true } })), 1);
     assert.equal(requests.filter(({ path }) => isCreatePath(path, kind)).length, addsBeforeRepeat, 'a repeated CREATE resolves the established pair without another B24 card create');
 
+    if (kind === 'service') {
+      const baseline = await sendUpdate(kind, id, 'service-baseline');
+      assert.equal(baseline.status, 200);
+      await waitForStatus(database, oneEventId(await baseline.json()), 'SUCCEEDED');
+      sourceRecords.set(id, { ...sourceRecords.get(id), name: 'service-renamed-after-boundary' });
+      const update = await sendUpdate(kind, id, 'service-update');
+      assert.equal(update.status, 200);
+      const updateEventId = oneEventId(await update.json());
+      await waitForStatus(database, updateEventId, 'SUCCEEDED');
+      assert.equal(createdCards.get(pair.bitrix24Id)?.name, 'service-renamed-after-boundary', 'service UPDATE is read back from the service endpoint and applies to the service card');
+      assert.equal(requests.some(({ path }) => path.includes('catalog.product.service.update.json')), true, 'service lifecycle uses service-specific UPDATE endpoint');
+      assert.equal(requests.some(({ path }) => path.includes('catalog.product.update.json')), false, 'service UPDATE never routes through product UPDATE');
+    }
+
     const staleId = randomUUID();
     sourceRecords.set(staleId, { id: staleId, meta: { type: kind }, name: `${kind}-before-boundary`, code: `${kind}-old`, created: '2025-12-31T23:59:59.000Z' });
     const addsBeforeStale = requests.filter(({ path }) => isCreatePath(path, kind)).length;
@@ -143,10 +160,104 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
   assert.equal(requests.some(({ path }) => /crm\.deal|customerorder|invoiceout|document/i.test(path)), false, 'catalog create and retries do not touch document APIs');
 });
 
+test('MySklad product UPDATE applies confirmed price and UOM mappings through the webhook runtime without touching document rows', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const database = app.get(DatabaseService);
+  const productId = randomUUID();
+  const bitrix24Id = String(nextCardId++);
+  const configuredPriceType = randomUUID();
+  const unconfiguredPriceType = randomUUID();
+  const oldUnitId = randomUUID();
+  const newUnitId = randomUUID();
+  const currencyId = randomUUID();
+  const b24PriceId = String(nextCardId++);
+  const settingsVersion = 990_000 + Math.floor(Math.random() * 9_000);
+  const originalDocumentRows = structuredClone(fakeDocumentRows);
+  documentWriteAttempts = 0;
+  const configuredPrice = { id: b24PriceId, productId: Number(bitrix24Id), catalogGroupId: 2, price: 10, currency: 'RUB' };
+  const unrelatedPrice = { id: String(Number(b24PriceId) + 1), productId: Number(bitrix24Id), catalogGroupId: 9, price: 777, currency: 'RUB' };
+  priceRows.set(bitrix24Id, [configuredPrice, unrelatedPrice]);
+  const productCard = { id: Number(bitrix24Id), type: 1, name: 'Paired catalog item', code: 'SKU-1', detailText: 'catalog only', measure: 3, xmlId: `MOYSKLAD_PRODUCT_${productId}` };
+  createdCards.set(bitrix24Id, productCard);
+  sourceRecords.set(productId, {
+    id: productId, meta: { type: 'product' }, name: 'Paired catalog item', code: 'SKU-1', description: 'catalog only',
+    created: '2026-02-01T00:00:00.000Z', updated: '2026-10-18T00:00:00.000Z',
+    uom: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/uom/${oldUnitId}` } },
+    salePrices: [
+      { value: 10, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
+      { value: 777, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
+    ],
+  });
+  const config = {
+    schemaVersion: 1,
+    productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name', 'code', 'description'] },
+    rules: [{ id: 'catalog-name', entity: 'catalog', sourceField: 'name', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+    groups: [],
+    references: {
+      units: [
+        { bitrix24Id: 3, moyskladId: oldUnitId, status: 'configured' },
+        { bitrix24Id: 4, moyskladId: newUnitId, status: 'configured' },
+      ],
+      priceTypes: [{ bitrix24Id: 2, moyskladId: configuredPriceType, status: 'configured' }],
+      dictionaries: [], namedPairs: [],
+    },
+    serviceCounterpartyId: null,
+  };
+  const pair = await database.entityPair.create({ data: {
+    entityType: 'PRODUCT', bitrix24Id, moyskladId: productId, moyskladType: 'product', source: 'MANUAL', active: true,
+  } });
+  await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
+  await database.fieldSettingsState.update({ where: { id: 'global' }, data: { version: settingsVersion } });
+  requests.length = 0;
+  try {
+    const baselineResponse = await sendUpdate('product', productId, 'catalog-price-uom-baseline');
+    assert.equal(baselineResponse.status, 200);
+    await waitForStatus(database, oneEventId(await baselineResponse.json()), 'SUCCEEDED');
+
+    const source = sourceRecords.get(productId)!;
+    source.uom = { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/uom/${newUnitId}` } };
+    source.salePrices = [
+      { value: 18.25, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
+      { value: 777, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
+    ];
+    const updateResponse = await sendUpdate('product', productId, 'catalog-price-uom-update');
+    assert.equal(updateResponse.status, 200);
+    const updateEventId = oneEventId(await updateResponse.json());
+    await waitForStatus(database, updateEventId, 'SUCCEEDED');
+
+    assert.equal(productCard.measure, 4, 'configured MySklad UOM mapping is written to the existing B24 catalog card');
+    assert.equal(priceRows.get(bitrix24Id)?.find((row) => row.id === b24PriceId)?.price, 18.25, 'configured sale price updates the exact existing B24 catalog price row');
+    assert.equal(priceRows.get(bitrix24Id)?.find((row) => row.id === unrelatedPrice.id)?.price, 777, 'unconfigured price type remains untouched');
+    const providerCalls = requests.map(({ path }) => path);
+    assert.ok(providerCalls.some((path) => path.includes('catalog.price.update.json')), 'the configured price is written through Bitrix catalog.price.update');
+    assert.ok(providerCalls.some((path) => path.includes('catalog.product.update.json')), 'the configured UOM is written through Bitrix catalog.product.update');
+    assert.ok(providerCalls.filter((path) => path.includes('catalog.price.list.json')).length >= 2, 'price write is confirmed by a provider readback');
+    assert.equal(providerCalls.some((path) => /crm\.deal|crm\.item\.productrow|customerorder|invoiceout|productrows\.set/i.test(path)), false, 'catalog price/UOM update cannot write or replace existing document rows');
+    assert.equal(documentWriteAttempts, 0, 'the fake provider observed no document write operation');
+    assert.deepEqual(fakeDocumentRows, originalDocumentRows, 'an already-existing document row remains unchanged');
+    assert.deepEqual(await database.entityPair.findUniqueOrThrow({ where: { id: pair.id } }).then((saved) => [saved.bitrix24Id, saved.moyskladId, saved.active]), [bitrix24Id, productId, true], 'catalog update retains exact product pair identity');
+  } finally {
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { in: ['catalog-price-uom-baseline', 'catalog-price-uom-update'] } } });
+    await database.entityPair.deleteMany({ where: { id: pair.id } });
+    createdCards.delete(bitrix24Id);
+    priceRows.delete(bitrix24Id);
+    sourceRecords.delete(productId);
+  }
+});
+
 async function sendCreate(kind: 'product' | 'service', id: string, requestId: string) {
   return fetch(`${apiUrl}/webhooks/moysklad/synthetic-product-create-secret?requestId=${encodeURIComponent(requestId)}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ events: [{ action: 'CREATE', meta: { type: kind, href: `${fakeBase}entity/${kind}/${id}` } }] }),
+  });
+}
+
+async function sendUpdate(kind: 'product' | 'service', id: string, requestId: string) {
+  return fetch(`${apiUrl}/webhooks/moysklad/synthetic-product-create-secret?requestId=${encodeURIComponent(requestId)}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { type: kind, href: `${fakeBase}entity/${kind}/${id}` } }] }),
   });
 }
 
@@ -165,7 +276,8 @@ async function waitForStatus(database: DatabaseService, eventId: string, status:
     const event = await database.inboundEvent.findUnique({ where: { id: eventId }, select: { status: true, lastErrorCategory: true } });
     if (event?.status === status) return;
     if (event && ['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'SKIPPED_UNSUPPORTED_ENTITY'].includes(event.status)) {
-      assert.equal(event.status, status, `event stopped as ${event.status}: ${event.lastErrorCategory}`);
+      const recentCalls = requests.slice(-20).map(({ method, path, body }) => ({ method, path, body }));
+      assert.equal(event.status, status, `event stopped as ${event.status}: ${event.lastErrorCategory}; recent fake API calls=${JSON.stringify(recentCalls)}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -185,6 +297,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (pathname.includes('/entity/product/') || pathname.includes('/entity/service/')) {
     const id = pathname.split('/').at(-1)!;
     const record = sourceRecords.get(id);
+    if (record && request.method === 'PUT') {
+      const update = JSON.parse(body) as Record<string, unknown>;
+      Object.assign(record, update);
+      response.writeHead(200); response.end(JSON.stringify(record)); return;
+    }
     if (record) { response.writeHead(200); response.end(JSON.stringify(record)); return; }
   }
   if (method.endsWith('catalog.product.getFieldsByFilter') || method.endsWith('catalog.product.service.getFieldsByFilter')) {
@@ -206,6 +323,35 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     createdCards.set(id, card);
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind === 'service' ? 'service' : 'element']: card } })); return;
   }
+  if (method.endsWith('catalog.product.update') || method.endsWith('catalog.product.service.update')) {
+    const kind = method.includes('.service.') ? 'service' : 'product';
+    const parameters = new URLSearchParams(body);
+    const id = parameters.get('id');
+    const fields = Object.fromEntries([...parameters.entries()].flatMap(([key, value]) => {
+      const match = /^fields\[([^\]]+)\]$/.exec(key);
+      if (!match) return [];
+      const field = match[1]!;
+      return [[field, field === 'measure' ? Number(value) : value]];
+    }));
+    const card = createdCards.get(String(id));
+    if (!card || card.type !== (kind === 'service' ? 7 : 1)) { response.writeHead(404); response.end(JSON.stringify({ error: 'not found' })); return; }
+    Object.assign(card, fields);
+    response.writeHead(200); response.end(JSON.stringify({ result: true })); return;
+  }
+  if (method.endsWith('catalog.price.update')) {
+    const parameters = new URLSearchParams(body);
+    const id = parameters.get('id');
+    const price = [...priceRows.values()].flat().find((row) => row.id === id);
+    if (!price) { response.writeHead(404); response.end(JSON.stringify({ error: 'not found' })); return; }
+    price.price = Number(parameters.get('fields[price]'));
+    price.currency = parameters.get('fields[currency]') ?? price.currency;
+    response.writeHead(200); response.end(JSON.stringify({ result: true })); return;
+  }
+  if (/crm\.deal|crm\.item\.productrow|customerorder|invoiceout|productrows\.set/i.test(path) && /\.(?:add|update|delete|set)(?:\.json)?$/i.test(path)) {
+    documentWriteAttempts += 1;
+    fakeDocumentRows[0]!.price = -999;
+    response.writeHead(200); response.end(JSON.stringify({ result: true })); return;
+  }
   if (method.endsWith('catalog.product.get') || method.endsWith('catalog.product.service.get')) {
     const kind = method.includes('.service.') ? 'service' : 'product';
     const payload = parseProviderBody(body) as { id: string };
@@ -213,7 +359,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (!card) { response.writeHead(404); response.end(JSON.stringify({ error: 'not found' })); return; }
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind]: card } })); return;
   }
-  if (method.endsWith('catalog.price.list')) { response.writeHead(200); response.end(JSON.stringify({ result: { prices: [], total: 0 } })); return; }
+  if (method.endsWith('catalog.price.list')) {
+    const productId = new URLSearchParams(body).get('filter[productId]');
+    const prices = priceRows.get(String(productId)) ?? [];
+    response.writeHead(200); response.end(JSON.stringify({ result: { prices: structuredClone(prices), total: prices.length } })); return;
+  }
   response.writeHead(404); response.end(JSON.stringify({ error: 'unexpected fake API call' }));
 }
 
