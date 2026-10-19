@@ -126,6 +126,10 @@ test('an enabled direction is blocked until its own read-only API and webhook-au
       findUnique: async () => state,
       update: async ({ data }: { data: typeof state }) => { updates++; Object.assign(state, data); return state; },
     },
+    $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work({
+      $queryRaw: async () => [{ version: 3 }],
+      syncDirectionSetting: { update: async ({ data }: { data: typeof state }) => { updates++; Object.assign(state, data); return state; } },
+    }),
   };
   const fieldSettings = { active: async () => ({ version: 3, config: { rules: [], references: { namedPairs: [] } } }) };
   const fieldData = { fieldCatalogs: async (_token: string, _entity: string) => ({ bitrix24: [], moysklad: [] }) };
@@ -144,6 +148,86 @@ test('an enabled direction is blocked until its own read-only API and webhook-au
     assert.equal(updates, 1);
     assert.equal(state.bitrix24ToMoysklad, false);
     assert.equal(state.moyskladToBitrix24, true);
+  } finally {
+    if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
+    else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
+  }
+});
+
+test('deal preflight uses the selected source catalogs and keeps optional catalog failures as warnings', async () => {
+  const configuration = {
+    rules: [],
+    references: { namedPairs: [
+      { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'ms-stage-uuid', status: 'confirmed' },
+      { kind: 'currencies', bitrix24Id: 'USD', moyskladId: 'ms-currency-uuid', status: 'confirmed' },
+    ] },
+    dealOrderRuntime: {
+      nativeOrderNumberingVerified: true, defaultOrganizationId: 'org', defaultStoreId: 'store', defaultEmployeeId: 'employee',
+      stages: [{ bitrix24StageId: '0:NEW', moyskladId: 'ms-stage-uuid' }],
+      currencies: [{ bitrix24Code: 'USD', moyskladId: 'ms-currency-uuid' }],
+    },
+  };
+  let requestedDirection = '';
+  let failRequiredCatalogs = false;
+  const service = new SyncModeService({} as never, undefined, undefined,
+    { active: async () => ({ version: 4, config: configuration }) } as never,
+    {
+      dealOrderCatalogs: async (_token: string, direction: string) => {
+        requestedDirection = direction;
+        if (failRequiredCatalogs) throw new Error('required stage/currency endpoint failed');
+        return { stages: ['ms-stage-uuid'], currencies: ['ms-currency-uuid'] };
+      },
+      optionalDealOrderReferenceWarnings: async () => ['employees'],
+    } as never,
+  );
+  const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  try {
+    const report = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(requestedDirection, 'moyskladToBitrix24');
+    assert.equal(report.canEnable, true);
+    assert.deepEqual(report.warnings.map((warning) => warning.code), ['OPTIONAL_REFERENCE_UNAVAILABLE']);
+    failRequiredCatalogs = true;
+    const blocked = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(blocked.canEnable, false);
+    assert.ok(blocked.blockers.some((blocker) => blocker.code === 'API_ACCESS_UNAVAILABLE'));
+  } finally {
+    if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
+    else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
+  }
+});
+
+test('settings changing during read-only preflight cannot enable a stale version', async () => {
+  const directions = { bitrix24ToMoysklad: false, moyskladToBitrix24: false };
+  let activeVersion = 4;
+  let releaseProvider!: () => void;
+  const providerWait = new Promise<void>((resolve) => { releaseProvider = resolve; });
+  let updates = 0;
+  const database = {
+    syncDirectionSetting: {
+      upsert: async () => directions,
+      findUnique: async () => directions,
+      update: async ({ data }: { data: typeof directions }) => { updates += 1; Object.assign(directions, data); return directions; },
+    },
+    $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work({
+      $queryRaw: async () => [{ version: activeVersion }],
+      syncDirectionSetting: { update: async ({ data }: { data: typeof directions }) => { updates += 1; Object.assign(directions, data); return directions; } },
+    }),
+  };
+  const service = new SyncModeService(database as never, undefined, undefined,
+    { active: async () => ({ version: 4, config: { rules: [], references: { namedPairs: [] } } }) } as never,
+    { fieldCatalogs: async () => { await providerWait; return { bitrix24: [], moysklad: [] }; } } as never,
+  );
+  const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  try {
+    const enabling = service.setEntityDirections('invoices', { bitrix24ToMoysklad: false, moyskladToBitrix24: true }, 'admin-token');
+    await Promise.resolve();
+    activeVersion = 5;
+    releaseProvider();
+    await assert.rejects(enabling, (error: unknown) => error instanceof Error && error.message.includes('SYNC_PREFLIGHT_STALE'));
+    assert.equal(updates, 0);
+    assert.equal(directions.moyskladToBitrix24, false);
   } finally {
     if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
     else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;

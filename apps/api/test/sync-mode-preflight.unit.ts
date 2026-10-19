@@ -66,6 +66,30 @@ test('deal preflight passes when all required stage, currency, and create-order 
   assert.deepEqual(report.blockers, []);
 });
 
+test('deal preflight accepts confirmed reverse mappings against MySklad source IDs', () => {
+  const result = evaluateEnablePreflight({
+    entityKey: 'deals-orders', direction: 'moyskladToBitrix24', settings: {
+      version: 9,
+      config: {
+        rules: [],
+        references: { namedPairs: [
+          { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'ms-stage-uuid', status: 'confirmed' },
+          { kind: 'currencies', bitrix24Id: 'USD', moyskladId: 'ms-currency-uuid', status: 'confirmed' },
+        ] },
+        dealOrderRuntime: {
+          nativeOrderNumberingVerified: true, defaultOrganizationId: 'org', defaultStoreId: 'store', defaultEmployeeId: 'employee',
+          stages: [{ bitrix24StageId: '0:NEW', moyskladId: 'ms-stage-uuid' }],
+          currencies: [{ bitrix24Code: 'USD', moyskladId: 'ms-currency-uuid' }],
+        },
+      },
+    },
+    apiAccess: true, webhookAuthConfigured: true,
+    applicableStages: ['ms-stage-uuid'], applicableCurrencies: ['ms-currency-uuid'],
+  });
+  assert.equal(result.canEnable, true);
+  assert.deepEqual(result.blockers, []);
+});
+
 test('product preflight rejects the unsupported reverse direction and requires a catalog and authenticated APIs', () => {
   const unsupported = evaluateEnablePreflight({
     ...baseInput,

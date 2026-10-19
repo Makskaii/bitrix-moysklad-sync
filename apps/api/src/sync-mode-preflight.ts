@@ -30,6 +30,7 @@ export type EnablePreflightInput = {
   applicableCurrencies?: readonly string[];
   applicableUnits?: readonly string[];
   optionalReferenceWarnings?: readonly string[];
+  optionalEndpointWarnings?: readonly string[];
   availableProductCatalogIds?: readonly string[];
 };
 
@@ -114,6 +115,9 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
 
     for (const kind of input.optionalReferenceWarnings ?? []) {
       warnings.push(finding('OPTIONAL_REFERENCE_UNMAPPED', `Справочник «${kind}» не полностью сопоставлен; он не блокирует выбранное направление.`));
+    }
+    for (const kind of input.optionalEndpointWarnings ?? []) {
+      warnings.push(finding('OPTIONAL_REFERENCE_UNAVAILABLE', `Не удалось проверить необязательный справочник «${kind}»; это не блокирует выбранное направление.`));
     }
   }
 

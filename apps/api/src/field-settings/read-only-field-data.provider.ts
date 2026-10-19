@@ -22,6 +22,52 @@ const REQUEST_TIMEOUT_MS = 10_000;
 
 @Injectable()
 export class ReadOnlyFieldDataProvider {
+  async dealOrderCatalogs(bitrixAccessToken: string, direction: 'bitrix24ToMoysklad' | 'moyskladToBitrix24'): Promise<{ stages: string[]; currencies: string[] }> {
+    if (direction === 'bitrix24ToMoysklad') {
+      const [currencies, stages] = await Promise.all([
+        this.bitrixList(bitrixAccessToken, 'crm.currency.list'),
+        this.bitrixDealStages(bitrixAccessToken),
+      ]);
+      return { stages: stages.map((item) => item.id), currencies: currencies.map((row) => text(row.CURRENCY)).filter(Boolean) };
+    }
+    const [currencies, stages] = await Promise.all([
+      this.moyskladList('/entity/currency'),
+      this.moyskladList('/entity/customerorder/metadata/states'),
+    ]);
+    return {
+      stages: stages.map((row) => text(row.id)).filter(Boolean),
+      currencies: currencies.map((row) => text(row.id)).filter(Boolean),
+    };
+  }
+
+  async optionalDealOrderReferenceWarnings(bitrixAccessToken: string): Promise<string[]> {
+    const checks: Array<[string, Promise<unknown>]> = [
+      ['employees', this.bitrixList(bitrixAccessToken, 'user.get')],
+      ['moyskladEmployees', this.moyskladList('/entity/employee')],
+      ['organizations', this.moyskladList('/entity/organization')],
+      ['warehouses', this.moyskladList('/entity/store')],
+      ['projects', this.moyskladList('/entity/project')],
+    ];
+    const results = await Promise.allSettled(checks.map(([, request]) => request));
+    return results.flatMap((result, index) => result.status === 'rejected' ? [checks[index]![0]] : []);
+  }
+
+  async productCatalogReadiness(bitrixAccessToken: string): Promise<{ units: string[]; productCatalogs: string[] }> {
+    const [moyskladUnits, catalogPayload] = await Promise.all([
+      this.moyskladList('/entity/uom'),
+      this.bitrixCall(bitrixAccessToken, 'catalog.catalog.list', {}),
+    ]);
+    const catalogRoot = asRecord(catalogPayload);
+    const catalogRows = Array.isArray(catalogRoot.catalogs) ? catalogRoot.catalogs : Array.isArray(catalogPayload) ? catalogPayload : [];
+    return {
+      units: moyskladUnits.map((row) => text(row.id)).filter(Boolean),
+      productCatalogs: catalogRows.filter(isRecord).flatMap((row) => {
+        const id = row.id;
+        return (typeof id === 'string' || typeof id === 'number') && /^\d+$/.test(String(id)) ? [String(id)] : [];
+      }),
+    };
+  }
+
   async referenceCatalogs(bitrixAccessToken: string): Promise<LiveReferenceCatalogs> {
     const [users, currencies, organizations, warehouses, projects, stages, msEmployees, msCurrencies, msOrganizations, msWarehouses, msProjects, msStates] = await Promise.all([
       this.bitrixList(bitrixAccessToken, 'user.get'),

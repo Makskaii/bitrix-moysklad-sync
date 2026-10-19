@@ -148,14 +148,29 @@ export class SyncModeService {
       ...(directions.bitrix24ToMoysklad && !current.bitrix24ToMoysklad ? ['bitrix24ToMoysklad' as const] : []),
       ...(directions.moyskladToBitrix24 && !current.moyskladToBitrix24 ? ['moyskladToBitrix24' as const] : []),
     ];
+    const reports: EnablePreflightReport[] = [];
     for (const direction of candidates) {
       const report = await this.preflightEntityDirection(entityKey, direction, bitrixAccessToken);
       if (!report.canEnable) throw new ConflictException({ message: 'SYNC_PREFLIGHT_BLOCKED', preflight: report });
+      reports.push(report);
     }
-    const setting = await this.database.syncDirectionSetting.update({
-      where: { entityKey },
-      data: directions,
-      select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    const checkedVersions = new Set(reports.map((report) => report.settingsVersion));
+    if (checkedVersions.size > 1 || reports.some((report) => report.settingsVersion === null)) {
+      throw new ConflictException('SYNC_PREFLIGHT_STALE');
+    }
+    const expectedSettingsVersion = reports[0]?.settingsVersion;
+    const setting = await this.database.$transaction(async (transaction) => {
+      const activeVersions = await transaction.$queryRaw<Array<{ version: number }>>`
+        SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR SHARE
+      `;
+      if (!activeVersions[0] || activeVersions[0].version !== expectedSettingsVersion) {
+        throw new ConflictException('SYNC_PREFLIGHT_STALE');
+      }
+      return transaction.syncDirectionSetting.update({
+        where: { entityKey },
+        data: directions,
+        select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+      });
     });
     return { key: entityKey, ...setting };
   }
@@ -172,16 +187,18 @@ export class SyncModeService {
     let applicableCurrencies: string[] = [];
     let applicableUnits: string[] = [];
     let availableProductCatalogIds: string[] = [];
+    let optionalEndpointWarnings: string[] = [];
     if (this.fieldData && bitrixAccessToken) {
       try {
         if (entityKey === 'deals-orders') {
-          const catalogs = await this.fieldData.referenceCatalogs(bitrixAccessToken);
-          applicableStages = catalogs.dealStages.bitrix24.map((item) => item.id);
-          applicableCurrencies = catalogs.currencies.bitrix24.map((item) => item.id);
+          const catalogs = await this.fieldData.dealOrderCatalogs(bitrixAccessToken, direction);
+          applicableStages = catalogs.stages;
+          applicableCurrencies = catalogs.currencies;
+          optionalEndpointWarnings = await this.fieldData.optionalDealOrderReferenceWarnings(bitrixAccessToken);
         } else if (entityKey === 'products-variations') {
-          const catalogs = await this.fieldData.catalogs(bitrixAccessToken);
-          applicableUnits = (direction === 'bitrix24ToMoysklad' ? catalogs.units.bitrix24 : catalogs.units.moysklad).map((item) => item.id);
-          availableProductCatalogIds = catalogs.productCatalogs.map((item) => item.id);
+          const catalogs = await this.fieldData.productCatalogReadiness(bitrixAccessToken);
+          applicableUnits = catalogs.units;
+          availableProductCatalogIds = catalogs.productCatalogs;
         } else if (entityKey === 'invoices') {
           await this.fieldData.fieldCatalogs(bitrixAccessToken, 'smart-invoices');
         } else if (entityKey === 'contacts-companies') {
@@ -198,6 +215,7 @@ export class SyncModeService {
       webhookAuthConfigured: Boolean(process.env[incomingSource]),
       applicableStages, applicableCurrencies, applicableUnits, availableProductCatalogIds,
       optionalReferenceWarnings,
+      optionalEndpointWarnings,
     });
   }
 
