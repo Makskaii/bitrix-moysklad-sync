@@ -508,6 +508,17 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
 });
 
 test('saving creates an immutable version and activates it for future events only', async () => {
+  const beforeResetResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
+  assert.equal(beforeResetResponse.status, 200);
+  const beforeReset = await beforeResetResponse.json() as { config: Record<string, unknown> };
+  const baselineConfig = structuredClone(beforeReset.config);
+  baselineConfig.rules = [];
+  baselineConfig.groups = [];
+  const baselineResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: baselineConfig }),
+  });
+  assert.equal(baselineResponse.status, 200, 'the audit assertion starts from a known empty mapping baseline');
   const originalResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal(originalResponse.status, 200);
   const original = await originalResponse.json() as { version: number; config: Record<string, unknown> };
@@ -540,7 +551,8 @@ test('saving creates an immutable version and activates it for future events onl
   assert.deepEqual(reloaded.config.rules, saved.config.rules);
   assert.deepEqual(reloaded.config.groups, saved.config.groups);
   const auditEntries = await app.get(DatabaseService).operationalLog.findMany({ where: { category: 'ADMIN', referenceId: String(saved.version) } });
-  assert.ok(auditEntries.some((entry) => entry.message.includes('added deals-orders:TITLE → name')), 'risky added keys are audited against the activated version');
+  assert.ok(auditEntries.some((entry) => entry.message.includes('added deals-orders:TITLE → name')),
+    `risky added keys are audited against the activated version; version ${saved.version} audit messages: ${JSON.stringify(auditEntries.map((entry) => entry.message))}`);
 
   const legacyConfig = structuredClone(reloaded.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
   delete legacyConfig.rules[0]!.criticality;

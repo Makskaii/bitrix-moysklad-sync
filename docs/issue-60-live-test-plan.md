@@ -13,17 +13,17 @@ Do not schedule live actions until all are true:
 5. The deployed runtime can safely isolate processing to the manifest's unique run ID/test records before any event is accepted. If it cannot, stop: enabling a broad flow is not an acceptable substitute.
 6. The operator confirms how each exact test record can be preserved or reversibly restored. No irreversible deletion, bulk cleanup, or deletion of dependent/foreign records is in scope.
 
-Current gate state: **BLOCKED**. Docker's engine was unavailable; PostgreSQL acceptance and the all-scope fake/API/browser run remain incomplete. The runtime's tenant-level isolation for arbitrary live records is not yet proven. No live-test window is requested or scheduled here.
+Current gate state: **BLOCKED for live acceptance**. Offline build, fake-HTTP/browser slices, and isolated PostgreSQL test schemas have run; these do not prove tenant readiness. A read-only live inventory found the required MySklad invoiceout/service/contactperson webhook subscriptions absent or disabled, Bitrix24 event API returning `WRONG_AUTH_TYPE`, SSH public-key access denied, and no native run-ID isolation. No live-test window is requested or scheduled here; no provider configuration or records were changed.
 
 ## Capability/scope restrictions
 
 | Scope | Planned test direction | Restriction |
 | --- | --- | --- |
-| Contacts/companies | Only the specifically verified existing-pair EMAIL slice, if separately approved | This is not full client/contact exchange; no customer records or unverified matching/create flow. |
+| Contacts/companies | Configured rule/group exchange and matching only within an explicitly approved, isolated synthetic manifest | Code and offline PG fake-provider tests cover configured fields/groups, baseline, pair and readback, but the full client matching/recovery matrix and live tenant behavior are not accepted. No unrelated customer records. |
 | Deals/orders | Both directions only after the complete field/reference/stage preflight passes | Use synthetic test records and safe run-ID isolation; no broad event intake. |
 | Invoices | Both directions only after explicit approval of the post-launch invoice stage | Parent #1 / `requirements.md` defer invoice exchange after first launch; #60 acceptance testing does not itself lift that production boundary. |
 | Product/catalog cards and prices | MySklad → Bitrix24 only | B24 → MySklad product writes remain prohibited. |
-| Deal service dictionary | No live test | Feature is missing; catalog service cards are a separate feature. |
+| Deal service-dictionary values | Only as part of a separately approved deal/order test and its configured field mapping | Deal/order runtime supports custom service-dictionary values; the separate standalone service-dictionary feed remains unavailable. Catalog service cards are another capability. |
 
 ## Synthetic manifest format
 

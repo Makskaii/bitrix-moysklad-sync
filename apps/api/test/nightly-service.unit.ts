@@ -319,7 +319,7 @@ test('nightly accepted DELETE stays terminal when its canonical sync direction i
 
 test('a latest accepted DELETE observed with its direction disabled suppresses an older enabled UPDATE', async () => {
   const harness = await createHarness('on');
-  harness.store.directionResults = [true, true, false, true];
+  harness.store.directionResults = Array.from({ length: 4 }, () => [false, true, true, true]).flat();
   const receivedAt = new Date('2026-10-20T21:00:00.000Z');
   harness.store.acceptedRows = [
     { id: 'accepted-0000', source: 'BITRIX24', eventType: 'ONCRMCONTACTUPDATE', externalEntityType: 'contact', externalEntityId: 'contact-1', receivedAt },
@@ -334,7 +334,7 @@ test('a latest accepted DELETE observed with its direction disabled suppresses a
     harness.service.onApplicationBootstrap();
     await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
 
-    assert.equal(harness.store.directionReadCount, 4);
+    assert.equal(harness.store.directionReadCount, 16, 'the scheduler, page scan, final scan check, and candidate recheck each read all four ready scopes');
     assert.deepEqual(harness.store.accepted.map((event) => [event.eventType, event.payload]), []);
     assert.equal(harness.store.dispatched.length, 0);
   } finally {

@@ -5,6 +5,9 @@ import { test } from 'node:test';
 import { DatabaseService } from '../src/database.service';
 import { EventDispatcherService, InboundEventProcessor } from '../src/event-dispatcher.service';
 import { EventWorkerLeaseService } from '../src/event-worker-lease.service';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
+import { SyncModeService } from '../src/sync-mode.service';
+import { SyncRecoveryService } from '../src/sync-recovery.service';
 
 test('PostgreSQL shares worker fencing slots across instances and dispatches a durable accepted event', {
   skip: process.env.ISSUE57_EVENT_RELIABILITY_POSTGRES !== '1',
@@ -148,5 +151,103 @@ test('PostgreSQL shares worker fencing slots across instances and dispatches a d
     });
     await firstDatabase.inboundEvent.deleteMany({ where: { id: eventId } });
     await Promise.all([firstDatabase.$disconnect(), secondDatabase.$disconnect()]);
+  }
+});
+
+test('nightly PostgreSQL scan preserves the latest accepted DELETE when it crosses the 500-row boundary', {
+  skip: process.env.ISSUE57_EVENT_RELIABILITY_POSTGRES !== '1',
+}, async () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  assert.ok(databaseUrl, 'Set DATABASE_URL to a disposable PostgreSQL test database');
+  const parsedUrl = new URL(databaseUrl);
+  assert.match(parsedUrl.hostname, /^(localhost|127\.0\.0\.1)$/i, 'Refusing a non-local test database');
+  assert.match(parsedUrl.pathname, /(test|issue57)/i, 'Database name must identify a disposable test database');
+
+  const oldMode = process.env.SYNC_MODE;
+  const oldB24Url = process.env.BITRIX24_REST_BASE_URL;
+  const oldMsUrl = process.env.MOYSKLAD_API_BASE_URL;
+  const oldMsToken = process.env.MOYSKLAD_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  process.env.SYNC_MODE = 'apply';
+  process.env.BITRIX24_REST_BASE_URL = 'http://bitrix-nightly.test/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'http://moysklad-nightly.test/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-nightly-test-token';
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    assert.ok(['bitrix-nightly.test', 'moysklad-nightly.test'].includes(url.hostname), 'nightly provider access must use fake test hosts');
+    if (url.hostname === 'bitrix-nightly.test') {
+      return new Response(JSON.stringify({ result: { items: [] } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ rows: [], meta: { size: 0, limit: 1000, offset: 0 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const database = new DatabaseService();
+  await database.$connect();
+  const sourceId = `nightly-delete-${randomUUID()}`;
+  const pairId = `nightly-delete-pair-${randomUUID()}`;
+  const eventPrefix = `accepted-${randomUUID()}-`;
+  const deletedEventId = `${eventPrefix}0500`;
+  const createdEventIds = Array.from({ length: 501 }, (_, index) => `${eventPrefix}${String(index).padStart(4, '0')}`);
+  const now = new Date();
+  const scheduledDate = now.toISOString().slice(0, 10);
+  const receivedAt = new Date(now.getTime() - 60 * 60 * 1000);
+  const settings = new SyncModeService(database);
+  const fieldSettings = new FieldSettingsService(database, {} as never, {} as never);
+  const service = new SyncRecoveryService(database, settings, {} as never, undefined, fieldSettings, undefined);
+
+  try {
+    await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
+    await database.syncSetting.update({
+      where: { id: 'global' },
+      data: {
+        nightlyScheduledDate: scheduledDate, nightlyStatus: 'running', nightlyFrom: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        nightlyThrough: new Date(now.getTime() + 60_000), nightlyProvider: 'BITRIX24', nightlyBitrixStatus: 'pending',
+        nightlyMoyskladStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
+        nightlyMoyskladOffset: 0, nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
+        nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
+      },
+    });
+    await database.syncDirectionSetting.upsert({
+      where: { entityKey: 'contacts-companies' },
+      create: { entityKey: 'contacts-companies', bitrix24ToMoysklad: true, moyskladToBitrix24: false },
+      update: { bitrix24ToMoysklad: true, moyskladToBitrix24: false },
+    });
+    await database.entityPair.create({ data: {
+      id: pairId, entityType: 'CONTACT', bitrix24Id: sourceId, moyskladId: randomUUID(),
+      moyskladType: 'counterparty', source: 'MANUAL', active: true,
+    } });
+    await database.inboundEvent.createMany({ data: createdEventIds.map((id, index) => ({
+      id, source: 'BITRIX24', deliveryKey: `nightly-pg-source-${id}`,
+      eventType: id === deletedEventId ? 'ONCRMCONTACTDELETE' : 'ONCRMCONTACTUPDATE',
+      externalEntityType: 'contact', externalEntityId: index === 0 || id === deletedEventId ? sourceId : `unpaired-${id}`,
+      payload: { synthetic: true }, status: 'SUCCEEDED', receivedAt,
+    })) });
+
+    service.onApplicationBootstrap();
+    let finalState = null as Awaited<ReturnType<typeof database.syncSetting.findUnique>>;
+    for (let attempt = 0; attempt < 150; attempt++) {
+      finalState = await database.syncSetting.findUnique({ where: { id: 'global' } });
+      if (finalState?.nightlyStatus === 'awaiting_processing' || finalState?.nightlyStatus === 'failed' || finalState?.nightlyStatus === 'skipped') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(finalState?.nightlyStatus, 'awaiting_processing', finalState?.nightlyError ?? 'nightly run did not finish');
+    const nightlyRows = await database.inboundEvent.findMany({
+      where: { deliveryKey: { startsWith: `nightly:${finalState?.nightlyScheduledDate}:CONTACT:` }, externalEntityId: sourceId },
+      select: { eventType: true, externalEntityId: true, externalEntityType: true, deliveryKey: true, payload: true, status: true },
+    });
+    assert.equal(nightlyRows.length, 1, 'the cross-page identity must stage only its last accepted action');
+    assert.deepEqual(nightlyRows[0], {
+      eventType: 'ONCRMCONTACTDELETE', externalEntityId: sourceId, externalEntityType: 'contact',
+      deliveryKey: `nightly:${finalState?.nightlyScheduledDate}:CONTACT:ONCRMCONTACTDELETE:ACTIVE:${sourceId}`,
+      payload: { recovery: 'nightly', entity: 'CONTACT', acceptedEventId: deletedEventId }, status: 'RECEIVED',
+    });
+  } finally {
+    service.onModuleDestroy();
+    await database.$disconnect();
+    globalThis.fetch = originalFetch;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+    if (oldB24Url === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldB24Url;
+    if (oldMsUrl === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMsUrl;
+    if (oldMsToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldMsToken;
   }
 });

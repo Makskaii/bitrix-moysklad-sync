@@ -128,7 +128,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByLabel('Критичность EMAIL → email').selectOption('critical');
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveValue('EMAIL');
   await expect(page.getByLabel('Поле МойСклад').last()).toHaveValue('email');
-  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
+  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', /Email · EMAIL · crm_multifield/);
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
   await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
   await mappingRow.getByText('Технические коды').click();
