@@ -478,6 +478,9 @@ test('catalog product and service reads confirm only the documented missing-item
       globalThis.fetch = async () => Response.json(responseBody('200040300040', 'Insufficient rights to read the information block element'));
       assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'UNCERTAIN');
 
+      globalThis.fetch = async () => Response.json({ error: 'ACCESS_DENIED', result: { [scenario.nativeType]: { id: '42' } } });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'UNCERTAIN');
+
       globalThis.fetch = async () => Response.json({ result: { [scenario.nativeType]: { id: '42' } } });
       assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'PRESENT');
     }

@@ -304,6 +304,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     const catalogKind = entityType === 'PRODUCT' && (nativeType === 'product' || nativeType === 'service') ? nativeType : null;
     if (catalogKind && isBitrixCatalogItemMissing(result, catalogKind)) return 'DELETED';
     if (catalogKind && response.ok && isBitrixAmbiguousCatalogError(result)) throw new ProviderFailure('BITRIX24', 503);
+    if (catalogKind && Object.hasOwn(result, 'error')) return 'UNCERTAIN';
     if (!response.ok) {
       const description = typeof result.error_description === 'string' ? result.error_description.trim().toLowerCase() : '';
       const notFound = new Set(['not found', 'element not found', 'item not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'service is not found', 'company not found', 'contact not found', 'deal not found', 'product not found', 'service not found']);
