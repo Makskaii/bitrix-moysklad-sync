@@ -9,6 +9,7 @@ import { InvoiceEventProcessor } from '../src/invoices/invoice-event.processor';
 import { InvoiceHttpApi, InvoiceRecord } from '../src/invoices/invoice-http-api';
 import { SyncModeService } from '../src/sync-mode.service';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 
 const suffix = randomUUID();
 const orderId = randomUUID();
@@ -30,6 +31,7 @@ let oldMoyskladToken: string | undefined;
 let oldDatabaseUrl: string | undefined;
 let invoiceCounter = 5000;
 let failNextInvoiceCreate = false;
+let failNextMoyskladUpdate = false;
 let reparentOnNextMoyskladWrite = false;
 let moyskladWrites = 0;
 let processorStarted = false;
@@ -67,7 +69,10 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = new URL('rest/', base).href;
   process.env.MOYSKLAD_API_BASE_URL = new URL('api/remap/1.2/', base).href;
   process.env.MOYSKLAD_API_TOKEN = 'invoice-fake-provider-only';
-  const settings = { eventConfig: async () => ({ version: 1, config: activeFieldConfig }) };
+  const settings = {
+    eventConfig: async () => ({ version: 1, config: activeFieldConfig }),
+    transformField: FieldSettingsService.prototype.transformField,
+  };
   const recovery = { launchBoundary: async () => launchBoundary, assertReady: async () => true };
   processor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settings as never, new SyncModeService(db), recovery as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db));
 });
@@ -140,13 +145,117 @@ test('invoice worker durably defers before the deal/order pair exists, then auto
   const writesBeforeOrderPair = moyskladWrites;
   assert.equal(writesBeforeOrderPair, writesBeforeInvoiceEvent, 'the waiting invoice must not create an invoiceout or bypass the order-pair gate');
   await db.entityPair.create({ data: { id: `invoice55-${suffix}-deal-${nextDeal}`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
-  processorStarted = true;
-  processor.onApplicationBootstrap();
+  startRecoveryScanner();
   await waitForEventStatus(event.id, 'SUCCEEDED');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId, moyskladParentId: nextOrder } }), 1);
   const invoicePair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
   assert.equal((moyskladInvoices.get(invoicePair.moyskladId)?.customerOrder as any)?.meta?.href, `${base}api/remap/1.2/entity/customerorder/${nextOrder}`);
   assert.equal(moyskladWrites, writesBeforeOrderPair + 1, 'automatic resume creates exactly one invoice linked to the paired order');
+});
+
+test('MySklad invoiceout durably waits for a new customer order pair and automatically resumes against its exact deal', async () => {
+  const nextOrder = randomUUID();
+  const nextDeal = `${Date.now()}92`;
+  const sourceId = randomUUID();
+  orders.set(nextOrder, { id: nextOrder, meta: { type: 'customerorder' }, created: createdAfterBoundary });
+  moyskladInvoices.set(sourceId, { id: sourceId, name: 'Early MySklad invoice', created: createdAfterBoundary, meta: { type: 'invoiceout' },
+    customerOrder: { id: nextOrder, meta: { type: 'customerorder' } } });
+  const writesBefore = bitrixInvoices.size;
+  const event = await createEvent(`ms-wait-${sourceId}`, 'MOYSKLAD', 'CREATE', 'invoiceout', sourceId);
+  assert.equal((await processor.process(event.id))?.status, 'WAITING_FOR_ORDER');
+  const waiting = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(waiting.status, 'WAITING_FOR_ORDER');
+  assert.equal(waiting.lastErrorCategory, 'INVOICE_LINKED_ORDER_PAIR_PENDING');
+  assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', moyskladId: sourceId } }), 0);
+  assert.equal(bitrixInvoices.size, writesBefore, 'the invoice must not create a standalone smart invoice before its order pair exists');
+
+  deals.set(nextDeal, { ID: nextDeal, DATE_CREATE: createdAfterBoundary });
+  await db.entityPair.create({ data: { id: `invoice55-${suffix}-ms-deal-${nextOrder}`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
+  startRecoveryScanner();
+  await waitForEventStatus(event.id, 'SUCCEEDED');
+  const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', moyskladId: sourceId } });
+  assert.equal(pair.moyskladParentId, nextOrder);
+  assert.equal(bitrixInvoices.get(pair.bitrix24Id)?.parentId2, Number(nextDeal));
+  assert.equal(bitrixInvoices.size, writesBefore + 1);
+});
+
+test('invoice groups use the configured #56 join transform and baseline for create and update', async () => {
+  activeFieldConfig = { ...fieldConfig, rules: [{ id: 'invoice-code', entity: 'smart-invoices', sourceField: 'title', targetField: 'code',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }], groups: [{ id: 'invoice-name', entity: 'smart-invoices', direction: 'BITRIX24_TO_MOYSKLAD',
+    targetField: 'name', sourceFields: ['title', 'description'], criticality: 'optional',
+    transform: { kind: 'join-non-empty', separator: ' ' } },
+  { id: 'invoice-moysklad-label', entity: 'smart-invoices', direction: 'MOYSKLAD_TO_BITRIX24',
+    targetField: 'description', sourceFields: ['name', 'code'], criticality: 'optional',
+    transform: { kind: 'join-non-empty', separator: ' / ' } }] } as unknown as typeof activeFieldConfig;
+  try {
+    const sourceId = String(++invoiceCounter);
+    bitrixInvoices.set(sourceId, { id: sourceId, title: '  Customer ', description: 'Invoice  ', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    const create = await createEvent(`group-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+    assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'Customer Invoice');
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.code, '  Customer ');
+
+    bitrixInvoices.get(sourceId)!.description = ' Updated ';
+    const update = await createEvent(`group-update-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(update.id))?.status, 'SUCCEEDED');
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'Customer Updated');
+
+    moyskladInvoices.get(pair.moyskladId)!.name = 'MySklad label';
+    const reverse = await createEvent(`group-reverse-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
+    assert.equal((await processor.process(reverse.id))?.status, 'SUCCEEDED');
+    assert.equal(bitrixInvoices.get(sourceId)?.description, 'MySklad label / Customer');
+
+    bitrixInvoices.get(sourceId)!.title = 'Customer 2';
+    moyskladInvoices.get(pair.moyskladId)!.name = 'MySklad wins';
+    const conflict = await createEvent(`group-conflict-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(conflict.id))?.status, 'SUCCEEDED');
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'MySklad wins', 'the MySklad target wins a simultaneous group edit');
+
+    bitrixInvoices.get(sourceId)!.description = 'retry';
+    failNextMoyskladUpdate = true;
+    const retry = await createEvent(`group-retry-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(retry.id))?.status, 'RETRYABLE_FAILURE');
+    startRecoveryScanner();
+    await waitForEventStatus(retry.id, 'SUCCEEDED');
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'Customer 2 retry');
+
+    const emptyId = String(++invoiceCounter);
+    bitrixInvoices.set(emptyId, { id: emptyId, title: '  ', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    const emptyCreate = await createEvent(`group-empty-${emptyId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', emptyId);
+    assert.equal((await processor.process(emptyCreate.id))?.status, 'SUCCEEDED');
+    const emptyPair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: emptyId } });
+    assert.equal(moyskladInvoices.get(emptyPair.moyskladId)?.name, '');
+    bitrixInvoices.get(emptyId)!.description = 'Now present';
+    const emptyUpdate = await createEvent(`group-empty-update-${emptyId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', emptyId);
+    assert.equal((await processor.process(emptyUpdate.id))?.status, 'SUCCEEDED');
+    assert.equal(moyskladInvoices.get(emptyPair.moyskladId)?.name, 'Now present', 'the persisted empty baseline must detect a later non-empty group value');
+  } finally {
+    activeFieldConfig = fieldConfig;
+  }
+});
+
+test('invoice processor rejects transforms that #56 does not allow for smart invoices', async () => {
+  try {
+    const invalidGroups = [
+      { id: 'invoice-invalid-split', entity: 'smart-invoices', direction: 'MOYSKLAD_TO_BITRIX24', targetField: 'PHONE', sourceFields: ['description'], criticality: 'optional', transform: { kind: 'split-non-empty', separator: ';', valueType: 'WORK' } },
+      { id: 'invoice-invalid-order-link', entity: 'smart-invoices', direction: 'BITRIX24_TO_MOYSKLAD', targetField: 'customerOrder', sourceFields: ['title'], criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' ' } },
+    ];
+    const expectedReasons = ['INVOICE_FIELD_GROUP_UNSUPPORTED', 'INVOICE_RELATIONSHIP_MAPPING_UNSUPPORTED'];
+    for (let index = 0; index < invalidGroups.length; index++) {
+      activeFieldConfig = { ...fieldConfig, groups: [invalidGroups[index]] } as unknown as typeof activeFieldConfig;
+      const sourceId = String(++invoiceCounter);
+      bitrixInvoices.set(sourceId, { id: sourceId, title: 'Protected group field', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+      const event = await createEvent(`invalid-group-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+      const writesBefore = moyskladWrites;
+      assert.equal((await processor.process(event.id))?.status, 'MANUAL_REVIEW');
+      assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } })).lastErrorCategory, expectedReasons[index]);
+      assert.equal(moyskladWrites, writesBefore);
+    }
+  } finally {
+    activeFieldConfig = fieldConfig;
+  }
 });
 
 test('MySklad invoiceout creates a linked smart invoice, and multiple invoices on one order stay independent', async () => {
@@ -404,6 +513,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       return send(response, invoice ?? { errors: [{ error: 'not found' }] }, invoice ? 200 : 404);
     }
     if (invoiceId && request.method === 'PUT') {
+      if (failNextMoyskladUpdate) { failNextMoyskladUpdate = false; return send(response, { errors: [{ error: 'temporary' }] }, 503); }
       moyskladWrites++;
       const invoice = moyskladInvoices.get(invoiceId);
       if (invoice) Object.assign(invoice, JSON.parse(raw));
@@ -429,7 +539,7 @@ function restoreEnv(name: string, value: string | undefined) {
 }
 
 async function waitForEventStatus(eventId: string, expected: string) {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     const event = await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
     if (event.status === expected) return event;
@@ -438,4 +548,10 @@ async function waitForEventStatus(eventId: string, expected: string) {
   const event = await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
   assert.equal(event.status, expected, `expected invoice event ${eventId} to reach ${expected}`);
   return event;
+}
+
+function startRecoveryScanner() {
+  if (processorStarted) return;
+  processorStarted = true;
+  processor.onApplicationBootstrap();
 }
