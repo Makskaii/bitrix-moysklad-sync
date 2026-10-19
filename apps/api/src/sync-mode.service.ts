@@ -19,9 +19,9 @@ const entityControls = [
     label: 'Контакты и компании ↔ контрагенты и контактные лица',
     ready: true,
     supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'],
-    implementation: 'partial',
-    directionScope: 'CONTACT_EMAIL_EXISTING_PAIRS',
-    availability: 'Частично готово: только поле EMAIL существующей пары контакта.',
+    implementation: 'implemented',
+    directionScope: 'CLIENT_CONFIGURED_FIELDS_GROUPS_CREATE_DEPENDENCIES',
+    availability: 'Реализованы события компаний и контактов: настроенные поля и группы, baseline/readback, безопасное создание пары и зависимости контакта. Полнота acceptance проверяется отдельно; preflight обязателен.',
   },
   {
     key: 'deals-orders',
@@ -52,12 +52,12 @@ const entityControls = [
   },
   {
     key: 'service-dictionary',
-    label: 'Справочник услуг сделки ↔ поле справочника заказа',
+    label: 'Отдельный обмен справочником услуг (вне полей сделки/заказа)',
     ready: false,
     supportedDirections: [],
     implementation: 'not_implemented',
     directionScope: null,
-    availability: 'Обмен этой сущности пока недоступен.',
+    availability: 'Отдельный поток справочника услуг не реализован. Сопоставленные поля справочника услуг внутри сделки/заказа обслуживаются настройками и runtime обмена сделки/заказа.',
   },
 ] as const;
 
@@ -358,7 +358,7 @@ function collectOptionalReferenceWarnings(config: Record<string, unknown> | unde
 }
 
 function directionDefault(entityKey: string): boolean {
-  // Preserve the already-shipped partial EMAIL exchange while every newly
-  // implemented scope remains opt-in until its preflight succeeds.
+  // Preserve existing direction defaults; newly implemented scopes remain
+  // opt-in until their preflight succeeds.
   return entityKey === 'contacts-companies';
 }

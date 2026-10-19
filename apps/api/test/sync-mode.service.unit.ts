@@ -90,7 +90,12 @@ test('implemented scopes are visible with independent directions disabled until 
   const invoices = scopes.find((scope) => scope.key === 'invoices')!;
   const products = scopes.find((scope) => scope.key === 'products-variations')!;
   const deals = scopes.find((scope) => scope.key === 'deals-orders')!;
+  const contacts = scopes.find((scope) => scope.key === 'contacts-companies')!;
+  const standaloneServiceDictionary = scopes.find((scope) => scope.key === 'service-dictionary')!;
 
+  assert.equal(contacts.implementation, 'implemented');
+  assert.equal(contacts.directionScope, 'CLIENT_CONFIGURED_FIELDS_GROUPS_CREATE_DEPENDENCIES');
+  assert.match(contacts.availability, /configured fields and groups|настроенные поля и группы/i);
   assert.equal(invoices.implementation, 'implemented');
   assert.equal(products.implementation, 'implemented');
   assert.equal(deals.implementation, 'implemented');
@@ -106,6 +111,9 @@ test('implemented scopes are visible with independent directions disabled until 
   assert.equal(products.moyskladToBitrix24, false);
   assert.equal(deals.bitrix24ToMoysklad, false);
   assert.equal(deals.moyskladToBitrix24, false);
+  assert.equal(standaloneServiceDictionary.implementation, 'not_implemented');
+  assert.equal(standaloneServiceDictionary.ready, false);
+  assert.match(standaloneServiceDictionary.availability, /отдельный поток/i);
   assert.deepEqual([...settings.keys()].sort(), ['contacts-companies', 'deals-orders', 'invoices', 'products-variations']);
 });
 
