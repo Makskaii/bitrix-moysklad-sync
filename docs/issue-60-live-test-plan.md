@@ -59,7 +59,7 @@ Create a restricted, run-specific manifest only after the go/no-go gates. Store 
   "records": [
     {
       "entity": "<client|deal-order|invoice|catalog-product|catalog-service>",
-      "direction": "<source-to-target>",
+      "direction": "BITRIX24_TO_MOYSKLAD",
       "name": "тест <runId> <scenario>",
       "syntheticOnly": true,
       "source": { "system": "<Bitrix24|MoySklad>", "nativeId": "<filled-after-approved-create>", "url": "<record-url>" },
@@ -77,6 +77,12 @@ Create a restricted, run-specific manifest only after the go/no-go gates. Store 
   "remainingTestRecords": []
 }
 ```
+
+`direction` is enforced, not descriptive: use `BITRIX24_TO_MOYSKLAD` or
+`MOYSKLAD_TO_BITRIX24` and keep `sourceSystem`/`targetSystem` consistent.
+Use `BOTH` only when this exact synthetic pair is explicitly approved for
+echo updates in either direction. A one-way record cannot authorize reverse
+admission or writes.
 
 All before/after values must be limited to synthetic fields needed to prove the scenario. Redact unrelated values. A manually posted webhook, direct creation of both provider records, or a mock API response is not evidence of genuine delivery.
 

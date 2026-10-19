@@ -15,7 +15,10 @@ test('controlled live source admission and target binding survive service restar
   const databaseUrl = process.env.CONTROLLED_LIVE_TEST_POSTGRES_URL;
   if (!databaseUrl) throw new Error('CONTROLLED_LIVE_TEST_POSTGRES_URL_REQUIRED');
   const target = new URL(databaseUrl);
-  if (!['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) || !/(?:^|[_-])test(?:$|[_-])/i.test(target.pathname.slice(1))) {
+  const testDatabaseName = decodeURIComponent(target.pathname.slice(1));
+  const testSchemaName = target.searchParams.get('schema');
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) || !/(?:^|[_-])test(?:$|[_-])/i.test(testDatabaseName) ||
+      !testSchemaName || !/(?:^|[_-])test(?:$|[_-])/i.test(testSchemaName)) {
     throw new Error('CONTROLLED_LIVE_TEST_POSTGRES_TARGET_NOT_ISOLATED');
   }
   const now = new Date();
@@ -33,8 +36,8 @@ test('controlled live source admission and target binding survive service restar
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: decodeURIComponent(target.pathname.slice(1)), records: [{
-    entity: 'client:COMPANY', direction: 'BITRIX24_TO_MOYSKLAD', name, syntheticOnly: true,
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, records: [{
+    entity: 'client:COMPANY', direction: 'BOTH', name, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: null, targetSystem: 'MOYSKLAD', targetNativeId: null,
     createdAfterUtc: new Date(now.getTime() - 5_000).toISOString(),
   }] }), 'utf8');

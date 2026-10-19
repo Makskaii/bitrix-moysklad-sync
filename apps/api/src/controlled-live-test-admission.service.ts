@@ -27,7 +27,7 @@ export class ControlledLiveTestAdmissionService {
 
   async admit(eventId: string, source: VerifiedControlledSource): Promise<void> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
-    const scopedEntity = source.entity.startsWith('client:') ? source.entity : `client:${source.entity}`;
+    const scopedEntity = controlledManifestEntity(source.entity);
     if (!source.currentNativeId || source.currentNativeId !== source.sourceNativeId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_ID_MISMATCH');
     const priorAdmissions = await this.database.controlledTestAdmission.findMany({ where: { runId: this.manifest.runId, entity: scopedEntity } });
     const match = this.manifest.records.map((candidate: any) => {
@@ -36,7 +36,7 @@ export class ControlledLiveTestAdmissionService {
           source.sourceCreatedAt.getTime() < new Date(candidate.createdAfterUtc).getTime() || source.sourceCreatedAt.getTime() > Date.now()) return null;
       if (candidate.sourceSystem === source.sourceSystem &&
           (candidate.sourceNativeId === null || candidate.sourceNativeId === source.sourceNativeId)) return { record: candidate, reversed: false, prior: null };
-      if (candidate.targetSystem === source.sourceSystem) {
+      if (candidate.direction === 'BOTH' && candidate.targetSystem === source.sourceSystem) {
         const prior = priorAdmissions.find((row: any) => row.sourceSystem === candidate.sourceSystem &&
           (candidate.sourceNativeId === null || row.sourceNativeId === candidate.sourceNativeId) &&
           row.targetSystem === source.sourceSystem && row.targetNativeId === source.sourceNativeId);
@@ -122,8 +122,8 @@ export class ControlledLiveTestAdmissionService {
     const candidates = this.manifest.records.filter((record: any) => {
       if (entityHint && record.entity !== entityHint) return false;
       return record.syntheticOnly === true && (
-        record.sourceSystem === sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === sourceNativeId) ||
-        record.targetSystem === sourceSystem && (record.targetNativeId === null || record.targetNativeId === sourceNativeId));
+        record.direction !== 'MOYSKLAD_TO_BITRIX24' && record.sourceSystem === sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === sourceNativeId) ||
+        record.direction === 'BOTH' && record.targetSystem === sourceSystem && (record.targetNativeId === null || record.targetNativeId === sourceNativeId));
     });
     if (candidates.length !== 1) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_READ_NOT_UNIQUELY_MANIFESTED');
     const record = candidates[0];
@@ -167,4 +167,10 @@ export class ControlledLiveTestAdmissionService {
     };
     return scope;
   }
+}
+
+function controlledManifestEntity(value: string): string {
+  if (['client:COMPANY', 'client:CONTACT', 'deal-order', 'invoice', 'catalog-product', 'catalog-service'].includes(value)) return value;
+  if (value === 'COMPANY' || value === 'CONTACT') return `client:${value}`;
+  throw new Error('CONTROLLED_LIVE_TEST_ENTITY_UNSUPPORTED');
 }
