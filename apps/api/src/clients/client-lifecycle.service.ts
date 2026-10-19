@@ -665,9 +665,8 @@ function bitrixGetMethod(entity: LifecycleEntityType, nativeType?: string): stri
     case 'COMPANY': return 'crm.company.get.json';
     case 'CONTACT': return 'crm.contact.get.json';
     case 'DEAL': return 'crm.deal.get.json';
-    case 'PRODUCT': return 'catalog.product.get.json';
-    case 'INVOICE': return 'crm.item.get.json';
     case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.get.json' : 'catalog.product.get.json';
+    case 'INVOICE': return 'crm.item.get.json';
   }
 }
 
@@ -676,9 +675,8 @@ function bitrixUpdateMethod(entity: LifecycleEntityType, nativeType?: string): s
     case 'COMPANY': return 'crm.company.update.json';
     case 'CONTACT': return 'crm.contact.update.json';
     case 'DEAL': return 'crm.deal.update.json';
-    case 'PRODUCT': return 'catalog.product.update.json';
-    case 'INVOICE': return 'crm.item.update.json';
     case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.update.json' : 'catalog.product.update.json';
+    case 'INVOICE': return 'crm.item.update.json';
   }
 }
 

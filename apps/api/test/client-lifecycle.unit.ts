@@ -403,3 +403,99 @@ test('restore clears the configured Bitrix24 marker before reactivating the exac
     if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
   }
 });
+
+test('catalog service lifecycle uses service endpoints for deletion checks, markers, and restore', async () => {
+  const oldMode = process.env.SYNC_MODE;
+  const oldBase = process.env.BITRIX24_REST_BASE_URL;
+  const oldMoyskladBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldMoyskladToken = process.env.MOYSKLAD_API_TOKEN;
+  const oldFetch = globalThis.fetch;
+  process.env.SYNC_MODE = 'apply';
+  process.env.BITRIX24_REST_BASE_URL = 'https://fixture.invalid/rest/test/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://fixture.invalid/api/remap/1.2';
+  process.env.MOYSKLAD_API_TOKEN = 'fixture-token';
+  const pair = {
+    id: 'service-pair', entityType: 'PRODUCT', bitrix24Id: 'b24-service-17', moyskladId: 'ms-service-29',
+    moyskladType: 'service', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED',
+    tombstoneSource: 'MOYSKLAD', deletionMarkerStatus: 'PENDING', tombstonedAt: null,
+    tombstoneReason: null,
+  };
+  const calls: Array<{ url: string; method: string; body: URLSearchParams }> = [];
+  let serviceExists = true;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    const body = new URLSearchParams(String(init?.body ?? ''));
+    calls.push({ url, method, body });
+    if (url.includes('/entity/service/')) return Response.json({ id: pair.moyskladId });
+    if (url.endsWith('/catalog.product.get.json')) return Response.json({ result: { product: { id: 'b24-product-18' } } });
+    if (url.endsWith('/catalog.product.service.get.json')) {
+      return serviceExists
+        ? Response.json({ result: { service: { id: pair.bitrix24Id } } })
+        : Response.json({ error: 'NOT_FOUND' }, { status: 404 });
+    }
+    if (url.endsWith('/catalog.product.service.update.json')) return Response.json({ result: true });
+    throw new Error(`Unexpected Bitrix method ${url}`);
+  };
+
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findUnique: async () => pair,
+      findFirst: async () => null,
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return pair; },
+    },
+    adminAuditEntry: { create: async () => ({}) },
+  };
+  const database = {
+    entityPair: {
+      findUnique: async () => pair,
+      findMany: async () => [],
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return { count: 1 }; },
+    },
+    syncSetting: { findUnique: async () => ({ clientDeletionMarkerFields: { PRODUCT: 'UF_ARCHIVE_STATE' } }) },
+    ...mockLifecycleLocks(),
+    $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+  };
+  const gateway = {
+    readBitrix: async () => ({ ID: pair.bitrix24Id }),
+    readMoysklad: async (_type: string, id: string) => ({ id }),
+  };
+  const service = new ClientLifecycleService(database as never, gateway as never, { read: async () => ({ mode: 'on' }) } as never);
+  const readState = (service as unknown as { readDeletionState(source: 'BITRIX24', entity: 'PRODUCT', nativeType: string, id: string, payload: unknown): Promise<string> }).readDeletionState.bind(service);
+  try {
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'service', pair.bitrix24Id, {}), 'PRESENT');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.service.get.json'));
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'product', 'b24-product-18', {}), 'PRESENT');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.get.json'), 'ordinary products keep the product endpoint');
+    serviceExists = false;
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'service', pair.bitrix24Id, {}), 'DELETED');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.service.get.json'));
+
+    serviceExists = true;
+    await (service as unknown as { ensureDeletionMarker(id: string, entity: 'PRODUCT'): Promise<void> }).ensureDeletionMarker(pair.id, 'PRODUCT');
+    const markerWrite = calls.at(-1)!;
+    assert.ok(markerWrite.url.endsWith('/catalog.product.service.update.json'));
+    assert.equal(markerWrite.body.get('id'), pair.bitrix24Id);
+    assert.equal(markerWrite.body.get('fields[UF_ARCHIVE_STATE]'), 'Удалён');
+
+    await service.restore(pair.id, true, 'BITRIX24_USER:42');
+    const serviceReads = calls.filter((call) => call.url.endsWith('/catalog.product.service.get.json'));
+    const serviceUpdates = calls.filter((call) => call.url.endsWith('/catalog.product.service.update.json'));
+    assert.ok(serviceReads.length >= 2, 'deletion recheck and restoration identity check read the service endpoint');
+    assert.equal(serviceReads.at(-1)?.body.get('id'), pair.bitrix24Id);
+    assert.ok(calls.some((call) => call.url.endsWith(`/entity/service/${pair.moyskladId}`)), 'restore verifies the exact MoySklad service ID');
+    assert.equal(serviceUpdates.length, 2, 'marker write and clear both update the service endpoint');
+    assert.equal(serviceUpdates.at(-1)?.body.get('id'), pair.bitrix24Id);
+    assert.equal(serviceUpdates.at(-1)?.body.get('fields[UF_ARCHIVE_STATE]'), '');
+    assert.equal(pair.bitrix24Id, 'b24-service-17');
+    assert.equal(pair.moyskladId, 'ms-service-29');
+    assert.equal(pair.lifecycleStatus, 'ACTIVE');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+    if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
+    if (oldMoyskladBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMoyskladBase;
+    if (oldMoyskladToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldMoyskladToken;
+  }
+});
