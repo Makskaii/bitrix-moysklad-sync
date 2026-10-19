@@ -54,7 +54,7 @@ type ChildResourceBinding = {
   moyskladCounterpartyId: string; legalFields: ChildFieldPair[];
   bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: ChildFieldPair[] };
 };
-type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
+type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT' | 'INVOICE'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
 type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
@@ -78,11 +78,12 @@ const entityOptions = [
   ['contacts', 'Контакты'],
   ['companies', 'Компании'],
   ['deals-orders', 'Сделки и заказы покупателей'],
-  ['smart-invoices', 'Смарт-счета (отложено)'],
+  ['smart-invoices', 'Смарт-счета ↔ счета покупателям'],
   ['catalog', 'Товары и услуги каталога'],
 ] as const;
 
-const deferredEntities = new Set(['smart-invoices']);
+const deferredEntities = new Set<string>();
+const groupUnsupportedEntities = new Set(['smart-invoices']);
 const requisiteFields: Array<[string, string]> = [
   ['RQ_COMPANY_NAME', 'Краткое наименование'], ['RQ_COMPANY_FULL_NAME', 'Полное наименование'], ['RQ_INN', 'ИНН'],
   ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OGRNIP', 'ОГРНИП'], ['RQ_OKPO', 'ОКПО'],
@@ -103,6 +104,7 @@ function entityTypeForUI(entity: string): ActiveEntityPair['entityType'] | null 
     case 'contacts': return 'CONTACT';
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
+    case 'smart-invoices': return 'INVOICE';
     case 'catalog': return 'PRODUCT';
     default: return null;
   }
@@ -619,7 +621,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
-          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value) || groupUnsupportedEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD" disabled={groupForm.transformKind === 'split-non-empty'}>Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
           <label>Преобразование<select aria-label="Преобразование группы" value={groupForm.transformKind} onChange={(event) => {
             const transformKind = event.target.value as FieldGroup['transform']['kind'];

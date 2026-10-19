@@ -628,11 +628,12 @@ function UnavailablePage({ title, eyebrow, description, action, badge = 'Пок�
   </>;
 }
 
-type PairEntityType = 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT';
+type PairEntityType = 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT' | 'INVOICE';
 const pairEntityTypes: { id: PairEntityType; label: string }[] = [
   { id: 'CONTACT', label: 'Контакт' },
   { id: 'COMPANY', label: 'Компания' },
   { id: 'DEAL', label: 'Сделка / заказ покупателя' },
+  { id: 'INVOICE', label: 'Смарт-счёт / счёт покупателю' },
   { id: 'PRODUCT', label: 'Товар / модификация' },
 ];
 const pairReviewReasonLabels: Record<string, string> = {
@@ -646,10 +647,10 @@ const pairReviewReasonLabels: Record<string, string> = {
 };
 type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; bitrix24Label?: string | null; moyskladLabel?: string | null; labelStatus?: string; moyskladType: string | null; moyskladParentId: string | null; source: string; reason: string | null; createdAt: string };
 type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; sourceLabel?: string | null; labelStatus?: string; eventId: string | null; reason: string; openedAt: string };
-type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT';
+type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT' | 'INVOICE';
 type LifecycleMarkerFields = Partial<Record<LifecycleEntityType, string>>;
 type ClientLifecycleRow = { id: string; entityType: LifecycleEntityType; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; lifecycleStatus: string; tombstonedAt: string | null; tombstoneSource: string | null; tombstoneReason: string | null; deletionMarkerStatus: string; deletionTimelineStatus: string };
-const lifecycleEntityLabels: Record<LifecycleEntityType, string> = { COMPANY: 'Компания', CONTACT: 'Контакт', DEAL: 'Сделка', PRODUCT: 'Товар' };
+const lifecycleEntityLabels: Record<LifecycleEntityType, string> = { COMPANY: 'Компания', CONTACT: 'Контакт', DEAL: 'Сделка', PRODUCT: 'Товар', INVOICE: 'Счёт' };
 const lifecycleMarkerStatusLabels: Record<string, string> = {
   NOT_REQUIRED: 'Метка не требуется для этого типа записи', PENDING: 'Ожидает записи метки', WRITING: 'Метка записывается',
   MARKED: 'Метка удаления записана', NOT_CONFIGURED: 'Поле метки не настроено', FAILED: 'Не удалось записать метку',
@@ -715,7 +716,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       .finally(() => setLoading(false));
   }, []);
 
-  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) {
+  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) {
     setSaving(true);
     try {
       const response = await fetch('/api/admin/pairs', {
@@ -788,7 +789,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       <p className="pair-safety-note">Удалённая запись не считается несопоставленной и не удаляет запись партнёра. Восстановление проверяет, что обе исходные записи по тем же ID всё ещё существуют.</p>
       <form className="manual-pair-form" onSubmit={(event) => void saveMarkerFields(event)} aria-label="Поля меток удаления">
         <div className="records-head"><div><h4>Поля меток удаления</h4><p className="panel-description">Точные коды пользовательских полей Bitrix24. Код должен быть настроен на сервере; догадки не применяются.</p></div></div>
-        {markerFieldsAvailable && (['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'] as const).map((entityType) => <label key={entityType}>{lifecycleEntityLabels[entityType]} · код UF-поля<input maxLength={100} value={markerFields[entityType] ?? ''} onChange={(change) => setMarkerFields((current) => ({ ...current, [entityType]: change.target.value }))} placeholder="UF_CRM_…" /></label>)}
+        {markerFieldsAvailable && (['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT', 'INVOICE'] as const).map((entityType) => <label key={entityType}>{lifecycleEntityLabels[entityType]} · код UF-поля<input maxLength={100} value={markerFields[entityType] ?? ''} onChange={(change) => setMarkerFields((current) => ({ ...current, [entityType]: change.target.value }))} placeholder="UF_CRM_…" /></label>)}
         {markerFieldsError && <p role="alert" className="inline-error">{markerFieldsError}</p>}
         {markerFieldsNotice && <p role="status" className="pair-safety-note">{markerFieldsNotice}</p>}
         {markerFieldsAvailable && <button type="submit" disabled={saving}>Сохранить настройки меток</button>}
@@ -814,7 +815,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
   </>;
 }
 
-function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: PairReviewRow; saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: PairReviewRow; saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [bitrix24Id, setBitrix24Id] = useState(review.sourceSystem === 'BITRIX24' ? review.sourceEntityId : '');
   const [moyskladId, setMoyskladId] = useState(review.sourceSystem === 'MOYSKLAD' ? review.sourceEntityId : '');
   const [moyskladType, setMoyskladType] = useState<'counterparty' | 'contactperson'>('counterparty');
@@ -850,7 +851,7 @@ function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: P
   </article>;
 }
 
-function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [entityType, setEntityType] = useState<PairEntityType>('DEAL');
   const [bitrix24Id, setBitrix24Id] = useState('');
   const [moyskladId, setMoyskladId] = useState('');
@@ -865,7 +866,7 @@ function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; 
     event.preventDefault();
     setLocalError('');
     try {
-      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : {}), replaceExisting });
+      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : entityType === 'INVOICE' ? { moyskladType: 'invoiceout' as const, ...(moyskladParentId ? { moyskladParentId: moyskladParentId.trim() } : {}) } : {}), replaceExisting });
       setBitrix24Id('');
       setMoyskladId('');
       setReplaceExisting(false);
@@ -880,6 +881,7 @@ function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; 
     <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
     <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
       {entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
+    {entityType === 'INVOICE' && <label>Связанный заказ МойСклад · ID<input maxLength={200} value={moyskladParentId} onChange={(event) => setMoyskladParentId(event.target.value)} /><small>Необязательно; при обработке связь всё равно проверяется через документ счёта.</small></label>}
     {replaceExisting && conflicts.length > 0 && <p className="pair-safety-note" role="status">Будет заменена активная связь: {conflicts.map((pair) => `${pair.bitrix24Label ?? 'Название не загружено'} (${pair.bitrix24Id}) ↔ ${pair.moyskladLabel ?? 'Название не загружено'} (${pair.moyskladId})`).join('; ')} → {bitrix24Id.trim()} ↔ {moyskladId.trim()}. События не переигрываются автоматически; новая пара применяется при следующем событии.</p>}
     <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
     <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Подтверждаю замену показанной активной пары (если она есть).</label>

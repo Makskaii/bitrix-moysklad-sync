@@ -59,6 +59,8 @@ import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from './clients/clie
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
+import { InvoiceHttpApi } from './invoices/invoice-http-api';
+import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 
 @Controller()
 class AppController {
@@ -75,13 +77,14 @@ class AppController {
 @Module({
   controllers: [AppController, AdminController, AdminAuditController, ClientLifecycleController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
-    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
+    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
     EventWorkerLeaseService, DatabaseRecoveryService,
     WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
     DryRunWriteJournal,
     { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCardRuntimeService, ProductCardEventProcessor,
+    { provide: InvoiceHttpApi, useFactory: (dry: DryRunWriteJournal) => new InvoiceHttpApi(dry), inject: [DryRunWriteJournal] }, InvoiceEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
     { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },

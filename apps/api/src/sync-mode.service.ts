@@ -28,9 +28,9 @@ const entityControls = [
   {
     key: 'invoices',
     label: 'Счета ↔ счета покупателям',
-    ready: false,
-    directionScope: null,
-    availability: 'Обмен этой сущности пока недоступен.',
+    ready: true,
+    directionScope: 'INVOICE_PAIRS',
+    availability: 'Только новые смарт-счета entityTypeId=31 и счета покупателям со связью на подтверждённый заказ.',
   },
   {
     key: 'products-variations',

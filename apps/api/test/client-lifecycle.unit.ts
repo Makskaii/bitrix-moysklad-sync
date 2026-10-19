@@ -27,10 +27,12 @@ test('delete processor supports each enabled durable pair entity and only explic
     ['BITRIX24', 'ONCRMCONTACTDELETE', 'contact'],
     ['BITRIX24', 'ONCRMDEALDELETE', 'deal'],
     ['BITRIX24', 'CATALOG.PRODUCT.ON.DELETE', 'product'],
+    ['BITRIX24', 'ONCRMDYNAMICITEMDELETE', 'invoice'],
     ['MOYSKLAD', 'DELETE', 'counterparty'],
     ['MOYSKLAD', 'DELETE', 'contactperson'],
     ['MOYSKLAD', 'DELETE', 'customerorder'],
     ['MOYSKLAD', 'DELETE', 'product'],
+    ['MOYSKLAD', 'DELETE', 'invoiceout'],
   ] as const) {
     assert.equal(service.supports({ id: 'event', source, eventType, externalEntityType, externalEntityId: 'native-id' }), true);
   }
@@ -70,13 +72,14 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   const records = [
     { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '42', moyskladId: 'ms-company', active: true, lifecycleStatus: 'ACTIVE' },
     { id: 'contact-pair', entityType: 'CONTACT', bitrix24Id: '42', moyskladId: 'ms-contact', active: true, lifecycleStatus: 'ACTIVE' },
+    { id: 'invoice-pair', entityType: 'INVOICE', bitrix24Id: '42', moyskladId: 'ms-invoice', active: true, lifecycleStatus: 'ACTIVE' },
   ];
   const updates: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
   const tx = {
     $queryRaw: async () => [{ locked: 1 }],
     entityPair: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => records.find((row) =>
-        row.entityType === where.entityType && row.bitrix24Id === where.bitrix24Id) ?? null,
+        row.entityType === where.entityType && (row.bitrix24Id === where.bitrix24Id || row.moyskladId === where.moyskladId)) ?? null,
       update: async (input: { where: { id: string }; data: Record<string, unknown> }) => {
         updates.push(input);
         const row = records.find((candidate) => candidate.id === input.where.id)!;
@@ -99,6 +102,12 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   assert.equal(records[0]?.lifecycleStatus, 'TOMBSTONED');
   assert.equal(records[1]?.active, true);
   assert.equal(records[1]?.lifecycleStatus, 'ACTIVE');
+
+  const invoice = await service.tombstoneByNativeId('MOYSKLAD', 'INVOICE', 'ms-invoice', 'CONFIRMED_PROVIDER_DELETION');
+  assert.deepEqual(invoice, { status: 'TOMBSTONED', pairId: 'invoice-pair', changed: true });
+  assert.equal(records[2]?.bitrix24Id, '42');
+  assert.equal(records[2]?.moyskladId, 'ms-invoice');
+  assert.equal(records[2]?.active, false, 'invoice tombstones preserve both native invoice IDs and only deactivate the exact pair');
 });
 
 test('pair write gate refuses tombstoned pairs and leaves unrelated active pairs usable', async () => {
