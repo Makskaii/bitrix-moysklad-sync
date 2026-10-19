@@ -48,7 +48,7 @@ type DealOrderRuntime = {
 };
 type ProductCatalogRuntime = { bitrix24CatalogId: string | null; bitrix24DefaultSectionId?: string | null; moyskladFields: Array<'name' | 'code' | 'description'> };
 type DictionaryOption = { id: string; title: string; code: string };
-type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
+type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service' };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ChildFieldPair = { bitrix24Field: string; moyskladField: string };
 type ChildResourceBinding = {
@@ -126,6 +126,12 @@ function fieldCategory(field: FieldCandidate, system: 'bitrix24' | 'moysklad', e
   if (system === 'moysklad' && field.code.startsWith('attributes.')) return 'custom';
   if (system === 'bitrix24' && (/^UF_CRM/i.test(field.code) || (entity === 'catalog' && /^property\d+$/i.test(field.code)))) return 'custom';
   return 'standard';
+}
+
+function fieldOptionLabel(field: FieldCandidate) {
+  const writable = field.writable === true ? 'запись разрешена' : field.writable === false ? 'только чтение' : 'запись не подтверждена';
+  const resource = field.resource === 'product' ? 'товар' : field.resource === 'service' ? 'услуга' : field.resource === 'product-or-service' ? 'товар / услуга' : '';
+  return `${field.title || field.code} · ${field.code} · ${field.type} · ${writable}${resource ? ` · ${resource}` : ''}`;
 }
 
 function compatibleFieldTypes(left: string, right: string) {
@@ -590,12 +596,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             const source = sourceFields.find((field) => field.code === rule.sourceField);
             const target = targetFields.find((field) => field.code === rule.targetField);
             return <article className="field-mapping-row" role="row" key={rule.id}>
-              <select aria-label="Поле Bitrix24" title={source ? `${source.code} · ${source.type}` : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
+              <select aria-label="Поле Bitrix24" title={source ? fieldOptionLabel(source) : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={fieldOptionLabel(field)}>{fieldOptionLabel(field)}</option>)}
               </select>
               <span className="mapping-direction" role="cell" aria-label="Направление">→</span>
-              <select aria-label="Поле МойСклад" title={target ? `${target.code} · ${target.type}` : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
+              <select aria-label="Поле МойСклад" title={target ? fieldOptionLabel(target) : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={fieldOptionLabel(field)}>{fieldOptionLabel(field)}</option>)}
               </select>
               <span className="mapping-equals" role="cell">=</span>
               <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => { setAutoMatchSummary(null); changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) })); }}>⊖</button>
@@ -632,8 +638,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
             const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
             setGroupForm({ ...groupForm, sourceFields: (groupForm.transformKind === 'split-non-empty' ? selected.slice(0, 1) : selected).join(',') });
-          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
-          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{fieldOptionLabel(field)}</option>)}</select></label>
+          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{fieldOptionLabel(field)}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           {groupForm.transformKind === 'split-non-empty' && <label>Тип значения Bitrix24<select aria-label="Тип значения Bitrix24" value={groupForm.valueType} onChange={(event) => setGroupForm({ ...groupForm, valueType: event.target.value })}><option value="">Выберите тип</option>{['WORK', 'HOME', 'MOBILE', 'MAILING', 'OTHER', 'FAX', 'PAGER'].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>}
           <button type="submit" className="button-secondary">Добавить составное правило</button>

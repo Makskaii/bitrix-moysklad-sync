@@ -29,8 +29,8 @@ class MemoryState implements ProductCardStateStore {
 }
 
 class FakeApi implements ProductCardApi {
-  bitrix24 = card('Initial', 'B24 detail', '3', [{ priceId: 'b24-price-2', typeId: '2', value: 10, currency: 'RUB' }]);
-  moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }]);
+  bitrix24 = card('Initial', 'B24 detail', '3', [{ priceId: 'b24-price-2', typeId: '2', value: 10, currency: 'RUB' }], { weight: 1.5, xmlId: 'initial-external' });
+  moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }], { weight: 1.5, externalCode: 'initial-external' });
   writes: Array<{ side: string; fields: string }> = [];
   ambiguousBitrixUpdate = false;
   ambiguousBitrixPriceUpdate = false;
@@ -42,6 +42,7 @@ class FakeApi implements ProductCardApi {
     if ('detailText' in fields) this.bitrix24.detailText = String(fields.detailText);
     if ('code' in fields) this.bitrix24.code = String(fields.code);
     if ('measure' in fields) this.bitrix24.unitId = String(fields.measure);
+    Object.assign(this.bitrix24.fields ?? {}, fields);
     if (this.ambiguousBitrixUpdate) {
       this.ambiguousBitrixUpdate = false;
       throw new ProviderFailure('BITRIX24', null);
@@ -64,8 +65,8 @@ class FakeApi implements ProductCardApi {
   }
 }
 
-function card(name: string, detailText: string, unitId: string, prices: ProductCardPrice[]): ProductCardSnapshot {
-  return { name, detailText, unitId, prices, updatedAt: '2026-10-07T10:00:00Z' };
+function card(name: string, detailText: string, unitId: string, prices: ProductCardPrice[], fields: Record<string, string | number | boolean | null> = {}): ProductCardSnapshot {
+  return { name, detailText, unitId, prices, fields, updatedAt: '2026-10-07T10:00:00Z' };
 }
 function currencyRef() { return { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/currency-id', type: 'currency', mediaType: 'application/json' } }; }
 
@@ -172,4 +173,48 @@ test('configured service price changes update Bitrix24 and an applied write with
   assert.equal(api.bitrix24.prices[0]!.value, 11);
   assert.equal(api.writes.filter((write) => write.fields.startsWith('price:')).length, 1);
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('explicit scalar catalog mappings update typed fields generically and preserve zero and empty string', async () => {
+  const api = new FakeApi();
+  const mapped = { ...settings, rules: [...settings.rules,
+    { id: 'product-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+    { id: 'product-external-code', entity: 'catalog', sourceField: 'xmlId', targetField: 'externalCode',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+  ] };
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'BASELINED');
+  api.moysklad.fields!.weight = 0;
+  api.moysklad.fields!.externalCode = '';
+
+  const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.fields!.weight, 0);
+  assert.equal(api.bitrix24.fields!.xmlId, '');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['weight', 'xmlId']);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'UNCHANGED');
+});
+
+test('unconfigured and disabled catalog scalar candidates are never written', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const disabled = { ...settings, rules: [...settings.rules,
+    { id: 'disabled-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
+  ] };
+  const sync = new ProductCardSyncService(api, state);
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: disabled })).status, 'BASELINED');
+  api.moysklad.fields!.weight = 9;
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: disabled })).status, 'UNCHANGED');
+  assert.deepEqual(api.writes, []);
+  api.moysklad.fields!.externalCode = 'unconfigured';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings })).status, 'UNCHANGED');
+  assert.deepEqual(api.writes, []);
 });

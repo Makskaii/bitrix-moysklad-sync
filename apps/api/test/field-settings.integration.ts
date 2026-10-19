@@ -85,8 +85,12 @@ before(async () => {
                 ? [{ FIELD_NAME: 'UF_DEAL_SAMPLE', EDIT_FORM_LABEL: 'Deal sample' }]
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
-                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
+                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, weight: { type: 'double', name: 'Weight', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
                 : { product: {} }
+            : method === 'catalog.product.service.getFieldsByFilter.json'
+              ? form.get('filter[iblockId]') === '11'
+                ? { service: { name: { type: 'string', name: 'Service name', isReadOnly: false }, code: { type: 'string', name: 'Service code', isReadOnly: false } } }
+                : { service: {} }
             : method === 'catalog.catalog.list.json'
               ? { catalogs: [{ id: 11, name: 'Товары' }] }
             : method === 'catalog.product.get.json'
@@ -339,17 +343,27 @@ test('catalog field metadata uses the product information block and API field na
   const body = await response.text();
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as {
-    bitrix24: Array<{ code: string; title: string; type: string; category: string }>;
-    moysklad: Array<{ code: string; title: string; type: string; category: string }>;
+    bitrix24: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string }>;
+    moysklad: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string }>;
   };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.category === 'custom'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.category === 'standard'), 'unknown field codes are not assumed to be user-defined');
-  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара / услуги'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.resource === 'product'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'code' && field.title === 'Service code'), 'service schema contributes fields not present in product metadata');
+  assert.ok(catalog.moysklad.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'article' && field.writable === true));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'barcodes' && field.type === 'array'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'weight' && field.resource === 'product'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'minimumStock' && field.type === 'object' && field.resource === 'product'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.resource === 'product-or-service'));
   assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
+  assert.ok(fakeUpstreamMethods.includes('catalog.product.service.getFieldsByFilter.json'));
   assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
   assert.ok(!fakeUpstreamMethods.some((method) => method.endsWith('.userfield.list.json')));
 });
@@ -621,6 +635,21 @@ test('catalog field settings reject Bitrix24-to-MySklad product writes for rules
     body: JSON.stringify({ config: groupConfig }),
   });
   assert.equal(groupResponse.status, 400, 'catalog groups cannot write Bitrix24 product changes into MySklad');
+
+  const customFieldConfig = {
+    ...active.config,
+    rules: [{
+      id: 'unhandled-catalog-custom-fields', entity: 'catalog', sourceField: 'property108',
+      targetField: 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+    }],
+  };
+  const customFieldResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: customFieldConfig }),
+  });
+  assert.equal(customFieldResponse.status, 400, 'custom properties remain visible metadata but cannot be falsely configured as standard scalar copies');
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

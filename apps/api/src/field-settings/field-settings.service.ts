@@ -209,7 +209,7 @@ export class FieldSettingsService {
       throw new BadRequestException('Composite field mappings are not supported for smart invoices');
     }
     const entities = [...new Set(ruleEntities)];
-    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null }>; moysklad: Array<{ code: string; writable: boolean | null }> }>>();
+    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null; type: string; category?: string }>; moysklad: Array<{ code: string; writable: boolean | null; type: string; category?: string }> }>>();
     for (const entity of entities) {
       catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity)]);
     }
@@ -230,6 +230,19 @@ export class FieldSettingsService {
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
       const reverse = rule.moyskladToBitrix24 as JsonRecord;
+      if (entity === 'catalog' && (forward.enabled === true || reverse.enabled === true)) {
+        const catalogs = catalogsByEntity.get(entity) ?? [];
+        const b24Field = catalogs[0]?.bitrix24.find((field) => field.code === rule.sourceField);
+        const msField = catalogs[0]?.moysklad.find((field) => field.code === rule.targetField);
+        if (isRecord(forward.transform) && forward.transform.kind === 'copy' || isRecord(reverse.transform) && reverse.transform.kind === 'copy') {
+          if (b24Field?.category === 'custom' || msField?.category === 'custom') {
+            throw new BadRequestException('Catalog custom fields require a dedicated adapter and cannot use standard scalar copy rules');
+          }
+          if (!b24Field || !msField || !compatibleCatalogScalarTypes(b24Field.type, msField.type)) {
+            throw new BadRequestException(`Catalog fields ${String(rule.sourceField)} and ${String(rule.targetField)} do not have compatible scalar types`);
+          }
+        }
+      }
       if (entity === 'catalog' && forward.enabled === true) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }
@@ -453,6 +466,22 @@ export class FieldSettingsService {
     if (transaction) await initialize(transaction);
     else await this.database.$transaction(initialize, { isolationLevel: 'Serializable' });
   }
+}
+
+function compatibleCatalogScalarTypes(bitrixType: string, moyskladType: string): boolean {
+  const scalarFamily = (type: string) => {
+    const normalized = type.trim().toLowerCase();
+    if (['string', 'text', 'varchar'].includes(normalized)) return 'string';
+    if (['double', 'number', 'decimal', 'float', 'integer', 'int'].includes(normalized)) return 'number';
+    if (['boolean', 'bool'].includes(normalized)) return 'boolean';
+    if (['datetime', 'date'].includes(normalized)) return 'datetime';
+    // B24 char can represent flags, but its metadata does not establish that
+    // a particular field is Boolean; require an explicit typed transform.
+    return null;
+  };
+  const left = scalarFamily(bitrixType);
+  const right = scalarFamily(moyskladType);
+  return left !== null && left === right;
 }
 
 function serializeVersion(row: VersionRow): VersionedFieldSettingsDto {
