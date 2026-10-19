@@ -64,7 +64,7 @@ test('a settings-version drift holds the event for manual review without recaptu
       readBitrix24DealForBaseline: async () => { sourceReads++; return {}; },
       readMoySkladCustomerOrderForBaseline: async () => { sourceReads++; return {}; },
     } as never),
-    { process: async () => { headerCalls++; return 'BASELINE_MISSING'; } } as never,
+    { processClient: async () => { headerCalls++; return 'UNSUPPORTED'; }, process: async () => { headerCalls++; return 'BASELINE_MISSING'; } } as never,
   );
 
   try {
@@ -93,7 +93,7 @@ test('a baseline-missing result returned after readiness is durably held for man
       readBitrix24DealForBaseline: async () => ({}),
       readMoySkladCustomerOrderForBaseline: async () => ({}),
     } as never),
-    { process: async () => 'BASELINE_MISSING' } as never,
+    { processClient: async () => 'UNSUPPORTED', process: async () => 'BASELINE_MISSING' } as never,
   );
 
   try {
@@ -167,14 +167,26 @@ test('a concurrent baseline created for another event version is not accepted af
 
 test('pair-first workers leave durable events unclaimed while paused', async () => {
   let reads = 0;
+  let claims = 0;
+  let resolutions = 0;
+  const event = {
+    id: 'event-paused', source: 'BITRIX24', eventType: 'ONCRMDEALUPDATE', externalEntityType: 'deal',
+    externalEntityId: 'deal-paused', status: 'RECEIVED', attempts: 0, processingStartedAt: null, retryAfter: null,
+  };
   const processor = new PairFirstEventProcessor(
-    { inboundEvent: { findUnique: async () => { reads++; return null; } } } as never,
-    { resolve: async () => ({ status: 'unavailable', reason: 'unused' }) } as never,
+    { inboundEvent: {
+      findUnique: async () => { reads++; return event; },
+      updateMany: async () => { claims++; return { count: 1 }; },
+    } } as never,
+    { resolve: async () => { resolutions++; return { status: 'unavailable', reason: 'unused' }; } } as never,
     undefined, undefined, undefined, undefined,
     { read: async () => ({ mode: 'pause' }) } as never,
   );
   assert.equal(await processor.process('event-paused'), null);
-  assert.equal(reads, 0);
+  assert.equal(reads, 1, 'the worker may load durable queue metadata while paused');
+  assert.equal(claims, 0, 'the worker must leave the queued event unclaimed');
+  assert.equal(resolutions, 0, 'the worker must not resolve a pair while paused');
+  assert.equal(event.status, 'RECEIVED');
 });
 
 test('a deal event resolves its pinned company and contact dependencies before baseline processing', async () => {
@@ -190,7 +202,7 @@ test('a deal event resolves its pinned company and contact dependencies before b
       readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }),
       readMoySkladCustomerOrderForBaseline: async () => ({}),
     } as never),
-    { process: async () => 'NOOP' } as never,
+    { processClient: async () => 'UNSUPPORTED', process: async () => 'NOOP' } as never,
     undefined,
     { read: async () => ({ mode: 'on' }) } as never,
     { resolveForDocument: async (input: typeof calls[number]) => { calls.push(input); return { status: 'RESOLVED', pair, selectedSourceId: input.sourceId, reason: 'PERSISTED_PAIR' }; } } as never,
@@ -225,7 +237,7 @@ test('an optional contact dependency failure is queued separately and does not b
       readBitrix24DealForBaseline: async () => ({ COMPANY_ID: 'company-8', CONTACT_ID: 'contact-9' }),
       readMoySkladCustomerOrderForBaseline: async () => ({}),
     } as never),
-    { process: async () => 'NOOP' } as never,
+    { processClient: async () => 'UNSUPPORTED', process: async () => 'NOOP' } as never,
     undefined,
     { read: async () => ({ mode: 'on' }) } as never,
     {
@@ -261,7 +273,7 @@ test('a document with no client is held only when no service counterparty is con
     new DealOrderBaselineService(state.database as never, {
       readBitrix24DealForBaseline: async () => ({}), readMoySkladCustomerOrderForBaseline: async () => ({}),
     } as never),
-    { process: async () => 'NOOP' } as never,
+    { processClient: async () => 'UNSUPPORTED', process: async () => 'NOOP' } as never,
     undefined,
     { read: async () => ({ mode: 'on' }) } as never,
     { resolveForDocument: async () => { assert.fail('no explicit client should not invoke client resolution'); } } as never,
