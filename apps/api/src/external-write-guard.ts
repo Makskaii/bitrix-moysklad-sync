@@ -147,7 +147,25 @@ function extractMutationTarget(provider: string, path: string, bodyText: string)
   }
   const form = new URLSearchParams(bodyText);
   const method = path.split('/').pop()?.replace(/\.json$/i, '') ?? '';
+  if (/^crm\.(?:requisite|timeline\.comment)\./i.test(method)) {
+    for (const key of ['fields[ENTITY_ID]', 'filter[ENTITY_ID]', 'ENTITY_ID']) {
+      const value = form.get(key);
+      if (value) return value;
+    }
+  }
   if (/\.(?:add|create)$/i.test(method)) return null;
+  if (/^crm\.item\.productrow\./i.test(method)) {
+    for (const key of ['ownerId', 'fields[ownerId]']) {
+      const value = form.get(key);
+      if (value) return value;
+    }
+  }
+  if (/^catalog\.price\./i.test(method)) {
+    for (const key of ['productId', 'fields[productId]', 'catalogProductId']) {
+      const value = form.get(key);
+      if (value) return value;
+    }
+  }
   for (const key of ['id', 'fields[ENTITY_ID]', 'filter[ENTITY_ID]', 'ENTITY_ID', 'entityId', 'ownerId', 'fields[ownerId]', 'productId', 'fields[productId]', 'catalogProductId']) {
     const value = form.get(key);
     if (value) return value;

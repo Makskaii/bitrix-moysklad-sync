@@ -237,6 +237,8 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
         method: 'POST', body: new URLSearchParams({ id: 'b24-17' }),
       });
       await fetch(request);
+      await fetch('https://guarded-bitrix.invalid/rest/crm.requisite.add.json', { method: 'POST', body: new URLSearchParams({ 'fields[ENTITY_TYPE_ID]': '4', 'fields[ENTITY_ID]': 'b24-17' }) });
+      await fetch('https://guarded-bitrix.invalid/rest/crm.timeline.comment.add.json', { method: 'POST', body: new URLSearchParams({ 'fields[ENTITY_TYPE_ID]': '4', 'fields[ENTITY_ID]': 'b24-17' }) });
       await fetch('https://guarded-bitrix.invalid/rest/crm.company.get.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) });
       await assert.rejects(fetch('https://guarded-bitrix.invalid/rest/crm.company.get.json', { method: 'POST', body: new URLSearchParams({ id: 'shared-real-id' }) }), /READ_ID_NOT_APPROVED/);
       await fetch('https://guarded-bitrix.invalid/rest/crm.company.fields.json', { method: 'POST' });
@@ -249,7 +251,53 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
       await fetch('https://guarded-ms.invalid/api/entity/counterparty/ms-29', { method: 'PUT', body: JSON.stringify({ name: 'synthetic update' }) });
       await assert.rejects(fetch('https://guarded-ms.invalid/api/entity/counterparty/shared-real-id', { method: 'PUT', body: JSON.stringify({ name: 'synthetic update' }) }), /TARGET_NOT_IN_MANIFEST/);
     });
-    assert.equal(calls, 5);
+    assert.equal(calls, 7);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    if (previous.mode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE; else process.env.CONTROLLED_LIVE_TEST_MODE = previous.mode;
+    if (previous.b24 === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = previous.b24;
+    if (previous.ms === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = previous.ms;
+  }
+});
+
+test('final fetch guard binds invoice, deal rows, catalog prices and service mutations to their manifest owner IDs', async () => {
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, b24: process.env.BITRIX24_REST_BASE_URL, ms: process.env.MOYSKLAD_API_BASE_URL };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.BITRIX24_REST_BASE_URL = 'https://matrix-bitrix.invalid/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://matrix-ms.invalid/api/';
+  globalThis.fetch = (async () => { calls++; return new Response('{}', { status: 200 }); }) as typeof fetch;
+  try {
+    installControlledLiveFetchGuard();
+    const cases = [
+      { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.deal.update.json', body: { id: 'deal-1' }, target: 'deal-1' },
+      { provider: 'BITRIX24' as const, entity: 'invoice', path: 'crm.item.update.json', body: { entityTypeId: '31', id: 'invoice-1' }, target: 'invoice-1' },
+      { provider: 'BITRIX24' as const, entity: 'catalog-product', path: 'catalog.price.update.json', body: { id: 'price-shared', productId: 'product-1' }, target: 'product-1' },
+      { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.item.productrow.update.json', body: { id: 'row-shared', ownerId: 'deal-2' }, target: 'deal-2' },
+      { provider: 'MOYSKLAD' as const, entity: 'invoice', path: 'entity/invoiceout/invoice-2', body: { name: 'synthetic invoice' }, target: 'invoice-2' },
+      { provider: 'MOYSKLAD' as const, entity: 'catalog-product', path: 'entity/product/product-2/prices', body: { value: 100 }, target: 'product-2' },
+      { provider: 'MOYSKLAD' as const, entity: 'catalog-service', path: 'entity/service/service-1', body: { name: 'synthetic service' }, target: 'service-1' },
+      { provider: 'MOYSKLAD' as const, entity: 'deal-order', path: 'entity/customerorder/deal-3/positions/row-shared', body: { quantity: 2 }, target: 'deal-3' },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const runId = `LIVE-TEST-20261019T120000Z-matrix${String(index).padStart(2, '0')}`;
+      const sourceSystem = item.provider === 'BITRIX24' ? 'MOYSKLAD' as const : 'BITRIX24' as const;
+      const sourceNativeId = `source-${index}`;
+      const name = `тест ${runId} ${item.entity}`;
+      const record = { entity: item.entity, direction: `${sourceSystem}_TO_${item.provider}`, name, syntheticOnly: true as const,
+        sourceSystem, sourceNativeId, targetSystem: item.provider, targetNativeId: item.target, createdAfterUtc: '2026-10-19T00:00:00Z' };
+      setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId, testDatabaseName: 'sync_issue60_test', records: [record] }, 'postgres://localhost/sync_issue60_test'));
+      const eventScope = { eventId: `matrix-${index}`, runId, entity: item.entity, sourceSystem, sourceNativeId,
+        targetSystem: item.provider, targetNativeId: item.target, admittedSourceName: name, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' };
+      const form = new URLSearchParams(Object.entries(item.body).map(([key, value]) => [key, String(value)]));
+      const url = item.provider === 'BITRIX24' ? `https://matrix-bitrix.invalid/rest/${item.path}` : `https://matrix-ms.invalid/api/${item.path}`;
+      await withControlledLiveEventScope(eventScope, async () => {
+        await fetch(url, { method: item.provider === 'BITRIX24' ? 'POST' : 'PUT', body: item.provider === 'BITRIX24' ? form : JSON.stringify(item.body) });
+      });
+    }
+    assert.equal(calls, cases.length);
   } finally {
     globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);
