@@ -3,6 +3,9 @@ import { DatabaseService } from './database.service';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { assertApplyExternalWrite } from './external-write-guard';
 import { ClientLifecycleService } from './clients/client-lifecycle.service';
+import { FieldSettingsService } from './field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from './field-settings/read-only-field-data.provider';
+import { EnablePreflightReport, SyncModeDirection, evaluateEnablePreflight } from './sync-mode-preflight';
 
 export type ServiceMode = 'on' | 'pause' | 'off';
 export type DealOrderWriteDirection = 'bitrix24ToMoysklad' | 'moyskladToBitrix24';
@@ -15,6 +18,7 @@ const entityControls = [
     key: 'contacts-companies',
     label: 'Контакты и компании ↔ контрагенты и контактные лица',
     ready: true,
+    supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'],
     implementation: 'partial',
     directionScope: 'CONTACT_EMAIL_EXISTING_PAIRS',
     availability: 'Частично готово: только поле EMAIL существующей пары контакта.',
@@ -22,15 +26,17 @@ const entityControls = [
   {
     key: 'deals-orders',
     label: 'Сделки ↔ заказы покупателей',
-    ready: false,
+    ready: true,
+    supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'],
     implementation: 'implemented',
     directionScope: 'DEAL_ORDER_RUNTIME',
-    availability: 'Runtime реализован; сквозной preflight и cutover #60 не завершены.',
+    availability: 'Обмен реализован; перед включением каждого направления проверяются настройки и доступ API.',
   },
   {
     key: 'invoices',
     label: 'Счета ↔ счета покупателям',
     ready: true,
+    supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'],
     implementation: 'implemented',
     directionScope: 'INVOICE_PAIRS',
     availability: 'Только новые смарт-счета entityTypeId=31 и счета покупателям со связью на подтверждённый заказ.',
@@ -38,15 +44,17 @@ const entityControls = [
   {
     key: 'products-variations',
     label: 'Товары ↔ товары и модификации',
-    ready: false,
+    ready: true,
+    supportedDirections: ['moyskladToBitrix24'],
     implementation: 'implemented',
     directionScope: 'MOYSKLAD_PRODUCT_CATALOG_TO_BITRIX24',
-    availability: 'Каталожный runtime реализован; сквозной preflight и cutover #60 не завершены.',
+    availability: 'Каталожный обмен реализован только из МойСклад в Bitrix24; перед включением проверяются каталог и единицы измерения.',
   },
   {
     key: 'service-dictionary',
     label: 'Справочник услуг сделки ↔ поле справочника заказа',
     ready: false,
+    supportedDirections: [],
     implementation: 'not_implemented',
     directionScope: null,
     availability: 'Обмен этой сущности пока недоступен.',
@@ -59,6 +67,8 @@ export class SyncModeService {
     private readonly database: DatabaseService,
     @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
     @Optional() @Inject(ClientLifecycleService) private readonly clientLifecycle?: ClientLifecycleService,
+    @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
+    @Optional() @Inject(ReadOnlyFieldDataProvider) private readonly fieldData?: ReadOnlyFieldDataProvider,
   ) {}
 
   async read() {
@@ -114,30 +124,81 @@ export class SyncModeService {
   }
 
   async readEntitySettings() {
-    const ready = entityControls.find((entity) => entity.ready)!;
-    const directions = await this.ensureDirectionSetting(ready.key);
-    return entityControls.map((entity) => ({
-      ...entity,
-      bitrix24ToMoysklad: entity.ready ? directions.bitrix24ToMoysklad : false,
-      moyskladToBitrix24: entity.ready ? directions.moyskladToBitrix24 : false,
+    return Promise.all(entityControls.map(async (entity) => {
+      const directions = entity.ready ? await this.ensureDirectionSetting(entity.key) : null;
+      return {
+        ...entity,
+        bitrix24ToMoysklad: directions?.bitrix24ToMoysklad ?? false,
+        moyskladToBitrix24: directions?.moyskladToBitrix24 ?? false,
+      };
     }));
   }
 
   async setEntityDirections(
     entityKey: string,
     directions: { bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean },
+    bitrixAccessToken = '',
   ) {
     const entity = entityControls.find((control) => control.key === entityKey);
     if (!entity || !entity.ready) {
       throw new ConflictException('This entity is not ready to be enabled');
     }
-    await this.ensureDirectionSetting(entityKey);
+    const current = await this.ensureDirectionSetting(entityKey);
+    const candidates: SyncModeDirection[] = [
+      ...(directions.bitrix24ToMoysklad && !current.bitrix24ToMoysklad ? ['bitrix24ToMoysklad' as const] : []),
+      ...(directions.moyskladToBitrix24 && !current.moyskladToBitrix24 ? ['moyskladToBitrix24' as const] : []),
+    ];
+    for (const direction of candidates) {
+      const report = await this.preflightEntityDirection(entityKey, direction, bitrixAccessToken);
+      if (!report.canEnable) throw new ConflictException({ message: 'SYNC_PREFLIGHT_BLOCKED', preflight: report });
+    }
     const setting = await this.database.syncDirectionSetting.update({
       where: { entityKey },
       data: directions,
       select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
     });
     return { key: entityKey, ...setting };
+  }
+
+  async preflightEntityDirection(entityKey: string, direction: SyncModeDirection, bitrixAccessToken: string): Promise<EnablePreflightReport> {
+    let settings: { version: number; config: Record<string, unknown> } | null = null;
+    try {
+      const active = await this.fieldSettings?.active();
+      if (active && active.config) settings = { version: active.version, config: active.config as unknown as Record<string, unknown> };
+    } catch { /* The report below will make unavailable settings a blocker. */ }
+
+    let apiAccess = false;
+    let applicableStages: string[] = [];
+    let applicableCurrencies: string[] = [];
+    let applicableUnits: string[] = [];
+    let availableProductCatalogIds: string[] = [];
+    if (this.fieldData && bitrixAccessToken) {
+      try {
+        if (entityKey === 'deals-orders') {
+          const catalogs = await this.fieldData.referenceCatalogs(bitrixAccessToken);
+          applicableStages = catalogs.dealStages.bitrix24.map((item) => item.id);
+          applicableCurrencies = catalogs.currencies.bitrix24.map((item) => item.id);
+        } else if (entityKey === 'products-variations') {
+          const catalogs = await this.fieldData.catalogs(bitrixAccessToken);
+          applicableUnits = (direction === 'bitrix24ToMoysklad' ? catalogs.units.bitrix24 : catalogs.units.moysklad).map((item) => item.id);
+          availableProductCatalogIds = catalogs.productCatalogs.map((item) => item.id);
+        } else if (entityKey === 'invoices') {
+          await this.fieldData.fieldCatalogs(bitrixAccessToken, 'smart-invoices');
+        } else if (entityKey === 'contacts-companies') {
+          await this.fieldData.fieldCatalogs(bitrixAccessToken, 'contacts-companies');
+        }
+        apiAccess = true;
+      } catch { /* Do not disclose provider responses or credential details in admin diagnostics. */ }
+    }
+
+    const incomingSource = direction === 'bitrix24ToMoysklad' ? 'BITRIX24_EVENT_APPLICATION_TOKEN' : 'MOYSKLAD_WEBHOOK_SECRET';
+    const optionalReferenceWarnings = collectOptionalReferenceWarnings(settings?.config);
+    return evaluateEnablePreflight({
+      entityKey, direction, settings, apiAccess,
+      webhookAuthConfigured: Boolean(process.env[incomingSource]),
+      applicableStages, applicableCurrencies, applicableUnits, availableProductCatalogIds,
+      optionalReferenceWarnings,
+    });
   }
 
   private async ensureGlobalSetting() {
@@ -163,7 +224,7 @@ export class SyncModeService {
     try {
       return await this.database.syncDirectionSetting.upsert({
         where: { entityKey },
-        create: { entityKey },
+        create: { entityKey, bitrix24ToMoysklad: directionDefault(entityKey), moyskladToBitrix24: directionDefault(entityKey) },
         update: {},
         select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
       });
@@ -183,7 +244,7 @@ export class SyncModeService {
     direction: 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
   ): Promise<boolean> {
     const setting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey } });
-    return setting?.[direction] ?? true;
+    return setting?.[direction] ?? directionDefault(entityKey);
   }
 
   /** Re-read durable global/direction/recovery state immediately before each
@@ -194,7 +255,7 @@ export class SyncModeService {
     if (setting.serviceMode !== 'on') throw new DealOrderWriteGateError(setting.serviceMode === 'off' ? 'OFF' : 'PAUSE');
     if (this.databaseRecovery && !await this.databaseRecovery.assertReady()) throw new DealOrderWriteGateError('RECOVERY');
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' } });
-    if (directions?.[direction] === false) throw new DealOrderWriteGateError('DIRECTION');
+    if (!directions?.[direction]) throw new DealOrderWriteGateError('DIRECTION');
     if (assertLease && !await assertLease()) throw new DealOrderWriteGateError('LEASE');
     if (pair && this.clientLifecycle) {
       for (const item of Array.isArray(pair) ? pair : [pair]) await this.clientLifecycle.assertPairActive(item.id, item.entityType);
@@ -236,7 +297,7 @@ export class SyncModeService {
       const direction = await transaction.$queryRaw<Array<{ moyskladToBitrix24: boolean }>>`
         SELECT "moyskladToBitrix24" FROM "SyncDirectionSetting" WHERE "entityKey" = 'products-variations' FOR SHARE
       `;
-      if (direction[0] && !direction[0].moyskladToBitrix24) throw new DealOrderWriteGateError('DIRECTION');
+      if (!direction[0]?.moyskladToBitrix24) throw new DealOrderWriteGateError('DIRECTION');
       if (this.databaseRecovery && !await this.databaseRecovery.assertReady()) throw new DealOrderWriteGateError('RECOVERY');
       if (process.env.SYNC_MODE !== 'apply') throw new DealOrderWriteGateError('NOT_APPLY');
       if (assertLease && !await assertLease()) throw new DealOrderWriteGateError('LEASE');
@@ -249,4 +310,21 @@ export class SyncModeService {
 
 function isUniqueConstraintViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002';
+}
+
+function collectOptionalReferenceWarnings(config: Record<string, unknown> | undefined): string[] {
+  if (!config || typeof config.references !== 'object' || config.references === null) return [];
+  const references = config.references as Record<string, unknown>;
+  const optionalKinds = ['currencies', 'organizations', 'warehouses', 'employees', 'projects'];
+  const pairs = Array.isArray(references.namedPairs) ? references.namedPairs : [];
+  return optionalKinds.filter((kind) => {
+    const applicable = pairs.filter((pair) => typeof pair === 'object' && pair !== null && 'kind' in pair && pair.kind === kind);
+    return applicable.some((pair) => typeof pair === 'object' && pair !== null && 'status' in pair && pair.status !== 'confirmed');
+  });
+}
+
+function directionDefault(entityKey: string): boolean {
+  // Preserve the already-shipped partial EMAIL exchange while every newly
+  // implemented scope remains opt-in until its preflight succeeds.
+  return entityKey === 'contacts-companies';
 }

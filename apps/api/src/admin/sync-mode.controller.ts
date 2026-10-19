@@ -1,6 +1,7 @@
-import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Optional, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Optional, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { AdminAccessGuard } from './admin-access.guard';
 import { ServiceMode, SyncModeService } from '../sync-mode.service';
+import { SyncModeDirection } from '../sync-mode-preflight';
 import { SyncRecoveryService } from '../sync-recovery.service';
 import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
@@ -72,8 +73,25 @@ export class SyncModeController {
     return this.syncMode.readEntitySettings();
   }
 
+  @Get('entities/:entityKey/preflight')
+  preflightEntityDirection(
+    @Param('entityKey') entityKey: string,
+    @Query('direction') direction: string,
+    @Req() request: { header(name: string): string | undefined },
+  ) {
+    if (direction !== 'bitrix24ToMoysklad' && direction !== 'moyskladToBitrix24') {
+      throw new BadRequestException('direction must be bitrix24ToMoysklad or moyskladToBitrix24');
+    }
+    const token = request.header('authorization')?.match(/^Bearer ([^\s]+)$/i)?.[1] ?? '';
+    return this.syncMode.preflightEntityDirection(entityKey, direction as SyncModeDirection, token);
+  }
+
   @Patch('entities/:entityKey')
-  async setEntityDirections(@Param('entityKey') entityKey: string, @Body() body: Record<string, unknown> | null) {
+  async setEntityDirections(
+    @Param('entityKey') entityKey: string,
+    @Body() body: Record<string, unknown> | null,
+    @Req() request: { header(name: string): string | undefined },
+  ) {
     if (typeof body?.bitrix24ToMoysklad !== 'boolean' || typeof body.moyskladToBitrix24 !== 'boolean') {
       throw new BadRequestException('Both direction values must be boolean');
     }
@@ -88,7 +106,7 @@ export class SyncModeController {
     const result = await this.syncMode.setEntityDirections(entityKey, {
       bitrix24ToMoysklad: body.bitrix24ToMoysklad,
       moyskladToBitrix24: body.moyskladToBitrix24,
-    });
+    }, request.header('authorization')?.match(/^Bearer ([^\s]+)$/i)?.[1] ?? '');
     if (changed) await writeOperationalLog(this.database, 'ADMIN', `Directions updated for ${entityKey}`);
     return result;
   }

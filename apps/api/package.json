@@ -8,6 +8,7 @@
     "test:admin-operations:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-operations.postgres.integration.js",
     "test:events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/events-intake.integration.js",
     "test:sync-mode-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode.service.unit.js",
+    "test:sync-mode-preflight-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode-preflight.unit.js",
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
     "test:nightly-accepted-recheck-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/nightly-accepted-event-recheck.unit.js",
