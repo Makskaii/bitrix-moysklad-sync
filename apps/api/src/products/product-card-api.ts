@@ -206,7 +206,7 @@ function isSafeCatalogScalarField(key: string, value: unknown): boolean {
   const blocked = new Set([
     'id', 'meta', 'type', 'iblockId', 'iblockSection', 'iblockSectionId',
     'detailPicture', 'previewPicture', 'quantity', 'quantityReserved', 'quantityTrace',
-    'available', 'active', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
+    'available', 'active', 'xmlId', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
     'dateActiveFrom', 'dateActiveTo', 'priceType', 'purchasingPrice', 'purchasingCurrency',
   ]);
   return /^[A-Za-z][A-Za-z0-9]*$/.test(key) && !blocked.has(key) &&

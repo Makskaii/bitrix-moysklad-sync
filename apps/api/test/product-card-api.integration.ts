@@ -87,6 +87,8 @@ test('product API adapter reads only addressed cards and issues partial field an
 
   await api.updateBitrix24('101', { name: 'Renamed' });
   await api.updateBitrix24('101', { weight: 0 });
+  await assert.rejects(api.updateBitrix24('101', { xmlId: '' }), /PRODUCT_FIELD_NOT_ALLOWED/);
+  await assert.rejects(api.updateBitrix24('101', { xmlId: 'different-identity' }), /PRODUCT_FIELD_NOT_ALLOWED/);
   await assert.rejects(api.updateBitrix24('101', { quantity: 0 }), /PRODUCT_FIELD_NOT_ALLOWED/);
   await api.updateBitrix24Price('51', 13.25, 'RUB');
   await api.updateMoysklad(productId, { description: 'Plain text' });

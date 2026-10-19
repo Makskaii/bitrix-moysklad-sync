@@ -305,6 +305,7 @@ function productRules(settings: ProductCardSettings): ProductRules {
   const result: ProductRules = { fields: [] };
   for (const candidate of settings.rules) {
     if (!record(candidate) || candidate.entity !== 'catalog' || typeof candidate.sourceField !== 'string' || typeof candidate.targetField !== 'string') continue;
+    if (candidate.sourceField === 'xmlId') continue; // reserved as ProductCatalogCreateService's recovery identity
     const forward = record(candidate.bitrix24ToMoysklad) ? candidate.bitrix24ToMoysklad : null;
     const reverse = record(candidate.moyskladToBitrix24) ? candidate.moyskladToBitrix24 : null;
     if ((forward?.enabled === true && record(forward.transform) && forward.transform.kind !== 'copy') ||
@@ -358,7 +359,7 @@ function isWritableScalarField(field: string) {
   const protectedFields = new Set([
     'id', 'meta', 'type', 'iblockId', 'iblockSection', 'iblockSectionId',
     'detailPicture', 'previewPicture', 'quantity', 'quantityReserved', 'quantityTrace',
-    'available', 'active', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
+    'available', 'active', 'xmlId', 'createdBy', 'modifiedBy', 'dateCreate', 'timestampX',
     'dateActiveFrom', 'dateActiveTo', 'priceType', 'purchasingPrice', 'purchasingCurrency',
   ]);
   return /^[A-Za-z][A-Za-z0-9]*$/.test(field) && !protectedFields.has(field);

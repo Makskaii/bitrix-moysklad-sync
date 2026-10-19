@@ -175,7 +175,7 @@ test('configured service price changes update Bitrix24 and an applied write with
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
 });
 
-test('explicit scalar catalog mappings update typed fields generically and preserve zero and empty string', async () => {
+test('explicit scalar mappings preserve zero and empty string without overwriting Bitrix24 recovery identity', async () => {
   const api = new FakeApi();
   const mapped = { ...settings, rules: [...settings.rules,
     { id: 'product-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
@@ -195,10 +195,14 @@ test('explicit scalar catalog mappings update typed fields generically and prese
 
   assert.equal(result.status, 'SYNCED');
   assert.equal(api.bitrix24.fields!.weight, 0);
-  assert.equal(api.bitrix24.fields!.xmlId, '');
-  assert.deepEqual(api.writes.map((write) => write.fields), ['weight', 'xmlId']);
+  assert.equal(api.bitrix24.fields!.xmlId, 'initial-external', 'the XML ID remains the durable catalog-create recovery key');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['weight']);
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
   assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'UNCHANGED');
+  api.moysklad.fields!.externalCode = 'different-identity';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'UNCHANGED');
+  assert.equal(api.bitrix24.fields!.xmlId, 'initial-external');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['weight'], 'empty and changed MySklad external codes cannot replace the recovery XML ID');
 });
 
 test('unconfigured and disabled catalog scalar candidates are never written', async () => {

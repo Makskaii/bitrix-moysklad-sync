@@ -14,7 +14,7 @@ export type PairSnapshot = {
   sourceValues: Record<string, unknown>;
   targetCurrent: Record<string, unknown>;
 };
-export type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service' };
+export type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service'; reserved?: string };
 
 const PAGE_SIZE = 50;
 const MAX_PAGES = 20;
@@ -408,7 +408,7 @@ function describeBitrixFields(value: unknown, entity: string, userFields?: unkno
     const title = localizedLabels.get(code) ?? apiTitle;
     const type = typeof definition.type === 'string' ? definition.type : typeof definition.userTypeId === 'string' ? definition.userTypeId : 'unknown';
     const custom = /^UF_CRM/i.test(code) || (entity === 'catalog' && /^property\d+$/i.test(code));
-    return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null, category: custom ? 'custom' : 'standard', ...(entity === 'catalog' && resourceByCode?.has(code) ? { resource: resourceByCode.get(code)! } : {}) }];
+    return [{ code, title, type, writable: typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null, category: custom ? 'custom' : 'standard', ...(entity === 'catalog' && resourceByCode?.has(code) ? { resource: resourceByCode.get(code)! } : {}), ...(entity === 'catalog' && code === 'xmlId' ? { reserved: 'PRODUCT_CREATE_RECOVERY_IDENTITY' } : {}) }];
   });
 }
 
