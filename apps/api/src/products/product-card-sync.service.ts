@@ -376,6 +376,9 @@ function chooseField(field: string, b24: unknown, ms: unknown, oldB24: unknown, 
 }
 
 function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, mappings: unknown[]): Direction | null {
+  // Unit is optional in both catalogs. Preserve a genuinely absent value instead of
+  // treating it like a malformed provider ID; present but invalid IDs still fail closed.
+  if (isAbsentUnit(b24) && isAbsentUnit(ms) && isAbsentUnit(oldB24) && isAbsentUnit(oldMs)) return null;
   if (b24 === undefined || ms === undefined || oldB24 === undefined || oldMs === undefined) {
     throw new ProductCardManualReviewError('PRODUCT_UNIT_VALUE_UNAVAILABLE');
   }
@@ -387,6 +390,10 @@ function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, 
   const row = mappings.filter((item) => record(item) && String(item.moyskladId) === ms && item.status === 'configured' && Number.isInteger(item.bitrix24Id) && Number(item.bitrix24Id) > 0);
   if (row.length !== 1 || !record(row[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
   return { field: 'unit', target, value: row[0].bitrix24Id };
+}
+
+function isAbsentUnit(value: unknown): boolean {
+  return value === null || value === undefined;
 }
 
 function sameDirectionValue(field: string, actual: unknown, expected: unknown): boolean {

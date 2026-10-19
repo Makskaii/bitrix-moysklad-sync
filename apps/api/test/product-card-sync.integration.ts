@@ -135,6 +135,21 @@ test('configured UOM ID compares numeric settings with string Bitrix24 readback 
   assert.equal(api.writes.filter((write) => write.fields === 'measure').length, 1, 'numeric/string unit ID equivalence prevents a second unit write');
 });
 
+test('optional UOM absent on both providers stays unchanged without a unit write', async () => {
+  for (const absent of [null, undefined]) {
+    const api = new FakeApi();
+    api.bitrix24.unitId = absent as null;
+    api.moysklad.unitId = absent as null;
+    const sync = new ProductCardSyncService(api, new MemoryState());
+    assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings })).status, 'BASELINED');
+
+    const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+
+    assert.equal(result.status, 'UNCHANGED');
+    assert.equal(api.writes.some((write) => write.fields === 'measure'), false);
+  }
+});
+
 test('product provider retries use the durable attempt number for bounded fallback backoff', async () => {
   const api = new FakeApi();
   const state = new MemoryState();
