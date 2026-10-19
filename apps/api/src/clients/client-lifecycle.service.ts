@@ -147,15 +147,16 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       if (claim.count !== 1) return;
       const entityType = lifecycleEntityForEvent(event.source, event.externalEntityType!);
       if (!entityType) throw new ProviderFailure(event.source as LifecycleSource, 400);
+      const nativeType = event.source === 'MOYSKLAD' ? event.externalEntityType! : undefined;
       const pair = await this.database.entityPair.findFirst({ where: event.source === 'BITRIX24'
         ? { entityType, bitrix24Id: event.externalEntityId }
-        : { entityType, moyskladId: event.externalEntityId },
+        : { entityType, moyskladId: event.externalEntityId, moyskladType: nativeType },
         select: { id: true, bitrix24Id: true, moyskladId: true, moyskladType: true },
       });
       if (pair) pairLease = await this.acquireEntityPairLease(pair, event.source as LifecycleSource, entityType, event.externalEntityId);
-      const nativeType = event.source === 'BITRIX24' && entityType === 'PRODUCT' && pair?.moyskladType === 'service'
+      const readNativeType = event.source === 'BITRIX24' && entityType === 'PRODUCT' && pair?.moyskladType === 'service'
         ? 'service' : event.externalEntityType!;
-      const state = await this.readDeletionState(event.source as LifecycleSource, entityType, nativeType, event.externalEntityId, event.payload);
+      const state = await this.readDeletionState(event.source as LifecycleSource, entityType, readNativeType, event.externalEntityId, event.payload);
       if (state === 'PRESENT') {
         await this.database.inboundEvent.update({ where: { id: eventId }, data: { status: 'UNCHANGED', processingStartedAt: null, lastErrorCategory: null } });
         return;
@@ -170,7 +171,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         return;
       }
       await pairLease?.assertOwned();
-      const result = await this.tombstoneByNativeId(event.source as LifecycleSource, entityType, event.externalEntityId, 'CONFIRMED_PROVIDER_DELETION');
+      const result = await this.tombstoneByNativeId(event.source as LifecycleSource, entityType, event.externalEntityId, 'CONFIRMED_PROVIDER_DELETION', nativeType);
       if (result.status === 'TOMBSTONED' && event.source === 'MOYSKLAD' && result.pairId) {
         await this.ensureDeletionMarker(result.pairId, entityType);
       }
@@ -322,12 +323,13 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
   }
 
   /** Call only after the provider's deletion event and current-state read agree. */
-  async tombstoneByNativeId(source: LifecycleSource, entityType: LifecycleEntityType, nativeId: string, reason: string) {
+  async tombstoneByNativeId(source: LifecycleSource, entityType: LifecycleEntityType, nativeId: string, reason: string, moyskladType?: string) {
     return this.database.$transaction(async (tx) => {
       await lockEntityPairState(tx);
+      if (source === 'MOYSKLAD' && !moyskladType) throw new Error('CLIENT_LIFECYCLE_NATIVE_TYPE_REQUIRED');
       const pair = await tx.entityPair.findFirst({ where: {
         entityType,
-        ...(source === 'BITRIX24' ? { bitrix24Id: nativeId } : { moyskladId: nativeId }),
+        ...(source === 'BITRIX24' ? { bitrix24Id: nativeId } : { moyskladId: nativeId, moyskladType }),
       } });
       if (!pair) return { status: 'UNPAIRED' as const };
       if (pair.lifecycleStatus === 'TOMBSTONED') return { status: 'TOMBSTONED' as const, pairId: pair.id, changed: false };

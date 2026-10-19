@@ -239,6 +239,37 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
   }
 });
 
+test('MoySklad lifecycle tombstones resolve a shared native ID by exact entity kind', async () => {
+  const product = { id: 'historical-product', entityType: 'PRODUCT', bitrix24Id: 'b24-product', moyskladId: 'shared-ms-id', moyskladType: 'product', active: false, lifecycleStatus: 'TOMBSTONED' };
+  const servicePair = { id: 'active-service', entityType: 'PRODUCT', bitrix24Id: 'b24-service', moyskladId: 'shared-ms-id', moyskladType: 'service', active: true, lifecycleStatus: 'ACTIVE' };
+  const pairs = [product, servicePair];
+  let lookup: Record<string, unknown> | undefined;
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+        lookup = where;
+        return pairs.find((pair) => Object.entries(where).every(([key, value]) => pair[key as keyof typeof pair] === value)) ?? null;
+      },
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        const pair = pairs.find((candidate) => candidate.id === where.id)!;
+        Object.assign(pair, data);
+        return pair;
+      },
+    },
+    operationalLog: { create: async () => ({}) },
+  };
+  const service = new ClientLifecycleService({ $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx) } as never);
+  const result = await service.tombstoneByNativeId('MOYSKLAD', 'PRODUCT', 'shared-ms-id', 'confirmed deletion', 'service');
+  assert.equal(result.status, 'TOMBSTONED');
+  assert.equal(result.pairId, 'active-service');
+  assert.deepEqual(lookup, { entityType: 'PRODUCT', moyskladId: 'shared-ms-id', moyskladType: 'service' });
+  assert.equal(product.lifecycleStatus, 'TOMBSTONED', 'same-ID historical product remains untouched');
+  assert.equal(product.active, false);
+  assert.equal(servicePair.lifecycleStatus, 'TOMBSTONED');
+  await assert.rejects(() => service.tombstoneByNativeId('MOYSKLAD', 'PRODUCT', 'shared-ms-id', 'missing kind'), /CLIENT_LIFECYCLE_NATIVE_TYPE_REQUIRED/);
+});
+
 test('deletion marker uses configured entity field code, is idempotent, and rejects guessed/invalid codes', async () => {
   const oldMode = process.env.SYNC_MODE;
   const oldBase = process.env.BITRIX24_REST_BASE_URL;
