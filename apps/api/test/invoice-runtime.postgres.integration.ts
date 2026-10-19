@@ -71,6 +71,7 @@ before(async () => {
 
 after(async () => {
   await db.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
+  await db.pairReviewCase.deleteMany({ where: { id: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
   await db.entityPair.deleteMany({ where: { id: { startsWith: `invoice55-${suffix}-` } } }).catch(() => undefined);
   await db.entityPair.deleteMany({ where: { id: `invoice-test-deal-${suffix}` } }).catch(() => undefined);
   await db.$disconnect();
@@ -80,6 +81,24 @@ after(async () => {
   restoreEnv('MOYSKLAD_API_TOKEN', oldMoyskladToken);
   restoreEnv('DATABASE_URL', oldDatabaseUrl);
   if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+test('database constraints accept invoice pairs and review cases while preserving the allowlist', async () => {
+  await db.entityPair.create({ data: {
+    id: `invoice55-${suffix}-constraint-pair`, entityType: 'INVOICE', bitrix24Id: '510001', moyskladId: randomUUID(),
+    moyskladType: 'invoiceout', moyskladParentId: orderId, source: 'AUTOMATIC',
+  } });
+  await db.pairReviewCase.create({ data: {
+    id: `invoice55-${suffix}-constraint-review`, entityType: 'INVOICE', sourceSystem: 'BITRIX24',
+    sourceEntityId: '510001', reason: 'INVOICE_TEST_REVIEW',
+  } });
+  await assert.rejects(db.entityPair.create({ data: {
+    id: `invoice55-${suffix}-invalid-pair`, entityType: 'UNSUPPORTED', bitrix24Id: '510002', moyskladId: randomUUID(), source: 'MANUAL',
+  } }));
+  await assert.rejects(db.pairReviewCase.create({ data: {
+    id: `invoice55-${suffix}-invalid-review`, entityType: 'UNSUPPORTED', sourceSystem: 'BITRIX24',
+    sourceEntityId: '510002', reason: 'INVOICE_TEST_REVIEW',
+  } }));
 });
 
 test('invoice processor creates one independently paired invoiceout, then update replay echoes without another write', async () => {
