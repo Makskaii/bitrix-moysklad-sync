@@ -7,6 +7,7 @@ import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
 import { ClientSyncProcessor } from './clients/client-sync.processor';
 import { FieldSettingsService } from './field-settings/field-settings.service';
+import { EventDispatcherService } from './event-dispatcher.service';
 
 const MOYSKLAD_PAGE_SIZE = 1_000;
 const MOYSKLAD_CONTACTPERSON_MAX_PAGES = 20;
@@ -31,6 +32,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     private readonly processor: ContactSyncProcessor,
     @Optional() private readonly clients?: ClientSyncProcessor,
     @Optional() private readonly fieldSettings?: FieldSettingsService,
+    @Optional() private readonly dispatcher?: EventDispatcherService,
   ) {}
 
   onApplicationBootstrap() {
@@ -96,6 +98,25 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     const local = localScheduleParts(now);
     const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
     if (!setting) return;
+
+    // Feed completion means events were durably enqueued, not that their
+    // processors finished. Keep the run visibly pending until every event
+    // created by this nightly window has left a retryable/in-flight state.
+    if (setting.nightlyStatus === 'awaiting_processing') {
+      const pending = await this.database.inboundEvent.count({
+        where: {
+          deliveryKey: { startsWith: `nightly:${setting.nightlyScheduledDate}:` },
+          status: { in: ['RECEIVED', 'PROCESSING', 'RETRYABLE_FAILURE'] },
+        },
+      });
+      if (pending === 0) {
+        await this.database.syncSetting.updateMany({
+          where: { id: 'global', nightlyScheduledDate: setting.nightlyScheduledDate, nightlyStatus: 'awaiting_processing' },
+          data: { nightlyStatus: 'complete_with_limitations', nightlyError: 'Nightly feeds covered active pairs; delete and archival changes remain outside this slice.' },
+        });
+      }
+      return;
+    }
 
     if (setting.nightlyStatus === 'running') {
       await this.runNightlyJob();
@@ -190,10 +211,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       await this.database.syncSetting.updateMany({
         where: { id: 'global', nightlyLeaseToken: leaseToken },
         data: {
-          nightlyStatus: final?.nightlyStatus === 'skipped' ? 'skipped' : complete ? 'complete_with_limitations' : failed ? 'failed' : 'running',
+          nightlyStatus: final?.nightlyStatus === 'skipped' ? 'skipped' : complete ? 'awaiting_processing' : failed ? 'failed' : 'running',
           nightlyProvider: complete ? 'COMPLETE' : 'BITRIX24',
           nightlyRetryAfter: failed ? retryAfter : null,
-          ...(complete ? { nightlyError: 'Nightly feeds cover active Bitrix24 contact/company pairs and MoySklad contact persons attached to active company pairs. Delete and archival changes remain outside this slice.' } : {}),
+          ...(complete ? { nightlyError: 'Provider feeds are queued for active pairs; waiting for event processing. Delete and archival changes remain outside this slice.' } : {}),
         },
       });
     } catch {
@@ -584,7 +605,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
             update: {}, select: { id: true },
           });
         if (enabled) {
-          if (this.clients) this.clients.enqueue(row.id);
+          if (this.dispatcher) await this.dispatcher.dispatch(row.id);
+          else if (this.clients) this.clients.enqueue(row.id);
           else if (pair.entity === 'CONTACT') this.processor.enqueue(row.id);
         }
       } catch (error) { failures.push(error); }
