@@ -132,8 +132,17 @@ function parseManifest(value: unknown): ControlledLiveManifest {
     }
     return item as unknown as ControlledLiveManifestRecord;
   });
-  const uniqueness = records.map((record) => record.sourceNativeId === null ? `${record.targetSystem}:${record.name}` : `${record.sourceSystem}:${record.sourceNativeId}`);
-  if (new Set(uniqueness).size !== uniqueness.length) throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_DUPLICATE_RECORD');
+  const uniqueness = new Set<string>();
+  for (const record of records) {
+    const identities = [
+      record.sourceNativeId === null ? null : `${record.entity}:${record.sourceSystem}:${record.sourceNativeId}`,
+      record.targetNativeId === null ? `${record.entity}:${record.targetSystem}:name:${record.name}` : `${record.entity}:${record.targetSystem}:${record.targetNativeId}`,
+    ].filter((value): value is string => value !== null);
+    for (const identity of identities) {
+      if (uniqueness.has(identity)) throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_DUPLICATE_RECORD');
+      uniqueness.add(identity);
+    }
+  }
   return { runId: value.runId, testDatabaseName: value.testDatabaseName, records };
 }
 

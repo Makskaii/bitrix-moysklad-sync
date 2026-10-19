@@ -30,6 +30,8 @@ test('controlled writes require a dedicated database named exactly in the manife
 test('malformed manifests, duplicate targets and omitted policy data fail closed', () => {
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, runId: 'run' }, 'postgres://localhost/sync_issue60_test'), /MANIFEST_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [...manifest.records, ...manifest.records] }, 'postgres://localhost/sync_issue60_test'), /DUPLICATE_RECORD/);
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [manifest.records[0], { ...manifest.records[0], sourceNativeId: 'b24-18' }] }, 'postgres://localhost/sync_issue60_test'), /DUPLICATE_RECORD/);
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [manifest.records[0], { ...manifest.records[0], sourceSystem: 'MOYSKLAD', sourceNativeId: 'ms-29', targetSystem: 'BITRIX24', targetNativeId: 'b24-18' }] }, 'postgres://localhost/sync_issue60_test'), /DUPLICATE_RECORD/);
   assert.throws(() => createControlledLiveTestPolicy(manifest, undefined), /DATABASE_URL_REQUIRED/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], name: 'тест invented-run client' }] }, 'postgres://localhost/sync_issue60_test'), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], syntheticOnly: false }] }, 'postgres://localhost/sync_issue60_test'), /MANIFEST_RECORD_INVALID/);
