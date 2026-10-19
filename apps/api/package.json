@@ -11,6 +11,7 @@
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
     "test:nightly-accepted-recheck-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/nightly-accepted-event-recheck.unit.js",
+    "test:nightly-service-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/nightly-service.unit.js",
     "test:manual-review-details-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/manual-review-details.unit.js",
     "test:event-reliability:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-reliability.postgres.integration.js",
     "test:provider-failure-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/provider-failure.unit.js",
