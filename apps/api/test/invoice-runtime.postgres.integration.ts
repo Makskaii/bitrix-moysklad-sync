@@ -152,7 +152,9 @@ test('invoice field conflicts use the configured MySklad-wins baseline policy an
   const sourceId = String(++invoiceCounter);
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Baseline title', parentId2: Number(dealId), createdTime: createdAfterBoundary });
   const create = await createEvent(`conflict-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
-  assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
+  const createResult = await processor.process(create.id);
+  const createState = await db.inboundEvent.findUniqueOrThrow({ where: { id: create.id } });
+  assert.equal(createResult?.status, 'SUCCEEDED', `${createState.status}: ${createState.lastErrorCategory ?? ''}`);
   const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
   const msInvoice = moyskladInvoices.get(pair.moyskladId)!;
   bitrixInvoices.get(sourceId)!.title = 'Bitrix changed';
@@ -225,7 +227,9 @@ test('relationship mappings are rejected and post-write reads confirm both invoi
   const sourceId = String(++invoiceCounter);
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Relationship mapping guard', parentId2: Number(dealId), createdTime: createdAfterBoundary });
   const create = await createEvent(`relationship-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
-  assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
+  const createResult = await processor.process(create.id);
+  const createState = await db.inboundEvent.findUniqueOrThrow({ where: { id: create.id } });
+  assert.equal(createResult?.status, 'SUCCEEDED', `${createState.status}: ${createState.lastErrorCategory ?? ''}`);
   const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
   const target = moyskladInvoices.get(pair.moyskladId)!;
   const beforeWrites = moyskladWrites;
@@ -237,7 +241,7 @@ test('relationship mappings are rejected and post-write reads confirm both invoi
     const event = await createEvent(`relationship-guard-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
     assert.equal((await processor.process(event.id))?.status, 'MANUAL_REVIEW');
     assert.equal(moyskladWrites, beforeWrites);
-    assert.equal((target.customerOrder as Record<string, unknown>).id, orderId);
+  assert.equal((target.customerOrder as { meta?: { href?: string } }).meta?.href, `${base}api/remap/1.2/entity/customerorder/${orderId}`);
   } finally {
     activeFieldConfig = fieldConfig;
   }
@@ -286,7 +290,9 @@ test('invoice creation retries a transient provider failure using the same sourc
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice Retry', parentId2: Number(dealId), createdTime: createdAfterBoundary });
   const event = await createEvent(`retry-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
   failNextInvoiceCreate = true;
-  assert.equal((await processor.process(event.id))?.status, 'RETRYABLE_FAILURE');
+  const firstAttempt = await processor.process(event.id);
+  const firstAttemptState = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(firstAttempt?.status, 'RETRYABLE_FAILURE', `${firstAttemptState.status}: ${firstAttemptState.lastErrorCategory ?? ''}`);
   await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
   assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 1);

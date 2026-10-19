@@ -10,6 +10,8 @@ import { SyncModeController } from '../src/admin/sync-mode.controller';
 import { ContactSyncStatusController } from '../src/admin/contact-sync-status.controller';
 import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
+import { FieldSettingsService } from '../src/field-settings/field-settings.service';
+import { ReadOnlyFieldDataProvider } from '../src/field-settings/read-only-field-data.provider';
 import { SyncRecoveryService } from '../src/sync-recovery.service';
 import { ContactSyncProcessor, ContactSyncStatusReader } from '../src/contact-sync.service';
 import { EventsController, EventIntakeService } from '../src/events.controller';
@@ -19,7 +21,30 @@ import { EventsController, EventIntakeService } from '../src/events.controller';
   providers: [
     DatabaseService,
     AdminAccessGuard,
-    SyncModeService,
+    {
+      provide: SyncModeService,
+      useFactory: (database: DatabaseService) => new SyncModeService(
+        database,
+        undefined,
+        undefined,
+        { active: async () => activePreflightSettings } as unknown as FieldSettingsService,
+        {
+          fieldCatalogs: async () => {
+            if (pauseInvoiceCatalogRead) {
+              invoiceCatalogReadStarted?.();
+              await new Promise<void>((resolve) => { pauseInvoiceCatalogRead = resolve; });
+            }
+            return {};
+          },
+          referenceCatalogs: async () => ({ dealStages: { bitrix24: [], moysklad: [] }, currencies: { bitrix24: [], moysklad: [] } }),
+          catalogs: async () => ({ units: { bitrix24: [], moysklad: [] }, productCatalogs: [] }),
+          dealOrderCatalogs: async () => ({ stages: fakeDealStages, currencies: fakeDealCurrencies }),
+          optionalDealOrderReferenceWarnings: async () => fakeOptionalReferenceWarnings,
+          verifyRequiredDealOrderReferences: async () => { fakeRequiredReferenceReads++; return []; },
+        } as unknown as ReadOnlyFieldDataProvider,
+      ),
+      inject: [DatabaseService],
+    },
     SyncRecoveryService,
     ContactSyncProcessor,
     ContactSyncStatusReader,
@@ -42,6 +67,13 @@ let releaseRaceReads: (() => void) | null = null;
 let raceReadsFinished: (() => void) | null = null;
 let raceReadCompletion = Promise.resolve();
 let raceExternalWrites = 0;
+let activePreflightSettings: { version: number; config: Record<string, unknown> } | null = null;
+let fakeDealStages: string[] = [];
+let fakeDealCurrencies: string[] = [];
+let fakeOptionalReferenceWarnings: string[] = [];
+let fakeRequiredReferenceReads = 0;
+let pauseInvoiceCatalogRead: (() => void) | null = null;
+let invoiceCatalogReadStarted: (() => void) | null = null;
 
 before(async () => {
   assert.ok(process.env.DATABASE_URL, 'DATABASE_URL must point to an isolated PostgreSQL test database');
@@ -51,6 +83,8 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = 'https://b24-fake.invalid/rest/';
   process.env.MOYSKLAD_API_BASE_URL = 'https://ms-fake.invalid/api/';
   process.env.MOYSKLAD_API_TOKEN = 'moysklad-test-token';
+  process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'bitrix-test-application-token';
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'moysklad-test-webhook-secret';
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     if (url.startsWith('https://aerosystems.bitrix24.ru/rest/user.admin.json')) {
@@ -124,6 +158,8 @@ before(async () => {
   app = await NestFactory.create(SyncModeTestModule, { logger: false });
   await app.get(DatabaseService).syncSetting.deleteMany();
   await app.get(DatabaseService).syncDirectionSetting.deleteMany();
+  await app.get(DatabaseService).fieldSettingsState.deleteMany();
+  await app.get(DatabaseService).fieldSettingsVersion.deleteMany();
   await app.get(DatabaseService).syncSetting.create({ data: { id: 'global' } });
   await app.get(DatabaseService).syncDirectionSetting.create({ data: { entityKey: 'contacts-companies' } });
   await app.listen(0, '127.0.0.1');
@@ -221,6 +257,8 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
   const entities = await response.json() as Array<{
     key: string;
     ready: boolean;
+    implementation: string;
+    supportedDirections: string[];
     directionScope: string | null;
     bitrix24ToMoysklad: boolean;
     moyskladToBitrix24: boolean;
@@ -246,8 +284,14 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
     bitrix24ToMoysklad: true,
     moyskladToBitrix24: true,
   });
-  assert.ok(entities.slice(1).every(({ ready, bitrix24ToMoysklad, moyskladToBitrix24 }) =>
-    !ready && !bitrix24ToMoysklad && !moyskladToBitrix24));
+  assert.deepEqual(entities.slice(1).map(({ key, ready, implementation, supportedDirections, bitrix24ToMoysklad, moyskladToBitrix24 }) => ({
+    key, ready, implementation, supportedDirections, bitrix24ToMoysklad, moyskladToBitrix24,
+  })), [
+    { key: 'deals-orders', ready: true, implementation: 'implemented', supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'], bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'invoices', ready: true, implementation: 'implemented', supportedDirections: ['bitrix24ToMoysklad', 'moyskladToBitrix24'], bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'products-variations', ready: true, implementation: 'implemented', supportedDirections: ['moyskladToBitrix24'], bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+    { key: 'service-dictionary', ready: false, implementation: 'not_implemented', supportedDirections: [], bitrix24ToMoysklad: false, moyskladToBitrix24: false },
+  ]);
   const unconfirmedDirection = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/contacts-companies`, {
     method: 'PATCH', headers: { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' },
     body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: true }),
@@ -257,16 +301,110 @@ test('settings list v1 exchange pairs and identifies the partial contact email c
   assert.equal((await unchanged.json() as typeof entities)[0].bitrix24ToMoysklad, true);
 });
 
-test('administrator cannot enable an entity whose exchange is not ready', async () => {
-  const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/deals-orders`, {
+test('the HTTP preflight blocks incomplete scopes, then permits only after the same gate is satisfied', async () => {
+  activePreflightSettings = null;
+  const token = { authorization: 'Bearer admin-test-token' };
+  const preview = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices/preflight?direction=bitrix24ToMoysklad`, { headers: token });
+  assert.equal(preview.status, 200);
+  const blockedReport = await preview.json() as { canEnable: boolean; blockers: Array<{ code: string }> };
+  assert.equal(blockedReport.canEnable, false);
+  assert.ok(blockedReport.blockers.some(({ code }) => code === 'FIELD_SETTINGS_UNAVAILABLE'));
+  const blockedPatch = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices`, {
     method: 'PATCH',
-    headers: {
-      authorization: 'Bearer admin-test-token',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }),
+    headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: false, confirmed: true }),
   });
-  assert.equal(response.status, 409);
+  assert.equal(blockedPatch.status, 409);
+  assert.equal((await app.get(DatabaseService).syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' } }))?.bitrix24ToMoysklad, false);
+
+  activePreflightSettings = { version: 7, config: { rules: [], references: {} } };
+  const db = app.get(DatabaseService);
+  await db.fieldSettingsVersion.create({ data: { version: 7, config: activePreflightSettings.config as never } });
+  await db.fieldSettingsState.create({ data: { id: 'global', version: 7 } });
+  const readyPreview = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices/preflight?direction=bitrix24ToMoysklad`, { headers: token });
+  const readyReport = await readyPreview.json() as { canEnable: boolean; settingsVersion: number | null };
+  assert.equal(readyReport.canEnable, true);
+  assert.equal(readyReport.settingsVersion, 7);
+  const enabled = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices`, {
+    method: 'PATCH',
+    headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: false, confirmed: true }),
+  });
+  assert.equal(enabled.status, 200);
+  assert.deepEqual(await enabled.json(), { key: 'invoices', bitrix24ToMoysklad: true, moyskladToBitrix24: false });
+
+  await db.fieldSettingsVersion.create({ data: { version: 8, config: activePreflightSettings.config as never } });
+  let releaseProviderRead!: () => void;
+  let notifyProviderReadStarted!: () => void;
+  const providerStarted = new Promise<void>((resolve) => { notifyProviderReadStarted = resolve; });
+  pauseInvoiceCatalogRead = releaseProviderRead = () => {};
+  invoiceCatalogReadStarted = notifyProviderReadStarted;
+  const staleEnable = nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices`, {
+    method: 'PATCH',
+    headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: true, moyskladToBitrix24: true, confirmed: true }),
+  });
+  await providerStarted;
+  await db.fieldSettingsState.update({ where: { id: 'global' }, data: { version: 8 } });
+  activePreflightSettings = { version: 8, config: { rules: [], references: {} } };
+  pauseInvoiceCatalogRead?.();
+  pauseInvoiceCatalogRead = null;
+  invoiceCatalogReadStarted = null;
+  const staleResponse = await staleEnable;
+  assert.equal(staleResponse.status, 409);
+  assert.equal((await staleResponse.json() as { message: string }).message, 'SYNC_PREFLIGHT_STALE');
+  assert.equal((await db.syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' } }))?.moyskladToBitrix24, false);
+  const disabled = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/invoices`, {
+    method: 'PATCH',
+    headers: { ...token, 'content-type': 'application/json' },
+    body: JSON.stringify({ bitrix24ToMoysklad: false, moyskladToBitrix24: false, confirmed: true }),
+  });
+  assert.equal(disabled.status, 200);
+  assert.deepEqual(await disabled.json(), { key: 'invoices', bitrix24ToMoysklad: false, moyskladToBitrix24: false });
+});
+
+test('reverse deal preflight validates MySklad-native references and tolerates failed optional endpoints', async () => {
+  const stageId = 'ms-stage-9d3d2d0e';
+  const currencyId = 'ms-currency-a30e9635';
+  fakeDealStages = [stageId];
+  fakeDealCurrencies = [currencyId];
+  fakeOptionalReferenceWarnings = ['employees'];
+  activePreflightSettings = {
+    version: 8,
+    config: {
+      rules: [],
+      references: { namedPairs: [
+        { kind: 'dealStages', bitrix24Id: 'B24_STAGE', moyskladId: stageId, status: 'confirmed' },
+        { kind: 'currencies', bitrix24Id: 'USD', moyskladId: currencyId, status: 'confirmed' },
+      ] },
+      dealOrderRuntime: {
+        nativeOrderNumberingVerified: false,
+        stages: [{ bitrix24StageId: 'B24_STAGE', moyskladId: stageId }],
+        currencies: [{ bitrix24Code: 'USD', moyskladId: currencyId }],
+      },
+    },
+  };
+  const token = { authorization: 'Bearer admin-test-token' };
+  const valid = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/deals-orders/preflight?direction=moyskladToBitrix24`, { headers: token });
+  const validReport = await valid.json() as { canEnable: boolean; blockers: Array<{ code: string }>; warnings: Array<{ code: string }> };
+  assert.equal(validReport.canEnable, true);
+  assert.equal(validReport.blockers.length, 0);
+  assert.ok(validReport.warnings.some(({ code }) => code === 'OPTIONAL_REFERENCE_UNAVAILABLE'));
+  assert.equal(fakeRequiredReferenceReads, 0, 'reverse mapping must not read MySklad order-creation default IDs');
+
+  fakeDealStages = ['unmapped-ms-stage'];
+  const unmapped = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/deals-orders/preflight?direction=moyskladToBitrix24`, { headers: token });
+  const unmappedReport = await unmapped.json() as { canEnable: boolean; blockers: Array<{ code: string }> };
+  assert.equal(unmappedReport.canEnable, false);
+  assert.ok(unmappedReport.blockers.some(({ code }) => code === 'STAGE_MAPPING_UNCONFIRMED'));
+
+  fakeDealStages = [];
+  fakeDealCurrencies = [];
+  const requiredUnavailable = await nativeFetch(`${apiUrl}/api/admin/sync-mode/entities/deals-orders/preflight?direction=moyskladToBitrix24`, { headers: token });
+  const requiredReport = await requiredUnavailable.json() as { canEnable: boolean; blockers: Array<{ code: string }> };
+  assert.equal(requiredReport.canEnable, false);
+  assert.ok(requiredReport.blockers.some(({ code }) => code === 'DEAL_STAGES_UNAVAILABLE'));
+  fakeOptionalReferenceWarnings = [];
 });
 
 test('a disabled direction is skipped once and does not replay after it is re-enabled', async () => {

@@ -92,7 +92,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByText('Версия 1', { exact: true })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'Bitrix24' })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'МойСклад' })).toBeVisible();
-  await expect(page.locator('option[value="smart-invoices"]').first()).toHaveAttribute('disabled', '');
+  await expect(page.locator('option[value="smart-invoices"]').first()).not.toHaveAttribute('disabled', '');
   await page.locator('details.field-advanced-settings > summary').click();
   await expect(page.getByRole('heading', { name: 'Услуги и способы оплаты' })).toBeVisible();
   await expect(page.getByLabel('Пара сущностей группы')).toHaveValue('contacts');
