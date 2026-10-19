@@ -106,6 +106,9 @@ test('the existing provider-write seam blocks missing controlled-test policy and
     setControlledLiveTestWriteCheck(null);
     assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE'), /POLICY_NOT_INITIALIZED/);
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, 'postgres://localhost/sync_issue60_test'));
+    // Legacy call sites use this no-target assertion only as a preflight; it
+    // does not authorize transport, whose final guard checks the exact URL/body.
+    assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE'));
     withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'ms-29', 'client:COMPANY')));
     withControlledLiveEventScope({ ...scope, targetNativeId: 'work-record-9' }, () =>
       assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CHILD_RESOURCE_UPDATE', 'work-record-9', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
@@ -273,7 +276,9 @@ test('final fetch guard binds invoice, deal rows, catalog prices and service mut
     installControlledLiveFetchGuard();
     const cases = [
       { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.deal.update.json', body: { id: 'deal-1' }, target: 'deal-1' },
+      { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.item.update.json', body: { entityTypeId: '2', id: 'deal-item-1' }, target: 'deal-item-1' },
       { provider: 'BITRIX24' as const, entity: 'invoice', path: 'crm.item.update.json', body: { entityTypeId: '31', id: 'invoice-1' }, target: 'invoice-1' },
+      { provider: 'BITRIX24' as const, entity: 'catalog-service', path: 'catalog.product.service.update.json', body: { id: 'service-1' }, target: 'service-1' },
       { provider: 'BITRIX24' as const, entity: 'catalog-product', path: 'catalog.price.update.json', body: { id: 'price-shared', productId: 'product-1' }, target: 'product-1' },
       { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.item.productrow.update.json', body: { id: 'row-shared', ownerId: 'deal-2' }, target: 'deal-2' },
       { provider: 'MOYSKLAD' as const, entity: 'invoice', path: 'entity/invoiceout/invoice-2', body: { name: 'synthetic invoice' }, target: 'invoice-2' },

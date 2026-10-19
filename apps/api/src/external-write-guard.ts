@@ -15,9 +15,11 @@ export function assertApplyExternalWrite(provider: string, operation: string, na
   }
   if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
     if (!controlledWriteCheck) throw new Error('CONTROLLED_LIVE_TEST_POLICY_NOT_INITIALIZED');
-    // Missing IDs are denied: a per-call guard without the exact resource ID
-    // must never inherit permission from a manifest-scoped event.
-    controlledWriteCheck(provider, operation, nativeId, entity);
+    // Some legacy adapters use this as an apply-mode preflight before they
+    // construct the provider request. It carries no target authority; the
+    // final fetch guard classifies and checks the complete request immediately
+    // before transport. Calls that do carry a target are checked here too.
+    if (nativeId !== undefined || entity !== undefined) controlledWriteCheck(provider, operation, nativeId, entity);
   }
 }
 
@@ -76,6 +78,7 @@ function mutationOperation(provider: string, method: string, path: string): stri
     const restMethod = path.split('/').pop()?.replace(/\.json$/i, '') ?? '';
     if (/\.(?:add|create)$/i.test(restMethod)) {
       return /^(?:crm\.(?:company|contact|deal|item)\.add|catalog\.product\.add|crm\.product\.add)$/i.test(restMethod)
+        || restMethod.toLowerCase() === 'catalog.product.service.add'
         ? 'CONTROLLED_CREATE' : 'CONTROLLED_CHILD_CREATE';
     }
     return 'CONTROLLED_UPDATE';
@@ -104,10 +107,15 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
     if (method.startsWith('crm.company.')) return 'client:COMPANY';
     if (method.startsWith('crm.contact.')) return 'client:CONTACT';
     if (method.startsWith('crm.deal.') || method.startsWith('crm.item.productrow.')) return 'deal-order';
-    if (method.startsWith('crm.product.') || method.startsWith('catalog.product.') || method.startsWith('catalog.price.')) return 'catalog-product';
+    if (method.startsWith('crm.product.') || method.startsWith('catalog.price.')) return 'catalog-product';
+    if (method.startsWith('catalog.product.service.')) return 'catalog-service';
+    if (method.startsWith('catalog.product.')) return 'catalog-product';
     if (method.startsWith('crm.invoice.') || method.startsWith('crm.item.')) {
       const form = new URLSearchParams(bodyText);
-      return form.get('entityTypeId') === '31' || form.get('fields[entityTypeId]') === '31' ? 'invoice' : undefined;
+      const entityType = form.get('entityTypeId') ?? form.get('fields[entityTypeId]');
+      if (entityType === '31') return 'invoice';
+      if (entityType === '2') return 'deal-order';
+      return undefined;
     }
     if (method.startsWith('crm.requisite.') || method.startsWith('crm.timeline.comment.')) {
       const form = new URLSearchParams(bodyText);
