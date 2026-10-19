@@ -83,7 +83,6 @@ const entityOptions = [
 ] as const;
 
 const deferredEntities = new Set<string>();
-const groupUnsupportedEntities = new Set(['smart-invoices']);
 const requisiteFields: Array<[string, string]> = [
   ['RQ_COMPANY_NAME', 'Краткое наименование'], ['RQ_COMPANY_FULL_NAME', 'Полное наименование'], ['RQ_INN', 'ИНН'],
   ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OGRNIP', 'ОГРНИП'], ['RQ_OKPO', 'ОКПО'],
@@ -212,6 +211,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [previewError, setPreviewError] = useState('');
   const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
+  const [groupFieldMetadata, setGroupFieldMetadata] = useState<FieldMetadata | null>(null);
+  const [groupMetadataLoading, setGroupMetadataLoading] = useState(false);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [metadataError, setMetadataError] = useState('');
   const [autoMatchSummary, setAutoMatchSummary] = useState<AutoMatchSummary | null>(null);
@@ -349,6 +350,20 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   useEffect(() => { void loadFieldMetadata(mappingEntity); }, [mappingEntity]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setGroupMetadataLoading(true);
+    fetch(`${endpoint}/fields?entity=${encodeURIComponent(groupForm.entity)}`, { headers })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json() as Promise<FieldMetadata>;
+      })
+      .then((metadata) => { if (!cancelled) setGroupFieldMetadata(metadata); })
+      .catch(() => { if (!cancelled) setGroupFieldMetadata(null); })
+      .finally(() => { if (!cancelled) setGroupMetadataLoading(false); });
+    return () => { cancelled = true; };
+  }, [groupForm.entity, accessToken]);
+
   function addRule() {
     if (!draft) return;
     setAutoMatchSummary(null);
@@ -363,7 +378,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   function addGroup(event: React.FormEvent) {
     event.preventDefault();
-    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
+    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.entity === 'smart-invoices' && groupForm.transformKind !== 'join-non-empty' || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
@@ -621,17 +636,17 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
-          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value) || groupUnsupportedEntities.has(value)}>{label}</option>)}</select></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value, targetField: '', sourceFields: '', ...(event.target.value === 'smart-invoices' ? { transformKind: 'join-non-empty' as const } : {}) })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD" disabled={groupForm.transformKind === 'split-non-empty'}>Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
           <label>Преобразование<select aria-label="Преобразование группы" value={groupForm.transformKind} onChange={(event) => {
             const transformKind = event.target.value as FieldGroup['transform']['kind'];
             setGroupForm({ ...groupForm, transformKind, ...(transformKind === 'split-non-empty' ? { direction: 'MOYSKLAD_TO_BITRIX24' as const } : {}) });
-          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
+          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.entity === 'smart-invoices' || groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
           <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
             const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
             setGroupForm({ ...groupForm, sourceFields: (groupForm.transformKind === 'split-non-empty' ? selected.slice(0, 1) : selected).join(',') });
-          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
-          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          }} disabled={groupMetadataLoading || !groupFieldMetadata || groupFieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? groupFieldMetadata?.bitrix24 : groupFieldMetadata?.moysklad)?.filter((field) => groupForm.entity !== 'smart-invoices' || !['customerOrder', 'parentId2'].includes(field.code)).map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={groupMetadataLoading || !groupFieldMetadata || groupFieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? groupFieldMetadata?.moysklad : groupFieldMetadata?.bitrix24)?.filter((field) => groupForm.entity !== 'smart-invoices' || !['customerOrder', 'parentId2'].includes(field.code)).map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           {groupForm.transformKind === 'split-non-empty' && <label>Тип значения Bitrix24<select aria-label="Тип значения Bitrix24" value={groupForm.valueType} onChange={(event) => setGroupForm({ ...groupForm, valueType: event.target.value })}><option value="">Выберите тип</option>{['WORK', 'HOME', 'MOBILE', 'MAILING', 'OTHER', 'FAX', 'PAGER'].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>}
           <button type="submit" className="button-secondary">Добавить составное правило</button>

@@ -24,6 +24,7 @@ let db: DatabaseService;
 let server: Server;
 let base = '';
 let processor: InvoiceEventProcessor;
+let settingsAdapter: { eventConfig: (eventId: string) => Promise<unknown>; transformField: typeof FieldSettingsService.prototype.transformField };
 let oldMode: string | undefined;
 let oldBitrixBase: string | undefined;
 let oldMoyskladBase: string | undefined;
@@ -69,12 +70,12 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = new URL('rest/', base).href;
   process.env.MOYSKLAD_API_BASE_URL = new URL('api/remap/1.2/', base).href;
   process.env.MOYSKLAD_API_TOKEN = 'invoice-fake-provider-only';
-  const settings = {
+  settingsAdapter = {
     eventConfig: async () => ({ version: 1, config: activeFieldConfig }),
     transformField: FieldSettingsService.prototype.transformField,
   };
   const recovery = { launchBoundary: async () => launchBoundary, assertReady: async () => true };
-  processor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settings as never, new SyncModeService(db), recovery as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db));
+  processor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db), recovery as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db));
 });
 
 after(async () => {
@@ -445,6 +446,61 @@ test('invoice creation retries a transient provider failure using the same sourc
   await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
   assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 1);
+});
+
+test('invoice group saved through field settings is reloaded and consumed by invoice runtime', async () => {
+  const provider = {
+    fieldCatalogs: async (_token: string, entity: string) => entity === 'smart-invoices' ? {
+      bitrix24: [
+        { code: 'title', writable: true }, { code: 'description', writable: true },
+        { code: 'parentId2', writable: true },
+      ],
+      moysklad: [
+        { code: 'name', writable: true }, { code: 'description', writable: true },
+        { code: 'customerOrder', writable: true },
+      ],
+    } : { bitrix24: [], moysklad: [] },
+  };
+  assert.ok((await provider.fieldCatalogs('synthetic-invoice-settings-token', 'smart-invoices')).bitrix24.some((field) => field.code === 'title'));
+  const settings = new FieldSettingsService(db, provider as never, {} as never);
+  const originalEventConfig = settingsAdapter.eventConfig;
+  const current = await settings.active();
+  const saved = await settings.save({
+    ...current.config,
+    rules: [],
+    groups: [{ id: `invoice55-${suffix}-saved-join`, entity: 'smart-invoices',
+      direction: 'BITRIX24_TO_MOYSKLAD', targetField: 'name', sourceFields: ['description'],
+      criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' ' } }],
+  }, 'synthetic-invoice-settings-token');
+  const reloaded = await settings.version(saved.version);
+  assert.deepEqual(reloaded.config.groups, saved.config.groups, 'a persisted version read reloads the operator-saved group');
+  settingsAdapter.eventConfig = (eventId) => settings.eventConfig(eventId);
+  try {
+    const sourceId = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    bitrixInvoices.set(sourceId, { id: sourceId, title: 'Saved customer', description: 'Saved invoice', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    const event = await settings.saveAcceptedEvent({ source: 'BITRIX24', deliveryKey: `invoice55-${suffix}-saved-group-${sourceId}`,
+      eventType: 'ONCRMDYNAMICITEMADD', externalEntityType: 'invoice', externalEntityId: sourceId,
+      payload: {}, directionDisabled: false });
+    const pinned = await settings.eventConfig(event.id);
+    assert.equal(pinned.version, saved.version);
+    assert.deepEqual(pinned.config.groups, saved.config.groups);
+    const processed = await processor.process(event.id);
+    assert.equal(processed?.status, 'SUCCEEDED', JSON.stringify(await db.inboundEvent.findUnique({ where: { id: event.id } })));
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'Saved invoice', 'runtime consumes the persisted group, not an injected fieldConfig seed');
+
+    const invalidGroups = [
+      { id: 'invalid-invoice-split', entity: 'smart-invoices', direction: 'MOYSKLAD_TO_BITRIX24', targetField: 'title', sourceFields: ['description'], criticality: 'optional', transform: { kind: 'split-non-empty', separator: ';', valueType: 'WORK' } },
+      { id: 'invalid-invoice-order-target', entity: 'smart-invoices', direction: 'BITRIX24_TO_MOYSKLAD', targetField: 'customerOrder', sourceFields: ['title'], criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' ' } },
+      { id: 'invalid-invoice-deal-source', entity: 'smart-invoices', direction: 'BITRIX24_TO_MOYSKLAD', targetField: 'name', sourceFields: ['parentId2'], criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' ' } },
+    ];
+    for (const group of invalidGroups) {
+      await assert.rejects(settings.save({ ...saved.config, groups: [group] }, 'synthetic-invoice-settings-token'));
+      assert.equal((await settings.active()).version, saved.version, 'invalid relationships and transforms do not create active settings versions');
+    }
+  } finally {
+    settingsAdapter.eventConfig = originalEventConfig;
+  }
 });
 
 async function createEvent(id: string, source: string, eventType: string, externalEntityType: string, externalEntityId: string) {
