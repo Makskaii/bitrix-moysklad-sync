@@ -41,15 +41,37 @@ export class ReadOnlyFieldDataProvider {
   }
 
   async optionalDealOrderReferenceWarnings(bitrixAccessToken: string): Promise<string[]> {
-    const checks: Array<[string, Promise<unknown>]> = [
-      ['employees', this.bitrixList(bitrixAccessToken, 'user.get')],
-      ['moyskladEmployees', this.moyskladList('/entity/employee')],
-      ['organizations', this.moyskladList('/entity/organization')],
-      ['warehouses', this.moyskladList('/entity/store')],
-      ['projects', this.moyskladList('/entity/project')],
-    ];
+    const checks: Array<[string, Promise<unknown>]> = [['projects', this.moyskladList('/entity/project')]];
     const results = await Promise.allSettled(checks.map(([, request]) => request));
     return results.flatMap((result, index) => result.status === 'rejected' ? [checks[index]![0]] : []);
+  }
+
+  async verifyRequiredDealOrderReferences(config: Record<string, unknown> | undefined): Promise<string[]> {
+    const runtime = isRecord(config?.dealOrderRuntime) ? config.dealOrderRuntime : {};
+    const targets: Array<{ type: 'organization' | 'store' | 'employee'; id: string; label: string }> = [
+      { type: 'organization', id: text(runtime.defaultOrganizationId), label: 'default organization' },
+      { type: 'store', id: text(runtime.defaultStoreId), label: 'default store' },
+      { type: 'employee', id: text(runtime.defaultEmployeeId), label: 'default employee' },
+    ];
+    for (const [field, type, label] of [
+      ['organizations', 'organization', 'organization mapping'],
+      ['stores', 'store', 'store mapping'],
+      ['employees', 'employee', 'employee mapping'],
+    ] as const) {
+      const pairs = Array.isArray(runtime[field]) ? runtime[field] : [];
+      for (const pair of pairs) if (isRecord(pair) && typeof pair.moyskladId === 'string') {
+        targets.push({ type, id: pair.moyskladId, label });
+      }
+    }
+    const uniqueTargets = [...new Map(targets.filter((target) => target.id).map((target) => [`${target.type}:${target.id}`, target])).values()];
+    const checks = await Promise.all(uniqueTargets.map(async (target) => {
+      try {
+        const record = await this.moyskladGet(`/entity/${target.type}/${encodeURIComponent(target.id)}`);
+        if (isRecord(record) && record.id === target.id && isRecord(record.meta) && record.meta.type === target.type) return null;
+      } catch { /* A selected value that cannot be verified is unsafe for writes. */ }
+      return target.label;
+    }));
+    return [...new Set(checks.filter((label): label is string => label !== null))];
   }
 
   async productCatalogReadiness(bitrixAccessToken: string): Promise<{ units: string[]; productCatalogs: string[] }> {

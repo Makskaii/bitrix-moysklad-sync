@@ -169,6 +169,7 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
   };
   let requestedDirection = '';
   let failRequiredCatalogs = false;
+  let failSelectedReference = false;
   const service = new SyncModeService({} as never, undefined, undefined,
     { active: async () => ({ version: 4, config: configuration }) } as never,
     {
@@ -177,7 +178,8 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
         if (failRequiredCatalogs) throw new Error('required stage/currency endpoint failed');
         return { stages: ['ms-stage-uuid'], currencies: ['ms-currency-uuid'] };
       },
-      optionalDealOrderReferenceWarnings: async () => ['employees'],
+      optionalDealOrderReferenceWarnings: async () => ['projects'],
+      verifyRequiredDealOrderReferences: async () => failSelectedReference ? ['default store'] : [],
     } as never,
   );
   const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
@@ -187,6 +189,11 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
     assert.equal(requestedDirection, 'moyskladToBitrix24');
     assert.equal(report.canEnable, true);
     assert.deepEqual(report.warnings.map((warning) => warning.code), ['OPTIONAL_REFERENCE_UNAVAILABLE']);
+    failSelectedReference = true;
+    const invalidSelectedReference = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(invalidSelectedReference.canEnable, false);
+    assert.ok(invalidSelectedReference.blockers.some((blocker) => blocker.code === 'REQUIRED_REFERENCE_UNAVAILABLE'));
+    failSelectedReference = false;
     failRequiredCatalogs = true;
     const blocked = await service.preflightEntityDirection('deals-orders', 'moyskladToBitrix24', 'admin-token');
     assert.equal(blocked.canEnable, false);
@@ -232,6 +239,26 @@ test('settings changing during read-only preflight cannot enable a stale version
     if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
     else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
   }
+});
+
+test('disabling and leaving directions unchanged bypass enable preflight when settings or provider are unavailable', async () => {
+  const directions = { bitrix24ToMoysklad: true, moyskladToBitrix24: false };
+  let writes = 0;
+  const database = {
+    syncDirectionSetting: {
+      upsert: async () => directions,
+      update: async ({ data }: { data: typeof directions }) => { writes += 1; Object.assign(directions, data); return directions; },
+    },
+  };
+  const service = new SyncModeService(database as never, undefined, undefined,
+    { active: async () => { throw new Error('no active field settings'); } } as never,
+    { fieldCatalogs: async () => { throw new Error('API unavailable'); } } as never,
+  );
+  const disabled = await service.setEntityDirections('deals-orders', { bitrix24ToMoysklad: false, moyskladToBitrix24: false });
+  assert.deepEqual(disabled, { key: 'deals-orders', bitrix24ToMoysklad: false, moyskladToBitrix24: false });
+  const unchanged = await service.setEntityDirections('deals-orders', { bitrix24ToMoysklad: false, moyskladToBitrix24: false });
+  assert.deepEqual(unchanged, disabled);
+  assert.equal(writes, 1);
 });
 
 test('PAUSE timestamps the recovery window without scheduling an OFF replay', async () => {

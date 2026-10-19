@@ -148,6 +148,17 @@ export class SyncModeService {
       ...(directions.bitrix24ToMoysklad && !current.bitrix24ToMoysklad ? ['bitrix24ToMoysklad' as const] : []),
       ...(directions.moyskladToBitrix24 && !current.moyskladToBitrix24 ? ['moyskladToBitrix24' as const] : []),
     ];
+    if (candidates.length === 0) {
+      if (directions.bitrix24ToMoysklad === current.bitrix24ToMoysklad && directions.moyskladToBitrix24 === current.moyskladToBitrix24) {
+        return { key: entityKey, ...current };
+      }
+      const setting = await this.database.syncDirectionSetting.update({
+        where: { entityKey },
+        data: directions,
+        select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+      });
+      return { key: entityKey, ...setting };
+    }
     const reports: EnablePreflightReport[] = [];
     for (const direction of candidates) {
       const report = await this.preflightEntityDirection(entityKey, direction, bitrixAccessToken);
@@ -188,6 +199,7 @@ export class SyncModeService {
     let applicableUnits: string[] = [];
     let availableProductCatalogIds: string[] = [];
     let optionalEndpointWarnings: string[] = [];
+    let unverifiedRequiredReferences: string[] = [];
     if (this.fieldData && bitrixAccessToken) {
       try {
         if (entityKey === 'deals-orders') {
@@ -195,6 +207,7 @@ export class SyncModeService {
           applicableStages = catalogs.stages;
           applicableCurrencies = catalogs.currencies;
           optionalEndpointWarnings = await this.fieldData.optionalDealOrderReferenceWarnings(bitrixAccessToken);
+          unverifiedRequiredReferences = await this.fieldData.verifyRequiredDealOrderReferences(settings?.config);
         } else if (entityKey === 'products-variations') {
           const catalogs = await this.fieldData.productCatalogReadiness(bitrixAccessToken);
           applicableUnits = catalogs.units;
@@ -209,13 +222,14 @@ export class SyncModeService {
     }
 
     const incomingSource = direction === 'bitrix24ToMoysklad' ? 'BITRIX24_EVENT_APPLICATION_TOKEN' : 'MOYSKLAD_WEBHOOK_SECRET';
-    const optionalReferenceWarnings = collectOptionalReferenceWarnings(settings?.config);
+    const optionalReferenceWarnings = collectOptionalReferenceWarnings(settings?.config, entityKey);
     return evaluateEnablePreflight({
       entityKey, direction, settings, apiAccess,
       webhookAuthConfigured: Boolean(process.env[incomingSource]),
       applicableStages, applicableCurrencies, applicableUnits, availableProductCatalogIds,
       optionalReferenceWarnings,
       optionalEndpointWarnings,
+      unverifiedRequiredReferences,
     });
   }
 
@@ -330,10 +344,10 @@ function isUniqueConstraintViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002';
 }
 
-function collectOptionalReferenceWarnings(config: Record<string, unknown> | undefined): string[] {
+function collectOptionalReferenceWarnings(config: Record<string, unknown> | undefined, entityKey: string): string[] {
   if (!config || typeof config.references !== 'object' || config.references === null) return [];
   const references = config.references as Record<string, unknown>;
-  const optionalKinds = ['currencies', 'organizations', 'warehouses', 'employees', 'projects'];
+  const optionalKinds = entityKey === 'deals-orders' ? ['projects'] : [];
   const pairs = Array.isArray(references.namedPairs) ? references.namedPairs : [];
   return optionalKinds.filter((kind) => {
     const applicable = pairs.filter((pair) => typeof pair === 'object' && pair !== null && 'kind' in pair && pair.kind === kind);
