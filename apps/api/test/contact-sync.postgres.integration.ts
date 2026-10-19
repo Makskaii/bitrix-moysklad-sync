@@ -527,11 +527,11 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   nightlyProviderQueries.length = 0;
   try {
     freezeTime('2026-10-05T22:00:00.000Z');
-    await waitForNightlyStatus('complete_with_limitations');
+    await waitForNightlyStatus('awaiting_processing');
     const status = await readRecoveryStatus();
     assert.deepEqual(status.nightly, {
       scheduledDate: '2026-10-06',
-      status: 'complete_with_limitations',
+      status: 'awaiting_processing',
       from: '2026-10-04T22:00:00.000Z',
       through: '2026-10-05T22:00:00.000Z',
       provider: 'COMPLETE',
@@ -543,7 +543,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
       moyskladStatus: 'complete',
       retryAfter: null,
       attempts: 1,
-      error: 'Nightly feeds cover active Bitrix24 contact/company pairs and MoySklad contact persons attached to active company pairs. Delete and archival changes remain outside this slice.',
+      error: 'Provider feeds are queued for active pairs; waiting for event processing. Delete and archival changes remain outside this slice.',
     });
     const bitrixQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query));
     assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [3, 4]);
@@ -598,7 +598,7 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
   nightlyProviderQueries.length = 0;
   try {
     freezeTime('2026-10-08T22:00:00.000Z');
-    await waitForNightlyStatus('complete_with_limitations');
+    await waitForNightlyStatus('awaiting_processing');
     const events = await database.inboundEvent.findMany({ where: { source: 'BITRIX24', externalEntityId: bitrixCompanyId } });
     assert.equal(events.length, 1);
     assert.equal(events[0].eventType, 'ONCRMCOMPANYUPDATE');
@@ -730,7 +730,7 @@ test('lease loss during a provider call replays the page without duplicate durab
     holdNightlyCompanyFeed = false;
     await run();
     state = await database.syncSetting.findUnique({ where: { id: 'global' } });
-    assert.equal(state?.nightlyStatus, 'complete_with_limitations');
+    assert.equal(state?.nightlyStatus, 'awaiting_processing');
     assert.equal(await database.inboundEvent.count({ where: { source: 'BITRIX24', externalEntityId: bitrixId } }), 1);
   } finally {
     releaseNightlyCompanyFeed();
