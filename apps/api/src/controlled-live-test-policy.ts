@@ -128,6 +128,30 @@ export function registerControlledTargetReadback(provider: ControlledProvider, t
   scope.pendingTargetSystem = provider;
 }
 
+/** Last-boundary create check: a run-scoped CREATE must carry the exact marker
+ * in the target entity's own name/title field, not merely in arbitrary text. */
+export function assertControlledCreateMarker(provider: string, path: string, bodyText: string, entity: string | undefined): void {
+  const scope = scopeStorage.getStore();
+  if (!scope || scope.phase === 'SOURCE_READ' || !scope.admittedSourceName || entity !== scope.entity) {
+    throw new Error('CONTROLLED_LIVE_TEST_CREATE_SCOPE_INVALID');
+  }
+  let name: unknown;
+  if (provider === 'MOYSKLAD') {
+    let body: unknown;
+    try { body = JSON.parse(bodyText); } catch { throw new Error('CONTROLLED_LIVE_TEST_CREATE_BODY_INVALID'); }
+    if (isRecord(body)) {
+      const resource = path.split('/').filter(Boolean).at(-1);
+      name = resource === 'customerorder' ? body.description : body.name;
+    }
+  } else if (provider === 'BITRIX24') {
+    const form = new URLSearchParams(bodyText);
+    name = entity === 'client:COMPANY' ? form.get('fields[TITLE]')
+      : entity === 'client:CONTACT' ? form.get('fields[NAME]')
+      : form.get('fields[TITLE]') ?? form.get('fields[title]') ?? form.get('fields[name]');
+  }
+  if (name !== scope.admittedSourceName) throw new Error('CONTROLLED_LIVE_TEST_CREATE_SYNTHETIC_MARKER_REQUIRED');
+}
+
 function parseManifest(value: unknown): ControlledLiveManifest {
   if (!isRecord(value) || typeof value.runId !== 'string' || !/^LIVE-TEST-[0-9TZ-]+-[a-z0-9]{6,}$/i.test(value.runId) ||
       typeof value.testDatabaseName !== 'string' || typeof value.testSchemaName !== 'string' || !Array.isArray(value.records) || value.records.length === 0) {

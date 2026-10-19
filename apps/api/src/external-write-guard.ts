@@ -1,3 +1,5 @@
+import { assertControlledCreateMarker } from './controlled-live-test-policy';
+
 let databaseRecoveryReady = true;
 let controlledWriteCheck: ((provider: string, operation: string, nativeId?: string | null, entity?: string) => void) | null = null;
 
@@ -67,7 +69,9 @@ export function installControlledLiveFetchGuard(): void {
         : await request.clone().text();
       const nativeId = extractMutationTarget(match.provider, relativePath, bodyText);
       const requestEntity = mutationEntity(match.provider, relativePath, bodyText);
-      assertApplyExternalWrite(match.provider, mutationOperation(match.provider, method, relativePath), nativeId, requestEntity);
+      const operation = mutationOperation(match.provider, method, relativePath);
+      if (operation === 'CONTROLLED_CREATE') assertControlledCreateMarker(match.provider, relativePath, bodyText, requestEntity);
+      assertApplyExternalWrite(match.provider, operation, nativeId, requestEntity);
     }
     return originalFetch(request);
   }) as typeof fetch;
@@ -131,6 +135,7 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
   }
   const segments = path.split('/').filter(Boolean);
   if (segments[0] !== 'entity') return undefined;
+  if (segments[1] === 'customerorder' && segments[2] === 'metadata' && segments[3] === 'states') return 'readonly:state';
   if (segments[1] === 'counterparty') {
     if (!segments.includes('contactpersons') && !/"companyType"\s*:\s*"individual"/.test(bodyText)) return 'client:COUNTERPARTY';
     if (segments.includes('contactpersons') || /(?:^|&)companyType=individual(?:&|$)/.test(bodyText)) return 'client:CONTACT';
@@ -140,13 +145,14 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
   if (segments[1] === 'invoiceout') return 'invoice';
   if (segments[1] === 'product') return 'catalog-product';
   if (segments[1] === 'service') return 'catalog-service';
-  return undefined;
+  return segments[1] ? `readonly:${segments[1]}` : undefined;
 }
 
 function extractMutationTarget(provider: string, path: string, bodyText: string): string | null {
   if (provider === 'MOYSKLAD') {
     const segments = path.split('/').filter(Boolean);
     if (segments.length >= 3 && segments[0] === 'entity') {
+      if (segments[1] === 'customerorder' && segments[2] === 'metadata' && segments[3] === 'states' && segments[4]) return decodeURIComponent(segments[4]);
       if (segments[3] === 'contactpersons' && segments[4]) return decodeURIComponent(segments[4]);
       if (segments[3] === 'positions' || segments[3] === 'prices' || segments[3] === 'accounts' || segments[3] === 'attributes') return decodeURIComponent(segments[2]);
       if (segments[2] && segments.length >= 3) return decodeURIComponent(segments[2]);
