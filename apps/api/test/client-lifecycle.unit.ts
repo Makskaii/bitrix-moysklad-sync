@@ -104,7 +104,7 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   assert.equal(records[1]?.active, true);
   assert.equal(records[1]?.lifecycleStatus, 'ACTIVE');
 
-  const invoice = await service.tombstoneByNativeId('MOYSKLAD', 'INVOICE', 'ms-invoice', 'CONFIRMED_PROVIDER_DELETION');
+  const invoice = await service.tombstoneByNativeId('MOYSKLAD', 'INVOICE', 'ms-invoice', 'CONFIRMED_PROVIDER_DELETION', 'invoiceout');
   assert.deepEqual(invoice, { status: 'TOMBSTONED', pairId: 'invoice-pair', changed: true });
   assert.equal(records[2]?.bitrix24Id, '42');
   assert.equal(records[2]?.moyskladId, 'ms-invoice');
@@ -452,6 +452,41 @@ test('restore clears the configured Bitrix24 marker before reactivating the exac
   }
 });
 
+test('catalog product and service reads confirm only the documented missing-item error', async () => {
+  const oldBase = process.env.BITRIX24_REST_BASE_URL;
+  const oldFetch = globalThis.fetch;
+  process.env.BITRIX24_REST_BASE_URL = 'https://fixture.invalid/rest/test/';
+  const service = new ClientLifecycleService({} as never);
+  const readState = (service as unknown as {
+    readDeletionState(source: 'BITRIX24', entity: 'PRODUCT', nativeType: string, id: string, payload: unknown): Promise<string>;
+  }).readDeletionState.bind(service);
+  const responseBody = (error: unknown, error_description: string) => ({ error, error_description });
+  try {
+    for (const scenario of [
+      { nativeType: 'product', description: 'The product does not exist' },
+      { nativeType: 'service', description: 'Услуга не существует' },
+    ]) {
+      globalThis.fetch = async () => Response.json(responseBody(0, scenario.description));
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'DELETED');
+
+      globalThis.fetch = async () => Response.json(responseBody('0', scenario.description), { status: 404 });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'DELETED');
+
+      globalThis.fetch = async () => Response.json(responseBody(0, 'Other errors (e.g., fatal errors)'));
+      await assert.rejects(() => readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), /BITRIX24_API_FAILURE/);
+
+      globalThis.fetch = async () => Response.json(responseBody('200040300040', 'Insufficient rights to read the information block element'));
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'UNCERTAIN');
+
+      globalThis.fetch = async () => Response.json({ result: { [scenario.nativeType]: { id: '42' } } });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'PRESENT');
+    }
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
+  }
+});
+
 test('catalog service lifecycle uses service endpoints for deletion checks, markers, and restore', async () => {
   const oldMode = process.env.SYNC_MODE;
   const oldBase = process.env.BITRIX24_REST_BASE_URL;
@@ -480,7 +515,7 @@ test('catalog service lifecycle uses service endpoints for deletion checks, mark
     if (url.endsWith('/catalog.product.service.get.json')) {
       return serviceExists
         ? Response.json({ result: { service: { id: pair.bitrix24Id } } })
-        : Response.json({ error: 'NOT_FOUND' }, { status: 404 });
+        : Response.json({ error: '0', error_description: 'Услуга не существует' }, { status: 404 });
     }
     if (url.endsWith('/catalog.product.service.update.json')) return Response.json({ result: true });
     throw new Error(`Unexpected Bitrix method ${url}`);

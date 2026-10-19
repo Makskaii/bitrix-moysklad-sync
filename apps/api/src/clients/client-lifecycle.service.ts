@@ -301,10 +301,13 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     if (response.status === 408 || response.status === 429 || response.status >= 500) throw new ProviderFailure('BITRIX24', response.status);
     const result: unknown = await response.json().catch(() => null);
     if (!isRecord(result)) return 'UNCERTAIN';
+    const catalogKind = entityType === 'PRODUCT' && (nativeType === 'product' || nativeType === 'service') ? nativeType : null;
+    if (catalogKind && isBitrixCatalogItemMissing(result, catalogKind)) return 'DELETED';
+    if (catalogKind && response.ok && isBitrixAmbiguousCatalogError(result)) throw new ProviderFailure('BITRIX24', 503);
     if (!response.ok) {
       const description = typeof result.error_description === 'string' ? result.error_description.trim().toLowerCase() : '';
       const notFound = new Set(['not found', 'element not found', 'item not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'service is not found', 'company not found', 'contact not found', 'deal not found', 'product not found', 'service not found']);
-      if (result.error === 'NOT_FOUND' || (typeof result.error !== 'string' && notFound.has(description))) return 'DELETED';
+      if (!catalogKind && (result.error === 'NOT_FOUND' || (typeof result.error !== 'string' && notFound.has(description)))) return 'DELETED';
       return 'UNCERTAIN';
     }
     const nativeResult = isRecord(result.result) && isRecord(result.result.product) ? result.result.product
@@ -618,6 +621,17 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       throw error;
     }
   }
+}
+
+function isBitrixCatalogItemMissing(payload: Record<string, unknown>, kind: 'product' | 'service'): boolean {
+  const error = payload.error;
+  const description = typeof payload.error_description === 'string' ? payload.error_description.trim().toLocaleLowerCase('en-US') : '';
+  const expectedDescription = kind === 'service' ? 'услуга не существует' : 'the product does not exist';
+  return (error === 0 || error === '0') && description === expectedDescription;
+}
+
+function isBitrixAmbiguousCatalogError(payload: Record<string, unknown>): boolean {
+  return (payload.error === 0 || payload.error === '0') && typeof payload.error_description === 'string';
 }
 
 function normalizeReason(value: string): string {
