@@ -245,7 +245,11 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
       }), /TARGET_NOT_IN_MANIFEST/);
       await assert.rejects(fetch('https://unknown.invalid/anything', { method: 'POST', body: '{}' }), /UNCLASSIFIED_EXTERNAL_REQUEST/);
     });
-    assert.equal(calls, 4);
+    await withControlledLiveEventScope(scope, async () => {
+      await fetch('https://guarded-ms.invalid/api/entity/counterparty/ms-29', { method: 'PUT', body: JSON.stringify({ name: 'synthetic update' }) });
+      await assert.rejects(fetch('https://guarded-ms.invalid/api/entity/counterparty/shared-real-id', { method: 'PUT', body: JSON.stringify({ name: 'synthetic update' }) }), /TARGET_NOT_IN_MANIFEST/);
+    });
+    assert.equal(calls, 5);
   } finally {
     globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);

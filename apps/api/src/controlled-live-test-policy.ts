@@ -56,7 +56,7 @@ export function createControlledLiveTestPolicy(
     if (scope.runId !== manifest.runId) throw new Error('CONTROLLED_LIVE_TEST_RUN_ID_MISMATCH');
     if (!isProvider(providerValue)) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_INVALID');
     if (operation === 'CONTROLLED_READ') {
-      const entityMatches = requestEntity === scope.entity || (requestEntity === 'client:COUNTERPARTY' && ['client:COMPANY', 'client:CONTACT'].includes(scope.entity));
+      const entityMatches = entityMatchesScope(requestEntity, scope.entity);
       if (!entityMatches || !nativeId) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
       const directRead = providerValue === scope.sourceSystem && nativeId === scope.sourceNativeId ||
         providerValue === scope.targetSystem && nativeId === scope.targetNativeId ||
@@ -68,7 +68,7 @@ export function createControlledLiveTestPolicy(
       if (!sourceAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_NOT_IN_MANIFEST');
       return;
     }
-    if (!requestEntity || requestEntity !== scope.entity) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
+    if (!entityMatchesScope(requestEntity, scope.entity)) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
     const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation) && !/CHILD/i.test(operation);
     const allowed = manifest.records.some((record) => record.entity === scope.entity &&
       ((record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
@@ -145,4 +145,7 @@ function databaseTarget(value: string | undefined): { name: string; host: string
   return { name: decodeURIComponent(url.pathname.replace(/^\//, '')), host: url.hostname.toLowerCase().replace(/^\[|\]$/g, '') };
 }
 function isProvider(value: unknown): value is ControlledProvider { return value === 'BITRIX24' || value === 'MOYSKLAD'; }
+function entityMatchesScope(requestEntity: string | undefined, scopeEntity: string): boolean {
+  return requestEntity === scopeEntity || (requestEntity === 'client:COUNTERPARTY' && ['client:COMPANY', 'client:CONTACT'].includes(scopeEntity));
+}
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
