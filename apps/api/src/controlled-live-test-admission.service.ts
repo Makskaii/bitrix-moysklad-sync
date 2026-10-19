@@ -65,13 +65,12 @@ export class ControlledLiveTestAdmissionService {
     this.enterScope(existing);
   }
 
-  async bindCreatedTarget(eventId: string, targetNativeId: string, verifiedTargetNativeId: string, verifiedTargetName: string, targetCreatedAt: Date): Promise<void> {
+  async bindCreatedTarget(eventId: string, targetNativeId: string, verifiedTargetNativeId: string, verifiedTargetName: string, targetCreatedAt: Date, verifiedTargetRunMarker?: string): Promise<void> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
-    const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && (
-      candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) && candidate.targetSystem === admission.targetSystem ||
-      candidate.targetSystem === admission.sourceSystem && candidate.targetNativeId === admission.sourceNativeId && candidate.sourceSystem === admission.targetSystem));
-    if (!admission || !record || !targetNativeId || verifiedTargetNativeId !== targetNativeId || verifiedTargetName !== admission.sourceName ||
+    const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
+    const targetIdentityVerified = admission?.entity === 'deal-order' ? verifiedTargetName === admission.sourceName || verifiedTargetRunMarker === admission.runId : verifiedTargetName === admission?.sourceName;
+    if (!admission || !record || !targetNativeId || verifiedTargetNativeId !== targetNativeId || !targetIdentityVerified ||
         !Number.isFinite(targetCreatedAt.getTime()) || targetCreatedAt.getTime() < new Date(record.createdAfterUtc).getTime() || targetCreatedAt.getTime() > Date.now()) {
       throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID');
     }
@@ -90,9 +89,7 @@ export class ControlledLiveTestAdmissionService {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity &&
-      candidate.name === admission.sourceName && (
-        candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) ||
-        candidate.targetSystem === admission.sourceSystem && candidate.targetNativeId === admission.sourceNativeId));
+      candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
     if (!admission || !record || admission.targetSystem !== targetSystem || admission.targetNativeId !== targetNativeId ||
         (record.targetNativeId !== null && record.targetNativeId !== targetNativeId)) {
       throw new Error('CONTROLLED_LIVE_TEST_TARGET_NOT_MANIFESTED');
@@ -108,6 +105,14 @@ export class ControlledLiveTestAdmissionService {
     if (!admission || !record || admission.targetNativeId !== null || admission.targetSystem !== targetSystem || admission.entity !== entity) {
       throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
     }
+  }
+
+  async allowsSourceSideWrite(eventId: string): Promise<boolean> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
+    const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    if (!admission || admission.runId !== this.manifest.runId) return false;
+    const record = this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
+    return record?.direction === 'BOTH';
   }
 
   async runForEvent<T>(eventId: string, action: () => Promise<T>): Promise<T> {
@@ -173,4 +178,12 @@ function controlledManifestEntity(value: string): string {
   if (['client:COMPANY', 'client:CONTACT', 'deal-order', 'invoice', 'catalog-product', 'catalog-service'].includes(value)) return value;
   if (value === 'COMPANY' || value === 'CONTACT') return `client:${value}`;
   throw new Error('CONTROLLED_LIVE_TEST_ENTITY_UNSUPPORTED');
+}
+
+function manifestMatchesAdmission(record: any, admission: any): boolean {
+  const forward = record.sourceSystem === admission.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === admission.sourceNativeId) &&
+    record.targetSystem === admission.targetSystem && (record.targetNativeId === null || record.targetNativeId === admission.targetNativeId);
+  const reverse = record.direction === 'BOTH' && record.targetSystem === admission.sourceSystem && (record.targetNativeId === null || record.targetNativeId === admission.sourceNativeId) &&
+    record.sourceSystem === admission.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === admission.targetNativeId);
+  return forward || reverse;
 }

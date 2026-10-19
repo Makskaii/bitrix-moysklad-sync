@@ -17,9 +17,9 @@ Current gate state: **BLOCKED for live acceptance**. Offline build, fake-HTTP/br
 
 ## Local controlled-write guard implementation status
 
-The isolated candidate now has a schema-backed `ControlledTestAdmission` ledger and a source-admission path for the client vertical. Its event worker freshly reads the source, verifies the provider-returned native ID, exact manifest entity/system/ID/name and creation boundary, then persists the admission before proceeding. A manifest-reserved target create is permitted only with no target ID bound; the target's returned ID is then freshly read, verified against the exact synthetic name and creation window, and bound durably. A later echo/restart can use that frozen pair, but only the exact provider/native ID is allowed. Database uniqueness constraints prevent duplicate source/target bindings. A transport-level `fetch` guard is also installed only in explicit isolated test mode; it denies unknown mutation hosts and missing/mismatched target IDs. Normal runtime is not modified when the mode is off.
+The isolated candidate now has a schema-backed `ControlledTestAdmission` ledger and a central provider transport guard. Controlled mode requires an explicitly isolated instance, apply mode, an absolute manifest path, and a dedicated local PostgreSQL database plus schema whose exact names match the manifest. The source admission path now covers client, deal/order, invoice, and catalog product/service processors: each current source read is checked against the exact entity/provider/native ID, run marker, and creation boundary before durable admission. Product and invoice target creation bind only after provider readback; deal/order create flows now thread the admitted scope and require exact marker/readback binding. Manifest-declared read-only dependencies are exact provider/entity/native-ID entries and cannot authorize writes. `direction` is enforced (`BITRIX24_TO_MOYSKLAD`, `MOYSKLAD_TO_BITRIX24`, or explicitly approved `BOTH`); source-side writeback is limited to `BOTH`. Normal runtime is unchanged when controlled mode is off.
 
-The fake-provider client vertical and policy tests pass locally (11 tests), including target-name override, Request-body parsing, exact target/entity enforcement, readback/bind, restart/reverse update, forged source ID, wrong/shared target IDs, concurrency, unclassified-host denial, and exact-owner-ID transport checks for invoice, deal row, catalog-price and service mutations. The provider-specific `fetch` wrapper is the final mandatory mutation boundary; legacy preflight assertions that do not yet supply an ID/entity do not authorize transport and must still pass that final manifest/entity/native-ID check. The isolated PostgreSQL admission test is present, but could not currently authenticate to the retained local test instance; it must be rerun with the local disposable-DB helper credentials. This remains an implementation candidate, not a live-ready harness: positive end-to-end event processing/admission is implemented only for the client vertical; exact transport-boundary positives are not substitutes for processor-level proofs. Deal/order, invoice, catalog, lifecycle, and timeline event admission/dispatch paths, exhaustive adapter inventory/coverage, combined integration, independent review, and live gates remain outstanding. Never enable this on the production service. No provider traffic, credentials, hook/configuration changes, deployment, or real CRM writes are authorized or performed by these tests.
+Offline evidence to date: production and test TypeScript builds pass; client/product/deal source-admission policy tests pass; the isolated PG schema has all 36 migrations and tests durable admission/binding/restart plus deal/order, invoice, and catalog product admissions. Fake-HTTP transport tests exercise exact owner IDs for invoice, deal rows, catalog prices, services, requisites, and timeline comments. This is still not a live-ready harness: invoice/deal full fake-provider processor CREATE→readback→echo cases, complete lifecycle/timeline positives, exhaustive adapter inventory, a fresh combined suite, independent review, and all live gates remain outstanding. The PG tests used only local PostgreSQL and fake provider responses. No live provider traffic, hooks, service settings, deployment, or real CRM writes were performed or authorized.
 
 ## Capability/scope restrictions
 
@@ -33,48 +33,27 @@ The fake-provider client vertical and policy tests pass locally (11 tests), incl
 
 ## Synthetic manifest format
 
-Create a restricted, run-specific manifest only after the go/no-go gates. Store no credentials, secret URLs, auth query parameters, customer data, or tokens. The example is a schema/template and contains no real provider identifiers:
+The runtime manifest is a restricted, run-specific file. Store no credentials, secret URLs, auth query parameters, customer data, or tokens. It is separate from the operator evidence ledger below. Names and provider IDs shown here are placeholders:
 
 ```json
 {
   "runId": "LIVE-TEST-<UTC-YYYYMMDDTHHMMSSZ>-<random-suffix>",
-  "owner": "<named operator>",
-  "reviewer": "<independent observer>",
-  "service": {
-    "versionSha": "<approved combined SHA>",
-    "baseUrl": "<approved non-secret service origin>",
-    "windowStartUtc": "<timestamp>",
-    "windowEndUtc": "<timestamp>"
-  },
-  "writerExclusion": {
-    "htmlStudioDisabled": false,
-    "backgroundProcessesReviewed": false,
-    "evidenceReference": "<change record, not a secret>"
-  },
-  "settings": {
-    "version": null,
-    "scopes": [],
-    "preflightEvidence": []
-  },
+  "testDatabaseName": "sync_issue60_test_<unique-suffix>",
+  "testSchemaName": "issue60_test_<unique-suffix>",
   "records": [
     {
-      "entity": "<client|deal-order|invoice|catalog-product|catalog-service>",
+      "entity": "<client:COMPANY|client:CONTACT|deal-order|invoice|catalog-product|catalog-service>",
       "direction": "BITRIX24_TO_MOYSKLAD",
       "name": "тест <runId> <scenario>",
       "syntheticOnly": true,
-      "source": { "system": "<Bitrix24|MoySklad>", "nativeId": "<filled-after-approved-create>", "url": "<record-url>" },
-      "target": { "system": "<Bitrix24|MoySklad>", "nativeId": "<filled-after-genuine-webhook>", "url": "<record-url>" },
-      "pairId": "<persisted-pair-id>",
-      "scenario": "<expected operation and result>",
-      "before": {},
-      "after": {},
-      "providerEvent": { "genuineDeliveryObserved": false, "eventType": null, "correlationId": null, "receivedAtUtc": null },
-      "serviceEvidence": { "queueId": null, "currentRead": null, "settingsVersion": null, "writeReadback": null, "journalReference": null },
-      "disposition": "retain"
+      "sourceSystem": "BITRIX24",
+      "sourceNativeId": "<exact-source-id-or-null-for-approved-create>",
+      "targetSystem": "MOYSKLAD",
+      "targetNativeId": null,
+      "createdAfterUtc": "<UTC-run-boundary>",
+      "readOnlyDependencies": []
     }
-  ],
-  "finalConfigurationEvidence": null,
-  "remainingTestRecords": []
+  ]
 }
 ```
 

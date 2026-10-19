@@ -42,6 +42,19 @@ export class DryRunDocumentReader {
     return system === 'BITRIX24' ? parseTimestamp(raw) : parseMoySkladTimestamp(raw);
   }
 
+  async readDealOrderForControlledAdmission(system: 'BITRIX24' | 'MOYSKLAD', id: string): Promise<{ nativeId: string; name: string; createdAt: Date } | null> {
+    const record = system === 'BITRIX24'
+      ? await this.readBitrix24DealForBaseline(id)
+      : await this.readMoySkladCustomerOrderForBaseline(id);
+    const nativeId = system === 'BITRIX24' ? String(record.ID ?? record.id ?? '') : String(record.id ?? '');
+    const nameValue = system === 'BITRIX24' ? record.TITLE ?? record.title ?? record.name : record.name;
+    const name = typeof nameValue === 'string' ? nameValue : '';
+    const rawCreated = system === 'BITRIX24' ? record.DATE_CREATE : record.created;
+    const createdAt = system === 'BITRIX24' ? parseTimestamp(rawCreated) : parseMoySkladTimestamp(rawCreated);
+    if (nativeId !== id || !name.trim() || !createdAt) return null;
+    return { nativeId, name, createdAt };
+  }
+
   async readMoySkladCustomerOrder(id: string): Promise<Record<string, unknown>> {
     assertDryServerMode();
     return this.readMoySkladCustomerOrderForBaseline(id);

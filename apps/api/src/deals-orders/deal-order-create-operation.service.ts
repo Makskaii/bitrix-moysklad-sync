@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database.service';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 type CustomerOrderPosition = {
   assortment: { meta: { type: string; href: string } };
@@ -53,7 +54,7 @@ export class DealOrderPairConflictError extends Error {
 /** Durable, retry-safe MySklad creation for a fully preflighted new deal. */
 @Injectable()
 export class DealOrderCreateOperationService {
-  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService) {}
+  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
 
   /** Record that a new B24 deal is waiting for complete dependencies. This is
    * deliberately separate from the vendor POST: no external document exists
@@ -161,6 +162,7 @@ export class DealOrderCreateOperationService {
         orderId = created.id;
       }
 
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('MOYSKLAD', orderId);
       const order = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
@@ -172,7 +174,14 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
-      await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => writeBitrixOrderNumber(input.bitrix24DealId, order.name));
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
+        const createdAt = parseMoySkladCreatedAt(order.created);
+        if (order.description !== scope.admittedSourceName || !createdAt) throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID');
+        await this.controlledAdmission.bindCreatedTarget(input.eventId, orderId, orderId, order.name, createdAt, scope.runId);
+      }
+      const shouldWriteSourceNumber = !this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled' || await this.controlledAdmission.allowsSourceSideWrite(input.eventId);
+      if (shouldWriteSourceNumber) await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => writeBitrixOrderNumber(input.bitrix24DealId, order.name));
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
     } catch (error) {
@@ -585,3 +594,9 @@ function isStateHref(value: unknown, base: URL): value is string {
 }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isUniqueConstraintViolation(error: unknown): boolean { return isRecord(error) && error.code === 'P2002'; }
+function parseMoySkladCreatedAt(value: unknown): Date | null {
+  if (typeof value !== 'string') return null;
+  const local = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)$/.exec(value);
+  const date = new Date(local ? `${local[1]}T${local[2]}+03:00` : value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}

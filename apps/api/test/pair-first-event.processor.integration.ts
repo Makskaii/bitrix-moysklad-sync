@@ -1,7 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DealOrderBaselineService } from '../src/deals-orders/deal-order-baseline.service';
 import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
+import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 
 const pair = {
   id: 'pair-1', entityType: 'DEAL', bitrix24Id: 'deal-1', moyskladId: 'order-1',
@@ -286,4 +290,53 @@ test('a document with no client is held only when no service counterparty is con
   }
   assert.equal(state.event.status, 'MANUAL_REVIEW');
   assert.equal(state.event.lastErrorCategory, 'SERVICE_COUNTERPARTY_NOT_CONFIGURED');
+});
+
+test('controlled deal event verifies the current source, persists admission, then rehydrates scope for worker dispatch', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-deal-event-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const runId = 'LIVE-TEST-20261019T120000Z-deal01';
+  const name = `тест ${runId} deal`;
+  const now = new Date();
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
+    manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath; process.env.DATABASE_URL = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test'; process.env.SYNC_MODE = 'apply';
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+    entity: 'deal-order', direction: 'BOTH', name, syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: 'deal-1',
+    targetSystem: 'MOYSKLAD', targetNativeId: 'order-1', createdAfterUtc: new Date(now.getTime() - 10_000).toISOString(),
+  }] }), 'utf8');
+  const event: any = { id: 'event-1', source: 'BITRIX24', eventType: 'ONCRMDEALUPDATE', externalEntityType: 'deal', externalEntityId: 'deal-1', status: 'RECEIVED', attempts: 0 };
+  const admissions = new Map<string, any>();
+  const database: any = {
+    inboundEvent: { findUnique: async () => event, updateMany: async ({ data }: any) => { Object.assign(event, data); return { count: 1 }; } },
+    $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work(database),
+    controlledTestAdmission: {
+      findMany: async ({ where }: any) => [...admissions.values()].filter((row) => row.runId === where.runId && row.entity === where.entity),
+      findUnique: async ({ where }: any) => admissions.get(where.eventId) ?? null,
+      findFirst: async () => null,
+      upsert: async ({ where, create }: any) => { if (!admissions.has(where.eventId)) admissions.set(where.eventId, { ...create }); return admissions.get(where.eventId); },
+      updateMany: async () => ({ count: 0 }),
+    },
+  };
+  try {
+    const admission = new ControlledLiveTestAdmissionService(database);
+    let resolves = 0;
+    const processor = new PairFirstEventProcessor(database, { resolve: async () => { resolves += 1; return { status: 'confirmed', pair }; } } as never,
+      undefined, undefined, undefined, undefined, { read: async () => ({ mode: 'on' }) } as never, undefined,
+      { readDealOrderForControlledAdmission: async () => ({ nativeId: 'deal-1', name, createdAt: now }), readDealOrderCreationTimestamp: async () => now } as never,
+      { launchBoundary: async () => new Date(now.getTime() - 1_000) } as never,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, admission);
+    const result = await processor.process('event-1');
+    assert.equal(result?.status, 'confirmed');
+    assert.equal(resolves, 1);
+    assert.equal(admissions.get('event-1')?.entity, 'deal-order');
+    assert.equal(admissions.get('event-1')?.sourceNativeId, 'deal-1');
+    assert.equal(admissions.get('event-1')?.targetNativeId, 'order-1');
+  } finally {
+    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.manifest], ['DATABASE_URL', previous.database], ['SYNC_MODE', previous.sync]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
 });

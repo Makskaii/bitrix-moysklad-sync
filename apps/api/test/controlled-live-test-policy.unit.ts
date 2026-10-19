@@ -47,6 +47,7 @@ test('a mutation is allowed only for the exact current run, source, entity, prov
   const assertWrite = createControlledLiveTestPolicy(manifest, testDatabaseUrl);
   assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /EVENT_SCOPE_REQUIRED/);
   withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY')));
+  withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope(scope, () => assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', undefined, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   withControlledLiveEventScope({ ...scope, targetNativeId: 'shared-customer-1' }, () =>
     assert.throws(() => assertWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
@@ -72,7 +73,10 @@ test('one-way manifest direction denies the reverse write; BOTH must be explicit
   withControlledLiveEventScope(reverse, () => assert.throws(() => assertWrite('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/));
   const bidirectional = { ...manifest, records: [{ ...manifest.records[0], direction: 'BOTH' as const }] };
   const assertBoth = createControlledLiveTestPolicy(bidirectional, testDatabaseUrl);
-  withControlledLiveEventScope(reverse, () => assert.doesNotThrow(() => assertBoth('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY')));
+  withControlledLiveEventScope(reverse, () => {
+    assert.doesNotThrow(() => assertBoth('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY'));
+    assert.doesNotThrow(() => assertBoth('MOYSKLAD', 'CLIENT_SOURCE_MARKER_UPDATE', 'ms-29', 'client:COMPANY'));
+  });
 });
 
 test('pre-admission reads and create readback are exact-ID scoped; shared record reads are refused', () => {

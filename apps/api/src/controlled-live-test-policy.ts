@@ -83,10 +83,13 @@ export function createControlledLiveTestPolicy(
         record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId)) ||
        (record.direction === 'BOTH' && record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
         record.sourceSystem === scope.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.targetNativeId))) &&
-      scope.targetSystem === providerValue && scope.admittedSourceName === record.name &&
+      ((scope.targetSystem === providerValue && scope.admittedSourceName === record.name &&
+        (isCreate ? record.sourceSystem === scope.sourceSystem && record.targetNativeId === null && scope.targetNativeId === null && nativeId === null :
+          scope.targetNativeId !== null && nativeId === scope.targetNativeId)) ||
+       (record.direction === 'BOTH' && !isCreate && scope.sourceSystem === providerValue && nativeId === scope.sourceNativeId &&
+        (record.sourceSystem === scope.sourceSystem && record.name === scope.admittedSourceName || record.targetSystem === scope.sourceSystem && record.name === scope.admittedSourceName))) &&
       new Date(scope.admittedSourceCreatedAt).getTime() >= new Date(record.createdAfterUtc).getTime() &&
-      (isCreate ? record.sourceSystem === scope.sourceSystem && record.targetNativeId === null && scope.targetNativeId === null && nativeId === null :
-        scope.targetNativeId !== null && nativeId === scope.targetNativeId));
+      (!isCreate || scope.targetSystem === providerValue));
     if (!allowed) throw new Error('CONTROLLED_LIVE_TEST_TARGET_NOT_IN_MANIFEST');
   };
 }

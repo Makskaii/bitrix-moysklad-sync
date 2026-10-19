@@ -10,6 +10,7 @@ import { writeOperationalLog } from '../monitoring-log';
 import { resolveDictionaryValue } from './deal-order-field-runtime.service';
 import { moySkladMoneyToBitrix } from './deal-order-money';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -28,9 +29,10 @@ export class DealOrderReverseCreateService {
     private readonly mode: SyncModeService,
     @Optional() @Inject(CLIENT_DEPENDENCY_RESOLVER) private readonly clients?: ClientDependencyResolver,
     @Optional() private readonly productCatalogCreate?: ProductCatalogCreateService,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
-  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void> }): Promise<ReverseCreateResult> {
+  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
     if (!isUuid(input.moyskladOrderId)) throw new Error('Customer-order identity is invalid');
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) {
       throw new Error('Reverse deal creation is disabled');
@@ -43,6 +45,11 @@ export class DealOrderReverseCreateService {
     if (existingPair) return { status: 'ALREADY_PAIRED', bitrix24DealId: existingPair.bitrix24Id };
     if (!operation || operation.status === 'WAITING') {
       const prepared = await this.prepare(input);
+      if (input.controlledSyntheticName && this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        prepared.fields.title = input.controlledSyntheticName;
+        prepared.fields.UF_CRM_1729757435964 = input.controlledSyntheticName;
+        prepared.sourceSnapshot.name = input.controlledSyntheticName;
+      }
       const payload = serializePrepared(prepared);
       if (operation) {
           operation = await this.database.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: input.moyskladOrderId }, data: { payload: payload as Prisma.InputJsonValue, skippedRows: prepared.skippedRows as Prisma.InputJsonValue, settingsVersion: input.eventConfig.version, status: 'PENDING', lastErrorCategory: null }, include: { positions: true } });
@@ -82,7 +89,13 @@ export class DealOrderReverseCreateService {
     if (claim.count !== 1) throw new Error('Reverse deal create is already in progress');
     try {
       const dealId = operation.bitrix24DealId ?? await this.createOrRecoverDeal(prepared, leaseToken, input.assertWorkerLease);
-      await this.verifyDeal(dealId, prepared);
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('BITRIX24', dealId);
+      const verified = await this.verifyDeal(dealId, prepared);
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const createdAt = parseBitrixCreatedAt(verified.createdTime ?? verified.DATE_CREATE);
+        if (!createdAt) throw new DealOrderReverseManualReviewError('Controlled target creation timestamp is unavailable');
+        await this.controlledAdmission.bindCreatedTarget(input.eventId, dealId, dealId, String(verified.title ?? ''), createdAt);
+      }
       await this.createRows(prepared, leaseToken, input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined);
       return await this.persistPair(prepared, dealId, leaseToken);
     } catch (error) {
@@ -309,12 +322,13 @@ export class DealOrderReverseCreateService {
     return creator.createOrRecover(input);
   }
 
-  private async verifyDeal(dealId: string, prepared: Prepared) {
+  private async verifyDeal(dealId: string, prepared: Prepared): Promise<Row> {
     const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: true });
     const item = isRecord(result) && isRecord(result.item) ? result.item : null;
     if (!item || String(item.id) !== dealId || item.title !== prepared.fields.title || item.originatorId !== 'MOYSKLAD' || item.originId !== prepared.orderId || String(item.UF_CRM_1729757435964 ?? '') !== String(prepared.sourceSnapshot.name)) {
       throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
     }
+    return item;
   }
 
   private async createRows(prepared: Prepared, leaseToken: string, assertPairLease?: () => Promise<boolean>, writePair?: { id: string; entityType: string }) {
@@ -526,3 +540,8 @@ function readId(value: unknown): string | null { return typeof value === 'string
 function readNumericId(value: unknown): string | null { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^\d{1,20}$/.test(value)) ? String(value) : null; }
 function isUniqueViolation(error: unknown): boolean { return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'; }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function parseBitrixCreatedAt(value: unknown): Date | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
