@@ -205,8 +205,14 @@ export class FieldSettingsService {
     });
     const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'smart-invoices', 'catalog']);
     for (const entity of ruleEntities) if (!supported.has(entity)) throw new BadRequestException(`Entity ${entity} is not supported for field mappings`);
-    if (config.groups.some((group) => group.entity === 'smart-invoices')) {
-      throw new BadRequestException('Composite field mappings are not supported for smart invoices');
+    for (const group of config.groups) {
+      if (group.entity === 'smart-invoices' && group.transform.kind !== 'join-non-empty') {
+        throw new BadRequestException('Smart invoices support only join-non-empty field groups');
+      }
+      if (group.entity === 'smart-invoices' &&
+        [group.targetField, ...group.sourceFields].some((field) => ['customerOrder', 'parentId2'].includes(field))) {
+        throw new BadRequestException('Invoice order relationship fields cannot be configured as field groups');
+      }
     }
     const entities = [...new Set(ruleEntities)];
     const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null; type: string; category?: string }>; moysklad: Array<{ code: string; writable: boolean | null; type: string; category?: string }> }>>();
