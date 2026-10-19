@@ -12,6 +12,7 @@ export interface ControlledLiveManifestRecord {
   targetSystem: ControlledProvider;
   targetNativeId: string | null;
   createdAfterUtc: string;
+  readOnlyDependencies?: Array<{ provider: ControlledProvider; entity: string; nativeId: string }>;
 }
 export interface ControlledLiveManifest {
   runId: string;
@@ -61,16 +62,18 @@ export function createControlledLiveTestPolicy(
     if (scope.runId !== manifest.runId) throw new Error('CONTROLLED_LIVE_TEST_RUN_ID_MISMATCH');
     if (!isProvider(providerValue)) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_INVALID');
     if (operation === 'CONTROLLED_READ') {
-      const entityMatches = entityMatchesScope(requestEntity, scope.entity);
-      if (!entityMatches || !nativeId) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
+      if (!nativeId) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
       const directRead = providerValue === scope.sourceSystem && nativeId === scope.sourceNativeId ||
         providerValue === scope.targetSystem && nativeId === scope.targetNativeId ||
         providerValue === scope.pendingTargetSystem && nativeId === scope.pendingTargetNativeId;
-      if (!directRead) throw new Error('CONTROLLED_LIVE_TEST_READ_ID_NOT_APPROVED');
       const sourceAllowed = manifest.records.some((record) => record.entity === scope.entity &&
         ((record.sourceSystem === providerValue && (record.sourceNativeId === null || record.sourceNativeId === nativeId)) ||
          (record.targetSystem === providerValue && (record.targetNativeId === null || record.targetNativeId === nativeId))));
-      if (!sourceAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_NOT_IN_MANIFEST');
+      const dependencyAllowed = manifest.records.some((record) => record.entity === scope.entity && scopeMatchesManifestPair(record, scope) &&
+        record.readOnlyDependencies?.some((dependency) => dependency.provider === providerValue && dependency.nativeId === nativeId && entityMatchesScope(requestEntity, dependency.entity)));
+      if (!entityMatchesScope(requestEntity, scope.entity) && !dependencyAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_SCOPE_INVALID');
+      if (!directRead && !dependencyAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_ID_NOT_APPROVED');
+      if (!sourceAllowed && !dependencyAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_NOT_IN_MANIFEST');
       return;
     }
     if (!entityMatchesScope(requestEntity, scope.entity)) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
@@ -114,6 +117,7 @@ export function bindControlledLiveTarget(targetNativeId: string): void {
 
 export function registerControlledTargetReadback(provider: ControlledProvider, targetNativeId: string): void {
   const scope = scopeStorage.getStore();
+  if (scope && scope.phase !== 'SOURCE_READ' && scope.targetSystem === provider && scope.targetNativeId === targetNativeId && targetNativeId) return;
   if (!scope || scope.phase === 'SOURCE_READ' || scope.targetNativeId !== null || !targetNativeId || provider !== scope.targetSystem) {
     throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_SCOPE_INVALID');
   }
@@ -133,6 +137,8 @@ function parseManifest(value: unknown): ControlledLiveManifest {
         !Number.isFinite(new Date(item.createdAfterUtc).getTime()) ||
         !(item.sourceNativeId === null || (typeof item.sourceNativeId === 'string' && item.sourceNativeId)) ||
         !(item.targetNativeId === null || (typeof item.targetNativeId === 'string' && item.targetNativeId)) || item.sourceSystem === item.targetSystem ||
+        (item.readOnlyDependencies !== undefined && (!Array.isArray(item.readOnlyDependencies) || item.readOnlyDependencies.some((dependency) =>
+          !isRecord(dependency) || !isProvider(dependency.provider) || typeof dependency.entity !== 'string' || !dependency.entity || typeof dependency.nativeId !== 'string' || !dependency.nativeId))) ||
         (item.direction === 'BITRIX24_TO_MOYSKLAD' && (item.sourceSystem !== 'BITRIX24' || item.targetSystem !== 'MOYSKLAD')) ||
         (item.direction === 'MOYSKLAD_TO_BITRIX24' && (item.sourceSystem !== 'MOYSKLAD' || item.targetSystem !== 'BITRIX24'))) {
       throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_RECORD_INVALID');
@@ -165,5 +171,12 @@ function databaseTarget(value: string | undefined): { name: string; host: string
 function isProvider(value: unknown): value is ControlledProvider { return value === 'BITRIX24' || value === 'MOYSKLAD'; }
 function entityMatchesScope(requestEntity: string | undefined, scopeEntity: string): boolean {
   return requestEntity === scopeEntity || (requestEntity === 'client:COUNTERPARTY' && ['client:COMPANY', 'client:CONTACT'].includes(scopeEntity));
+}
+function scopeMatchesManifestPair(record: ControlledLiveManifestRecord, scope: ControlledLiveEventScope): boolean {
+  const forward = record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
+    record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId);
+  const reverse = record.direction === 'BOTH' && record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
+    record.sourceSystem === scope.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.targetNativeId);
+  return forward || reverse;
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

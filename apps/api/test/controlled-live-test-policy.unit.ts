@@ -99,6 +99,26 @@ test('pre-admission reads and create readback are exact-ID scoped; shared record
   }
 });
 
+test('manifest-approved dependencies are read-only and match exact provider, entity and native ID', () => {
+  const previousMode = process.env.CONTROLLED_LIVE_TEST_MODE;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  const scopedManifest = { ...manifest, records: [{ ...manifest.records[0], readOnlyDependencies: [
+    { provider: 'BITRIX24' as const, entity: 'deal-order', nativeId: 'deal-approved-10' },
+  ] }] };
+  setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(scopedManifest, testDatabaseUrl));
+  try {
+    withControlledLiveEventScope(scope, () => {
+      assert.doesNotThrow(() => assertControlledExternalRead('BITRIX24', 'deal-approved-10', 'deal-order'));
+      assert.throws(() => assertControlledExternalRead('BITRIX24', 'deal-shared-11', 'deal-order'), /CONTROLLED_LIVE_TEST_READ_/);
+      assert.throws(() => assertControlledExternalRead('MOYSKLAD', 'deal-approved-10', 'deal-order'), /CONTROLLED_LIVE_TEST_READ_/);
+      assert.throws(() => assertControlledExternalRead('BITRIX24', 'deal-approved-10', 'invoice'), /CONTROLLED_LIVE_TEST_READ_/);
+    });
+  } finally {
+    setControlledLiveTestWriteCheck(null);
+    if (previousMode === undefined) delete process.env.CONTROLLED_LIVE_TEST_MODE; else process.env.CONTROLLED_LIVE_TEST_MODE = previousMode;
+  }
+});
+
 test('async event scopes remain isolated when concurrent events overlap', async () => {
   const assertWrite = createControlledLiveTestPolicy(manifest, testDatabaseUrl);
   const outcomes = await Promise.all([

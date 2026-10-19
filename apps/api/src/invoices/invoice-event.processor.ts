@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
@@ -13,6 +13,7 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { invoiceCreatedAt, invoicePairLinksMatchOrder, resolveInvoiceOrderLink } from './invoice-contract';
 import { InvoiceHttpApi, InvoiceRecord } from './invoice-http-api';
 import { InvoiceFieldRule, planInvoiceField } from './invoice-field-plan';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -38,6 +39,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     private readonly databaseRecovery: DatabaseRecoveryService,
     private readonly workerLease: EventWorkerLeaseService,
     private readonly lifecycle: ClientLifecycleService,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
   supports(event: { source: string; eventType: string | null; externalEntityType: string | null }): boolean {
@@ -149,14 +151,24 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const groupError = validateInvoiceGroups(groups, rules);
       if (groupError) return this.finish(event, 'MANUAL_REVIEW', groupError, null, lease);
 
-      const sourceRecord = source === 'BITRIX24' ? await this.api.readBitrix24(sourceId) : await this.api.readMoysklad(sourceId);
+      const sourceRecord = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? await this.controlledAdmission.withCurrentSourceRead(event.id, source, sourceId, 'invoice', () => source === 'BITRIX24' ? this.api.readBitrix24(sourceId) : this.api.readMoysklad(sourceId))
+        : source === 'BITRIX24' ? await this.api.readBitrix24(sourceId) : await this.api.readMoysklad(sourceId);
       const createdAt = invoiceCreatedAt(sourceRecord);
       if (!createdAt) return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_CREATION_TIME_UNAVAILABLE', null, lease);
       if (createdAt.getTime() < boundary.getTime()) return this.finish(event, 'SKIPPED_PRE_LAUNCH', 'PRE_LAUNCH_INVOICE', null, lease);
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const currentName = controlledInvoiceName(sourceRecord);
+        if (!currentName) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+        await this.controlledAdmission.admit(event.id, { entity: 'invoice', sourceSystem: source, sourceNativeId: sourceId,
+          currentNativeId: sourceId, currentName, sourceCreatedAt: createdAt });
+      }
 
       const link = resolveInvoiceOrderLink(sourceRecord, source);
       if (link.status !== 'linked') return this.finish(event, 'MANUAL_REVIEW', link.status === 'missing' ? 'INVOICE_ORDER_LINK_MISSING' : 'INVOICE_ORDER_LINK_AMBIGUOUS', null, lease);
-      const order = await this.resolveOrderPair(source, link.orderId, boundary);
+      const resolveOrder = () => this.resolveOrderPair(source, link.orderId, boundary);
+      const order = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? await this.controlledAdmission.runForEvent(event.id, resolveOrder) : await resolveOrder();
       if (order.status === 'WAITING_FOR_ORDER') return this.finish(event, 'WAITING_FOR_ORDER', order.reason, null, lease);
       if (order.status === 'SKIPPED_OUT_OF_SCOPE') return this.finish(event, 'SKIPPED_PRE_LAUNCH', order.reason, null, lease);
       if (order.status === 'MANUAL_REVIEW') return this.finish(event, 'MANUAL_REVIEW', order.reason, null, lease);
@@ -167,11 +179,15 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       if (invoicePair.status === 'NONE') {
         if (process.env.SYNC_MODE === 'dry') return this.finish(event, 'SKIPPED_DISABLED', 'INVOICE_CREATE_REQUIRES_APPLY_MODE', null, lease);
         return await this.withInvoiceIdentityLease(source, sourceId, async () => {
-          const created = await this.createCounterpart({ source, sourceId, sourceRecord, orderId: order.pair.moyskladId, dealId: order.pair.bitrix24Id, rules, groups, settings, lease });
+          const create = () => this.createCounterpart({ eventId: event.id, source, sourceId, sourceRecord, orderId: order.pair.moyskladId, dealId: order.pair.bitrix24Id, rules, groups, settings, lease });
+          const created = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+            ? await this.controlledAdmission.runForEvent(event.id, create) : await create();
           if (created.status !== 'CREATED') return this.finish(event, created.status, created.reason, created.retryAfter ?? null, lease);
           const bitrix24Id = source === 'BITRIX24' ? sourceId : created.partnerId;
           const moyskladId = source === 'MOYSKLAD' ? sourceId : created.partnerId;
-          const [bitrix, moysklad] = await Promise.all([this.api.readBitrix24(bitrix24Id), this.api.readMoysklad(moyskladId)]);
+          const readPair = () => Promise.all([this.api.readBitrix24(bitrix24Id), this.api.readMoysklad(moyskladId)] as const);
+          const [bitrix, moysklad] = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+            ? await this.controlledAdmission.runForEvent(event.id, readPair) : await readPair();
           if (!invoicePairLinksMatchOrder(bitrix, moysklad, order.pair)) {
             return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_CREATE_READBACK_ORDER_LINK_MISMATCH', null, lease);
           }
@@ -184,12 +200,16 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       if (invoicePair.pair.moyskladParentId && invoicePair.pair.moyskladParentId !== order.pair.moyskladId) {
         return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_ORDER_PAIR_CHANGED', null, lease);
       }
-      const [bitrix, moysklad] = await Promise.all([this.api.readBitrix24(invoicePair.pair.bitrix24Id), this.api.readMoysklad(invoicePair.pair.moyskladId)]);
+      const readPair = () => Promise.all([this.api.readBitrix24(invoicePair.pair.bitrix24Id), this.api.readMoysklad(invoicePair.pair.moyskladId)] as const);
+      const [bitrix, moysklad] = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? await this.controlledAdmission.runForEvent(event.id, readPair) : await readPair();
       if (!invoicePairLinksMatchOrder(bitrix, moysklad, order.pair)) return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_PAIR_ORDER_LINK_MISMATCH', null, lease);
       const baseline = await this.ensureBaseline(invoicePair.pair.id, event.id, settings, rules, groups, bitrix, moysklad);
       if (baseline === 'VERSION_MISMATCH') return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_SETTINGS_VERSION_MISMATCH', null, lease);
-      const result = await this.lifecycle.withPairActiveLock(invoicePair.pair.id, 'INVOICE', () =>
-        this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline, bitrix, moysklad, lease }));
+      const result = await this.lifecycle.withPairActiveLock(invoicePair.pair.id, 'INVOICE', () => {
+        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline, bitrix, moysklad, lease });
+        return this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? this.controlledAdmission.runForEvent(event.id, sync) : sync();
+      });
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
@@ -224,30 +244,39 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   private async createCounterpart(input: {
-    source: Source; sourceId: string; sourceRecord: InvoiceRecord; orderId: string; dealId: string;
+    eventId: string; source: Source; sourceId: string; sourceRecord: InvoiceRecord; orderId: string; dealId: string;
     rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; settings: VersionedFieldSettingsDto; lease: EventWorkerLeaseContext;
   }): Promise<{ status: 'CREATED'; partnerId: string } | { status: 'MANUAL_REVIEW' | 'RETRYABLE_FAILURE'; reason: string; retryAfter?: Date }> {
     const direction: InvoiceDirection = input.source === 'BITRIX24' ? 'BITRIX24_TO_MOYSKLAD' : 'MOYSKLAD_TO_BITRIX24';
     const fields = mappedFields(input.sourceRecord, input.rules, input.groups, direction, input.settings.config, this.fieldSettings);
+    if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+      const syntheticName = controlledInvoiceName(input.sourceRecord);
+      if (!syntheticName) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+      fields[input.source === 'BITRIX24' ? 'name' : 'title'] = syntheticName;
+    }
     if (input.source === 'BITRIX24') {
       const existing = await this.api.findMoyskladByExternalCode(input.sourceId);
       if (existing.length > 1) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_AMBIGUOUS' };
       if (existing.length === 1) {
         const recoveredId = scalarId(existing[0]?.id);
         if (!recoveredId || !isMoyskladId(recoveredId)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_INVALID_ID' };
+        this.controlledAdmission?.allowTargetReadback('MOYSKLAD', recoveredId);
         const recovered = await this.api.readMoysklad(recoveredId);
         const recoveredLink = resolveInvoiceOrderLink(recovered, 'MOYSKLAD');
         if (recovered.externalCode !== input.sourceId || recoveredLink.status !== 'linked' || recoveredLink.orderId !== input.orderId) {
           return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_ORDER_LINK_MISMATCH' };
         }
+        await this.bindControlledInvoiceTarget(input.eventId, 'MOYSKLAD', recoveredId, recovered);
         return { status: 'CREATED', partnerId: recoveredId };
       }
       await input.lease.assertOwned();
       const partnerId = await this.api.createMoysklad(input.sourceId, input.orderId, fields);
       if (partnerId.startsWith('dry:')) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_DRY_CREATE_READBACK_UNAVAILABLE' };
+      this.controlledAdmission?.allowTargetReadback('MOYSKLAD', partnerId);
       const verified = await this.api.readMoysklad(partnerId);
       const link = resolveInvoiceOrderLink(verified, 'MOYSKLAD');
       if (link.status !== 'linked' || link.orderId !== input.orderId) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_READBACK_ORDER_LINK_MISMATCH' };
+      await this.bindControlledInvoiceTarget(input.eventId, 'MOYSKLAD', partnerId, verified);
       return { status: 'CREATED', partnerId };
     }
     const existing = await this.api.findBitrix24ByOrigin(input.sourceId);
@@ -255,21 +284,33 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     if (existing.length === 1) {
       const id = scalarId(existing[0]?.id);
       if (!id || !/^\d{1,20}$/.test(id)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_INVALID_ID' };
+      this.controlledAdmission?.allowTargetReadback('BITRIX24', id);
       const recovered = await this.api.readBitrix24(id);
       const recoveredLink = resolveInvoiceOrderLink(recovered, 'BITRIX24');
       if (String(recovered.originatorId ?? '') !== 'MOYSKLAD' || String(recovered.originId ?? '') !== input.sourceId ||
         recoveredLink.status !== 'linked' || recoveredLink.orderId !== input.dealId) {
         return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_RECOVERY_ORDER_LINK_MISMATCH' };
       }
+      await this.bindControlledInvoiceTarget(input.eventId, 'BITRIX24', id, recovered);
       return { status: 'CREATED', partnerId: id };
     }
     await input.lease.assertOwned();
     const partnerId = await this.api.createBitrix24(input.sourceId, input.dealId, fields);
     if (partnerId.startsWith('dry:')) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_DRY_CREATE_READBACK_UNAVAILABLE' };
+    this.controlledAdmission?.allowTargetReadback('BITRIX24', partnerId);
     const verified = await this.api.readBitrix24(partnerId);
     const link = resolveInvoiceOrderLink(verified, 'BITRIX24');
     if (link.status !== 'linked' || link.orderId !== input.dealId) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_READBACK_ORDER_LINK_MISMATCH' };
+    await this.bindControlledInvoiceTarget(input.eventId, 'BITRIX24', partnerId, verified);
     return { status: 'CREATED', partnerId };
+  }
+
+  private async bindControlledInvoiceTarget(eventId: string, provider: Source, nativeId: string, record: InvoiceRecord): Promise<void> {
+    if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+    const name = controlledInvoiceName(record);
+    const createdAt = invoiceCreatedAt(record);
+    if (!name || !createdAt) throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID');
+    await this.controlledAdmission.bindCreatedTarget(eventId, nativeId, nativeId, name, createdAt);
   }
 
   private async persistPair(source: Source, sourceId: string, partnerId: string, orderId: string, eventId: string, lease: EventWorkerLeaseContext) {
@@ -530,6 +571,11 @@ function validateInvoiceGroups(groups: VersionedFieldSettingsDto['config']['grou
     targets.add(key);
   }
   return null;
+}
+
+function controlledInvoiceName(record: InvoiceRecord): string | null {
+  const name = record.name ?? record.title ?? record.TITLE;
+  return typeof name === 'string' && name.trim() ? name : null;
 }
 
 function readField(record: InvoiceRecord, field: string, source: Source): unknown {

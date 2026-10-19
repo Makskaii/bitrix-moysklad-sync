@@ -84,6 +84,10 @@ Use `BOTH` only when this exact synthetic pair is explicitly approved for
 echo updates in either direction. A one-way record cannot authorize reverse
 admission or writes.
 
+An optional `readOnlyDependencies` array may list shared parent/reference
+records needed to validate a synthetic target. Each entry requires an exact
+provider, entity, and native ID; it authorizes reads only, never writes.
+
 All before/after values must be limited to synthetic fields needed to prove the scenario. Redact unrelated values. A manually posted webhook, direct creation of both provider records, or a mock API response is not evidence of genuine delivery.
 
 ## Controlled execution outline (future, after approval)
