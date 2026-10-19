@@ -37,3 +37,26 @@ test('dispatcher routes to its core owner and lets an explicit processor own mat
     'extra:event-5',
   ]);
 });
+
+test('dispatcher routes product and smart-invoice events to their registered processors', async () => {
+  const deliveries: string[] = [];
+  const events: Record<string, InboundEventMetadata> = {
+    product: { id: 'product', source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'product', externalEntityId: 'p-1' },
+    invoice: { id: 'invoice', source: 'BITRIX24', eventType: 'ONCRMDYNAMICITEMUPDATE', externalEntityType: 'invoice', externalEntityId: 'i-1' },
+  };
+  const owner = (name: string, entityType: string): InboundEventProcessor => ({
+    supports: (event) => event.externalEntityType === entityType,
+    enqueue: (eventId) => deliveries.push(`${name}:${eventId}`),
+  });
+  const dispatcher = new EventDispatcherService(
+    { inboundEvent: { findUnique: async ({ where }: { where: { id: string } }) => events[where.id] } } as never,
+    { enqueue: () => assert.fail('non-client events must not route to contacts') } as never,
+    { enqueue: () => assert.fail('non-deal events must not route to pair resolution') } as never,
+    [owner('products', 'product'), owner('invoices', 'invoice')],
+  );
+
+  await dispatcher.dispatch('product');
+  await dispatcher.dispatch('invoice');
+
+  assert.deepEqual(deliveries, ['products:product', 'invoices:invoice']);
+});
