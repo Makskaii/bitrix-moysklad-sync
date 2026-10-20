@@ -102,7 +102,7 @@ class AppController {
     { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
-class AppModule {}
+export class AppModule {}
 
 async function bootstrap() {
   const apiBindHost = resolveApiBindHost(process.env.API_BIND_HOST);
@@ -132,4 +132,4 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3000, apiBindHost);
 }
 
-void bootstrap();
+if (require.main === module) void bootstrap();

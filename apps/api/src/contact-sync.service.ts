@@ -10,6 +10,7 @@ import { ServiceModeNotOnError, withServiceModeOn } from './service-mode-transac
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from './event-worker-lease.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
+import { clientOwnsContactEvent } from './contact-event-owner';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -94,10 +95,13 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
             ] },
           ],
         },
-        select: { id: true },
+        select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
       }));
       if (!scan.enabled) return;
-      for (const event of scan.value) this.enqueue(event.id);
+      for (const event of scan.value) {
+        if (await clientOwnsContactEvent(this.database, event)) continue;
+        this.enqueue(event.id);
+      }
     } catch {
       // A later event delivery can enqueue pending work again; do not block app startup.
     }
@@ -116,7 +120,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (this.active.has(eventId)) return;
     if (!await this.isApplyEnabled()) return;
     const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
-    if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
+    if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType) ||
+        await clientOwnsContactEvent(this.database, candidate)) return;
     const entityKey = await this.entityLeaseKey(candidate);
     if (entityKey && this.activeEntities.has(entityKey)) return;
     this.active.add(eventId);

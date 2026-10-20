@@ -17,7 +17,11 @@ test('dispatcher routes to its core owner and lets an explicit processor own mat
     'event-5': { id: 'event-5', source: 'BITRIX24', eventType: 'ONCRMCOMPANYUPDATE', externalEntityType: 'company', externalEntityId: '5' },
   };
   const dispatcher = new EventDispatcherService(
-    { inboundEvent: { findUnique: async ({ where }: { where: { id: string } }) => events[where.id] } } as never,
+    {
+      inboundEvent: { findUnique: async ({ where }: { where: { id: string } }) => events[where.id] },
+      contactPair: { findFirst: async () => null },
+      entityPair: { findFirst: async () => null },
+    } as never,
     processor('contacts') as never,
     processor('pairs') as never,
     [{ supports: (event) => event.id === 'event-2' || event.id === 'event-5', enqueue: (eventId) => calls.push(`extra:${eventId}`) }],
@@ -49,7 +53,11 @@ test('dispatcher routes product and smart-invoice events to their registered pro
     enqueue: (eventId) => deliveries.push(`${name}:${eventId}`),
   });
   const dispatcher = new EventDispatcherService(
-    { inboundEvent: { findUnique: async ({ where }: { where: { id: string } }) => events[where.id] } } as never,
+    {
+      inboundEvent: { findUnique: async ({ where }: { where: { id: string } }) => events[where.id] },
+      contactPair: { findFirst: async () => null },
+      entityPair: { findFirst: async () => null },
+    } as never,
     { enqueue: () => assert.fail('non-client events must not route to contacts') } as never,
     { enqueue: () => assert.fail('non-deal events must not route to pair resolution') } as never,
     [owner('products', 'product'), owner('invoices', 'invoice')],

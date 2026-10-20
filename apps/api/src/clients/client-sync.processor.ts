@@ -17,6 +17,7 @@ import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admi
 import { enterControlledLiveEventScope } from '../controlled-live-test-policy';
 import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 import { parseClientMoyskladTimestamp } from './client-moysklad-date';
+import { legacyOwnsContactEvent } from '../contact-event-owner';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -85,7 +86,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           ] },
         ],
       },
-      select: { id: true, status: true },
+      select: { id: true, status: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
       take: 100,
       });
       return { now, pending };
@@ -93,6 +94,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     if (!scan.enabled) return;
     const { now, pending } = scan.value;
     for (const event of pending) {
+      if (await legacyOwnsContactEvent(this.database, event)) continue;
       if (event.status === 'RETRYABLE_FAILURE') {
         const reset = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
           where: { id: event.id, status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
@@ -403,7 +405,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<'IGNORED' | 'REVIEW' | 'BASELINE' | 'UNCHANGED' | 'SYNCED' | 'RETRY'> {
     if (this.active.has(eventId)) return 'IGNORED';
     const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } }) as PersistedEvent | null;
-    if (!event || !this.supports(event) || !(event.status === 'RECEIVED' || (event.status === 'PROCESSING' && (!event.processingStartedAt || event.processingStartedAt.getTime() < Date.now() - CLIENT_EVENT_LEASE_MS)))) return 'IGNORED';
+    if (!event || !this.supports(event) || await legacyOwnsContactEvent(this.database, event) ||
+        !(event.status === 'RECEIVED' || (event.status === 'PROCESSING' && (!event.processingStartedAt || event.processingStartedAt.getTime() < Date.now() - CLIENT_EVENT_LEASE_MS)))) return 'IGNORED';
     let entity = entityForEvent(event)!;
     let fence = workerLease;
     let releaseSourceLease: (() => Promise<void>) | undefined;
