@@ -12,8 +12,8 @@ const baseInput = {
       rules: [],
       references: {
         namedPairs: [
-          { kind: 'dealStages', bitrix24Id: 'NEW', moyskladId: 'state-1', status: 'confirmed' },
-          { kind: 'dealStages', bitrix24Id: 'WON', moyskladId: null, status: 'suggested' },
+          { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'state-1', status: 'confirmed' },
+          { kind: 'dealStages', bitrix24Id: '0:WON', moyskladId: null, status: 'suggested' },
           { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'currency-1', status: 'confirmed' },
         ],
       },
@@ -22,7 +22,7 @@ const baseInput = {
   },
   apiAccess: true,
   webhookAuthConfigured: true,
-  applicableStages: ['NEW', 'WON'],
+  applicableStages: ['0:NEW', '0:WON'],
   applicableCurrencies: ['RUB'],
 } as const;
 
@@ -32,7 +32,7 @@ test('deal preflight blocks every applicable stage without a confirmed mapping a
     optionalReferenceWarnings: ['employees', 'projects'],
   });
   assert.equal(report.canEnable, false);
-  assert.ok(report.blockers.some((item) => item.code === 'STAGE_MAPPING_UNCONFIRMED' && item.referenceId === 'WON'));
+  assert.ok(report.blockers.some((item) => item.code === 'STAGE_MAPPING_UNCONFIRMED' && item.referenceId === '0:WON'));
   assert.equal(report.warnings.length, 2);
   assert.equal(report.settingsVersion, 7);
 });
@@ -53,13 +53,13 @@ test('deal preflight passes when all required stage, currency, and create-order 
           currencies: [{ bitrix24Code: 'RUB', moyskladId: 'currency-1' }],
         },
         references: { namedPairs: [
-          { kind: 'dealStages', bitrix24Id: 'NEW', moyskladId: 'state-1', status: 'confirmed' },
-          { kind: 'dealStages', bitrix24Id: 'WON', moyskladId: 'state-2', status: 'confirmed' },
+          { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'state-1', status: 'confirmed' },
+          { kind: 'dealStages', bitrix24Id: '0:WON', moyskladId: 'state-2', status: 'confirmed' },
           { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'currency-1', status: 'confirmed' },
         ] },
       },
     },
-    applicableStages: ['NEW', 'WON'],
+    applicableStages: ['0:NEW', '0:WON'],
     applicableCurrencies: ['RUB'],
   });
   assert.equal(report.canEnable, true);

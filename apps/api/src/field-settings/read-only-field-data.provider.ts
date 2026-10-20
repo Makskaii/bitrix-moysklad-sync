@@ -46,7 +46,7 @@ export class ReadOnlyFieldDataProvider {
     }
     const [currencies, stages] = await Promise.all([
       this.moyskladList('/entity/currency'),
-      this.moyskladList('/entity/customerorder/metadata/states'),
+      this.moyskladOrderStates(),
     ]);
     return {
       stages: stages.map((row) => text(row.id)).filter(Boolean),
@@ -117,7 +117,7 @@ export class ReadOnlyFieldDataProvider {
       this.moyskladList('/entity/organization'),
       this.moyskladList('/entity/store'),
       this.moyskladList('/entity/project'),
-      this.moyskladList('/entity/customerorder/metadata/states'),
+      this.moyskladOrderStates(),
     ]);
     return {
       employees: { bitrix24: users.map((row) => named(row, row.ID, `${row.NAME ?? ''} ${row.SECOND_NAME ?? ''} ${row.LAST_NAME ?? ''}`.trim())), moysklad: msEmployees.map((row) => named(row, row.id, row.shortFio ?? row.fullName ?? `${row.name ?? ''} ${row.lastName ?? ''}`.trim())) },
@@ -446,6 +446,14 @@ export class ReadOnlyFieldDataProvider {
       url = new URL(nextHref);
     }
     throw new ServiceUnavailableException(`MoySklad catalog exceeds ${MAX_PAGES} pages; use a narrower catalog filter`);
+  }
+
+  private async moyskladOrderStates(): Promise<Array<Record<string, unknown>>> {
+    const metadata = await this.moyskladGet('/entity/customerorder/metadata');
+    if (!isRecord(metadata) || !Array.isArray(metadata.states) || metadata.states.some((state) => !isRecord(state) || !text(state.id))) {
+      throw new ServiceUnavailableException('MoySklad returned invalid customer-order state metadata');
+    }
+    return metadata.states as Array<Record<string, unknown>>;
   }
 
   private async moyskladGet(path: string): Promise<unknown> {
