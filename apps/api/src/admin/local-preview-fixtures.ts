@@ -20,7 +20,10 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
     return {
       units: {
         bitrix24: APPROVED_UNITS.map((unit) => ({ id: String(unit.bitrix24Id), code: unit.bitrix24Code, label: `Демо: единица ${unit.bitrix24Code}` })),
-        moysklad: unique(APPROVED_UNITS.flatMap((unit) => unit.moyskladId ? [{ id: unit.moyskladId, code: unit.moyskladCode ?? unit.bitrix24Code, label: `Демо: единица ${unit.moyskladCode ?? unit.bitrix24Code}` }] : [])),
+        moysklad: unique([
+          ...APPROVED_UNITS.flatMap((unit) => unit.moyskladId ? [{ id: unit.moyskladId, code: unit.moyskladCode ?? unit.bitrix24Code, label: `Демо: единица ${unit.moyskladCode ?? unit.bitrix24Code}` }] : []),
+          { id: '42345678-1234-1234-1234-123456789abc', code: '796', label: 'Демо: единица 796' },
+        ]),
       },
       priceTypes: {
         bitrix24: APPROVED_PRICE_TYPES.map((price) => ({ id: String(price.bitrix24Id), code: price.bitrix24Code, label: `Демо: тип цены ${price.bitrix24Code}` })),
@@ -40,7 +43,7 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
   override async fieldCatalogs(_bitrixAccessToken: string, entity: string) {
     const bitrix24: FieldCandidate[] = entity === 'catalog'
       ? [field('NAME', 'Демо: название товара'), field('property108', 'Демо: ключ склада'), field('PREVIEW_LABEL', 'Демо: подпись'), field('ID', 'ID', 'integer', false)]
-      : [field('NAME', 'Демо: имя'), field('LAST_NAME', 'Демо: фамилия'), field('EMAIL', 'Демо: электронная почта'), field('PHONE', 'Демо: телефон'), field('TITLE', 'Демо: тема'), field('PREVIEW_LABEL', 'Демо: подпись'), field('ID', 'ID', 'integer', false)];
+      : [field('NAME', 'Демо: имя'), field('LAST_NAME', 'Демо: фамилия'), field('EMAIL', 'Демо: электронная почта'), field('PHONE', 'Демо: телефон'), field('TITLE', 'Демо: тема'), field('COMMENTS', 'Демо: комментарий'), field('PREVIEW_LABEL', 'Демо: подпись'), field('ID', 'ID', 'integer', false)];
     const moysklad: FieldCandidate[] = [field('name', 'Демо: наименование'), field('description', 'Демо: описание'), field('externalCode', 'Демо: внешний код'), field('email', 'Демо: электронная почта'), field('phone', 'Демо: телефон'), field('attributes.preview-demo-attribute', 'Демо: дополнительный атрибут')];
     return { entity, bitrix24, moysklad };
   }
@@ -60,7 +63,7 @@ export class LocalPreviewFixtureFieldDataProvider extends ReadOnlyFieldDataProvi
 
 function field(code: string, title: string, type = 'string', writable: boolean | null = true): FieldCandidate {
   const custom = /^UF_CRM/i.test(code) || /^property\d+$/i.test(code) || code.startsWith('attributes.');
-  return { code, title, type, writable, category: custom ? 'custom' : 'standard' };
+  return { code, title, type, writable, category: custom ? 'custom' : 'standard', cardinality: 'single', shape: 'scalar' };
 }
 
 function unique<T extends { id: string }>(items: T[]): T[] {

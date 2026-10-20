@@ -198,6 +198,28 @@ test('unique normalized company email matches despite a name change and no phone
   });
 });
 
+test('unique normalized email pairs a nameless existing company and contact', async () => {
+  const companyResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+    companyByEmail: async (email) => email === 'billing@example.com' ? [candidate('company-email', { type: 'company', email })] : [],
+    contactByEmail: async () => [], contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const company = await companyResolver.resolve({ id: 'nameless-company', entity: 'COMPANY', email: ' BILLING@EXAMPLE.COM ' });
+  assert.equal(company.action, 'USE_CANDIDATE');
+  assert.equal(company.action === 'USE_CANDIDATE' && company.targetId, 'company-email');
+
+  const contactResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
+    contactByEmail: async (email) => email === 'person@example.com' ? [candidate('person-email', { type: 'contactperson', email })] : [],
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const contact = await contactResolver.resolve({ id: 'nameless-contact', entity: 'CONTACT', email: ' Person@Example.com ' });
+  assert.equal(contact.action, 'USE_CANDIDATE');
+  assert.equal(contact.action === 'USE_CANDIDATE' && contact.targetId, 'person-email');
+});
+
 test('unique contact email matches within its native parent scope despite a different name', async () => {
   const resolver = new ClientRuntimeResolver({
     findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
