@@ -27,6 +27,7 @@ let reverseEventId = '';
 let companyBaselineEventId = '';
 let companyForwardEventId = '';
 let companyReverseEventId = '';
+let invalidCriticalTransformEventId = '';
 let missingTargetPairId = '';
 let missingTargetEventId = '';
 let database: DatabaseService;
@@ -61,8 +62,8 @@ before(async () => {
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
-        bitrix24: ['ID', 'TITLE', 'NAME', 'SECOND_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'UF_READONLY'].map((code) => ({ code, writable: code !== 'ID' && code !== 'UF_READONLY' })),
-        moysklad: ['id', 'meta', 'name', 'phone', 'email', 'calculated', 'unmapped'].map((code) => ({ code, writable: !['id', 'meta', 'calculated'].includes(code) })),
+        bitrix24: ['ID', 'TITLE', 'NAME', 'SECOND_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'UF_READONLY', 'UF_NUM_CRITICAL', 'UF_NUM_OPTIONAL'].map((code) => ({ code, writable: code !== 'ID' && code !== 'UF_READONLY' })),
+        moysklad: ['id', 'meta', 'name', 'phone', 'email', 'calculated', 'unmapped', 'amount', 'amountOptional'].map((code) => ({ code, writable: !['id', 'meta', 'calculated'].includes(code) })),
       };
     },
   } as never, {} as EntityPairService);
@@ -89,7 +90,9 @@ before(async () => {
     rules: [{ id: 'field53-company-name', entity: 'companies', sourceField: 'TITLE', targetField: 'name', criticality: 'optional',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
-    }],
+    },
+    { id: 'field53-critical-number', entity: 'contacts-companies', sourceField: 'UF_NUM_CRITICAL', targetField: 'amount', criticality: 'critical', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
+    { id: 'field53-optional-number', entity: 'contacts-companies', sourceField: 'UF_NUM_OPTIONAL', targetField: 'amountOptional', criticality: 'optional', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }],
     childResourceBindings: [{
         id: 'field53-company-legal-bank', entity: 'companies', bitrix24CompanyId: companySourceId, bitrix24RequisiteId: '482',
       moyskladCounterpartyId: companyTargetId,
@@ -120,8 +123,8 @@ before(async () => {
   await database.entityPair.create({ data: { id: pairId, entityType: 'CONTACT', bitrix24Id: sourceId, moyskladId: targetId, moyskladType: 'contactperson', moyskladParentId: parentId, active: true, source: 'MANUAL' } });
   await database.entityPair.create({ data: { id: companyPairId, entityType: 'COMPANY', bitrix24Id: companySourceId, moyskladId: companyTargetId, moyskladType: 'counterparty', active: true, source: 'MANUAL' } });
 
-  b24 = { ID: sourceId, NAME: 'Ada', LAST_NAME: 'Lovelace', SECOND_NAME: '', PHONE: [{ VALUE: '+7 111', VALUE_TYPE: 'WORK' }, { VALUE: '+7 222', VALUE_TYPE: 'MOBILE' }], EMAIL: [{ VALUE: 'ada@example.test', VALUE_TYPE: 'WORK' }], UF_READONLY: 'must-not-write' };
-  moysklad = { id: targetId, name: 'Old Name', phone: '+7 000', email: 'old@example.test', calculated: 'server-owned', unmapped: 'leave' };
+  b24 = { ID: sourceId, NAME: 'Ada', LAST_NAME: 'Lovelace', SECOND_NAME: '', PHONE: [{ VALUE: '+7 111', VALUE_TYPE: 'WORK' }, { VALUE: '+7 222', VALUE_TYPE: 'MOBILE' }], EMAIL: [{ VALUE: 'ada@example.test', VALUE_TYPE: 'WORK' }], UF_READONLY: 'must-not-write', UF_NUM_CRITICAL: '41', UF_NUM_OPTIONAL: '20' };
+  moysklad = { id: targetId, name: 'Old Name', phone: '+7 000', email: 'old@example.test', calculated: 'server-owned', unmapped: 'leave', amount: 41, amountOptional: 7 };
   companyB24 = { ID: companySourceId, TITLE: 'Old Co', PHONE: [{ VALUE: '+7 100' }], EMAIL: [] };
   companyMs = { id: companyTargetId, companyType: 'legal', name: 'Old Co', phone: '+7 000', email: 'old@example.test', inn: '2222222222' };
   const journal = new DryRunWriteJournal(database);
@@ -161,7 +164,7 @@ after(async () => {
   await database.entityPairBaseline.deleteMany({ where: { pairId: companyPairId } });
   await database.entityPair.deleteMany({ where: { id: companyPairId } });
   await database.entityPair.deleteMany({ where: { id: missingTargetPairId } });
-  await database.inboundEvent.deleteMany({ where: { id: { in: [baseEventId, forwardEventId, echoEventId, reverseEventId, companyBaselineEventId, companyForwardEventId, companyReverseEventId, missingTargetEventId] } } });
+  await database.inboundEvent.deleteMany({ where: { id: { in: [baseEventId, forwardEventId, echoEventId, reverseEventId, companyBaselineEventId, companyForwardEventId, companyReverseEventId, missingTargetEventId, invalidCriticalTransformEventId] } } });
   await database.dryRunWriteProposal.deleteMany({ where: { entityId: { in: [sourceId, targetId] } } });
   await database.dryRunWriteProposal.deleteMany({ where: { entityId: { in: [companySourceId, companyTargetId] } } });
   await database.$disconnect();
@@ -175,7 +178,7 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
   assert.deepEqual(basePin.config.childResourceBindings, (await settings.active()).config.childResourceBindings, 'explicit child identities and field bindings are stored with and pinned to settings version');
   const forward = await event(`client-field-forward-${suffix}`, 'BITRIX24', sourceId, 'contact');
   forwardEventId = forward.id;
-  b24 = { ...b24, NAME: 'Augusta', SECOND_NAME: 'Ada', PHONE: [{ VALUE: '+7 333' }, { VALUE: '+7 444' }], EMAIL: [] };
+  b24 = { ...b24, NAME: 'Augusta', SECOND_NAME: 'Ada', PHONE: [{ VALUE: '+7 333' }, { VALUE: '+7 444' }], EMAIL: [], UF_NUM_CRITICAL: '42', UF_NUM_OPTIONAL: 'not a number' };
   const forwardResult = await processor.process(forwardEventId);
   assert.equal(forwardResult, 'SYNCED', JSON.stringify({ logs: await database.operationalLog.findMany({ where: { referenceId: forwardEventId }, select: { message: true } }), pinned: await settings.eventConfig(forwardEventId), state: await database.entityPairSyncState.findUnique({ where: { pairId } }) }));
   const forwardPin = await settings.eventConfig(forwardEventId);
@@ -185,6 +188,9 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
   assert.equal(proposal.phone, '+7 333 | +7 444');
   assert.equal(proposal.email, '', 'configured empty multifield clears the destination');
   assert.equal(proposal.name, 'Lovelace Augusta Ada');
+  assert.equal(proposal.amount, 42, 'critical numeric field is converted using the shared transform');
+  assert.equal('amountOptional' in proposal, false, 'invalid optional conversion does not write null or an empty value');
+  assert.equal(moysklad.amountOptional, 7, 'invalid optional conversion preserves the current target');
   assert.equal('calculated' in proposal, false);
   assert.equal('unmapped' in proposal, false);
   moysklad = { ...moysklad, ...proposal };
@@ -237,6 +243,13 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
   assert.deepEqual(companyB24Proposal.PHONE, [{ VALUE: '+7 300', VALUE_TYPE: 'WORK' }, { VALUE: '+7 301', VALUE_TYPE: 'WORK' }]);
   assert.deepEqual(companyB24Proposal.EMAIL, [{ VALUE: 'first@company.test', VALUE_TYPE: 'WORK' }, { VALUE: 'second@company.test', VALUE_TYPE: 'WORK' }]);
   assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: companyPairId } })).moyskladId, companyTargetId);
+
+  b24 = { ...b24, UF_NUM_CRITICAL: 'not a number' };
+  const invalidCriticalTransform = await event(`client-field-invalid-critical-${suffix}`, 'BITRIX24', sourceId, 'contact');
+  invalidCriticalTransformEventId = invalidCriticalTransform.id;
+  const proposalsBeforeInvalidCritical = await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: targetId } });
+  assert.equal(await processor.process(invalidCriticalTransformEventId), 'REVIEW', 'invalid critical conversion stops the event before a write');
+  assert.equal(await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: targetId } }), proposalsBeforeInvalidCritical);
 });
 
 test('missing saved target remains paired and fails safe without candidate search or replacement creation', async () => {

@@ -1,6 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
 
-type Transform = { kind: 'tbd' | 'copy' };
+type Transform =
+  | { kind: 'tbd' | 'copy' }
+  | { kind: 'string-to-number'; numberType: 'integer' | 'decimal'; precision?: number; leadingZeros?: 'reject' | 'allow' }
+  | { kind: 'number-to-string'; precision?: number }
+  | { kind: 'date-to-datetime'; timeZone: string; time?: string }
+  | { kind: 'datetime-to-date'; timeZone: string }
+  | { kind: 'boolean-map'; trueValue: boolean | 'Y' | 'N' | '1' | '0'; falseValue: boolean | 'Y' | 'N' | '1' | '0' }
+  | { kind: 'enum-map' | 'reference-map'; resource?: string; pairs: Array<{ source: string; target: string }> }
+  | { kind: 'multiple-to-single'; strategy: 'only' | 'first' | 'join'; separator?: string }
+  | { kind: 'single-to-multiple' };
 type RuleDirection = { enabled: boolean; transform: Transform };
 type FieldRule = {
   id: string;
@@ -48,7 +57,7 @@ type DealOrderRuntime = {
 };
 type ProductCatalogRuntime = { bitrix24CatalogId: string | null; bitrix24DefaultSectionId?: string | null; moyskladFields: Array<'name' | 'code' | 'description'> };
 type DictionaryOption = { id: string; title: string; code: string };
-type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service'; reserved?: string };
+type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; cardinality?: 'single' | 'multiple' | 'unknown'; shape?: string; enumOptions?: Array<{ id: string; value: string }>; referenceKind?: string; category?: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service'; reserved?: string };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ChildFieldPair = { bitrix24Field: string; moyskladField: string };
 type ChildResourceBinding = {
@@ -70,7 +79,7 @@ const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTy
 const referenceKinds: Array<[ReferenceKind, string]> = [
   ['employees', 'Сотрудники'], ['currencies', 'Валюты'], ['organizations', 'Организации'], ['warehouses', 'Склады'], ['projects', 'Проекты'], ['dealStages', 'Стадии сделок ↔ статусы заказов'],
 ];
-type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
+type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; status?: 'mapped' | 'skip' | 'error'; reason?: string; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 type AutoMatch = { source: FieldCandidate; target: FieldCandidate; canBitrix24ToMoysklad: boolean; canMoyskladToBitrix24: boolean };
 type AutoMatchBlock = { matches: AutoMatch[]; unmatched: number; conflicts: number };
 type AutoMatchSummary = { standard: AutoMatchBlock; custom: AutoMatchBlock };
@@ -130,8 +139,67 @@ function fieldCategory(field: FieldCandidate, system: 'bitrix24' | 'moysklad', e
 function fieldOptionLabel(field: FieldCandidate) {
   const writable = field.writable === true ? 'запись разрешена' : field.writable === false ? 'только чтение' : 'запись не подтверждена';
   const resource = field.resource === 'product' ? 'товар' : field.resource === 'service' ? 'услуга' : field.resource === 'product-or-service' ? 'товар / услуга' : '';
-  const reserved = field.reserved === 'PRODUCT_CREATE_RECOVERY_IDENTITY' ? 'зарезервировано: ключ восстановления карточки' : field.reserved;
-  return `${field.title || field.code} · ${field.code} · ${field.type} · ${writable}${resource ? ` · ${resource}` : ''}${reserved ? ` · ${reserved}` : ''}`;
+  const reserved = field.reserved === 'PRODUCT_CREATE_RECOVERY_IDENTITY' ? 'зарезервировано: ключ восстановления карточки' : field.reserved === 'UNSUPPORTED_PRODUCT_PROPERTY_PAYLOAD' ? 'недоступно: формат записи свойства каталога не подтверждён' : field.reserved;
+  const title = field.title?.trim() && field.title.trim() !== field.code.trim() ? field.title.trim() : 'Без подписи';
+  const cardinality = field.cardinality === 'multiple' ? 'множественное' : field.cardinality === 'single' ? 'одиночное' : 'кратность неизвестна';
+  return `${title} · ${field.code} · ${field.type} · ${cardinality} · ${writable}${resource ? ` · ${resource}` : ''}${reserved ? ` · ${reserved}` : ''}`;
+}
+
+function transformForKind(kind: string): Transform {
+  switch (kind) {
+    case 'copy': return { kind };
+    case 'string-to-number': return { kind, numberType: 'decimal', leadingZeros: 'reject' };
+    case 'number-to-string': return { kind };
+    case 'date-to-datetime': return { kind, timeZone: 'Europe/Moscow', time: '00:00:00' };
+    case 'datetime-to-date': return { kind, timeZone: 'Europe/Moscow' };
+    case 'boolean-map': return { kind, trueValue: 'Y', falseValue: 'N' };
+    case 'enum-map': return { kind, pairs: [] };
+    case 'reference-map': return { kind, resource: '', pairs: [] };
+    case 'multiple-to-single': return { kind, strategy: 'only' };
+    case 'single-to-multiple': return { kind };
+    default: return { kind: 'tbd' };
+  }
+}
+
+function transformKinds(): Array<[string, string]> {
+  return [
+    ['tbd', 'Не задано (TBD)'], ['copy', 'Копировать без преобразования'],
+    ['string-to-number', 'Строка → число (явная политика)'], ['number-to-string', 'Число → строка'],
+    ['date-to-datetime', 'Дата → дата и время (с часовым поясом)'], ['datetime-to-date', 'Дата и время → дата (с часовым поясом)'],
+    ['boolean-map', 'Логическое значение → явные значения'], ['enum-map', 'Сопоставление вариантов перечисления'],
+    ['reference-map', 'Сопоставление ссылок по ID'], ['multiple-to-single', 'Несколько значений → одно (явная политика)'],
+    ['single-to-multiple', 'Одно значение → список'],
+  ];
+}
+
+function BasicTransformOptions({ transform, onChange }: { transform: Transform; onChange: (next: Transform) => void }) {
+  if (transform.kind === 'string-to-number') return <div className="transform-options"><label>Число<select aria-label="Тип числа преобразования" value={transform.numberType} onChange={(event) => onChange({ ...transform, numberType: event.target.value as 'integer' | 'decimal' })}><option value="integer">Целое</option><option value="decimal">Десятичное</option></select></label><label>Точность (десятичные знаки)<input aria-label="Точность числового преобразования" type="number" min="0" max="15" value={transform.precision ?? ''} onChange={(event) => onChange({ ...transform, precision: event.target.value === '' ? undefined : Number(event.target.value) })} /></label><label>Начальные нули<select aria-label="Политика начальных нулей" value={transform.leadingZeros ?? 'reject'} onChange={(event) => onChange({ ...transform, leadingZeros: event.target.value as 'reject' | 'allow' })}><option value="reject">Отклонять (сохранить идентификатор)</option><option value="allow">Разрешить потерю нулей</option></select></label></div>;
+  if (transform.kind === 'number-to-string') return <label>Максимальная точность<input aria-label="Точность числа в строку" type="number" min="0" max="15" value={transform.precision ?? ''} onChange={(event) => onChange({ ...transform, precision: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>;
+  if (transform.kind === 'date-to-datetime' || transform.kind === 'datetime-to-date') return <div className="transform-options"><label>Часовой пояс IANA<input aria-label="Часовой пояс преобразования" value={transform.timeZone} placeholder="Europe/Moscow" onChange={(event) => onChange({ ...transform, timeZone: event.target.value })} /></label>{transform.kind === 'date-to-datetime' && <label>Время по умолчанию<input aria-label="Время преобразования даты" type="time" step="1" value={transform.time} onChange={(event) => onChange({ ...transform, time: event.target.value })} /></label>}</div>;
+  if (transform.kind === 'boolean-map') return <div className="transform-options"><label>Значение «да»<select aria-label="Значение true преобразования" value={String(transform.trueValue)} onChange={(event) => onChange({ ...transform, trueValue: parseBooleanOption(event.target.value) })}>{['true', 'false', 'Y', 'N', '1', '0'].map((value) => <option key={value}>{value}</option>)}</select></label><label>Значение «нет»<select aria-label="Значение false преобразования" value={String(transform.falseValue)} onChange={(event) => onChange({ ...transform, falseValue: parseBooleanOption(event.target.value) })}>{['false', 'true', 'N', 'Y', '0', '1'].map((value) => <option key={value}>{value}</option>)}</select></label></div>;
+  if (transform.kind === 'multiple-to-single') return <div className="transform-options"><label>Политика списка<select aria-label="Политика преобразования списка" value={transform.strategy} onChange={(event) => onChange({ ...transform, strategy: event.target.value as 'only' | 'first' | 'join' })}><option value="only">Только если ровно один элемент</option><option value="first">Первый элемент</option><option value="join">Соединить строки</option></select></label>{transform.strategy === 'join' && <label>Разделитель<input aria-label="Разделитель списка" value={transform.separator ?? ''} onChange={(event) => onChange({ ...transform, separator: event.target.value })} /></label>}</div>;
+  return null;
+}
+
+function EnumMapOptions({ transform, source, target, onChange }: { transform: Transform; source?: FieldCandidate; target?: FieldCandidate; onChange: (next: Transform) => void }) {
+  if (transform.kind !== 'enum-map') return null;
+  const sourceOptions = source?.enumOptions ?? [];
+  const targetOptions = target?.enumOptions ?? [];
+  const updatePair = (index: number, key: 'source' | 'target', value: string) => onChange({ ...transform, pairs: transform.pairs.map((pair, row) => row === index ? { ...pair, [key]: value } : pair) });
+  return <fieldset className="transform-options enum-map-options"><legend>Соответствие вариантов по точным ID</legend>
+    {!sourceOptions.length || !targetOptions.length ? <p role="status">Список вариантов недоступен для одного из полей; сопоставление можно оставить черновиком.</p> : null}
+    {transform.pairs.map((pair, index) => <div className="enum-map-row" key={`${index}-${pair.source}-${pair.target}`}>
+      <label>Вариант источника<select aria-label={`ID варианта источника ${index + 1}`} value={pair.source} onChange={(event) => updatePair(index, 'source', event.target.value)}><option value="">Выберите вариант</option>{sourceOptions.map((option) => <option key={option.id} value={option.id}>{option.value} · {option.id}</option>)}</select></label>
+      <span aria-hidden="true">→</span>
+      <label>Вариант результата<select aria-label={`ID варианта результата ${index + 1}`} value={pair.target} onChange={(event) => updatePair(index, 'target', event.target.value)}><option value="">Выберите вариант</option>{targetOptions.map((option) => <option key={option.id} value={option.id}>{option.value} · {option.id}</option>)}</select></label>
+      <button type="button" className="button-secondary" aria-label={`Удалить пару вариантов ${index + 1}`} onClick={() => onChange({ ...transform, pairs: transform.pairs.filter((_, row) => row !== index) })}>Удалить пару</button>
+    </div>)}
+    <button type="button" className="button-secondary" onClick={() => onChange({ ...transform, pairs: [...transform.pairs, { source: '', target: '' }] })}>Добавить пару вариантов</button>
+  </fieldset>;
+}
+
+function parseBooleanOption(value: string): boolean | 'Y' | 'N' | '1' | '0' {
+  return value === 'true' ? true : value === 'false' ? false : value as 'Y' | 'N' | '1' | '0';
 }
 
 function compatibleFieldTypes(left: string, right: string) {
@@ -177,7 +245,7 @@ function suggestFieldMatches(metadata: FieldMetadata, entity: string, existingRu
       }
       const source = sourceMatches[0]!;
       const target = targetMatches[0]!;
-      if (usedFields.has(source.code) || usedFields.has(target.code) || !compatibleFieldTypes(source.type, target.type)) {
+      if (usedFields.has(source.code) || usedFields.has(target.code) || !compatibleFieldTypes(source.type, target.type) || source.shape !== target.shape || !source.cardinality || source.cardinality === 'unknown' || source.cardinality !== target.cardinality) {
         summary[category].conflicts += 1;
         blocked.add(source.code);
         blocked.add(target.code);
@@ -625,8 +693,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <details className="mapping-row-advanced"><summary>Направления и коды</summary>
                 <div className="mapping-advanced-content">
                   <label>Критичность<select aria-label={`Критичность ${rule.sourceField || 'поля'} → ${rule.targetField || 'поля'}`} value={rule.criticality ?? 'tbd'} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, criticality: event.target.value as FieldRule['criticality'] }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label>
-                  <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
-                  <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
+                  <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: transformForKind(event.target.value) } }))}>{transformKinds().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><BasicTransformOptions transform={rule.bitrix24ToMoysklad.transform} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform } }))} /><EnumMapOptions transform={rule.bitrix24ToMoysklad.transform} source={source} target={target} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform } }))} /><label>Дополнительные параметры (JSON)<textarea aria-label="Параметры преобразования Bitrix24 в МойСклад" key={`${rule.id}-b24-ms-${JSON.stringify(rule.bitrix24ToMoysklad.transform)}`} defaultValue={JSON.stringify(rule.bitrix24ToMoysklad.transform)} onBlur={(event) => { try { const next = JSON.parse(event.target.value) as Transform; if (next && typeof next === 'object' && 'kind' in next) updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform: next } })); } catch { /* keep the saved transform; validation runs on save */ } }} /></label></fieldset>
+                  <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: transformForKind(event.target.value) } }))}>{transformKinds().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><BasicTransformOptions transform={rule.moyskladToBitrix24.transform} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform } }))} /><EnumMapOptions transform={rule.moyskladToBitrix24.transform} source={target} target={source} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform } }))} /><label>Дополнительные параметры (JSON)<textarea aria-label="Параметры преобразования МойСклад в Bitrix24" key={`${rule.id}-ms-b24-${JSON.stringify(rule.moyskladToBitrix24.transform)}`} defaultValue={JSON.stringify(rule.moyskladToBitrix24.transform)} onBlur={(event) => { try { const next = JSON.parse(event.target.value) as Transform; if (next && typeof next === 'object' && 'kind' in next) updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform: next } })); } catch { /* keep the saved transform; validation runs on save */ } }} /></label></fieldset>
                   <details className="mapping-codes"><summary>Технические коды</summary><code>{rule.sourceField || '—'} → {rule.targetField || '—'}</code><small>{source?.type ?? 'тип недоступен'} → {target?.type ?? 'тип недоступен'}</small></details>
                 </div>
               </details>

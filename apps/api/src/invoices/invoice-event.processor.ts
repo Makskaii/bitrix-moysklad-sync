@@ -212,6 +212,9 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       });
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
+      if (error instanceof Error && error.message.startsWith('INVOICE_FIELD_TRANSFORM_CRITICAL:')) {
+        return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
+      }
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
         return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_PROVIDER_REJECTED', null, lease);
       }
@@ -394,17 +397,27 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       });
       if (plan.action === 'HOLD') return { status: 'MANUAL_REVIEW', reason: `INVOICE_FIELD_${plan.reason}` };
       if (plan.action === 'ECHO') continue;
+      const targetField = plan.direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
+      const transformSource = plan.direction === 'BITRIX24_TO_MOYSKLAD' ? input.bitrix : input.moysklad;
+      const transformed = this.fieldSettings.transformFieldResult(input.eventConfig.config, 'smart-invoices', plan.direction, targetField, transformSource);
+      if (!transformed || transformed.status === 'skip') continue;
+      if (transformed.status === 'error') {
+        if (rule.criticality === 'critical') return { status: 'MANUAL_REVIEW', reason: `INVOICE_FIELD_TRANSFORM_FAILED:${targetField}` };
+        logger.warn(`Optional invoice field transform skipped (${targetField}): ${transformed.reason}`);
+        continue;
+      }
+      const writeValue = transformed.value;
       try {
         await this.assertWriteAllowed(plan.direction, input.pair.id, input.lease);
-        if (plan.direction === 'BITRIX24_TO_MOYSKLAD') await this.api.updateMoysklad(input.pair.moyskladId, { [rule.targetField]: plan.value });
-        else await this.api.updateBitrix24(input.pair.bitrix24Id, { [rule.sourceField]: plan.value });
+        if (plan.direction === 'BITRIX24_TO_MOYSKLAD') await this.api.updateMoysklad(input.pair.moyskladId, { [rule.targetField]: writeValue });
+        else await this.api.updateBitrix24(input.pair.bitrix24Id, { [rule.sourceField]: writeValue });
         const target = plan.direction === 'BITRIX24_TO_MOYSKLAD' ? await this.api.readMoysklad(input.pair.moyskladId) : await this.api.readBitrix24(input.pair.bitrix24Id);
         const [verifiedB24, verifiedMs] = await Promise.all([this.api.readBitrix24(input.pair.bitrix24Id), this.api.readMoysklad(input.pair.moyskladId)]);
         if (!invoicePairLinksMatchOrder(verifiedB24, verifiedMs, input.order)) {
           return { status: 'MANUAL_REVIEW', reason: 'INVOICE_POST_WRITE_ORDER_LINK_MISMATCH' };
         }
         const actual = plan.direction === 'BITRIX24_TO_MOYSKLAD' ? readField(target, rule.targetField, 'MOYSKLAD') : readField(target, rule.sourceField, 'BITRIX24');
-        if (!sameJson(actual, plan.value)) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_FIELD_READBACK_MISMATCH', retryAfter: retryAtForFailure(new Error('INVOICE_FIELD_READBACK_MISMATCH'), 1) };
+        if (!sameJson(actual, writeValue)) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_FIELD_READBACK_MISMATCH', retryAfter: retryAtForFailure(new Error('INVOICE_FIELD_READBACK_MISMATCH'), 1) };
         if (plan.direction === 'BITRIX24_TO_MOYSKLAD') msValueCache(input.moysklad, rule.targetField, actual);
         else msValueCache(input.bitrix, rule.sourceField, actual);
       } catch (error) {
@@ -429,9 +442,15 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const currentTarget = readField(target, group.targetField, targetSide);
       const targetChanged = !sameJson(jsonValue(currentTarget), jsonRecord(targetBaseline).targetValue);
       if (targetChanged && sourceSide === 'BITRIX24') continue;
-      const transformed = this.fieldSettings.transformField(input.eventConfig.config, 'smart-invoices', group.direction, group.targetField, source);
-      if (!transformed || transformed.error || !isScalar(transformed.value) && !Array.isArray(transformed.value)) {
-        return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_TRANSFORM_FAILED' };
+      const transformed = this.fieldSettings.transformFieldResult(input.eventConfig.config, 'smart-invoices', group.direction, group.targetField, source);
+      if (!transformed || transformed.status === 'skip') continue;
+      if (transformed.status === 'error') {
+        if (group.criticality === 'critical') return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_TRANSFORM_FAILED' };
+        logger.warn(`Optional invoice field group transform skipped (${group.targetField}): ${transformed.reason}`);
+        continue;
+      }
+      if (!isScalar(transformed.value) && !Array.isArray(transformed.value)) {
+        return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_VALUE_SHAPE_UNSUPPORTED' };
       }
       try {
         await this.assertWriteAllowed(group.direction, input.pair.id, input.lease);
@@ -523,16 +542,24 @@ function mappedFields(source: InvoiceRecord, rules: VersionedFieldSettingsDto['c
   const output: InvoiceRecord = {};
   for (const rule of rules) {
     const mapping = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.bitrix24ToMoysklad : rule.moyskladToBitrix24;
-    if (!mapping.enabled || mapping.transform.kind !== 'copy') continue;
+    if (!mapping.enabled) continue;
     const sourceField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
     const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
-    const value = readField(source, sourceField, direction === 'BITRIX24_TO_MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD');
-    if (value !== undefined && isScalar(value) && !isExcludedField(sourceField, targetField) &&
-      !isInvoiceRelationshipField(sourceField) && !isInvoiceRelationshipField(targetField)) output[targetField] = value;
+    if (isExcludedField(sourceField, targetField) || isInvoiceRelationshipField(sourceField) || isInvoiceRelationshipField(targetField)) continue;
+    const transformed = fieldSettings.transformFieldResult(config, 'smart-invoices', direction, targetField, source);
+    if (transformed?.status === 'mapped') output[targetField] = transformed.value;
+    else if (transformed?.status === 'error' && rule.criticality === 'critical') throw new Error(`INVOICE_FIELD_TRANSFORM_CRITICAL:${targetField}`);
+    else if (transformed?.status === 'error') logger.warn(`Optional invoice field transform skipped (${targetField}): ${transformed.reason}`);
   }
   for (const group of groups.filter((candidate) => candidate.direction === direction)) {
-    const transformed = fieldSettings.transformField(config, 'smart-invoices', direction, group.targetField, source);
-    if (!transformed || transformed.error || !(isScalar(transformed.value) || Array.isArray(transformed.value))) throw new Error('INVOICE_FIELD_GROUP_TRANSFORM_FAILED');
+    const transformed = fieldSettings.transformFieldResult(config, 'smart-invoices', direction, group.targetField, source);
+    if (transformed?.status === 'skip') continue;
+    if (transformed?.status === 'error') {
+      if (group.criticality === 'critical') throw new Error(`INVOICE_FIELD_GROUP_TRANSFORM_CRITICAL:${group.targetField}`);
+      logger.warn(`Optional invoice field group transform skipped (${group.targetField}): ${transformed.reason}`);
+      continue;
+    }
+    if (!transformed || !(isScalar(transformed.value) || Array.isArray(transformed.value))) throw new Error('INVOICE_FIELD_GROUP_VALUE_SHAPE_UNSUPPORTED');
     output[group.targetField] = transformed.value;
   }
   return output;

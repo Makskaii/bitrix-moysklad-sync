@@ -4,9 +4,10 @@ import { DatabaseService } from '../database.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, NamedReferenceKind, NamedReferencePair, VersionedFieldSettingsDto } from './field-settings.dto';
-import { ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
+import { FieldCandidate, ReadOnlyFieldDataProvider } from './read-only-field-data.provider';
 import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 import { validateChildResourceBindings } from '../clients/client-child-resource-sync';
+import { applyFieldTransform, FieldTransform } from './field-transform';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -215,7 +216,7 @@ export class FieldSettingsService {
       }
     }
     const entities = [...new Set(ruleEntities)];
-    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null; type: string; category?: string }>; moysklad: Array<{ code: string; writable: boolean | null; type: string; category?: string }> }>>();
+    const catalogsByEntity = new Map<string, Array<{ bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] }>>();
     for (const entity of entities) {
       catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity)]);
     }
@@ -226,7 +227,7 @@ export class FieldSettingsService {
       const catalogs = catalogsByEntity.get(entity) ?? [];
       if (!catalogs.length || catalogs.some((catalog) => {
         const candidate = catalog[system].find((field) => field.code === code);
-        return !candidate || (writable && candidate.writable === false) || (writable && system === 'bitrix24' && candidate.writable !== true);
+        return !candidate || (writable && candidate.writable !== true);
       })) throw new BadRequestException(`Field ${code} is not available as a ${writable ? 'writable ' : ''}${system} field for ${entity}`);
     };
     for (const candidate of config.rules) {
@@ -239,24 +240,20 @@ export class FieldSettingsService {
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
       const reverse = rule.moyskladToBitrix24 as JsonRecord;
-      if (entity === 'catalog' && (forward.enabled === true || reverse.enabled === true)) {
-        const catalogs = catalogsByEntity.get(entity) ?? [];
-        const b24Field = catalogs[0]?.bitrix24.find((field) => field.code === rule.sourceField);
-        const msField = catalogs[0]?.moysklad.find((field) => field.code === rule.targetField);
-        if (isRecord(forward.transform) && forward.transform.kind === 'copy' || isRecord(reverse.transform) && reverse.transform.kind === 'copy') {
-          if (b24Field?.category === 'custom' || msField?.category === 'custom') {
-            throw new BadRequestException('Catalog custom fields require a dedicated adapter and cannot use standard scalar copy rules');
-          }
-          if (!b24Field || !msField || !compatibleCatalogScalarTypes(b24Field.type, msField.type)) {
-            throw new BadRequestException(`Catalog fields ${String(rule.sourceField)} and ${String(rule.targetField)} do not have compatible scalar types`);
-          }
-        }
-      }
       if (entity === 'catalog' && forward.enabled === true) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }
-      if (forward.enabled === true && isRecord(forward.transform) && forward.transform.kind === 'copy') requireField(entity, 'moysklad', rule.targetField, true);
-      if (reverse.enabled === true && isRecord(reverse.transform) && reverse.transform.kind === 'copy') requireField(entity, 'bitrix24', rule.sourceField, true);
+      if (forward.enabled === true) {
+        requireField(entity, 'moysklad', rule.targetField, true);
+        validateRuleCompatibility(entity, rule, 'BITRIX24_TO_MOYSKLAD', catalogsByEntity.get(entity)?.[0]);
+      }
+      if (reverse.enabled === true) {
+        if (entity === 'catalog' && /^property\d+$/i.test(String(rule.sourceField))) {
+          throw new BadRequestException('Catalog custom-property writes are not supported until the Bitrix24 property payload shape is verified');
+        }
+        requireField(entity, 'bitrix24', rule.sourceField, true);
+        validateRuleCompatibility(entity, rule, 'MOYSKLAD_TO_BITRIX24', catalogsByEntity.get(entity)?.[0]);
+      }
     }
     for (const candidate of config.groups) {
       const group = candidate as unknown as JsonRecord;
@@ -268,8 +265,12 @@ export class FieldSettingsService {
       if (entity === 'catalog' && b24ToMs) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }
+      if (entity === 'catalog' && !b24ToMs && /^property\d+$/i.test(String(group.targetField))) {
+        throw new BadRequestException('Catalog custom-property writes are not supported until the Bitrix24 property payload shape is verified');
+      }
       for (const sourceField of group.sourceFields as string[]) requireField(entity, b24ToMs ? 'bitrix24' : 'moysklad', sourceField, false);
       requireField(entity, b24ToMs ? 'moysklad' : 'bitrix24', group.targetField, true);
+      validateGroupCompatibility(entity, group, catalogsByEntity.get(entity)?.[0]);
     }
   }
 
@@ -362,6 +363,12 @@ export class FieldSettingsService {
   }
 
   transformField(config: unknown, entity: string, direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24', targetField: string, source: JsonRecord) {
+    const result = this.transformFieldResult(config, entity, direction, targetField, source);
+    if (!result) return null;
+    return { value: result.status === 'mapped' ? result.value : null, error: result.status === 'error' ? result.reason : null, reason: result.status === 'skip' ? result.reason : null, status: result.status, transform: result.transform };
+  }
+
+  transformFieldResult(config: unknown, entity: string, direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24', targetField: string, source: JsonRecord) {
     if (!isRecord(config)) return null;
     const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     const rules = Array.isArray(config.rules) ? config.rules : [];
@@ -371,18 +378,16 @@ export class FieldSettingsService {
     if (isRecord(rule)) {
       const mapping = rule[ruleDirection];
       if (isRecord(mapping) && mapping.enabled === true && isRecord(mapping.transform)) {
-        const kind = mapping.transform.kind;
         const sourceField = rule[sourceFieldKey];
         const value = isString(sourceField) ? source[sourceField] : undefined;
-        if (kind === 'copy' && value !== undefined && value !== null) return { value, error: null, transform: 'copy' };
-        return { value: null, error: kind === 'tbd' ? 'transform is not configured' : 'source value is missing', transform: String(kind) };
+        return applyFieldTransform(mapping.transform as unknown as FieldTransform, value);
       }
     }
     const groups = Array.isArray(config.groups) ? config.groups : [];
     const group = groups.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.direction === direction && candidate.targetField === targetField);
     if (isRecord(group)) {
       if (!Array.isArray(group.sourceFields) || !isRecord(group.transform) || typeof group.transform.separator !== 'string') {
-        return { value: null, error: 'transform is not supported', transform: 'unsupported' };
+        return { status: 'error' as const, reason: 'transform is not supported', transform: 'unsupported' };
       }
       const fields = group.sourceFields.filter(isString);
       if (group.transform.kind === 'join-non-empty') {
@@ -391,23 +396,25 @@ export class FieldSettingsService {
         for (const field of fields) {
           const raw = source[field];
           const parts = Array.isArray(raw) ? raw.map((entry) => isRecord(entry) ? entry.VALUE : entry) : [raw];
-          for (const part of parts) if (part !== undefined && part !== null && typeof part !== 'object') {
-            const normalized = String(part).trim();
+          for (const part of parts) {
+            if (part === undefined || part === null || part === '') continue;
+            if (typeof part !== 'string') return { status: 'error' as const, reason: 'join-non-empty accepts string values only', transform: 'join-non-empty' };
+            const normalized = part.trim();
             if (normalized) values.push(normalized);
           }
         }
-        return { value: values.join(separator), error: null, transform: 'join-non-empty' };
+        if (values.some((value) => typeof value !== 'string')) return { status: 'error' as const, reason: 'join-non-empty accepts string values only', transform: 'join-non-empty' };
+        return { status: 'mapped' as const, value: values.join(separator), transform: 'join-non-empty' };
       }
       if (group.transform.kind === 'split-non-empty' && direction === 'MOYSKLAD_TO_BITRIX24' && isString(group.transform.valueType) && group.transform.valueType.trim()) {
         const separator = group.transform.separator;
         const valueType = group.transform.valueType;
-        const values = fields.flatMap((field) => {
-          const raw = source[field];
-          return raw === undefined || raw === null ? [] : String(raw).split(separator).map((item) => item.trim()).filter(Boolean);
-        });
-        return { value: values.map((VALUE) => ({ VALUE, VALUE_TYPE: valueType })), error: null, transform: 'split-non-empty' };
+        const rawValues = fields.map((field) => source[field]);
+        if (rawValues.some((raw) => raw !== undefined && raw !== null && typeof raw !== 'string')) return { status: 'error' as const, reason: 'split-non-empty accepts string values only', transform: 'split-non-empty' };
+        const values = rawValues.flatMap((raw) => typeof raw === 'string' ? raw.split(separator).map((item) => item.trim()).filter(Boolean) : []);
+        return { status: 'mapped' as const, value: values.map((VALUE) => ({ VALUE, VALUE_TYPE: valueType })), transform: 'split-non-empty' };
       }
-      return { value: null, error: 'split-non-empty requires MOYSKLAD_TO_BITRIX24 and an explicit value type', transform: 'split-non-empty' };
+      return { status: 'error' as const, reason: 'split-non-empty requires MOYSKLAD_TO_BITRIX24 and an explicit value type', transform: 'split-non-empty' };
     }
     return null;
   }
@@ -494,6 +501,105 @@ function compatibleCatalogScalarTypes(bitrixType: string, moyskladType: string):
   const left = scalarFamily(bitrixType);
   const right = scalarFamily(moyskladType);
   return left !== null && left === right;
+}
+
+function validateRuleCompatibility(
+  entity: string,
+  rule: JsonRecord,
+  direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24',
+  catalogs: { bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] } | undefined,
+) {
+  const sourceSystem = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24' : 'moysklad';
+  const targetSystem = direction === 'BITRIX24_TO_MOYSKLAD' ? 'moysklad' : 'bitrix24';
+  const sourceCode = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
+  const targetCode = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
+  const source = catalogs?.[sourceSystem].find((field) => field.code === sourceCode);
+  const target = catalogs?.[targetSystem].find((field) => field.code === targetCode);
+  const directionsKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
+  const configured = rule[directionsKey];
+  const transform = isRecord(configured) && isRecord(configured.transform) ? configured.transform : null;
+  if (!source || !target || !transform) throw new BadRequestException('Enabled field mappings require complete source and target metadata');
+  if (transform.kind === 'tbd') throw new BadRequestException(`Enabled field mapping ${String(sourceCode)} → ${String(targetCode)} needs an explicit transform`);
+  const sourceCardinality = source.cardinality ?? 'unknown';
+  const targetCardinality = target.cardinality ?? 'unknown';
+  const sourceShape = source.shape ?? inferFieldShape(source.type);
+  const targetShape = target.shape ?? inferFieldShape(target.type);
+  const kind = transform.kind;
+  if (kind === 'copy') {
+    if (source.type !== target.type || sourceShape !== targetShape || sourceCardinality === 'unknown' || sourceCardinality !== targetCardinality) {
+      throw new BadRequestException(`Copy requires exact type and cardinality compatibility for ${String(sourceCode)} → ${String(targetCode)}`);
+    }
+    return;
+  }
+  if (kind === 'string-to-number' && stringTypes.has(source.type.toLowerCase()) && (integerTypes.has(target.type.toLowerCase()) || decimalTypes.has(target.type.toLowerCase()))) {
+    if (transform.numberType === 'integer' && !integerTypes.has(target.type.toLowerCase()) || transform.numberType === 'decimal' && !numberTypes.has(target.type.toLowerCase())) throw new BadRequestException('string-to-number policy does not match the target numeric field type');
+    return;
+  }
+  if (kind === 'number-to-string' && numberTypes.has(source.type.toLowerCase()) && stringTypes.has(target.type.toLowerCase())) return;
+  if (kind === 'date-to-datetime' && dateTypes.has(source.type.toLowerCase()) && dateTimeTypes.has(target.type.toLowerCase())) return;
+  if (kind === 'datetime-to-date' && dateTimeTypes.has(source.type.toLowerCase()) && dateTypes.has(target.type.toLowerCase())) return;
+  if (kind === 'boolean-map') {
+    const sourceIsBoolean = booleanTypes.has(source.type.toLowerCase());
+    const targetIsBoolean = booleanTypes.has(target.type.toLowerCase());
+    const expectedOutputType = typeof transform.trueValue === 'boolean';
+    if (sourceIsBoolean && (targetIsBoolean ? expectedOutputType : !expectedOutputType && stringTypes.has(target.type.toLowerCase()))) return;
+    if (!sourceIsBoolean && booleanTypes.has(target.type.toLowerCase()) && expectedOutputType && (stringTypes.has(source.type.toLowerCase()) || source.type.toLowerCase() === 'char')) return;
+  }
+  if (kind === 'enum-map') {
+    if (!enumTypes.has(source.type.toLowerCase()) || !enumTypes.has(target.type.toLowerCase())) throw new BadRequestException('enum-map requires enumeration fields on both sides');
+    const pairs = transform.pairs as Array<{ source: string; target: string }>;
+    if (!pairs.every((pair) => source.enumOptions?.some((option) => option.id === pair.source || option.value === pair.source) && target.enumOptions?.some((option) => option.id === pair.target || option.value === pair.target))) {
+      throw new BadRequestException('enum-map values must exist in the source and target field option catalogs');
+    }
+    return;
+  }
+  if (kind === 'reference-map') {
+    if (!source.referenceKind || !target.referenceKind || transform.resource !== source.referenceKind) throw new BadRequestException('reference-map requires confirmed reference metadata and the exact source resource');
+    return;
+  }
+  if (kind === 'multiple-to-single') {
+    if (sourceCardinality !== 'multiple' || targetCardinality !== 'single') throw new BadRequestException('multiple-to-single requires a multiple source and a single target');
+    if (transform.strategy === 'join' && (!stringTypes.has(source.type.toLowerCase()) || !stringTypes.has(target.type.toLowerCase()))) throw new BadRequestException('multiple-to-single join requires string values on both sides');
+    if (source.type !== target.type && transform.strategy !== 'join') throw new BadRequestException('multiple-to-single may not change the element type');
+    return;
+  }
+  if (kind === 'single-to-multiple') {
+    if (sourceCardinality !== 'single' || targetCardinality !== 'multiple' || source.type !== target.type) throw new BadRequestException('single-to-multiple requires matching element types and explicit single/multiple cardinality');
+    return;
+  }
+  throw new BadRequestException(`Transform ${String(kind)} is not compatible with ${String(sourceCode)} → ${String(targetCode)} for ${entity}`);
+}
+
+function validateGroupCompatibility(entity: string, group: JsonRecord, catalogs: { bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] } | undefined) {
+  const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+  const sources = Array.isArray(group.sourceFields) ? group.sourceFields.map((code) => catalogs?.[b24ToMs ? 'bitrix24' : 'moysklad'].find((field) => field.code === code)) : [];
+  const target = catalogs?.[b24ToMs ? 'moysklad' : 'bitrix24'].find((field) => field.code === group.targetField);
+  if (!target || sources.some((field) => !field)) throw new BadRequestException('Field groups require complete source and target metadata');
+  if (group.transform && isRecord(group.transform) && group.transform.kind === 'join-non-empty') {
+    if (!stringTypes.has(target.type.toLowerCase()) || sources.some((field) => !stringTypes.has(field!.type.toLowerCase()) && !(field!.type === 'crm_multifield' && field!.cardinality === 'multiple'))) throw new BadRequestException('join-non-empty requires string-compatible source and target fields');
+    return;
+  }
+  if (group.transform && isRecord(group.transform) && group.transform.kind === 'split-non-empty') {
+    if (!stringTypes.has(sources[0]?.type.toLowerCase() ?? '') || target.type !== 'crm_multifield') throw new BadRequestException('split-non-empty requires a string source and a Bitrix24 multifield target');
+    return;
+  }
+  throw new BadRequestException(`Field group shape is not supported for ${entity}`);
+}
+
+const integerTypes = new Set(['integer', 'int', 'long']);
+const decimalTypes = new Set(['double', 'float', 'decimal', 'number']);
+const numberTypes = new Set([...integerTypes, ...decimalTypes]);
+const stringTypes = new Set(['string', 'text', 'url', 'char']);
+const booleanTypes = new Set(['boolean', 'bool']);
+const dateTypes = new Set(['date']);
+const dateTimeTypes = new Set(['datetime', 'time']);
+const enumTypes = new Set(['enum', 'enumeration', 'list']);
+
+function inferFieldShape(type: string): FieldCandidate['shape'] {
+  const normalized = type.toLowerCase();
+  if (normalized === 'array') return 'array';
+  if (normalized === 'object') return 'object';
+  return normalized && normalized !== 'unknown' ? 'scalar' : 'unknown';
 }
 
 function serializeVersion(row: VersionRow): VersionedFieldSettingsDto {
@@ -713,9 +819,9 @@ function validateRule(value: unknown) {
     throw new BadRequestException('Each field rule needs an ID, entity, and source/target field codes');
   }
   const criticality = validateCriticality(value.criticality);
-  validateDirection(value.bitrix24ToMoysklad);
-  validateDirection(value.moyskladToBitrix24);
-  return { ...value, criticality };
+  const bitrix24ToMoysklad = validateDirection(value.bitrix24ToMoysklad);
+  const moyskladToBitrix24 = validateDirection(value.moyskladToBitrix24);
+  return { ...value, bitrix24ToMoysklad, moyskladToBitrix24, criticality };
 }
 
 function validateGroup(value: unknown) {
@@ -798,10 +904,59 @@ function fieldRuleRiskChanges(before: FieldSettingsConfigDto, after: FieldSettin
   return changes;
 }
 
-function validateDirection(value: unknown) {
-  if (!isRecord(value) || typeof value.enabled !== 'boolean' || !isRecord(value.transform) || !['copy', 'tbd'].includes(String(value.transform.kind))) {
+function validateDirection(value: unknown): { enabled: boolean; transform: FieldTransform } {
+  if (!isRecord(value) || typeof value.enabled !== 'boolean' || !isRecord(value.transform)) {
     throw new BadRequestException('Each direction needs an enabled flag and a supported transform');
   }
+  return { enabled: value.enabled, transform: validateFieldTransform(value.transform) };
+}
+
+function validateFieldTransform(value: JsonRecord): FieldTransform {
+  const kind = value.kind;
+  if (kind === 'copy' || kind === 'tbd') return { kind };
+  if (kind === 'string-to-number') {
+    if (!['integer', 'decimal'].includes(String(value.numberType)) || value.precision !== undefined && (!Number.isInteger(value.precision) || Number(value.precision) < 0 || Number(value.precision) > 15) ||
+      value.min !== undefined && (typeof value.min !== 'number' || !Number.isFinite(value.min)) || value.max !== undefined && (typeof value.max !== 'number' || !Number.isFinite(value.max)) ||
+      value.leadingZeros !== undefined && !['reject', 'allow'].includes(String(value.leadingZeros))) throw new BadRequestException('string-to-number requires a number type and valid precision/range policy');
+    if (typeof value.min === 'number' && typeof value.max === 'number' && value.min > value.max) throw new BadRequestException('string-to-number minimum cannot exceed its maximum');
+    return { kind, numberType: value.numberType as 'integer' | 'decimal', ...(typeof value.precision === 'number' ? { precision: value.precision } : {}), ...(typeof value.min === 'number' ? { min: value.min } : {}), ...(typeof value.max === 'number' ? { max: value.max } : {}), leadingZeros: value.leadingZeros === 'allow' ? 'allow' : 'reject' };
+  }
+  if (kind === 'number-to-string') {
+    if (value.precision !== undefined && (!Number.isInteger(value.precision) || Number(value.precision) < 0 || Number(value.precision) > 15)) throw new BadRequestException('number-to-string precision must be an integer between 0 and 15');
+    return { kind, ...(typeof value.precision === 'number' ? { precision: value.precision } : {}) };
+  }
+  if (kind === 'date-to-datetime') {
+    if (!isString(value.timeZone)) throw new BadRequestException('date-to-datetime requires an explicit time zone');
+    try { new Intl.DateTimeFormat('en', { timeZone: value.timeZone }).format(0); } catch { throw new BadRequestException('date-to-datetime timeZone must be a valid IANA time zone'); }
+    if (value.time !== undefined && (!isString(value.time) || !/^\d{2}:\d{2}:\d{2}$/.test(value.time))) throw new BadRequestException('date-to-datetime time must use HH:mm:ss');
+    return { kind, timeZone: value.timeZone, ...(typeof value.time === 'string' ? { time: value.time } : {}) };
+  }
+  if (kind === 'datetime-to-date') {
+    if (!isString(value.timeZone)) throw new BadRequestException('datetime-to-date requires an explicit time zone');
+    try { new Intl.DateTimeFormat('en', { timeZone: value.timeZone }).format(0); } catch { throw new BadRequestException('datetime-to-date timeZone must be a valid IANA time zone'); }
+    return { kind, timeZone: value.timeZone };
+  }
+  if (kind === 'boolean-map') {
+    const allowed = [true, false, 'Y', 'N', '1', '0'];
+    if (!allowed.includes(value.trueValue as boolean | 'Y' | 'N' | '1' | '0') || !allowed.includes(value.falseValue as boolean | 'Y' | 'N' | '1' | '0') || value.trueValue === value.falseValue) throw new BadRequestException('boolean-map requires distinct true and false target values');
+    if (typeof value.trueValue !== typeof value.falseValue) throw new BadRequestException('boolean-map true and false values must use the same target type');
+    return { kind, trueValue: value.trueValue as boolean | 'Y' | 'N' | '1' | '0', falseValue: value.falseValue as boolean | 'Y' | 'N' | '1' | '0' };
+  }
+  if (kind === 'enum-map' || kind === 'reference-map') {
+    const resource = kind === 'reference-map' ? value.resource : undefined;
+    if (kind === 'reference-map' && !isString(resource)) throw new BadRequestException('reference-map requires a reference resource');
+    if (!Array.isArray(value.pairs) || !value.pairs.length || value.pairs.some((pair) => !isRecord(pair) || !isString(pair.source) || !isString(pair.target))) throw new BadRequestException(`${kind} requires explicit source and target value pairs`);
+    const pairs = value.pairs as Array<{ source: string; target: string }>;
+    if (new Set(pairs.map((pair) => pair.source)).size !== pairs.length || new Set(pairs.map((pair) => pair.target)).size !== pairs.length) throw new BadRequestException(`${kind} pairs must be one-to-one`);
+    return kind === 'enum-map' ? { kind, pairs: pairs.map(({ source, target }) => ({ source, target })) } : { kind, resource: resource as string, pairs: pairs.map(({ source, target }) => ({ source, target })) };
+  }
+  if (kind === 'multiple-to-single') {
+    if (!['only', 'first', 'join'].includes(String(value.strategy))) throw new BadRequestException('multiple-to-single requires an explicit only, first, or join policy');
+    if (value.strategy === 'join' && typeof value.separator !== 'string') throw new BadRequestException('multiple-to-single join requires an explicit separator');
+    return { kind, strategy: value.strategy as 'only' | 'first' | 'join', ...(typeof value.separator === 'string' ? { separator: value.separator } : {}) };
+  }
+  if (kind === 'single-to-multiple') return { kind };
+  throw new BadRequestException('Field transform kind is unsupported');
 }
 
 function previewRule(rule: unknown, sample: JsonRecord, sampleIndex: number) {
@@ -840,31 +995,29 @@ function previewGroup(group: unknown, sample: JsonRecord, sampleIndex: number) {
   }];
 }
 
-function applyFieldSettings(config: unknown, entity: string, source: JsonRecord, direction: string): Record<string, { value: unknown; error?: string; transform: string }> {
-  const result: Record<string, { value: unknown; error?: string; transform: string }> = {};
+function applyFieldSettings(config: unknown, entity: string, source: JsonRecord, direction: string): Record<string, { value: unknown; status: 'mapped' | 'skip' | 'error'; reason?: string; error?: string; transform: string }> {
+  const result: Record<string, { value: unknown; status: 'mapped' | 'skip' | 'error'; reason?: string; error?: string; transform: string }> = {};
   if (!isRecord(config)) return result;
   const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
   for (const rule of Array.isArray(config.rules) ? config.rules : []) {
     if (!isRecord(rule) || rule.entity !== entity || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
     const mapping = rule[ruleDirection];
     if (!isRecord(mapping) || mapping.enabled !== true || !isRecord(mapping.transform)) continue;
-    const kind = String(mapping.transform.kind);
     const sourceField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
     const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
     const value = source[sourceField];
-    result[targetField] = kind === 'copy' && value !== undefined
-      ? { value, transform: kind }
-      : { value: null, error: kind === 'tbd' ? 'transform is not configured' : 'source value is missing', transform: kind };
+    const transformed = applyFieldTransform(mapping.transform as unknown as FieldTransform, value);
+    result[targetField] = { value: transformed.status === 'mapped' ? transformed.value : null, status: transformed.status, ...(transformed.status === 'error' ? { error: transformed.reason } : {}), ...(transformed.status === 'skip' ? { reason: transformed.reason } : {}), transform: transformed.transform };
   }
   for (const group of Array.isArray(config.groups) ? config.groups : []) {
     if (!isRecord(group) || group.entity !== entity || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
     const fields = group.sourceFields.filter(isString);
     if (typeof group.transform.separator !== 'string') {
-      result[group.targetField] = { value: null, error: 'transform is not supported', transform: String(group.transform.kind) };
+      result[group.targetField] = { value: null, status: 'error', error: 'transform is not supported', transform: String(group.transform.kind) };
       continue;
     }
     const transformed = applyGroupTransform(group, source, direction);
-    result[group.targetField] = transformed;
+    result[group.targetField] = { ...transformed, status: transformed.error ? 'error' : 'mapped' };
   }
   return result;
 }
@@ -878,22 +1031,26 @@ function applyGroupTransform(group: JsonRecord, source: JsonRecord, direction: s
     for (const field of fields) {
       const raw = source[field];
       const parts = Array.isArray(raw) ? raw.map((entry) => isRecord(entry) ? entry.VALUE : entry) : [raw];
-      for (const part of parts) if (part !== undefined && part !== null && typeof part !== 'object') {
-        const normalized = String(part).trim();
+      for (const part of parts) {
+        if (part === undefined || part === null || part === '') continue;
+        if (typeof part !== 'string') return { value: null, error: 'join-non-empty accepts string values only', transform: 'join-non-empty' };
+        const normalized = part.trim();
         if (normalized) values.push(normalized);
       }
     }
     return { value: values.join(transform.separator), transform: 'join-non-empty' };
   }
   if (transform.kind === 'split-non-empty' && direction === 'MOYSKLAD_TO_BITRIX24' && isString(transform.valueType) && transform.valueType.trim()) {
-    const values = splitValues(fields.map((field) => source[field]), transform.separator);
+    const rawValues = fields.map((field) => source[field]);
+    if (rawValues.some((raw) => raw !== undefined && raw !== null && typeof raw !== 'string')) return { value: null, error: 'split-non-empty accepts string values only', transform: 'split-non-empty' };
+    const values = splitValues(rawValues, transform.separator);
     return { value: values.map((VALUE) => ({ VALUE, VALUE_TYPE: transform.valueType })), transform: 'split-non-empty' };
   }
   return { value: null, error: 'split-non-empty requires MOYSKLAD_TO_BITRIX24 and an explicit value type', transform: 'split-non-empty' };
 }
 
 function splitValues(values: unknown[], separator: string) {
-  return values.flatMap((raw) => raw == null ? [] : String(raw).split(separator).map((part) => part.trim()).filter(Boolean));
+  return values.flatMap((raw) => raw == null ? [] : typeof raw === 'string' ? raw.split(separator).map((part) => part.trim()).filter(Boolean) : []);
 }
 
 function configuredTransforms(config: FieldSettingsConfig): string[] {
