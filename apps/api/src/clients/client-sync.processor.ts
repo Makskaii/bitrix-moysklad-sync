@@ -15,6 +15,7 @@ import { ClientChildResourceSync, ClientChildResourceSnapshot, syncPinnedClientC
 import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from '../admin/manual-review-details';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { enterControlledLiveEventScope } from '../controlled-live-test-policy';
+import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -33,16 +34,28 @@ const CLIENT_EVENT_LEASE_MS = 60_000;
 @Injectable()
 export class ClientSyncProcessor implements ClientDependencyResolver {
   private readonly active = new Set<string>();
+  private readonly gateway?: ClientSyncGateway;
+  private readonly candidateGateway?: WritableClientCandidateGateway;
+  private readonly childResources?: ClientChildResourceSync;
   constructor(
     private readonly database: DatabaseService,
     private readonly settings: FieldSettingsService,
     private readonly syncMode: SyncModeService,
-    @Optional() @Inject(CLIENT_SYNC_GATEWAY) private readonly gateway?: ClientSyncGateway,
-    @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) private readonly candidateGateway?: WritableClientCandidateGateway,
+    @Optional() @Inject(CLIENT_SYNC_GATEWAY) gateway?: ClientSyncGateway,
+    @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) candidateGateway?: WritableClientCandidateGateway,
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
-    @Optional() private readonly childResources?: ClientChildResourceSync,
+    @Optional() childResources?: ClientChildResourceSync,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
-  ) {}
+  ) {
+    this.gateway = gateway ? serviceModeBoundProvider(database, gateway) : undefined;
+    this.candidateGateway = candidateGateway ? serviceModeBoundProvider(database, candidateGateway) : undefined;
+    this.childResources = childResources;
+    childResources?.setProviderModeGate(async (work) => {
+      const result = await withServiceModeOn(database, async () => work());
+      if (!result.enabled) throw new ServiceModeNotOnError();
+      return result.value;
+    });
+  }
 
   async verifyServiceCounterparty(counterpartyId: string): Promise<boolean> {
     if (!this.candidateGateway) throw new Error('CLIENT_CANDIDATE_GATEWAY_UNAVAILABLE');
@@ -55,8 +68,9 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
   }
 
   async recoverPending(): Promise<void> {
-    const now = new Date();
-    const pending = await this.database.inboundEvent.findMany({
+    const scan = await withServiceModeOn(this.database, async (transaction) => {
+      const now = new Date();
+      const pending = await transaction.inboundEvent.findMany({
       where: {
         AND: [
           { OR: [
@@ -72,29 +86,34 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       },
       select: { id: true, status: true },
       take: 100,
+      });
+      return { now, pending };
     });
+    if (!scan.enabled) return;
+    const { now, pending } = scan.value;
     for (const event of pending) {
       if (event.status === 'RETRYABLE_FAILURE') {
-        const reset = await this.database.inboundEvent.updateMany({
+        const reset = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
           where: { id: event.id, status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
           data: { status: 'RECEIVED', retryAfter: null, lastErrorCategory: null },
-        });
-        if (reset.count !== 1) continue;
+        }));
+        if (!reset.enabled || reset.value.count !== 1) continue;
       }
       this.enqueue(event.id);
     }
-    const dependencyRetries = await this.database.clientDependencyRetry.findMany({
+    const retryScan = await withServiceModeOn(this.database, async (transaction) => transaction.clientDependencyRetry.findMany({
       where: { OR: [
         { status: 'PENDING', retryAfter: { lte: now } },
         { status: 'RUNNING', updatedAt: { lt: new Date(now.getTime() - CLIENT_EVENT_LEASE_MS) } },
       ] }, orderBy: { retryAfter: 'asc' }, take: 50,
-    });
-    for (const retry of dependencyRetries) {
-      const claimed = await this.database.clientDependencyRetry.updateMany({
+    }));
+    if (!retryScan.enabled) return;
+    for (const retry of retryScan.value) {
+      const claim = await withServiceModeOn(this.database, (transaction) => transaction.clientDependencyRetry.updateMany({
         where: { id: retry.id, status: retry.status, ...(retry.status === 'PENDING' ? { retryAfter: { lte: now } } : { updatedAt: { lt: new Date(now.getTime() - CLIENT_EVENT_LEASE_MS) } }) },
         data: { status: 'RUNNING', attempts: { increment: 1 } },
-      });
-      if (claimed.count !== 1) continue;
+      }));
+      if (!claim.enabled || claim.value.count !== 1) continue;
       const result = await this.resolveForDocument({
         eventId: retry.eventId, sourceSystem: retry.sourceSystem as ClientSystem, entity: 'CONTACT',
         sourceId: retry.sourceEntityId, primaryCompanySourceId: retry.companySourceId || null,
@@ -102,10 +121,10 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       });
       const complete = result.status === 'RESOLVED' || result.status === 'OMITTED';
       const nextAttempt = retry.attempts + 1;
-      await this.database.clientDependencyRetry.updateMany({ where: { id: retry.id, status: 'RUNNING' }, data: {
+      await withServiceModeOn(this.database, (transaction) => transaction.clientDependencyRetry.updateMany({ where: { id: retry.id, status: 'RUNNING' }, data: {
         status: complete ? 'SUCCEEDED' : 'PENDING', reason: result.status === 'RESOLVED' ? result.reason : result.reason,
         retryAfter: complete ? now : result.status === 'RETRY' && result.retryAfter ? result.retryAfter : retryAtForFailure(new Error(result.reason), nextAttempt),
-      } });
+      } }));
     }
   }
 
@@ -114,16 +133,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     const companySourceId = input.primaryCompanySourceId ?? '';
     const key = { eventId: input.eventId, sourceSystem: input.sourceSystem, sourceEntityId: input.sourceId, companySourceId };
     const dueAt = retryAfter ?? new Date();
-    await this.database.clientDependencyRetry.createMany({
-      data: [{ ...key, reason, retryAfter: dueAt }], skipDuplicates: true,
+    await withServiceModeOn(this.database, async (transaction) => {
+      await transaction.clientDependencyRetry.createMany({ data: [{ ...key, reason, retryAfter: dueAt }], skipDuplicates: true });
+      await transaction.clientDependencyRetry.updateMany({ where: { ...key, status: 'PENDING' }, data: { reason, retryAfter: dueAt } });
+      await transaction.operationalLog.create({ data: {
+        category: 'CLIENT_DEPENDENCY', referenceId: input.eventId,
+        message: `Optional contactperson dependency queued for separate retry (${input.sourceSystem} ${input.sourceId}; company ${companySourceId || 'none'}): ${reason}.`,
+      } });
     });
-    await this.database.clientDependencyRetry.updateMany({
-      where: { ...key, status: 'PENDING' }, data: { reason, retryAfter: dueAt },
-    });
-    await this.database.operationalLog.create({ data: {
-      category: 'CLIENT_DEPENDENCY', referenceId: input.eventId,
-      message: `Optional contactperson dependency queued for separate retry (${input.sourceSystem} ${input.sourceId}; company ${companySourceId || 'none'}): ${reason}.`,
-    } });
   }
 
   async resolveForDocument(input: ClientDependencyInput, workerLease?: EventWorkerLeaseContext): Promise<ClientDependencyResolution> {
@@ -193,6 +210,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         const companyPair = companyResolution.pair;
         try { await gateway.readMoysklad('counterparty', companyPair.moyskladId, null); }
         catch (error) {
+          if (error instanceof ServiceModeNotOnError) throw error;
           if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
           return await holdDependency('DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', { companyId, pairId: companyPair.id });
         }
@@ -263,6 +281,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           await this.logDependencyResolution(event.id, input, pair, reason, fence);
           return { status: 'RESOLVED', pair, companyPair: input.entity === 'COMPANY' ? pair : resolvedCompanyPair, selectedSourceId, reason };
         } catch (error) {
+          if (error instanceof ServiceModeNotOnError) throw error;
           if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'CLIENT_PERSISTED_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
           return await holdDependency('CLIENT_PERSISTED_TARGET_UNAVAILABLE', { entity: input.entity, selectedSourceId, pairId: pair.id });
         }
@@ -284,6 +303,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         : primaryCompanySourceId ? await this.findPersistedPair('COMPANY', primaryCompanySourceId, input.sourceSystem) : null;
       return { status: 'RESOLVED', pair: resolved, companyPair: resolvedCompanyPair, selectedSourceId, reason };
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       if (error instanceof Error && error.message === 'CLIENT_ENTITY_LOCK_BUSY') {
         await workerLease?.assertOwned();
         return { status: 'RETRY', reason: 'CLIENT_ENTITY_LOCK_BUSY', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
@@ -389,7 +409,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     let releasePairLease: (() => Promise<void>) | undefined;
     this.active.add(eventId);
     try {
-      const claimed = await this.database.$transaction(async (tx) => {
+      const claim = await withServiceModeOn(this.database, async (tx) => {
         await assertFenceInTransaction(workerLease, tx);
         return tx.inboundEvent.updateMany({
           where: { id: event.id, OR: [
@@ -399,7 +419,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           data: { status: 'PROCESSING', processingStartedAt: new Date(), attempts: { increment: 1 }, lastErrorCategory: null, retryAfter: null },
         });
       });
-      if (claimed.count !== 1) return 'IGNORED';
+      if (!claim.enabled || claim.value.count !== 1) return 'IGNORED';
       event.status = 'PROCESSING';
       if (event.externalEntityId) {
         const sourceSystem: ClientSystem = event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD';
@@ -621,6 +641,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       });
       return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length || childResourceChanged ? 'SYNCED' : 'UNCHANGED';
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) return 'IGNORED';
       const retryable = isRetryableFailure(error);
       const reason = error instanceof ProviderFailure && !retryable ? 'CLIENT_PROVIDER_REJECTED' : 'CLIENT_SYNC_FAILURE';
       await this.database.$transaction(async (tx) => {
@@ -741,6 +762,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         }
         revisedChildState = result.state as unknown as Prisma.JsonValue;
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) throw error;
         return { status: 'RETRY', reason: `CLIENT_SETTINGS_REVISION_CHILD_READBACK_FAILED:${safeReason(error)}` };
       }
     }
@@ -938,6 +960,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         });
         if (Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length) syncs++;
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) throw error;
         const reason = safeReason(error);
         failures.push({ pairId: pair.id, reason, retryable: isRetryableFailure(error), retryAfter: isRetryableFailure(error) ? retryAtForFailure(error, event.attempts + 1) : undefined });
       } finally {

@@ -15,6 +15,7 @@ import { InvoiceHttpApi, InvoiceRecord } from './invoice-http-api';
 import { InvoiceFieldRule, planInvoiceField } from './invoice-field-plan';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { InvoicePairLease, withInvoicePairLock } from './invoice-pair-lock';
+import { serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -31,17 +32,18 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
   private recoveryCursor: string | null = null;
+  private readonly api: InvoiceHttpApi;
 
   constructor(
     private readonly database: DatabaseService,
-    private readonly api: InvoiceHttpApi,
+    api: InvoiceHttpApi,
     private readonly fieldSettings: FieldSettingsService,
     private readonly syncMode: SyncModeService,
     private readonly databaseRecovery: DatabaseRecoveryService,
     private readonly workerLease: EventWorkerLeaseService,
     private readonly lifecycle: ClientLifecycleService,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
-  ) {}
+  ) { this.api = serviceModeBoundProvider(database, api); }
 
   supports(event: { source: string; eventType: string | null; externalEntityType: string | null }): boolean {
     return event.source === 'BITRIX24'
@@ -78,9 +80,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
   private async resumePendingEvents() {
     try {
-      const now = new Date();
-      const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
-      const pending = await this.database.inboundEvent.findMany({
+      const scan = await withServiceModeOn(this.database, async (transaction) => {
+        const now = new Date();
+        const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
+        return transaction.inboundEvent.findMany({
         where: {
           AND: [
             { OR: [
@@ -98,7 +101,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
           ],
         },
         select: { id: true }, orderBy: { id: 'asc' }, take: 100,
+        });
       });
+      if (!scan.enabled) return;
+      const pending = scan.value;
       if (pending.length) this.recoveryCursor = pending.length === 100 ? pending[pending.length - 1]!.id : null;
       else if (this.recoveryCursor) this.recoveryCursor = null;
       for (const event of pending) this.enqueue(event.id);
@@ -117,16 +123,15 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
     let mode: 'on' | 'pause' | 'off';
     try { mode = (await this.syncMode.read()).mode; }
-    catch { return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_SERVICE_MODE_READ_FAILED', retryAtForFailure(new Error('INVOICE_SERVICE_MODE_READ_FAILED'), event.attempts + 1), lease); }
-    if (mode === 'off') return this.finish(event, 'SKIPPED_DISABLED', 'SERVICE_MODE_OFF', null, lease);
-    if (mode === 'pause') return this.finish(event, 'DEFERRED_PAUSE', 'SERVICE_PAUSED', new Date(Date.now() + 60_000), lease);
-    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return this.finish(event, 'SKIPPED_DISABLED', 'SYNC_MODE_REQUIRED', null, lease);
+    catch { return null; }
+    if (mode !== 'on') return null;
+    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return null;
     let directionEnabled: boolean;
     try { directionEnabled = await this.syncMode.isDirectionEnabled('invoices', directionKey); }
     catch { return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_DIRECTION_READ_FAILED', retryAtForFailure(new Error('INVOICE_DIRECTION_READ_FAILED'), event.attempts + 1), lease); }
     if (!directionEnabled) return this.finish(event, 'SKIPPED_DIRECTION_DISABLED', 'INVOICE_DIRECTION_DISABLED', null, lease);
 
-    const claim = await this.database.inboundEvent.updateMany({
+    const claim = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
       where: { id: event.id, OR: [
         { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' },
         { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
@@ -134,8 +139,8 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: new Date(Date.now() - PROCESSING_LEASE_MS) } }] },
       ] },
       data: { status: 'PROCESSING', processingStartedAt: new Date(), attempts: { increment: 1 }, retryAfter: null, lastErrorCategory: null },
-    });
-    if (claim.count !== 1) return null;
+    }));
+    if (!claim.enabled || claim.value.count !== 1) return null;
 
     try {
       const boundary = await this.databaseRecovery.launchBoundary();
@@ -672,7 +677,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
   private async finish(event: any, status: ProcessStatus, reason: string, retryAfter: Date | null, lease: EventWorkerLeaseContext) {
     await lease.assertOwned();
-    await this.database.$transaction(async (transaction) => {
+    await withServiceModeOn(this.database, async (transaction) => {
       await lease.assertOwnedIn?.(transaction);
       if (status === 'MANUAL_REVIEW') {
         await transaction.manualReviewCase.upsert({

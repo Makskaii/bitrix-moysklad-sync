@@ -13,11 +13,12 @@ const productId = '12345678-1234-1234-1234-123456789abc';
 function harness(event: Record<string, unknown>, pairs: Array<Record<string, unknown>> = [{
   id: 'pair-1', entityType: 'PRODUCT', bitrix24Id: '101', moyskladId: productId,
   active: true, source: 'MANUAL', reason: null, createdAt: new Date(),
-}], gate: { status: 'READY' } | { status: 'SKIPPED_DISABLED'; reason: string } | { status: 'SKIPPED_DIRECTION_DISABLED'; reason: string } = { status: 'READY' }) {
+}], gate: { status: 'READY' } | { status: 'SKIPPED_DISABLED'; reason: string } | { status: 'SKIPPED_DIRECTION_DISABLED'; reason: string } = { status: 'READY' }, serviceMode: 'on' | 'pause' | 'off' | 'missing' = 'on') {
   const storedEvent: Record<string, unknown> = { id: 'event-1', source: 'BITRIX24', status: 'RECEIVED', attempts: 0, ...event };
   const reviewCases: Array<Record<string, unknown>> = [];
   const runtimeCalls: Array<Record<string, unknown>> = [];
   const database = {
+    $queryRaw: async () => serviceMode === 'missing' ? [] : [{ serviceMode }],
     inboundEvent: {
       findUnique: async () => structuredClone(storedEvent),
       updateMany: async ({ where, data }: { where: { status?: string; OR?: Array<{ status: string }> }; data: Record<string, unknown> }) => {
@@ -136,11 +137,25 @@ test('Bitrix24 price event observes apply/off/direction gates before catalog.pri
   const { processor, storedEvent, priceReadCount } = harness({
     eventType: 'CATALOG.PRICE.ON.UPDATE', externalEntityType: 'catalogprice', externalEntityId: '51',
     payload: { event: 'CATALOG.PRICE.ON.UPDATE', data: { FIELDS: { ID: 51 } } },
-  }, undefined, { status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF' });
+  }, undefined, { status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF' }, 'on');
   const result = await processor.process('event-1');
   assert.deepEqual(result, { status: 'SKIPPED_DISABLED', reason: 'SERVICE_OFF', changedFields: [] });
   assert.equal(storedEvent.status, 'SKIPPED_DISABLED');
   assert.equal(priceReadCount, 0);
+});
+
+test('OFF, PAUSE, and unavailable global mode leave a pending product event untouched and perform no provider reads', async () => {
+  for (const serviceMode of ['off', 'pause', 'missing'] as const) {
+    const { processor, storedEvent, runtimeCalls, priceReadCount } = harness({
+      eventType: 'CATALOG.PRICE.ON.UPDATE', externalEntityType: 'catalogprice', externalEntityId: '51',
+      payload: { event: 'CATALOG.PRICE.ON.UPDATE', data: { FIELDS: { ID: 51 } } },
+    }, undefined, { status: 'READY' }, serviceMode);
+    assert.equal(await processor.process('event-1'), null, `${serviceMode} mode must fail closed`);
+    assert.equal(storedEvent.status, 'RECEIVED');
+    assert.equal(storedEvent.attempts, 0);
+    assert.equal(runtimeCalls.length, 0);
+    assert.equal(priceReadCount, 0);
+  }
 });
 
 test('missing product hardpair opens manual review without guessing or creating a pair', async () => {
@@ -180,7 +195,7 @@ test('catalog ADD creates a persisted pair only after exact configured price, cu
     },
     manualReviewCase: { upsert: async () => undefined, updateMany: async () => ({ count: 0 }) },
     operationalLog: { create: async ({ data }: any) => { operationalLogs.push(data); } },
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ serviceMode: 'on' }],
     $transaction: async (operation: (transaction: unknown) => Promise<unknown>) => operation(database),
   };
   const aliasService = { resolveBitrix24Product: async () => ({ status: 'NONE' }), record: async () => { throw new Error('unexpected alias'); } };
@@ -240,6 +255,7 @@ test('controlled product event admits a current synthetic source before allowing
     payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } }, status: 'RECEIVED', attempts: 0 } as Record<string, unknown>;
   const admissions = new Map<string, any>();
   const database: any = {
+    $queryRaw: async () => [{ serviceMode: 'on' }],
     inboundEvent: { findUnique: async () => structuredClone(event), updateMany: async ({ data }: any) => { Object.assign(event, data); return { count: 1 }; } },
     entityPair: { findMany: async () => [{ id: 'pair-product', entityType: 'PRODUCT', bitrix24Id: '101', moyskladId: productId, active: true, source: 'MANUAL', createdAt: now }] },
     manualReviewCase: { upsert: async () => undefined, updateMany: async () => ({ count: 0 }) },

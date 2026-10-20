@@ -59,6 +59,7 @@ before(async () => {
   assert.notEqual(parentUrl.searchParams.get('schema'), dryUrl.searchParams.get('schema'));
   process.env.SYNC_MODE = 'dry';
   database = new DatabaseService();
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { serviceMode: 'on' }, update: { serviceMode: 'on' } });
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
@@ -277,4 +278,28 @@ test('missing saved target remains paired and fails safe without candidate searc
   assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: pair.id } })).moyskladId, target);
   assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: accepted.id } })).status, 'MANUAL_REVIEW');
   assert.equal(await database.entityPairSyncState.count({ where: { pairId: pair.id } }), 0, 'failed target read must not establish a partial baseline');
+});
+
+test('durable OFF leaves a pending client event unclaimed and performs no provider reads', async () => {
+  const accepted = await event(`client-field-off-${suffix}`, 'BITRIX24', sourceId, 'contact');
+  const reads: string[] = [];
+  const gated = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never, {
+    async readBitrix() { reads.push('bitrix'); return b24; },
+    async readMoysklad() { reads.push('moysklad'); return moysklad; },
+    async updateBitrix() { assert.fail('OFF must prevent provider writes'); },
+    async updateMoysklad() { assert.fail('OFF must prevent provider writes'); },
+  }, { async readCompanyInn() { reads.push('candidate'); return null; } } as never, undefined, undefined, undefined);
+
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+  try {
+    await gated.recoverPending();
+    await gated.process(accepted.id);
+    const stored = await database.inboundEvent.findUniqueOrThrow({ where: { id: accepted.id } });
+    assert.equal(stored.status, 'RECEIVED');
+    assert.equal(stored.attempts, 0);
+    assert.deepEqual(reads, []);
+  } finally {
+    await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+    await database.inboundEvent.delete({ where: { id: accepted.id } });
+  }
 });
