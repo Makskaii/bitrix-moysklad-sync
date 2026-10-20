@@ -23,6 +23,7 @@ let fakeB24DealStatuses: Record<string, Array<{ STATUS_ID: string; NAME: string 
 let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
 let omitContactNameFieldType = false;
 let fakeMoyskladAttributeType: string | undefined = 'string';
+let fakeMoyskladUnitListAsArray = false;
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -143,7 +144,10 @@ before(async () => {
         ? APPROVED_DICTIONARY_PAIRS.service.map(([, id]) => ({ id, name: `MS service ${id}` }))
         : paymentDirectory ? APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([, id]) => ({ id, name: `MS payment ${id}` })) : [];
       const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project'].some((path) => url.pathname.endsWith(path));
-      const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
+      // MoySklad's company-settings price-type endpoint returns a bare JSON
+      // array, unlike entity list endpoints that return { rows, meta }.
+      const body = isPriceList ? rows
+        : isUnitList ? fakeMoyskladUnitListAsArray ? rows : { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
         : orderStateMetadata ? { states: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Новая сделка' }] }
@@ -497,6 +501,13 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.equal(page.nextCursor, null);
   assert.ok(page.items.some((item) => item.id === 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
 
+  const pricePageResponse = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=priceTypes&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const pricePage = await pricePageResponse.json() as { items: Array<{ id: string; code: string; label: string }>; nextCursor: string | null };
+  assert.equal(pricePageResponse.status, 200, 'the public catalog endpoint accepts the provider native price-type list response');
+  assert.equal(pricePage.items.length, fakeMsPriceIds.length);
+  assert.ok(pricePage.items.some((item) => item.id === fakeMsPriceIds[0]));
+  assert.equal(pricePage.nextCursor, null);
+
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   const active = await activeResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }> } } };
   const config = structuredClone(active.config) as { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }>; namedPairs: Array<{ kind: string; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: string }> }; [key: string]: unknown };
@@ -537,6 +548,17 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
     body: JSON.stringify({ config: invalidSourceConfig }),
   });
   assert.equal(invalidSourceSave.status, 400, 'stale/deleted Bitrix24 source references cannot be saved');
+});
+
+test('entity list catalogs still fail closed when they return an unexpected top-level array', async () => {
+  fakeMoyskladUnitListAsArray = true;
+  try {
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=units&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /invalid catalog/);
+  } finally {
+    fakeMoyskladUnitListAsArray = false;
+  }
 });
 
 test('deal-order runtime requires unique explicitly confirmed header and stage mappings', async () => {

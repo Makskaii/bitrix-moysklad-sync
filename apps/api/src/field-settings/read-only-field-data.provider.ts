@@ -439,9 +439,15 @@ export class ReadOnlyFieldDataProvider {
       if (visited.has(key)) throw new ServiceUnavailableException('MoySklad returned a repeating catalog page');
       visited.add(key);
       const payload = await this.moyskladGet(url.toString());
-      if (!isRecord(payload) || !Array.isArray(payload.rows)) throw new ServiceUnavailableException('MoySklad returned an invalid catalog');
-      rows.push(...payload.rows.filter(isRecord));
-      const nextHref = isRecord(payload.meta) && typeof payload.meta.nextHref === 'string' ? payload.meta.nextHref : '';
+      // Unlike entity list resources, this company-settings endpoint returns
+      // the price types as a bare JSON array (verified against the live API).
+      const isPriceTypeCatalog = url.pathname.endsWith('/context/companysettings/pricetype');
+      let pageRows: unknown[] | null = null;
+      if (isPriceTypeCatalog && Array.isArray(payload)) pageRows = payload;
+      else if (isRecord(payload) && Array.isArray(payload.rows)) pageRows = payload.rows;
+      if (!pageRows) throw new ServiceUnavailableException('MoySklad returned an invalid catalog');
+      rows.push(...pageRows.filter(isRecord));
+      const nextHref = isRecord(payload) && isRecord(payload.meta) && typeof payload.meta.nextHref === 'string' ? payload.meta.nextHref : '';
       if (!nextHref) return rows;
       url = new URL(nextHref);
     }
