@@ -289,3 +289,45 @@ test('an OFF flip between a bounded source read and tombstone prevents the next 
     await database.entityPair.deleteMany({ where: { id: racePairId } });
   }
 });
+
+test('a late provider callback cannot continue lifecycle work after the durable transaction timeout', async () => {
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
+  const timeoutPairId = `${pairId}-timeout`;
+  const timeoutEvent = await database.inboundEvent.create({ data: {
+    source: 'BITRIX24', deliveryKey: `${eventPrefix}timeout`, eventType: 'ONCRMCOMPANYDELETE',
+    externalEntityType: 'company', externalEntityId: `${b24Id}-timeout`, payload: {}, status: 'RECEIVED',
+  } });
+  const timeoutPair = await database.entityPair.create({ data: {
+    id: timeoutPairId, entityType: 'COMPANY', bitrix24Id: `${b24Id}-timeout`, moyskladId: randomUUID(),
+    moyskladType: 'counterparty', active: true, lifecycleStatus: 'ACTIVE',
+  } });
+  const readsBefore = providerReads;
+  let started!: () => void;
+  const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+  const barrier: { started(): void; release(): void } = { started, release: () => {} };
+  nextReadBarrier = barrier;
+  const { app } = await createApp();
+  try {
+    await providerStarted;
+    const deadline = Date.now() + 18_000;
+    let event = await database.inboundEvent.findUniqueOrThrow({ where: { id: timeoutEvent.id } });
+    while (event.status !== 'RETRYABLE_FAILURE' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      event = await database.inboundEvent.findUniqueOrThrow({ where: { id: timeoutEvent.id } });
+    }
+    assert.equal(event.status, 'RETRYABLE_FAILURE', 'the 15-second transaction timeout must return control to the worker');
+    assert.equal(providerReads, readsBefore + 1, 'only the one bounded current-state operation may have started');
+    const pairBeforeLateCompletion = await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } });
+    assert.equal(pairBeforeLateCompletion.lifecycleStatus, 'ACTIVE');
+    barrier.release(); // the simulated provider ignores abort and resolves after the DB transaction timed out
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const pairAfterLateCompletion = await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } });
+    assert.equal(pairAfterLateCompletion.lifecycleStatus, 'ACTIVE', 'late callback result must not resume into tombstone or another provider operation');
+    assert.equal(providerReads, readsBefore + 1);
+  } finally {
+    barrier.release();
+    await app.close();
+    await database.inboundEvent.deleteMany({ where: { id: timeoutEvent.id } });
+    await database.entityPair.deleteMany({ where: { id: timeoutPairId } });
+  }
+});
