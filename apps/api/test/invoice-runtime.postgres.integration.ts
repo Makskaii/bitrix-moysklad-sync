@@ -1,6 +1,8 @@
 import 'reflect-metadata';
 import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
+import { INestApplication } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -16,6 +18,8 @@ import { FieldSettingsService } from '../src/field-settings/field-settings.servi
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
+import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
+import { EventDispatcherService } from '../src/event-dispatcher.service';
 
 const suffix = randomUUID();
 const orderId = randomUUID();
@@ -26,11 +30,14 @@ const fieldConfig = { rules: [{ id: 'invoice-title', entity: 'smart-invoices', s
   bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
   moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }], groups: [] };
 let activeFieldConfig = fieldConfig;
+let activeSettingsVersion = 1;
+const testSettingsHistory = new Map<number, typeof fieldConfig>([[1, fieldConfig]]);
+const testEventSettings = new Map<string, { version: number; config: typeof fieldConfig }>();
 let db: DatabaseService;
 let server: Server;
 let base = '';
 let processor: InvoiceEventProcessor;
-let settingsAdapter: { eventConfig: (eventId: string) => Promise<unknown>; transformFieldResult: typeof FieldSettingsService.prototype.transformFieldResult };
+let settingsAdapter: { eventConfig: (eventId: string) => Promise<unknown>; version: (version: number) => Promise<unknown>; transformFieldResult: typeof FieldSettingsService.prototype.transformFieldResult };
 let oldMode: string | undefined;
 let oldBitrixBase: string | undefined;
 let oldMoyskladBase: string | undefined;
@@ -39,6 +46,7 @@ let oldDatabaseUrl: string | undefined;
 let invoiceCounter = 5000;
 let failNextInvoiceCreate = false;
 let failNextMoyskladUpdate = false;
+let failNextBitrixUpdateField: string | null = null;
 let reparentOnNextMoyskladWrite = false;
 let moyskladWrites = 0;
 let processorStarted = false;
@@ -77,7 +85,8 @@ before(async () => {
   process.env.MOYSKLAD_API_BASE_URL = new URL('api/remap/1.2/', base).href;
   process.env.MOYSKLAD_API_TOKEN = 'invoice-fake-provider-only';
   settingsAdapter = {
-    eventConfig: async () => ({ version: 1, config: activeFieldConfig }),
+    eventConfig: async (eventId) => testEventSettings.get(eventId) ?? ({ version: activeSettingsVersion, config: activeFieldConfig }),
+    version: async (version) => ({ version, config: testSettingsHistory.get(version) }),
     transformFieldResult: FieldSettingsService.prototype.transformFieldResult,
   };
   const recovery = { launchBoundary: async () => launchBoundary, assertReady: async () => true };
@@ -115,6 +124,68 @@ test('database constraints accept invoice pairs and review cases while preservin
     id: `invoice55-${suffix}-invalid-review`, entityType: 'UNSUPPORTED', sourceSystem: 'BITRIX24',
     sourceEntityId: '510002', reason: 'INVOICE_TEST_REVIEW',
   } }));
+});
+
+test('admin HTTP V1→V2 invoice settings save is applied by the inbound webhook processor', async () => {
+  const savedEnv = Object.fromEntries(['ADMIN_PREVIEW', 'BITRIX24_EVENT_APPLICATION_TOKEN'].map((key) => [key, process.env[key]]));
+  const sourceId = String(++invoiceCounter);
+  const boundary = new Date(launchBoundary);
+  let app: INestApplication | undefined;
+  try {
+    process.env.ADMIN_PREVIEW = '1';
+    process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-invoice-http-token';
+    await db.databaseRecoveryState.upsert({ where: { id: 'global' }, create: { id: 'global', status: 'READY', previousLaunchBoundary: boundary, pairsRestored: true, lostEventsAcknowledged: true, acknowledgedAt: new Date(), acknowledgement: 'isolated issue79 HTTP fixture confirmation' }, update: { status: 'READY', previousLaunchBoundary: boundary, pairsRestored: true, lostEventsAcknowledged: true, acknowledgedAt: new Date(), acknowledgement: 'isolated issue79 HTTP fixture confirmation' } });
+    await db.databaseRecoveryAudit.create({ data: { id: randomUUID(), action: 'DATABASE_LOSS_RECOVERY_CONFIRMED', actorType: 'VERIFIED_BITRIX24_ADMIN', actorId: 'BITRIX24_USER:42', oldBoundaryAt: null, boundaryAt: boundary, pairsRestored: true, lostEventsAcknowledged: true, acknowledgement: 'isolated issue79 HTTP fixture confirmation', recoveryStateId: 'global' } });
+    app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
+    await app.listen(0, '127.0.0.1');
+    const api = await app.getUrl();
+    const saveUrl = `${api}/api/admin/field-settings`;
+    const headers = { 'content-type': 'application/json' };
+    const activeResponse = await fetch(saveUrl);
+    assert.equal(activeResponse.status, 200);
+    const active = await activeResponse.json() as { config: { references: unknown } };
+    const v1 = { rules: [{ id: 'http-invoice-title', entity: 'smart-invoices', sourceField: 'title', targetField: 'name', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }], groups: [], references: active.config.references };
+    const saveV1 = await fetch(saveUrl, { method: 'PUT', headers, body: JSON.stringify({ config: v1 }) });
+    assert.equal(saveV1.status, 200);
+    const v1Saved = await saveV1.json() as { version: number };
+    assert.equal(v1Saved.version, 2);
+    bitrixInvoices.set(sourceId, { id: sourceId, title: 'HTTP V1 invoice', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    const webhook = (event: string) => fetch(`${api}/webhooks/bitrix24`, { method: 'POST', headers, body: JSON.stringify({ event, data: { FIELDS: { ID: sourceId, ENTITY_TYPE_ID: 31 } }, auth: { application_token: 'synthetic-invoice-http-token' } }) });
+    const createResponse = await webhook('ONCRMDYNAMICITEMADD');
+    assert.ok(createResponse.status === 200 || createResponse.status === 201);
+    const createAck = await createResponse.json() as { eventId: string };
+    await app.get(EventDispatcherService).dispatch(createAck.eventId);
+    await waitForEventStatus(createAck.eventId, 'SUCCEEDED');
+    assert.equal((await db.inboundEventSettings.findUniqueOrThrow({ where: { eventId: createAck.eventId } })).settingsVersion, v1Saved.version);
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId, active: true } });
+    const savedV2 = { ...v1, rules: [...v1.rules, { id: 'http-invoice-code', entity: 'smart-invoices', sourceField: 'code', targetField: 'code', bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }] };
+    const saveV2 = await fetch(saveUrl, { method: 'PUT', headers, body: JSON.stringify({ config: savedV2 }) });
+    assert.equal(saveV2.status, 200);
+    const v2Version = (await saveV2.json() as { version: number }).version;
+    assert.equal(v2Version, v1Saved.version + 1);
+    const target = moyskladInvoices.get(pair.moyskladId)!;
+    target.code = 'HTTP-V2-CODE';
+    const updateResponse = await webhook('ONCRMDYNAMICITEMUPDATE');
+    assert.ok(updateResponse.status === 200 || updateResponse.status === 201);
+    const updateAck = await updateResponse.json() as { eventId: string };
+    await app.get(EventDispatcherService).dispatch(updateAck.eventId);
+    const completed = await waitForEventStatus(updateAck.eventId, 'SUCCEEDED');
+    assert.equal(completed.status, 'SUCCEEDED');
+    assert.equal((await db.inboundEventSettings.findUniqueOrThrow({ where: { eventId: updateAck.eventId } })).settingsVersion, v2Version);
+    assert.equal(bitrixInvoices.get(sourceId)?.code, 'HTTP-V2-CODE');
+    const revision = await db.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: v2Version } } });
+    assert.equal(revision.status, 'COMPLETE');
+    assert.equal((await db.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, v2Version);
+  } finally {
+    if (app) { (app.getHttpServer() as Server).closeAllConnections(); await app.close(); }
+    // Recovery audit rows are intentionally immutable; this test uses a disposable isolated database.
+    await db.entityPair.deleteMany({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    bitrixInvoices.delete(sourceId);
+    for (const [id, invoice] of moyskladInvoices) if (invoice.externalCode === sourceId) moyskladInvoices.delete(id);
+    moyskladWrites = 0;
+    restoreEnv('ADMIN_PREVIEW', savedEnv.ADMIN_PREVIEW);
+    restoreEnv('BITRIX24_EVENT_APPLICATION_TOKEN', savedEnv.BITRIX24_EVENT_APPLICATION_TOKEN);
+  }
 });
 
 test('invoice processor creates one independently paired invoiceout, then update replay echoes without another write', async () => {
@@ -314,6 +385,77 @@ test('invoice groups use the configured #56 join transform and baseline for crea
     assert.equal(moyskladInvoices.get(emptyPair.moyskladId)?.name, 'Now present', 'the persisted empty baseline must detect a later non-empty group value');
   } finally {
     activeFieldConfig = fieldConfig;
+  }
+});
+
+test('an invoice webhook applies a new MS-authoritative mapping and persists its verified settings revision', async () => {
+  const sourceId = String(++invoiceCounter);
+  bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice revision', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+  const create = await createEvent(`revision-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+  assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
+  const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+  const baselineV1 = await db.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.equal(baselineV1.settingsVersion, 1);
+  const oldRetry = await createEvent(`revision-old-retry-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+  const pinnedV1 = testEventSettings.get(oldRetry.id)!;
+  await db.inboundEvent.update({ where: { id: oldRetry.id }, data: { status: 'RETRYABLE_FAILURE', retryAfter: new Date(Date.now() + 3_600_000), lastErrorCategory: 'SYNTHETIC_DEFERRED_RETRY' } });
+  bitrixInvoices.get(sourceId)!.title = 'V1 edit retained across rebase';
+
+  const oldConfig = activeFieldConfig;
+  const oldVersion = activeSettingsVersion;
+  try {
+    activeSettingsVersion = 2;
+    activeFieldConfig = { ...fieldConfig, rules: [fieldConfig.rules[0]!,
+      { id: 'invoice-code-from-ms', entity: 'smart-invoices', sourceField: 'code', targetField: 'code',
+        bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+      { id: 'invoice-description-from-ms', entity: 'smart-invoices', sourceField: 'description', targetField: 'description',
+        bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+    ], groups: [{ id: 'invoice-ms-label', entity: 'smart-invoices', direction: 'MOYSKLAD_TO_BITRIX24', targetField: 'notes', sourceFields: ['code', 'description'], criticality: 'optional', transform: { kind: 'join-non-empty', separator: ' - ' } }] } as unknown as typeof activeFieldConfig;
+    testSettingsHistory.set(2, activeFieldConfig);
+    moyskladInvoices.get(pair.moyskladId)!.code = 'authoritative-ms-code';
+    moyskladInvoices.get(pair.moyskladId)!.description = 'authoritative-ms-description';
+    const update = await createEvent(`revision-update-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    failNextBitrixUpdateField = 'description';
+    const partial = await processor.process(update.id);
+    assert.equal(partial?.status, 'RETRYABLE_FAILURE');
+    assert.equal(bitrixInvoices.get(sourceId)?.code, 'authoritative-ms-code', 'the first provider write may succeed before a later field fails');
+    assert.equal(bitrixInvoices.get(sourceId)?.description, undefined);
+    assert.equal((await db.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, 1, 'a partial revision must not advance the baseline version');
+    assert.equal((await db.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: 2 } } })).status, 'PREPARED');
+    await db.inboundEvent.update({ where: { id: update.id }, data: { retryAfter: new Date(Date.now() - 1_000) } });
+    const outcome = await processor.process(update.id);
+    assert.equal(outcome?.status, 'SUCCEEDED', JSON.stringify(outcome));
+    assert.equal(bitrixInvoices.get(sourceId)?.code, 'authoritative-ms-code');
+    assert.equal(bitrixInvoices.get(sourceId)?.description, 'authoritative-ms-description');
+    assert.equal(bitrixInvoices.get(sourceId)?.notes, 'authoritative-ms-code - authoritative-ms-description');
+    assert.equal(moyskladInvoices.get(pair.moyskladId)?.name, 'V1 edit retained across rebase', 'the unchanged V1 mapping keeps its earlier difference state for ordinary synchronization');
+    const baselineV2 = await db.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
+    assert.equal(baselineV2.settingsVersion, 2);
+    assert.equal((baselineV2.bitrix24Values as Record<string, unknown>)['rule:invoice-code-from-ms'], 'authoritative-ms-code');
+    assert.equal((await db.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, 2);
+    const revision = await db.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: 2 } } });
+    assert.equal(revision.status, 'COMPLETE');
+    assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 1);
+    const writesBeforeOldRetry = moyskladWrites;
+    testEventSettings.set(oldRetry.id, pinnedV1);
+    await db.inboundEvent.update({ where: { id: oldRetry.id }, data: { retryAfter: new Date(Date.now() - 1_000) } });
+    const oldOutcome = await processor.process(oldRetry.id);
+    assert.equal(oldOutcome?.status, 'UNCHANGED');
+    assert.equal(oldOutcome?.reason, 'SETTINGS_PIN_SUPERSEDED');
+    assert.equal(moyskladWrites, writesBeforeOldRetry);
+    assert.equal((await db.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, 2);
+    assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 1);
+  } finally {
+    activeFieldConfig = oldConfig;
+    activeSettingsVersion = oldVersion;
+    testSettingsHistory.delete(2);
+    failNextBitrixUpdateField = null;
+    testEventSettings.delete(oldRetry.id);
+    await db.entityPair.deleteMany({ where: { id: pair.id } });
+    bitrixInvoices.delete(sourceId);
+    moyskladInvoices.delete(pair.moyskladId);
   }
 });
 
@@ -599,10 +741,12 @@ test('invoice group saved through field settings is reloaded and consumed by inv
 });
 
 async function createEvent(id: string, source: string, eventType: string, externalEntityType: string, externalEntityId: string) {
-  return db.inboundEvent.create({ data: {
+  const event = await db.inboundEvent.create({ data: {
     source, deliveryKey: `invoice55-${suffix}-${id}`, eventType, externalEntityType, externalEntityId,
     payload: {}, status: 'RECEIVED',
   } });
+  testEventSettings.set(event.id, { version: activeSettingsVersion, config: activeFieldConfig });
+  return event;
 }
 
 async function reply(request: IncomingMessage, response: ServerResponse) {
@@ -618,6 +762,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       const item = bitrixInvoices.get(id);
       return send(response, item ? { result: { item: { id, ...item } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, item ? 200 : 400);
     }
+    if (method === 'crm.item.fields.json') return send(response, { result: { fields: { title: { type: 'string', title: 'Title', isReadOnly: false }, code: { type: 'string', title: 'Code', isReadOnly: false } } } });
     if (method === 'crm.deal.get.json') {
       const id = form.get('id') ?? '';
       const deal = deals.get(id);
@@ -638,13 +783,22 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (method === 'crm.item.update.json') {
       const item = bitrixInvoices.get(form.get('id') ?? '');
       if (item) {
+        if (failNextBitrixUpdateField && form.has(`fields[${failNextBitrixUpdateField}]`)) {
+          failNextBitrixUpdateField = null;
+          return send(response, { error: 'TEMPORARY_PROVIDER_FAILURE', error_description: 'temporary' }, 503);
+        }
         const title = form.get('fields[title]'); if (title !== null) item.title = title;
         const description = form.get('fields[description]'); if (description !== null) item.description = description;
+        for (const [key, value] of form.entries()) {
+          const field = /^fields\[([^\]]+)\]$/.exec(key)?.[1];
+          if (field && field !== 'title' && field !== 'description') item[field] = value;
+        }
       }
       return send(response, { result: { item } });
     }
   }
   if (url.pathname.startsWith('/api/remap/1.2/')) {
+    if (request.method === 'GET' && url.pathname.endsWith('/entity/invoiceout/metadata/attributes')) return send(response, { rows: [{ id: randomUUID(), name: 'Code', type: 'string', writable: true }] });
     if (request.method === 'GET' && url.pathname === '/api/remap/1.2/entity/invoiceout') {
       const externalCode = url.searchParams.get('filter')?.replace(/^externalCode=/, '');
       return send(response, { rows: [...moyskladInvoices.values()].filter((invoice) => invoice.externalCode === externalCode) });

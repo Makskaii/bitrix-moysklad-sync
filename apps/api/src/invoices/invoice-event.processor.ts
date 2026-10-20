@@ -14,6 +14,7 @@ import { invoiceCreatedAt, invoicePairLinksMatchOrder, resolveInvoiceOrderLink }
 import { InvoiceHttpApi, InvoiceRecord } from './invoice-http-api';
 import { InvoiceFieldRule, planInvoiceField } from './invoice-field-plan';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { InvoicePairLease, withInvoicePairLock } from './invoice-pair-lock';
 
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -21,7 +22,7 @@ const RECOVERY_INTERVAL_MS = 1_000;
 const MAX_ATTEMPTS = 8;
 type Source = 'BITRIX24' | 'MOYSKLAD';
 type InvoiceDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
-type ProcessStatus = 'SUCCEEDED' | 'SKIPPED_PRE_LAUNCH' | 'SKIPPED_DISABLED' | 'SKIPPED_DIRECTION_DISABLED' | 'WAITING_FOR_ORDER' | 'MANUAL_REVIEW' | 'RETRYABLE_FAILURE' | 'DEFERRED_PAUSE';
+type ProcessStatus = 'SUCCEEDED' | 'UNCHANGED' | 'SKIPPED_PRE_LAUNCH' | 'SKIPPED_DISABLED' | 'SKIPPED_DIRECTION_DISABLED' | 'WAITING_FOR_ORDER' | 'MANUAL_REVIEW' | 'RETRYABLE_FAILURE' | 'DEFERRED_PAUSE';
 
 /** Owns only smart invoices (entityTypeId 31) and MySklad invoiceout documents. */
 @Injectable()
@@ -193,7 +194,11 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
           }
           const pair = await this.persistPair(source, sourceId, created.partnerId, order.pair.moyskladId, event.id, lease);
           if (!pair) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_PERSIST_FAILED', retryAtForFailure(new Error('INVOICE_PAIR_PERSIST_FAILED'), event.attempts + 1), lease);
-          await this.initializeBaseline(pair.id, event.id, settings, rules, groups, bitrix, moysklad);
+          const baselineLock = await withInvoicePairLock(this.database, pair.id, event.id, async (pairLease) => {
+            await this.initializeBaseline(pair.id, event.id, settings, rules, groups, bitrix, moysklad, pairLease);
+            return true;
+          });
+          if (!baselineLock) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
           return this.finish(event, 'SUCCEEDED', 'INVOICE_CREATED_AND_PAIRED', null, lease);
         });
       }
@@ -204,12 +209,14 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const [bitrix, moysklad] = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? await this.controlledAdmission.runForEvent(event.id, readPair) : await readPair();
       if (!invoicePairLinksMatchOrder(bitrix, moysklad, order.pair)) return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_PAIR_ORDER_LINK_MISMATCH', null, lease);
-      const baseline = await this.ensureBaseline(invoicePair.pair.id, event.id, settings, rules, groups, bitrix, moysklad);
-      if (baseline === 'VERSION_MISMATCH') return this.finish(event, 'MANUAL_REVIEW', 'INVOICE_SETTINGS_VERSION_MISMATCH', null, lease);
-      const result = await this.lifecycle.withPairActiveLock(invoicePair.pair.id, 'INVOICE', () => {
-        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline, bitrix, moysklad, lease });
+      const result = await this.lifecycle.withPairActiveLock(invoicePair.pair.id, 'INVOICE', () => withInvoicePairLock(this.database, invoicePair.pair.id, event.id, async (pairLease) => {
+        const baselineResult = await this.ensureBaseline(invoicePair.pair, order.pair, event.id, settings, rules, groups, bitrix, moysklad, lease, pairLease);
+        if (baselineResult.status === 'SUPERSEDED') return { status: 'UNCHANGED', reason: 'SETTINGS_PIN_SUPERSEDED', retryAfter: null } as const;
+        if (baselineResult.status !== 'READY') return baselineResult;
+        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline: baselineResult.baseline, bitrix: baselineResult.bitrix, moysklad: baselineResult.moysklad, lease, pairLease });
         return this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? this.controlledAdmission.runForEvent(event.id, sync) : sync();
-      });
+      }));
+      if (!result) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith('INVOICE_FIELD_TRANSFORM_CRITICAL:')) {
@@ -350,34 +357,177 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     return { status: 'FOUND', pair };
   }
 
-  private async initializeBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
+  private async initializeBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], bitrix: InvoiceRecord, moysklad: InvoiceRecord, pairLease: InvoicePairLease) {
     const bitrix24Values = baselineValues(bitrix, rules, groups, 'BITRIX24');
     const moyskladValues = baselineValues(moysklad, rules, groups, 'MOYSKLAD');
-    await this.database.entityPairBaseline.createMany({ data: [{ pairId, eventId, settingsVersion: settings.version, bitrix24Values: bitrix24Values as unknown as Prisma.InputJsonValue, moyskladValues: moyskladValues as unknown as Prisma.InputJsonValue }], skipDuplicates: true });
-    await this.database.entityPairSyncState.upsert({
-      where: { pairId },
-      create: { pairId, settingsVersion: settings.version, bitrix24Values: bitrix24Values as unknown as Prisma.InputJsonValue, moyskladValues: moyskladValues as unknown as Prisma.InputJsonValue },
-      update: {},
+    const committed = await pairLease.commit(async (transaction) => {
+      await transaction.entityPairBaseline.createMany({ data: [{ pairId, eventId, settingsVersion: settings.version, bitrix24Values: bitrix24Values as unknown as Prisma.InputJsonValue, moyskladValues: moyskladValues as unknown as Prisma.InputJsonValue }], skipDuplicates: true });
+      await transaction.entityPairSyncState.upsert({
+        where: { pairId },
+        create: { pairId, settingsVersion: settings.version, bitrix24Values: bitrix24Values as unknown as Prisma.InputJsonValue, moyskladValues: moyskladValues as unknown as Prisma.InputJsonValue },
+        update: {},
+      });
     });
+    if (!committed.committed) throw new Error('INVOICE_PAIR_LOCK_LOST');
   }
 
-  private async ensureBaseline(pairId: string, eventId: string, settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'], bitrix: InvoiceRecord, moysklad: InvoiceRecord) {
-    const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId } });
-    if (baseline && baseline.settingsVersion !== settings.version) return 'VERSION_MISMATCH' as const;
+  private async ensureBaseline(
+    pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string }, order: { bitrix24Id: string; moyskladId: string }, eventId: string,
+    settings: VersionedFieldSettingsDto, rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups'],
+    bitrix: InvoiceRecord, moysklad: InvoiceRecord, eventLease: EventWorkerLeaseContext, pairLease: InvoicePairLease,
+  ): Promise<{ status: 'READY'; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord } | { status: 'SUPERSEDED' } | { status: 'RETRYABLE_FAILURE' | 'MANUAL_REVIEW'; reason: string; retryAfter?: Date }> {
+    let baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
     if (!baseline) {
-      await this.initializeBaseline(pairId, eventId, settings, rules, groups, bitrix, moysklad);
-      return this.database.entityPairBaseline.findUnique({ where: { pairId } });
+      try { await this.initializeBaseline(pair.id, eventId, settings, rules, groups, bitrix, moysklad, pairLease); }
+      catch (error) { return { status: 'RETRYABLE_FAILURE', reason: error instanceof Error ? error.message : 'INVOICE_BASELINE_PERSIST_FAILED', retryAfter: retryAtForFailure(error, 1) }; }
+      baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
+      if (!baseline) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_BASELINE_PERSIST_FAILED', retryAfter: retryAtForFailure(new Error('INVOICE_BASELINE_PERSIST_FAILED'), 1) };
     }
-    let state = await this.database.entityPairSyncState.findUnique({ where: { pairId } });
-    if (state && state.settingsVersion !== settings.version) return 'VERSION_MISMATCH' as const;
-    if (!state) await this.database.entityPairSyncState.create({ data: { pairId, settingsVersion: settings.version, bitrix24Values: baseline.bitrix24Values as Prisma.InputJsonValue, moyskladValues: baseline.moyskladValues as Prisma.InputJsonValue } });
-    state = await this.database.entityPairSyncState.findUnique({ where: { pairId } });
-    return state;
+    if (settings.version < baseline.settingsVersion) return { status: 'SUPERSEDED' };
+    let state = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+    if (settings.version === baseline.settingsVersion) {
+      if (state && state.settingsVersion !== settings.version) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SYNC_STATE_VERSION_MISMATCH' };
+      if (!state) {
+        const committed = await pairLease.commit((transaction) => transaction.entityPairSyncState.create({ data: { pairId: pair.id, settingsVersion: settings.version, bitrix24Values: baseline.bitrix24Values as Prisma.InputJsonValue, moyskladValues: baseline.moyskladValues as Prisma.InputJsonValue } }));
+        if (!committed.committed) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_PAIR_LOCK_LOST', retryAfter: retryAtForFailure(new Error('INVOICE_PAIR_LOCK_LOST'), 1) };
+        state = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+      }
+      return state ? { status: 'READY', baseline: state, bitrix, moysklad } : { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SYNC_STATE_PERSIST_FAILED', retryAfter: retryAtForFailure(new Error('INVOICE_SYNC_STATE_PERSIST_FAILED'), 1) };
+    }
+
+    let oldSettings: VersionedFieldSettingsDto;
+    try { oldSettings = await this.fieldSettings.version(baseline.settingsVersion); }
+    catch { return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_SOURCE_UNAVAILABLE' }; }
+    const oldRules = oldSettings.config.rules.filter((rule) => rule.entity === 'smart-invoices' && (rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled));
+    const oldGroups = oldSettings.config.groups.filter((group) => group.entity === 'smart-invoices');
+    const oldProjection = invoiceSettingsProjection(oldRules, oldGroups);
+    const newProjection = invoiceSettingsProjection(rules, groups);
+    const changedRules = rules.filter((rule) => rule.entity === 'smart-invoices' && !oldRules.some((old) => stableJson(invoiceRuleSemantic(old)) === stableJson(invoiceRuleSemantic(rule))));
+    const changedGroups = groups.filter((group) => group.entity === 'smart-invoices' && !oldGroups.some((old) => stableJson(invoiceGroupSemantic(old)) === stableJson(invoiceGroupSemantic(group))));
+    const fingerprint = createHash('sha256').update(stableJson(newProjection)).digest('hex');
+    const previousBaseline = {
+      settingsVersion: baseline.settingsVersion, bitrix24Values: baseline.bitrix24Values, moyskladValues: baseline.moyskladValues,
+      capturedAt: baseline.capturedAt.toISOString(),
+      syncState: state ? { settingsVersion: state.settingsVersion, bitrix24Values: state.bitrix24Values, moyskladValues: state.moyskladValues } : null,
+    } as Prisma.InputJsonValue;
+    try {
+      await this.database.entityPairSettingsRevision.upsert({
+        where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: settings.version } },
+        create: { pairId: pair.id, fromSettingsVersion: baseline.settingsVersion, toSettingsVersion: settings.version, status: 'PREPARED', semanticFingerprint: fingerprint, previousBaseline },
+        update: {},
+      });
+    } catch { return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_PERSIST_FAILED', retryAfter: retryAtForFailure(new Error('INVOICE_SETTINGS_REVISION_PERSIST_FAILED'), 1) }; }
+
+    let verifiedBitrix = bitrix;
+    let verifiedMoysklad = moysklad;
+    if (stableJson(oldProjection) !== stableJson(newProjection)) {
+      if (process.env.SYNC_MODE !== 'apply') return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_REQUIRES_APPLY' };
+      try {
+        [verifiedBitrix, verifiedMoysklad] = await Promise.all([this.api.readBitrix24(pair.bitrix24Id), this.api.readMoysklad(pair.moyskladId)]);
+      } catch (error) { return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_READ_FAILED', retryAfter: retryAtForFailure(error, 1) }; }
+      if (!invoicePairLinksMatchOrder(verifiedBitrix, verifiedMoysklad, order)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_ORDER_LINK_MISMATCH' };
+      const reconciled = await this.reconcileInvoiceRevision(pair, order, eventId, changedRules, changedGroups, settings, verifiedBitrix, verifiedMoysklad, eventLease, pairLease);
+      if (reconciled.status !== 'READY') {
+        await this.database.entityPairSettingsRevision.updateMany({
+          where: { pairId: pair.id, toSettingsVersion: settings.version, status: 'PREPARED' },
+          data: { ...(reconciled.status === 'MANUAL_REVIEW' ? { status: 'FAILED' } : {}), errorCategory: reconciled.reason },
+        }).catch(() => undefined);
+        return reconciled;
+      }
+      verifiedBitrix = reconciled.bitrix;
+      verifiedMoysklad = reconciled.moysklad;
+    }
+
+    const baselineB24 = remapInvoiceSnapshot(baseline.bitrix24Values, oldRules, oldGroups, rules, groups, verifiedBitrix, 'BITRIX24');
+    const baselineMs = remapInvoiceSnapshot(baseline.moyskladValues, oldRules, oldGroups, rules, groups, verifiedMoysklad, 'MOYSKLAD');
+    const stateB24 = remapInvoiceSnapshot(state?.bitrix24Values ?? baseline.bitrix24Values, oldRules, oldGroups, rules, groups, verifiedBitrix, 'BITRIX24');
+    const stateMs = remapInvoiceSnapshot(state?.moyskladValues ?? baseline.moyskladValues, oldRules, oldGroups, rules, groups, verifiedMoysklad, 'MOYSKLAD');
+    try {
+      const committed = await pairLease.commit(async (transaction) => {
+        const current = await transaction.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
+        if (!current || current.settingsVersion !== baseline.settingsVersion) throw new Error('INVOICE_SETTINGS_REVISION_BASELINE_CHANGED');
+        await transaction.entityPairBaseline.update({ where: { pairId: pair.id }, data: { settingsVersion: settings.version, bitrix24Values: baselineB24 as Prisma.InputJsonValue, moyskladValues: baselineMs as Prisma.InputJsonValue } });
+        await transaction.entityPairSyncState.upsert({
+          where: { pairId: pair.id },
+          create: { pairId: pair.id, settingsVersion: settings.version, bitrix24Values: stateB24 as Prisma.InputJsonValue, moyskladValues: stateMs as Prisma.InputJsonValue },
+          update: { settingsVersion: settings.version, bitrix24Values: stateB24 as Prisma.InputJsonValue, moyskladValues: stateMs as Prisma.InputJsonValue },
+        });
+        await transaction.entityPairSettingsRevision.update({
+          where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: settings.version } },
+          data: { status: 'COMPLETE', currentBaseline: { settingsVersion: settings.version, bitrix24Values: baselineB24, moyskladValues: baselineMs } as Prisma.InputJsonValue },
+        });
+        return transaction.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
+      });
+      if (!committed.committed || !committed.value) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_COMMIT_FAILED', retryAfter: retryAtForFailure(new Error('INVOICE_SETTINGS_REVISION_COMMIT_FAILED'), 1) };
+      return { status: 'READY', baseline: committed.value, bitrix: verifiedBitrix, moysklad: verifiedMoysklad };
+    } catch {
+      await this.database.entityPairSettingsRevision.updateMany({ where: { pairId: pair.id, toSettingsVersion: settings.version, status: 'PREPARED' }, data: { status: 'FAILED', errorCategory: 'INVOICE_SETTINGS_REVISION_COMMIT_FAILED' } }).catch(() => undefined);
+      return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_COMMIT_FAILED', retryAfter: retryAtForFailure(new Error('INVOICE_SETTINGS_REVISION_COMMIT_FAILED'), 1) };
+    }
+  }
+
+  private async reconcileInvoiceRevision(
+    pair: { id: string; bitrix24Id: string; moyskladId: string }, order: { bitrix24Id: string; moyskladId: string }, eventId: string,
+    changedRules: VersionedFieldSettingsDto['config']['rules'], changedGroups: VersionedFieldSettingsDto['config']['groups'], config: VersionedFieldSettingsDto,
+    bitrix: InvoiceRecord, moysklad: InvoiceRecord, eventLease: EventWorkerLeaseContext, pairLease: InvoicePairLease,
+  ): Promise<{ status: 'READY'; bitrix: InvoiceRecord; moysklad: InvoiceRecord } | { status: 'RETRYABLE_FAILURE' | 'MANUAL_REVIEW'; reason: string; retryAfter?: Date }> {
+    const write = async (field: string, value: unknown, sourceFields: string[]): Promise<{ status: 'READY' } | { status: 'RETRYABLE_FAILURE' | 'MANUAL_REVIEW'; reason: string; retryAfter?: Date }> => {
+      if (!(isScalar(value) || Array.isArray(value))) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_VALUE_SHAPE_UNSUPPORTED' };
+      let latestB24: InvoiceRecord;
+      let latestMs: InvoiceRecord;
+      try { [latestB24, latestMs] = await Promise.all([this.api.readBitrix24(pair.bitrix24Id), this.api.readMoysklad(pair.moyskladId)]); }
+      catch (error) { return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_READ_BEFORE_WRITE_FAILED', retryAfter: retryAtForFailure(error, 1) }; }
+      if (!invoicePairLinksMatchOrder(latestB24, latestMs, order)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_ORDER_LINK_MISMATCH' };
+      if (!sameJson(readField(latestB24, field, 'BITRIX24'), readField(bitrix, field, 'BITRIX24')) ||
+        sourceFields.some((sourceField) => !sameJson(readField(latestMs, sourceField, 'MOYSKLAD'), readField(moysklad, sourceField, 'MOYSKLAD')))) {
+        return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_SOURCE_CHANGED', retryAfter: retryAtForFailure(new Error('INVOICE_SETTINGS_REVISION_SOURCE_CHANGED'), 1) };
+      }
+      const current = readField(latestB24, field, 'BITRIX24');
+      Object.assign(bitrix, latestB24);
+      Object.assign(moysklad, latestMs);
+      if (!sameJson(current, value)) {
+        try {
+          await pairLease.assertOwned();
+          await this.assertWriteAllowed('MOYSKLAD_TO_BITRIX24', pair.id, eventLease);
+          await eventLease.assertOwned();
+          await this.api.updateBitrix24(pair.bitrix24Id, { [field]: value });
+        } catch (error) {
+          return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_WRITE_FAILED', retryAfter: retryAtForFailure(error, 1) };
+        }
+      }
+      let verifiedB24: InvoiceRecord;
+      let verifiedMs: InvoiceRecord;
+      try { [verifiedB24, verifiedMs] = await Promise.all([this.api.readBitrix24(pair.bitrix24Id), this.api.readMoysklad(pair.moyskladId)]); }
+      catch (error) { return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_READBACK_FAILED', retryAfter: retryAtForFailure(error, 1) }; }
+      if (!invoicePairLinksMatchOrder(verifiedB24, verifiedMs, order)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_ORDER_LINK_MISMATCH' };
+      if (!sameJson(readField(verifiedB24, field, 'BITRIX24'), value)) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_SETTINGS_REVISION_READBACK_MISMATCH', retryAfter: retryAtForFailure(new Error('INVOICE_SETTINGS_REVISION_READBACK_MISMATCH'), 1) };
+      Object.assign(bitrix, verifiedB24);
+      Object.assign(moysklad, verifiedMs);
+      return { status: 'READY' };
+    };
+    for (const rule of changedRules.filter((candidate) => candidate.entity === 'smart-invoices' && (candidate.bitrix24ToMoysklad.enabled || candidate.moyskladToBitrix24.enabled))) {
+      if (!rule.moyskladToBitrix24.enabled) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_REQUIRES_MOYSKLAD_AUTHORITY' };
+      const transformed = this.fieldSettings.transformFieldResult(config.config, 'smart-invoices', 'MOYSKLAD_TO_BITRIX24', rule.sourceField, moysklad);
+      if (!transformed || transformed.status !== 'mapped') return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_TRANSFORM_INVALID' };
+      const result = await write(rule.sourceField, transformed.value, [rule.targetField]);
+      if (result.status !== 'READY') return result;
+    }
+    for (const group of changedGroups.filter((candidate) => candidate.entity === 'smart-invoices')) {
+      if (group.direction !== 'MOYSKLAD_TO_BITRIX24') return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_GROUP_REQUIRES_MOYSKLAD_AUTHORITY' };
+      const transformed = this.fieldSettings.transformFieldResult(config.config, 'smart-invoices', group.direction, group.targetField, moysklad);
+      if (!transformed || transformed.status !== 'mapped') return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_GROUP_TRANSFORM_INVALID' };
+      const result = await write(group.targetField, transformed.value, group.sourceFields);
+      if (result.status !== 'READY') return result;
+    }
+    const [verifiedB24, verifiedMs] = await Promise.all([this.api.readBitrix24(pair.bitrix24Id), this.api.readMoysklad(pair.moyskladId)]);
+    if (!await pairLease.assertOwned()) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_PAIR_LOCK_LOST', retryAfter: retryAtForFailure(new Error('INVOICE_PAIR_LOCK_LOST'), 1) };
+    if (!invoicePairLinksMatchOrder(verifiedB24, verifiedMs, order)) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_SETTINGS_REVISION_ORDER_LINK_MISMATCH' };
+    return { status: 'READY', bitrix: verifiedB24, moysklad: verifiedMs };
   }
 
   private async syncFields(input: {
     pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventConfig: VersionedFieldSettingsDto;
-    rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext;
+    rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext; pairLease: InvoicePairLease;
   }): Promise<{ status: ProcessStatus; reason?: string; retryAfter?: Date }> {
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
     const baselineB24 = jsonRecord(input.baseline.bitrix24Values);
@@ -408,6 +558,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       }
       const writeValue = transformed.value;
       try {
+        if (!await input.pairLease.assertOwned()) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_PAIR_LOCK_LOST', retryAfter: retryAtForFailure(new Error('INVOICE_PAIR_LOCK_LOST'), 1) };
         await this.assertWriteAllowed(plan.direction, input.pair.id, input.lease);
         if (plan.direction === 'BITRIX24_TO_MOYSKLAD') await this.api.updateMoysklad(input.pair.moyskladId, { [rule.targetField]: writeValue });
         else await this.api.updateBitrix24(input.pair.bitrix24Id, { [rule.sourceField]: writeValue });
@@ -453,6 +604,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         return { status: 'MANUAL_REVIEW', reason: 'INVOICE_FIELD_GROUP_VALUE_SHAPE_UNSUPPORTED' };
       }
       try {
+        if (!await input.pairLease.assertOwned()) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_PAIR_LOCK_LOST', retryAfter: retryAtForFailure(new Error('INVOICE_PAIR_LOCK_LOST'), 1) };
         await this.assertWriteAllowed(group.direction, input.pair.id, input.lease);
         if (targetSide === 'MOYSKLAD') await this.api.updateMoysklad(input.pair.moyskladId, { [group.targetField]: transformed.value });
         else await this.api.updateBitrix24(input.pair.bitrix24Id, { [group.targetField]: transformed.value });
@@ -474,11 +626,12 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     }
     const bitrix24Values = baselineValues(latestB24, input.rules, input.groups, 'BITRIX24');
     const moyskladValues = baselineValues(latestMs, input.rules, input.groups, 'MOYSKLAD');
-    await this.database.entityPairSyncState.upsert({
+    const committed = await input.pairLease.commit((transaction) => transaction.entityPairSyncState.upsert({
       where: { pairId: input.pair.id },
       create: { pairId: input.pair.id, settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues },
       update: { settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues },
-    });
+    }));
+    if (!committed.committed) return { status: 'RETRYABLE_FAILURE', reason: 'INVOICE_PAIR_LOCK_LOST', retryAfter: retryAtForFailure(new Error('INVOICE_PAIR_LOCK_LOST'), 1) };
     return { status: 'SUCCEEDED' };
   }
 
@@ -577,6 +730,54 @@ function baselineValues(value: InvoiceRecord, rules: VersionedFieldSettingsDto['
       : { targetValue: jsonValue(readField(value, group.targetField, side)) };
   }
   return values;
+}
+
+function invoiceRuleSemantic(rule: VersionedFieldSettingsDto['config']['rules'][number]) {
+  return {
+    entity: rule.entity, sourceField: rule.sourceField, targetField: rule.targetField, criticality: rule.criticality,
+    bitrix24ToMoysklad: { enabled: rule.bitrix24ToMoysklad.enabled, transform: rule.bitrix24ToMoysklad.transform },
+    moyskladToBitrix24: { enabled: rule.moyskladToBitrix24.enabled, transform: rule.moyskladToBitrix24.transform },
+  };
+}
+
+function invoiceGroupSemantic(group: VersionedFieldSettingsDto['config']['groups'][number]) {
+  return { entity: group.entity, direction: group.direction, sourceFields: group.sourceFields, targetField: group.targetField, criticality: group.criticality, transform: group.transform };
+}
+
+function invoiceSettingsProjection(rules: VersionedFieldSettingsDto['config']['rules'], groups: VersionedFieldSettingsDto['config']['groups']) {
+  return {
+    rules: rules.map(invoiceRuleSemantic).sort((left, right) => stableJson(left).localeCompare(stableJson(right))),
+    groups: groups.map(invoiceGroupSemantic).sort((left, right) => stableJson(left).localeCompare(stableJson(right))),
+  };
+}
+
+function remapInvoiceSnapshot(
+  snapshot: unknown,
+  oldRules: VersionedFieldSettingsDto['config']['rules'], oldGroups: VersionedFieldSettingsDto['config']['groups'],
+  newRules: VersionedFieldSettingsDto['config']['rules'], newGroups: VersionedFieldSettingsDto['config']['groups'],
+  live: InvoiceRecord, side: Source,
+): Record<string, unknown> {
+  const prior = jsonRecord(snapshot);
+  const result: Record<string, unknown> = {};
+  const rules = newRules.filter((rule) => rule.entity === 'smart-invoices');
+  const groups = newGroups.filter((group) => group.entity === 'smart-invoices');
+  for (const rule of rules) {
+    const old = oldRules.find((candidate) => stableJson(invoiceRuleSemantic(candidate)) === stableJson(invoiceRuleSemantic(rule)));
+    if (old && `rule:${old.id}` in prior) result[`rule:${rule.id}`] = prior[`rule:${old.id}`];
+    else result[`rule:${rule.id}`] = baselineValues(live, [rule], [], side)[`rule:${rule.id}`];
+  }
+  for (const group of groups) {
+    const old = oldGroups.find((candidate) => stableJson(invoiceGroupSemantic(candidate)) === stableJson(invoiceGroupSemantic(group)));
+    if (old && `group:${old.id}` in prior) result[`group:${group.id}`] = prior[`group:${old.id}`];
+    else result[`group:${group.id}`] = baselineValues(live, [], [group], side)[`group:${group.id}`];
+  }
+  return result;
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
 }
 
 function baselineForSide(baseline: unknown, side: 'BITRIX24' | 'MOYSKLAD') {
