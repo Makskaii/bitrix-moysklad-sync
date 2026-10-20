@@ -62,6 +62,7 @@ import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
 import { readFileSync } from 'node:fs';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from './external-write-guard';
+import { verifyControlledLiveProviderNamespace } from './controlled-live-test-namespace';
 import { createControlledLiveTestPolicy } from './controlled-live-test-policy';
 import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
 import { InvoiceHttpApi } from './invoices/invoice-http-api';
@@ -109,9 +110,15 @@ async function bootstrap() {
     if (!manifestPath || !isAbsolute(manifestPath)) {
       throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_PATH_INVALID');
     }
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { providerNamespace?: unknown };
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, process.env.DATABASE_URL));
-    installControlledLiveFetchGuard();
+    installControlledLiveFetchGuard(manifest.providerNamespace);
+    await verifyControlledLiveProviderNamespace(manifest.providerNamespace, {
+      bitrix24RestBaseUrl: process.env.BITRIX24_REST_BASE_URL,
+      moyskladApiBaseUrl: process.env.MOYSKLAD_API_BASE_URL,
+      moyskladApiToken: process.env.MOYSKLAD_API_TOKEN,
+      allowLoopbackHttp: process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled',
+    });
   }
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });

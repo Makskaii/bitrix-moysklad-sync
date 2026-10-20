@@ -9,6 +9,7 @@ import { DatabaseService } from '../src/database.service';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { enterControlledLiveEventScope } from '../src/controlled-live-test-policy';
 import { assertApplyExternalWrite, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 const isolated = process.env.CONTROLLED_LIVE_TEST_POSTGRES_ISOLATED === '1';
 test('controlled live source admission and target binding survive service restart in isolated PostgreSQL', { skip: !isolated }, async () => {
@@ -30,6 +31,7 @@ test('controlled live source admission and target binding survive service restar
     { entity: 'catalog-product', sourceId: 'b24-controlled-product', targetId: 'ms-controlled-product', name: `тест ${runId} product`, sourceType: 'catalogproduct' },
   ] as const;
   const name = entries[0]!.name;
+  const providerNamespace = { bitrix24PortalOrigin: 'https://issue60-b24-test.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   const directory = await mkdtemp(join(tmpdir(), 'issue60-admission-pg-'));
   const manifestPath = join(directory, 'manifest.json');
   const previous = {
@@ -42,7 +44,7 @@ test('controlled live source admission and target binding survive service restar
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, records: entries.map((entry, index) => ({
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, providerNamespace, records: entries.map((entry, index) => ({
     entity: entry.entity, direction: index === 0 ? 'BOTH' : 'BITRIX24_TO_MOYSKLAD', name: entry.name, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: index === 0 ? null : entry.sourceId, targetSystem: 'MOYSKLAD', targetNativeId: index === 0 ? null : entry.targetId,
     createdAfterUtc: new Date(now.getTime() - 5_000).toISOString(),
@@ -50,6 +52,7 @@ test('controlled live source admission and target binding survive service restar
   const database = new DatabaseService();
   const eventIds = [...entries.map(() => `issue60-${randomUUID()}`), `issue60-${randomUUID()}`];
   try {
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
     const sourceEvent = await database.inboundEvent.create({ data: {
       id: eventIds[0], source: 'BITRIX24', deliveryKey: randomUUID(), eventType: 'ONCOMPANYADD',
       externalEntityId: entries[0]!.sourceId, externalEntityType: entries[0]!.sourceType, payload: {},
@@ -62,6 +65,11 @@ test('controlled live source admission and target binding survive service restar
     });
     const persisted = await database.controlledTestAdmission.findUnique({ where: { eventId: sourceEvent.id } });
     assert.equal(persisted?.targetNativeId, 'ms-controlled-target');
+    assert.deepEqual({
+      bitrix24PortalOrigin: persisted?.bitrix24PortalOrigin,
+      bitrix24UserId: persisted?.bitrix24UserId,
+      moyskladAccountId: persisted?.moyskladAccountId,
+    }, providerNamespace, 'durable admission pins the verified provider namespace');
     for (const [index, entry] of entries.slice(1).entries()) {
       const eventId = eventIds[index + 1]!;
       const event = await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: randomUUID(),

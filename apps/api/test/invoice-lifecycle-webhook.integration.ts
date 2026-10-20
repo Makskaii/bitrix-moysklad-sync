@@ -15,6 +15,7 @@ import { InvoiceEventProcessor } from '../src/invoices/invoice-event.processor';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { createControlledLiveTestPolicy } from '../src/controlled-live-test-policy';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 type TestPair = {
   id: string;
@@ -302,7 +303,7 @@ test('disabled invoice delete directions are terminal skips and never reach life
 test('controlled MoySklad deal deletion admits only a readback-bound pair and scopes timeline marker writes', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-lifecycle-delete-'));
   const manifestPath = join(directory, 'manifest.json');
-  const previous = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'DATABASE_URL'].map((key) => [key, process.env[key]]));
+  const previous = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP', 'DATABASE_URL'].map((key) => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
   const runId = 'LIVE-TEST-20261019T120000Z-life01';
   const sourceName = `тест ${runId} deal`;
@@ -317,19 +318,23 @@ test('controlled MoySklad deal deletion admits only a readback-bound pair and sc
   events.set(eventId, { id: eventId, source: 'MOYSKLAD', deliveryKey: 'controlled-delete-key', eventType: 'DELETE', externalEntityType: 'customerorder',
     externalEntityId: moyskladId, payload: {}, status: 'RECEIVED', attempts: 0, lastErrorCategory: null, processingStartedAt: null });
   const sourceCreatedAt = new Date('2026-10-19T01:00:00Z');
+  const providerNamespace = { bitrix24PortalOrigin: new URL(process.env.BITRIX24_REST_BASE_URL!).origin,
+    bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   controlledAdmissions.push({ eventId: 'origin-bound-pair', runId, entity: 'deal-order', sourceSystem: 'MOYSKLAD', sourceNativeId: moyskladId,
-    targetSystem: 'BITRIX24', targetNativeId: bitrix24Id, sourceName, sourceCreatedAt });
+    targetSystem: 'BITRIX24', targetNativeId: bitrix24Id, sourceName, sourceCreatedAt, ...providerNamespace });
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
   process.env.DATABASE_URL = 'postgresql://postgres@127.0.0.1:58341/sync_issue60_test?schema=issue60_harness_test';
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace, records: [{
     entity: 'deal-order', direction: 'MOYSKLAD_TO_BITRIX24', name: sourceName, syntheticOnly: true, sourceSystem: 'MOYSKLAD', sourceNativeId: moyskladId,
     targetSystem: 'BITRIX24', targetNativeId: bitrix24Id, createdAfterUtc: '2026-10-19T00:00:00Z',
   }] }), 'utf8');
   try {
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(JSON.parse(await (await import('node:fs/promises')).readFile(manifestPath, 'utf8')), process.env.DATABASE_URL));
-    installControlledLiveFetchGuard();
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
+    installControlledLiveFetchGuard(providerNamespace);
     const admission = new ControlledLiveTestAdmissionService(database as never);
     const controlledLifecycle = new ClientLifecycleService(database as never, undefined, syncMode as never, admission);
     controlledLifecycle.enqueue(eventId);

@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ProductCardEventProcessor } from '../src/products/product-card-event.processor';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 import { assertApplyExternalWrite } from '../src/external-write-guard';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -171,12 +172,13 @@ test('controlled product event admits a current synthetic source before allowing
   const manifestPath = join(directory, 'manifest.json');
   const runId = 'LIVE-TEST-20261019T120000Z-product01';
   const name = `тест ${runId} product`;
+  const providerNamespace = { bitrix24PortalOrigin: 'https://issue60-b24-test.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   const now = new Date();
   const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
     manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath; process.env.DATABASE_URL = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test'; process.env.SYNC_MODE = 'apply';
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace, records: [{
     entity: 'catalog-product', direction: 'BITRIX24_TO_MOYSKLAD', name, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: '101', targetSystem: 'MOYSKLAD', targetNativeId: productId,
     createdAfterUtc: new Date(now.getTime() - 10_000).toISOString(),
@@ -198,6 +200,7 @@ test('controlled product event admits a current synthetic source before allowing
     $transaction: async (callback: (transaction: unknown) => Promise<unknown>) => callback(database),
   };
   try {
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
     const admission = new ControlledLiveTestAdmissionService(database);
     let writes = 0;
     const runtime = { preflight: async () => ({ status: 'READY' }), process: async () => {

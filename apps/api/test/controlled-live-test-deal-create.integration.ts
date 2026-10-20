@@ -8,12 +8,14 @@ import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-
 import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
 import { createControlledLiveTestPolicy } from '../src/controlled-live-test-policy';
 import { assertControlledExternalRead, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 test('controlled deal creation reads dependencies, creates one synthetic order, binds readback and persists exact pair', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-deal-create-'));
   const manifestPath = join(directory, 'manifest.json');
   const runId = 'LIVE-TEST-20261019T120000Z-deal01';
   const sourceName = `тест ${runId} deal`;
+  const providerNamespace = { bitrix24PortalOrigin: 'https://controlled-b24.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   const orderId = '10000000-0000-4000-8000-000000000001';
   const refs = {
     counterparty: '20000000-0000-4000-8000-000000000001', organization: '20000000-0000-4000-8000-000000000002',
@@ -35,7 +37,7 @@ test('controlled deal creation reads dependencies, creates one synthetic order, 
   process.env.MOYSKLAD_API_BASE_URL = 'https://controlled-ms.invalid/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'fake-token';
   process.env.BITRIX24_REST_BASE_URL = 'https://controlled-b24.invalid/rest/';
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace, records: [{
     entity: 'deal-order', direction: 'BITRIX24_TO_MOYSKLAD', name: sourceName, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: '17', targetSystem: 'MOYSKLAD', targetNativeId: null,
     createdAfterUtc: '2026-10-19T00:00:00.000Z', readOnlyDependencies: [
@@ -109,7 +111,8 @@ test('controlled deal creation reads dependencies, creates one synthetic order, 
   try {
     const policy = createControlledLiveTestPolicy(JSON.parse(await (await import('node:fs/promises')).readFile(manifestPath, 'utf8')), process.env.DATABASE_URL);
     setControlledLiveTestWriteCheck(policy);
-    installControlledLiveFetchGuard();
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
+    installControlledLiveFetchGuard(providerNamespace);
     const guardedFetch = globalThis.fetch;
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       try { return await guardedFetch(input, init); }

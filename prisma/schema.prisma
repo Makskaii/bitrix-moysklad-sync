@@ -133,6 +133,9 @@ model ControlledTestAdmission {
   sourceNativeId String
   targetSystem  String
   targetNativeId String?
+  bitrix24PortalOrigin String?
+  bitrix24UserId String?
+  moyskladAccountId String?
   sourceName    String
   sourceCreatedAt DateTime
   admittedAt    DateTime     @default(now())

@@ -1,4 +1,5 @@
 import { assertControlledCreateMarker } from './controlled-live-test-policy';
+import { parseExpectedNamespace, parseProviderBase } from './controlled-live-test-namespace';
 
 let databaseRecoveryReady = true;
 let controlledWriteCheck: ((provider: string, operation: string, nativeId?: string | null, entity?: string) => void) | null = null;
@@ -37,17 +38,18 @@ export function setControlledLiveTestWriteCheck(check: ((provider: string, opera
 }
 
 /** Final transport guard catches provider writes that bypass a domain adapter's local assertion. */
-export function installControlledLiveFetchGuard(): void {
+export function installControlledLiveFetchGuard(expectedNamespaceValue?: unknown): void {
   if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+  if (!expectedNamespaceValue) throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_NAMESPACE_REQUIRED');
+  const expectedNamespace = parseExpectedNamespace(expectedNamespaceValue, process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled');
   const originalFetch = globalThis.fetch.bind(globalThis);
   const configured = [
     { provider: 'BITRIX24', base: process.env.BITRIX24_REST_BASE_URL },
     { provider: 'MOYSKLAD', base: process.env.MOYSKLAD_API_BASE_URL },
   ].map(({ provider, base }) => {
-    if (!base) throw new Error(`CONTROLLED_LIVE_TEST_${provider}_BASE_URL_REQUIRED`);
-    const url = new URL(base);
-    if (!['https:', 'http:'].includes(url.protocol)) throw new Error(`CONTROLLED_LIVE_TEST_${provider}_BASE_URL_INVALID`);
-    return { provider, origin: url.origin, prefix: url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/` };
+    const parsed = parseProviderBase(provider as 'BITRIX24' | 'MOYSKLAD', base, process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled');
+    if (provider === 'BITRIX24' && parsed.origin !== expectedNamespace.bitrix24PortalOrigin) throw new Error('CONTROLLED_LIVE_TEST_BITRIX24_PORTAL_ORIGIN_MISMATCH');
+    return { provider, origin: parsed.origin, prefix: parsed.base.pathname };
   });
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const request = new Request(input, { ...init, redirect: 'error' });
@@ -118,7 +120,7 @@ function isUnscopedMetadataRead(provider: string, path: string): boolean {
     const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
     return /\.(?:fields|types|available|methods)$/.test(method) || method === 'user.current';
   }
-  return /^entity\/metadata(?:\/|$)/.test(path);
+  return /^entity\/metadata(?:\/|$)/.test(path) || path === 'context/employee';
 }
 
 function mutationEntity(provider: string, path: string, bodyText: string): string | undefined {

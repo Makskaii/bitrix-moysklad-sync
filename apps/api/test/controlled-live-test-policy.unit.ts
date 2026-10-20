@@ -4,17 +4,24 @@ import { test } from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
+import { createControlledLiveTestPolicy as createPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
 import { assertApplyExternalWrite, assertControlledExternalRead, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
 import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 const testDatabaseUrl = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test';
+const testProviderNamespace = { bitrix24PortalOrigin: 'https://guarded-bitrix.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
+setVerifiedControlledLiveProviderNamespace(testProviderNamespace);
+function createControlledLiveTestPolicy(value: any, databaseUrl: string | undefined) {
+  return createPolicy({ providerNamespace: testProviderNamespace, ...value }, databaseUrl);
+}
 const manifest = {
   runId: 'LIVE-TEST-20261019T120000Z-a1b2c3',
   testDatabaseName: 'sync_issue60_test',
   testSchemaName: 'issue60_harness_test',
+  providerNamespace: testProviderNamespace,
   records: [{ entity: 'client:COMPANY', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261019T120000Z-a1b2c3 client', syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: 'b24-17', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-29', createdAfterUtc: '2026-10-19T00:00:00Z' }],
 };
 const scope = {
@@ -137,7 +144,7 @@ test('final fetch guard permits only exact invoice recovery filters, never a bro
   const originalFetch = globalThis.fetch;
   let calls = 0;
   const invoiceName = `тест ${manifest.runId} invoice`;
-  const invoiceManifest = { ...manifest, records: [{ entity: 'invoice', direction: 'BOTH', name: invoiceName,
+  const invoiceManifest = { ...manifest, providerNamespace: { ...testProviderNamespace, bitrix24PortalOrigin: 'https://recovery-bitrix.invalid' }, records: [{ entity: 'invoice', direction: 'BOTH', name: invoiceName,
     syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: '123456789', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-invoice-1',
     createdAfterUtc: '2026-10-19T00:00:00Z' }] };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
@@ -146,7 +153,7 @@ test('final fetch guard permits only exact invoice recovery filters, never a bro
   globalThis.fetch = (async () => { calls++; return new Response('{}', { status: 200 }); }) as typeof fetch;
   setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(invoiceManifest, testDatabaseUrl));
   try {
-    installControlledLiveFetchGuard();
+    installControlledLiveFetchGuard(invoiceManifest.providerNamespace);
     const recoveryScope = { ...scope, entity: 'invoice', sourceSystem: 'BITRIX24' as const, sourceNativeId: '123456789',
       targetSystem: 'MOYSKLAD' as const, targetNativeId: 'ms-invoice-1', admittedSourceName: invoiceName, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' };
     await withControlledLiveEventScope(recoveryScope, async () => {
@@ -387,7 +394,7 @@ test('durable admissions preserve non-client manifest entities across current re
   } };
   const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE, path: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated'; process.env.DATABASE_URL = testDatabaseUrl; process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records }), 'utf8');
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace: testProviderNamespace, records }), 'utf8');
   try {
     const service = new ControlledLiveTestAdmissionService(fakeDatabase as any);
     for (const [index, entity] of entities.entries()) {
@@ -421,7 +428,7 @@ test('final fetch guard catches exact provider mutation IDs and refuses unclassi
   globalThis.fetch = (async () => { calls++; return new Response('{}', { status: 200 }); }) as typeof fetch;
   setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], direction: 'BOTH' }] }, testDatabaseUrl));
   try {
-    installControlledLiveFetchGuard();
+    installControlledLiveFetchGuard(manifest.providerNamespace);
     const reverseScope = { ...scope, sourceSystem: 'MOYSKLAD' as const, sourceNativeId: 'ms-29', targetSystem: 'BITRIX24' as const, targetNativeId: 'b24-17' };
     await withControlledLiveEventScope(reverseScope, async () => {
       await fetch('https://guarded-bitrix.invalid/rest/crm.company.update.json', { method: 'POST', body: new URLSearchParams({ id: 'b24-17' }) });
@@ -464,7 +471,7 @@ test('final fetch guard binds invoice, deal rows, catalog prices and service mut
   process.env.MOYSKLAD_API_BASE_URL = 'https://matrix-ms.invalid/api/';
   globalThis.fetch = (async () => { calls++; return new Response('{}', { status: 200 }); }) as typeof fetch;
   try {
-    installControlledLiveFetchGuard();
+    installControlledLiveFetchGuard({ ...testProviderNamespace, bitrix24PortalOrigin: 'https://matrix-bitrix.invalid' });
     const cases = [
       { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.deal.update.json', body: { id: 'deal-1' }, target: 'deal-1' },
       { provider: 'BITRIX24' as const, entity: 'deal-order', path: 'crm.item.update.json', body: { entityTypeId: '2', id: 'deal-item-1' }, target: 'deal-item-1' },
@@ -484,7 +491,7 @@ test('final fetch guard binds invoice, deal rows, catalog prices and service mut
       const name = `тест ${runId} ${item.entity}`;
       const record = { entity: item.entity, direction: `${sourceSystem}_TO_${item.provider}`, name, syntheticOnly: true as const,
         sourceSystem, sourceNativeId, targetSystem: item.provider, targetNativeId: item.target, createdAfterUtc: '2026-10-19T00:00:00Z' };
-      setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [record] }, testDatabaseUrl));
+      setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace: { ...testProviderNamespace, bitrix24PortalOrigin: 'https://matrix-bitrix.invalid' }, records: [record] }, testDatabaseUrl));
       const eventScope = { eventId: `matrix-${index}`, runId, entity: item.entity, sourceSystem, sourceNativeId,
         targetSystem: item.provider, targetNativeId: item.target, admittedSourceName: name, admittedSourceCreatedAt: '2026-10-19T01:00:00Z' };
       const form = new URLSearchParams(Object.entries(item.body).map(([key, value]) => [key, String(value)]));
@@ -495,7 +502,7 @@ test('final fetch guard binds invoice, deal rows, catalog prices and service mut
     }
     const createRun = 'LIVE-TEST-20261019T120000Z-createservice';
     const createName = `тест ${createRun} service`;
-    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId: createRun, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId: createRun, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace: { ...testProviderNamespace, bitrix24PortalOrigin: 'https://matrix-bitrix.invalid' }, records: [{
       entity: 'catalog-service', direction: 'MOYSKLAD_TO_BITRIX24', name: createName, syntheticOnly: true,
       sourceSystem: 'MOYSKLAD', sourceNativeId: 'source-service', targetSystem: 'BITRIX24', targetNativeId: null,
       createdAfterUtc: '2026-10-19T00:00:00Z',

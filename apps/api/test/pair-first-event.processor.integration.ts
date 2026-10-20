@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DealOrderBaselineService } from '../src/deals-orders/deal-order-baseline.service';
 import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 const pair = {
   id: 'pair-1', entityType: 'DEAL', bitrix24Id: 'deal-1', moyskladId: 'order-1',
@@ -297,12 +298,13 @@ test('controlled deal event verifies the current source, persists admission, the
   const manifestPath = join(directory, 'manifest.json');
   const runId = 'LIVE-TEST-20261019T120000Z-deal01';
   const name = `тест ${runId} deal`;
+  const providerNamespace = { bitrix24PortalOrigin: 'https://issue60-b24-test.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   const now = new Date();
   const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
     manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath; process.env.DATABASE_URL = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test'; process.env.SYNC_MODE = 'apply';
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace, records: [{
     entity: 'deal-order', direction: 'BOTH', name, syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: 'deal-1',
     targetSystem: 'MOYSKLAD', targetNativeId: 'order-1', createdAfterUtc: new Date(now.getTime() - 10_000).toISOString(),
   }] }), 'utf8');
@@ -320,6 +322,7 @@ test('controlled deal event verifies the current source, persists admission, the
     },
   };
   try {
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
     const admission = new ControlledLiveTestAdmissionService(database);
     let resolves = 0;
     const processor = new PairFirstEventProcessor(database, { resolve: async () => { resolves += 1; return { status: 'confirmed', pair }; } } as never,

@@ -8,12 +8,14 @@ import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-
 import { createControlledLiveTestPolicy } from '../src/controlled-live-test-policy';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { InvoiceHttpApi } from '../src/invoices/invoice-http-api';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 test('controlled invoice adapter creates a run-marked target, binds current readback, then permits its exact BOTH echo', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'issue60-invoice-adapter-'));
   const manifestPath = join(directory, 'manifest.json');
   const runId = 'LIVE-TEST-20261019T120000Z-invoice01';
   const name = `тест ${runId} invoice`;
+  const providerNamespace = { bitrix24PortalOrigin: 'https://controlled-b24-invoice.invalid', bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   const targetId = '10000000-0000-4000-8000-000000000031';
   const previous = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'DATABASE_URL', 'SYNC_MODE', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN', 'BITRIX24_REST_BASE_URL'].map((key) => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
@@ -27,7 +29,7 @@ test('controlled invoice adapter creates a run-marked target, binds current read
   process.env.MOYSKLAD_API_BASE_URL = 'https://controlled-ms-invoice.invalid/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'fake-token';
   process.env.BITRIX24_REST_BASE_URL = 'https://controlled-b24-invoice.invalid/rest/';
-  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', records: [{
+  await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName: 'sync_issue60_test', testSchemaName: 'issue60_harness_test', providerNamespace, records: [{
     entity: 'invoice', direction: 'BOTH', name, syntheticOnly: true, sourceSystem: 'BITRIX24', sourceNativeId: '31',
     targetSystem: 'MOYSKLAD', targetNativeId: null, createdAfterUtc: '2026-10-19T00:00:00.000Z',
   }] }), 'utf8');
@@ -55,7 +57,8 @@ test('controlled invoice adapter creates a run-marked target, binds current read
   try {
     const manifest = JSON.parse(await (await import('node:fs/promises')).readFile(manifestPath, 'utf8'));
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, process.env.DATABASE_URL));
-    installControlledLiveFetchGuard();
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
+    installControlledLiveFetchGuard(providerNamespace);
     const admission = new ControlledLiveTestAdmissionService(database);
     const api = new InvoiceHttpApi();
     await admission.withCurrentSourceRead('invoice-create-event', 'BITRIX24', '31', 'invoice', async () => {

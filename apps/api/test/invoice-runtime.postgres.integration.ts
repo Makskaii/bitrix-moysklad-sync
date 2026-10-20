@@ -15,6 +15,7 @@ import { ClientLifecycleService } from '../src/clients/client-lifecycle.service'
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 const suffix = randomUUID();
 const orderId = randomUUID();
@@ -144,7 +145,9 @@ test('controlled invoice processor admits a synthetic source, creates and binds 
   const originalFetch = globalThis.fetch;
   const oldConfig = activeFieldConfig;
   let echoEventId: string | null = null;
-  const savedEnv = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST'].map((key) => [key, process.env[key]]));
+  const savedEnv = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP'].map((key) => [key, process.env[key]]));
+  const providerNamespace = { bitrix24PortalOrigin: new URL(process.env.BITRIX24_REST_BASE_URL!).origin,
+    bitrix24UserId: '42', moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188' };
   activeFieldConfig = { rules: [
     ...fieldConfig.rules,
     { id: 'invoice-description-controlled', entity: 'smart-invoices', sourceField: 'description', targetField: 'description',
@@ -154,7 +157,7 @@ test('controlled invoice processor admits a synthetic source, creates and binds 
   bitrixInvoices.set(sourceId, { id: sourceId, title: sourceName, description: 'before echo', parentId2: Number(dealId), createdTime: createdAfterBoundary });
   const created = await createEvent(`controlled-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
   const connection = new URL(process.env.DATABASE_URL!);
-  const runManifest = { runId, testDatabaseName: decodeURIComponent(connection.pathname.slice(1)), testSchemaName: connection.searchParams.get('schema'), records: [{
+  const runManifest = { runId, testDatabaseName: decodeURIComponent(connection.pathname.slice(1)), testSchemaName: connection.searchParams.get('schema'), providerNamespace, records: [{
     entity: 'invoice', direction: 'BOTH', name: sourceName, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: sourceId, targetSystem: 'MOYSKLAD', targetNativeId: null,
     createdAfterUtc: '2026-10-15T00:00:00.000Z', readOnlyDependencies: [
@@ -164,11 +167,13 @@ test('controlled invoice processor admits a synthetic source, creates and binds 
   }] };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
   await writeFile(manifestPath, JSON.stringify(runManifest), 'utf8');
   try {
+    setVerifiedControlledLiveProviderNamespace(providerNamespace);
+    installControlledLiveFetchGuard(providerNamespace);
     const admission = new ControlledLiveTestAdmissionService(db);
-    installControlledLiveFetchGuard();
     const controlledProcessor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db),
       { launchBoundary: async () => launchBoundary, assertReady: async () => true } as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db), admission);
     assert.equal((await controlledProcessor.process(created.id))?.status, 'SUCCEEDED', JSON.stringify(await db.inboundEvent.findUnique({ where: { id: created.id } })));

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { bindControlledLiveTarget, ControlledLiveEventScope, createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from './controlled-live-test-policy';
 import { setControlledLiveTestWriteCheck } from './external-write-guard';
+import { ControlledLiveProviderNamespace, getVerifiedControlledLiveProviderNamespace } from './controlled-live-test-namespace';
 
 export interface VerifiedControlledSource {
   entity: string;
@@ -16,12 +17,14 @@ export interface VerifiedControlledSource {
 @Injectable()
 export class ControlledLiveTestAdmissionService {
   private readonly manifest: any;
+  private readonly providerNamespace: ControlledLiveProviderNamespace | null = null;
 
   constructor(private readonly database: DatabaseService) {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const path = process.env.CONTROLLED_LIVE_TEST_MANIFEST;
     if (!path) throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_REQUIRED');
     this.manifest = JSON.parse(require('node:fs').readFileSync(path, 'utf8'));
+    this.providerNamespace = getVerifiedControlledLiveProviderNamespace(this.manifest.providerNamespace);
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(this.manifest, process.env.DATABASE_URL));
   }
 
@@ -51,6 +54,8 @@ export class ControlledLiveTestAdmissionService {
       create: { eventId, runId: this.manifest.runId, entity: scopedEntity, sourceSystem: source.sourceSystem,
         sourceNativeId: source.sourceNativeId, targetSystem: reversed ? record.sourceSystem : record.targetSystem,
         targetNativeId: reversed ? prior.sourceNativeId : record.targetNativeId,
+        bitrix24PortalOrigin: this.providerNamespace!.bitrix24PortalOrigin, bitrix24UserId: this.providerNamespace!.bitrix24UserId,
+        moyskladAccountId: this.providerNamespace!.moyskladAccountId,
         sourceName: source.currentName, sourceCreatedAt: source.sourceCreatedAt },
       update: {},
     });
@@ -59,6 +64,9 @@ export class ControlledLiveTestAdmissionService {
         existing.sourceSystem !== source.sourceSystem || existing.sourceNativeId !== source.sourceNativeId ||
         existing.targetSystem !== (reversed ? record.sourceSystem : record.targetSystem) ||
         existing.targetNativeId !== (reversed ? prior.sourceNativeId : record.targetNativeId) ||
+        existing.bitrix24PortalOrigin !== this.providerNamespace!.bitrix24PortalOrigin ||
+        existing.bitrix24UserId !== this.providerNamespace!.bitrix24UserId ||
+        existing.moyskladAccountId !== this.providerNamespace!.moyskladAccountId ||
         existing.sourceName !== source.currentName || existing.sourceCreatedAt.getTime() !== source.sourceCreatedAt.getTime()) {
       throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_CONFLICT');
     }
@@ -68,6 +76,7 @@ export class ControlledLiveTestAdmissionService {
   async bindCreatedTarget(eventId: string, targetNativeId: string, verifiedTargetNativeId: string, verifiedTargetName: string, targetCreatedAt: Date, verifiedTargetRunMarker?: string): Promise<void> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    if (admission) this.assertAdmissionNamespace(admission);
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
     const targetIdentityVerified = admission?.entity === 'deal-order' ? verifiedTargetName === admission.sourceName || verifiedTargetRunMarker === admission.runId : verifiedTargetName === admission?.sourceName;
     if (!admission || !record || !targetNativeId || verifiedTargetNativeId !== targetNativeId || !targetIdentityVerified ||
@@ -88,6 +97,7 @@ export class ControlledLiveTestAdmissionService {
   async assertTargetAllowed(eventId: string, targetSystem: 'BITRIX24' | 'MOYSKLAD', targetNativeId: string): Promise<void> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    if (admission) this.assertAdmissionNamespace(admission);
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === admission.entity &&
       candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
     if (!admission || !record || admission.targetSystem !== targetSystem || admission.targetNativeId !== targetNativeId ||
@@ -99,6 +109,7 @@ export class ControlledLiveTestAdmissionService {
   async assertCreateReserved(eventId: string, entity: string, targetSystem: 'BITRIX24' | 'MOYSKLAD'): Promise<void> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    if (admission) this.assertAdmissionNamespace(admission);
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === entity && candidate.name === admission.sourceName &&
       candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) &&
       candidate.targetSystem === targetSystem && candidate.targetNativeId === null);
@@ -110,6 +121,7 @@ export class ControlledLiveTestAdmissionService {
   async allowsSourceSideWrite(eventId: string): Promise<boolean> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
+    if (admission) this.assertAdmissionNamespace(admission);
     if (!admission || admission.runId !== this.manifest.runId) return false;
     const record = this.manifest.records.find((candidate: any) => candidate.entity === admission.entity && candidate.name === admission.sourceName && manifestMatchesAdmission(candidate, admission));
     return record?.direction === 'BOTH';
@@ -135,6 +147,7 @@ export class ControlledLiveTestAdmissionService {
       throw new Error('CONTROLLED_LIVE_TEST_LIFECYCLE_PAIR_INVALID');
     }
     const admissions = await this.database.controlledTestAdmission.findMany({ where: { runId: this.manifest.runId, entity } });
+    admissions.forEach((admission: any) => this.assertAdmissionNamespace(admission));
     for (const record of this.manifest.records) {
       if (record.entity !== entity || record.syntheticOnly !== true || !admissions.some((row: any) => row.sourceName === record.name)) continue;
       const forward = record.sourceSystem === input.sourceSystem && record.targetSystem === input.targetSystem &&
@@ -200,6 +213,7 @@ export class ControlledLiveTestAdmissionService {
   }
 
   private scope(eventId: string, admission: any): ControlledLiveEventScope {
+    this.assertAdmissionNamespace(admission);
     const scope: ControlledLiveEventScope = {
       eventId, runId: admission.runId, entity: admission.entity,
       sourceSystem: admission.sourceSystem as ControlledLiveEventScope['sourceSystem'], sourceNativeId: admission.sourceNativeId,
@@ -207,6 +221,13 @@ export class ControlledLiveTestAdmissionService {
       admittedSourceName: admission.sourceName, admittedSourceCreatedAt: admission.sourceCreatedAt.toISOString(),
     };
     return scope;
+  }
+
+  private assertAdmissionNamespace(admission: any): void {
+    if (!this.providerNamespace || admission.bitrix24PortalOrigin !== this.providerNamespace.bitrix24PortalOrigin ||
+        admission.bitrix24UserId !== this.providerNamespace.bitrix24UserId || admission.moyskladAccountId !== this.providerNamespace.moyskladAccountId) {
+      throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_PROVIDER_NAMESPACE_MISMATCH');
+    }
   }
 }
 

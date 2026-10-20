@@ -19,7 +19,7 @@ Current gate state: **BLOCKED for live acceptance**. Offline build, fake-HTTP/br
 
 The isolated candidate now has a schema-backed `ControlledTestAdmission` ledger and a central provider transport guard. Controlled mode requires an explicitly isolated instance, apply mode, an absolute manifest path, and a dedicated local PostgreSQL database plus schema whose exact names match the manifest. The source admission path now covers client, deal/order, invoice, and catalog product/service processors: each current source read is checked against the exact entity/provider/native ID, run marker, and creation boundary before durable admission. Product and invoice target creation bind only after provider readback; deal/order create flows now thread the admitted scope and require exact marker/readback binding. Manifest-declared read-only dependencies are exact provider/entity/native-ID entries and cannot authorize writes. `direction` is enforced (`BITRIX24_TO_MOYSKLAD`, `MOYSKLAD_TO_BITRIX24`, or explicitly approved `BOTH`); source-side writeback is limited to `BOTH`. Normal runtime is unchanged when controlled mode is off.
 
-Offline evidence to date: production and test TypeScript builds pass; client/product/deal source-admission policy tests pass; fake-provider deal/order and invoice processor create paths carry the exact run marker, verify current target readback, durably bind target IDs, and exercise exact-scope echo writes after restart. The invoice processor scenario runs against a fresh schema with all 36 migrations and verifies source admission, explicit linked-order dependency reads, create/readback/bind, and a reverse `BOTH` echo through the real processor. The deal/order create path also reads six explicitly approved dependencies and persists the pair. One fake-provider lifecycle path verifies a deleted synthetic MoySklad order is current-read-confirmed, tombstoned, and annotated only on the exact bound Bitrix deal; deferred marker/timeline recovery also reconstructs scope from the durable admitted pair. The isolated PG schema has all 36 migrations and tests durable admission/binding/restart plus deal/order, invoice, and catalog product admissions. The final transport guard now requires a target-native synthetic name/description marker on CREATE requests and scopes previously unclassified MySklad reference reads to explicit dependencies. Fake-HTTP transport tests exercise exact owner IDs for invoice, deal rows, catalog prices, services, requisites, and timeline comments. This is still not a live-ready harness: the full lifecycle entity/direction and retry matrix, exhaustive adapter inventory, a fresh combined suite, independent review, and all live gates remain outstanding. The PG tests used only local PostgreSQL and fake provider responses. No live provider traffic, hooks, service settings, deployment, or real CRM writes were performed or authorized.
+Offline evidence to date: production and test TypeScript builds pass; client/product/deal source-admission policy tests pass; fake-provider deal/order and invoice processor create paths carry the exact run marker, verify current target readback, durably bind target IDs, and exercise exact-scope echo writes after restart. The invoice processor scenario runs against a fresh schema with all 36 migrations and verifies source admission, explicit linked-order dependency reads, create/readback/bind, and a reverse `BOTH` echo through the real processor. The deal/order create path also reads six explicitly approved dependencies and persists the pair. One fake-provider lifecycle path verifies a deleted synthetic MoySklad order is current-read-confirmed, tombstoned, and annotated only on the exact bound Bitrix deal; deferred marker/timeline recovery also reconstructs scope from the durable admitted pair. The isolated PG schema has all 36 migrations and tests durable admission/binding/restart plus deal/order, invoice, and catalog product admissions. The final transport guard now requires a target-native synthetic name/description marker on CREATE requests and scopes previously unclassified MySklad reference reads to explicit dependencies. Fake-HTTP transport tests exercise exact owner IDs for invoice, deal rows, catalog prices, services, requisites, and timeline comments. The current namespace hardening work adds a manifest-pinned Bitrix24 portal origin and current principal ID plus MySklad account ID, verified at startup using read-only `user.current` and `/context/employee` calls; these identities are persisted with durable admission. Controlled provider URLs require HTTPS, except explicitly enabled loopback-only fake HTTP tests. Until this change and the remaining matrix pass fresh validation and independent review, the harness is not live-ready. The PG tests used only local PostgreSQL and fake provider responses. No live provider traffic, hooks, service settings, deployment, or real CRM writes were performed or authorized.
 
 ## Capability/scope restrictions
 
@@ -40,6 +40,11 @@ The runtime manifest is a restricted, run-specific file. Store no credentials, s
   "runId": "LIVE-TEST-<UTC-YYYYMMDDTHHMMSSZ>-<random-suffix>",
   "testDatabaseName": "sync_issue60_test_<unique-suffix>",
   "testSchemaName": "issue60_test_<unique-suffix>",
+  "providerNamespace": {
+    "bitrix24PortalOrigin": "https://<exact-portal-host>",
+    "bitrix24UserId": "<integration-principal-id>",
+    "moyskladAccountId": "<account-id-from-context-employee>"
+  },
   "records": [
     {
       "entity": "<client:COMPANY|client:CONTACT|deal-order|invoice|catalog-product|catalog-service>",
@@ -56,6 +61,20 @@ The runtime manifest is a restricted, run-specific file. Store no credentials, s
   ]
 }
 ```
+
+The namespace values are identifiers, not credentials. Do not put API tokens,
+Bitrix webhook URLs, auth headers, or secret query parameters in this file.
+At controlled-mode startup, the configured Bitrix24 base origin must exactly
+match the manifest and the current credentials are checked with the read-only
+[`user.current`](https://apidocs.bitrix24.ru/api-reference/user/user-current.html)
+method. MySklad's read-only `/context/employee` response is checked for its
+stable `accountId` (not employee profile data; see the
+[official Remap API guide](https://dev.moysklad.ru/doc/api/remap/1.2/)). The
+verified portal/principal/account identifiers are stored on each durable
+admission and must match on subsequent event processing and restart. Controlled
+remote provider base URLs must use HTTPS. Plain HTTP is accepted only when the
+explicit fake-provider test switch is enabled and the URL host is loopback;
+that switch cannot enable remote HTTP.
 
 `direction` is enforced, not descriptive: use `BITRIX24_TO_MOYSKLAD` or
 `MOYSKLAD_TO_BITRIX24` and keep `sourceSystem`/`targetSystem` consistent.

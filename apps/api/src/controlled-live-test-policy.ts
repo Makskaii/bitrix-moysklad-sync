@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { ControlledLiveProviderNamespace, parseExpectedNamespace } from './controlled-live-test-namespace';
 
 export type ControlledProvider = 'BITRIX24' | 'MOYSKLAD';
 export type ControlledTestDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'BOTH';
@@ -18,6 +19,7 @@ export interface ControlledLiveManifest {
   runId: string;
   testDatabaseName: string;
   testSchemaName: string;
+  providerNamespace: ControlledLiveProviderNamespace;
   records: ControlledLiveManifestRecord[];
 }
 export interface ControlledLiveEventScope {
@@ -165,6 +167,9 @@ function parseManifest(value: unknown): ControlledLiveManifest {
       typeof value.testDatabaseName !== 'string' || typeof value.testSchemaName !== 'string' || !Array.isArray(value.records) || value.records.length === 0) {
     throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_INVALID');
   }
+  let providerNamespace: ControlledLiveProviderNamespace;
+  try { providerNamespace = parseExpectedNamespace(value.providerNamespace, process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled'); }
+  catch { throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_NAMESPACE_INVALID'); }
   const records = value.records.map((item): ControlledLiveManifestRecord => {
     if (!isRecord(item) || typeof item.entity !== 'string' || !item.entity || !['BITRIX24_TO_MOYSKLAD', 'MOYSKLAD_TO_BITRIX24', 'BOTH'].includes(String(item.direction)) ||
         typeof item.name !== 'string' || !item.name.includes('тест') || !item.name.includes(value.runId as string) || item.syntheticOnly !== true ||
@@ -191,7 +196,7 @@ function parseManifest(value: unknown): ControlledLiveManifest {
       uniqueness.add(identity);
     }
   }
-  return { runId: value.runId, testDatabaseName: value.testDatabaseName, testSchemaName: value.testSchemaName, records };
+  return { runId: value.runId, testDatabaseName: value.testDatabaseName, testSchemaName: value.testSchemaName, providerNamespace, records };
 }
 
 function databaseTarget(value: string | undefined): { name: string; host: string; schema: string } {
