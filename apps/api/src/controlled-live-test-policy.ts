@@ -3,6 +3,7 @@ import { ControlledLiveProviderNamespace, parseExpectedNamespace } from './contr
 
 export type ControlledProvider = 'BITRIX24' | 'MOYSKLAD';
 export type ControlledTestDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'BOTH';
+export type ControlledLiveIngressAction = 'CREATE' | 'UPDATE';
 export interface ControlledLiveManifestRecord {
   entity: string;
   direction: ControlledTestDirection;
@@ -13,6 +14,8 @@ export interface ControlledLiveManifestRecord {
   targetSystem: ControlledProvider;
   targetNativeId: string | null;
   createdAfterUtc: string;
+  /** Exact actions the controlled ingress gate may accept; absent means deny intake for this record. */
+  allowedActions?: ControlledLiveIngressAction[];
   readOnlyDependencies?: Array<{ provider: ControlledProvider; entity: string; nativeId: string }>;
 }
 export interface ControlledLiveManifest {
@@ -176,6 +179,8 @@ function parseManifest(value: unknown): ControlledLiveManifest {
         typeof item.name !== 'string' || !item.name.includes('тест') || !item.name.includes(value.runId as string) || item.syntheticOnly !== true ||
         !isProvider(item.sourceSystem) || !isProvider(item.targetSystem) || typeof item.createdAfterUtc !== 'string' ||
         !Number.isFinite(new Date(item.createdAfterUtc).getTime()) ||
+        (item.allowedActions !== undefined && (!Array.isArray(item.allowedActions) || item.allowedActions.length === 0 ||
+          item.allowedActions.some((action) => action !== 'CREATE' && action !== 'UPDATE') || new Set(item.allowedActions).size !== item.allowedActions.length)) ||
         !(item.sourceNativeId === null || (typeof item.sourceNativeId === 'string' && item.sourceNativeId)) ||
         !(item.targetNativeId === null || (typeof item.targetNativeId === 'string' && item.targetNativeId)) || item.sourceSystem === item.targetSystem ||
         (item.readOnlyDependencies !== undefined && (!Array.isArray(item.readOnlyDependencies) || item.readOnlyDependencies.some((dependency) =>
