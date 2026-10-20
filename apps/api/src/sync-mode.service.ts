@@ -89,14 +89,27 @@ export class SyncModeService {
       const enteringOff = mode === 'off' && current.serviceMode !== 'off';
       const leavingOffInterval = mode === 'on' && current.offSince !== null;
       const now = new Date();
-      const offSince = enteringOff ? now : current.offSince;
+      const lastTransition = await tx.syncModeTransition.findFirst({
+        orderBy: [{ transitionedAt: 'desc' }, { id: 'desc' }], select: { transitionedAt: true },
+      });
+      const transitionedAt = lastTransition && lastTransition.transitionedAt >= now
+        ? new Date(lastTransition.transitionedAt.getTime() + 1)
+        : now;
+      if (!current.modeHistoryTrackedFrom) {
+        const trackedFrom = new Date(transitionedAt.getTime() - 1);
+        await tx.syncSetting.update({ where: { id: 'global' }, data: { modeHistoryTrackedFrom: trackedFrom } });
+        await tx.syncModeTransition.create({ data: {
+          fromMode: 'unknown', toMode: current.serviceMode, transitionedAt: trackedFrom,
+        } });
+      }
+      const offSince = enteringOff ? transitionedAt : current.offSince;
       const setting = await tx.syncSetting.update({
         where: { id: 'global' },
         data: {
           serviceMode: mode,
           offSince,
-          ...((mode === 'pause' || mode === 'off') ? { lastInactiveAt: now } : {}),
-          ...(mode === 'on' && current.serviceMode !== 'on' ? { lastActiveAt: now } : {}),
+          ...((mode === 'pause' || mode === 'off') ? { lastInactiveAt: transitionedAt } : {}),
+          ...(mode === 'on' && current.serviceMode !== 'on' ? { lastActiveAt: transitionedAt } : {}),
           ...(enteringOff ? {
             resumeStatus: 'skipped', resumeFrom: null, resumeThrough: null,
             resumeProvider: 'BITRIX24', resumeBitrixStart: 0, resumeMoyskladOffset: 0,
@@ -112,7 +125,7 @@ export class SyncModeService {
         },
         select: { serviceMode: true },
       });
-      await tx.syncModeTransition.create({ data: { fromMode: current.serviceMode, toMode: mode, transitionedAt: now } });
+      await tx.syncModeTransition.create({ data: { fromMode: current.serviceMode, toMode: mode, transitionedAt } });
       return { mode: setting.serviceMode as ServiceMode };
     });
   }

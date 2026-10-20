@@ -14,6 +14,8 @@ class NightlyStore {
   readonly accepted: Array<Record<string, unknown>> = [];
   readonly dispatched: string[] = [];
   readonly providerCalls: string[] = [];
+  readonly bitrixWindows: Array<[string, string]> = [];
+  readonly moyskladWindows: string[] = [];
   readonly acceptedQueryTypes: string[][] = [];
   loseLeaseAfterProviderResponse = false;
   leaseLost = false;
@@ -35,12 +37,18 @@ class NightlyStore {
   moyskladToBitrixEnabled = true;
   directionReadCount = 0;
   directionResults: boolean[] = [];
+  bitrixEvents: Array<{ id: string; changedAt: string }> = [];
+  modeTransitions: Array<{ id: string; fromMode: string; toMode: string; transitionedAt: Date }> = [];
 
   constructor(mode: 'on' | 'pause' | 'off' = 'on') {
+    const trackedFrom = new Date('2026-10-19T22:00:00.000Z');
+    this.modeTransitions = [{ id: 'baseline', fromMode: 'unknown', toMode: mode, transitionedAt: trackedFrom }];
     this.state = {
       id: 'global', serviceMode: mode, offSince: null,
       lastInactiveAt: mode === 'on' ? null : new Date('2026-10-20T21:30:00.000Z'), lastActiveAt: null,
+      modeHistoryTrackedFrom: trackedFrom,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+      nightlyActiveSegments: [], nightlySegmentIndex: 0, nightlyCoverage: {},
       nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3, nightlyBitrixLastId: null,
       nightlyMoyskladOffset: 0, nightlyMoyskladEntity: 'counterparty', nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending',
       nightlyLeaseToken: null, nightlyLeaseExpiresAt: null, nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
@@ -68,6 +76,9 @@ class NightlyStore {
       return { bitrix24ToMoysklad: result, moyskladToBitrix24: this.moyskladToBitrixEnabled };
     },
     findUnique: async () => ({ bitrix24ToMoysklad: this.bitrixToMoyskladEnabled, moyskladToBitrix24: this.moyskladToBitrixEnabled }),
+  };
+  readonly syncModeTransition = {
+    findMany: async () => [...this.modeTransitions],
   };
   readonly inboundEvent = {
     count: async ({ where }: { where: { deliveryKey: { startsWith: string }; status: { in: string[] } } }) => [...this.queued.values()]
@@ -150,11 +161,15 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
       if (store.loseLeaseAfterProviderResponse) store.leaseLost = true;
       if (store.failBitrix) return new Response('{}', { status: 503, headers: { 'retry-after': '3600' } });
       const request = JSON.parse(String(init?.body));
+      if (request.filter?.['>=updatedTime']) store.bitrixWindows.push([request.filter['>=updatedTime'], request.filter['<=updatedTime']]);
       if (url.includes('catalog.product.list')) return new Response(JSON.stringify({ result: { products: store.bitrixProductIds.map((id) => ({ id })) } }), { status: 200 });
-      const ids = request.entityTypeId === 2 ? store.bitrixDealIds : request.entityTypeId === 3 ? store.bitrixIds : request.entityTypeId === 31 ? store.bitrixInvoiceIds : [];
+      const ids = request.entityTypeId === 3 && store.bitrixEvents.length
+        ? store.bitrixEvents.filter((item) => item.changedAt >= request.filter['>=updatedTime'] && item.changedAt <= request.filter['<=updatedTime']).map((item) => item.id)
+        : request.entityTypeId === 2 ? store.bitrixDealIds : request.entityTypeId === 3 ? store.bitrixIds : request.entityTypeId === 31 ? store.bitrixInvoiceIds : [];
       return new Response(JSON.stringify({ result: { items: ids.map((id) => ({ id })) } }), { status: 200 });
     }
     const requestUrl = new URL(url);
+    store.moyskladWindows.push(requestUrl.searchParams.get('filter') ?? '');
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
     const entity = requestUrl.pathname.split('/').filter(Boolean).at(-1) ?? 'counterparty';
     const total = entity === 'counterparty' ? store.moyskladTotal : (store.moyskladEntityIds[entity] ?? []).length;
@@ -224,21 +239,42 @@ test('nightly scheduler skips OFF and PAUSE and does not catch up after resume i
   }
 });
 
-test('nightly scheduler skips an inactive interval overlapping the window even after resume to On', async () => {
+test('nightly scheduler discovers only active slices before and after OFF intervals', async () => {
   const harness = await createHarness('on');
-  harness.store.bitrixDealIds = ['changed-during-off-window'];
-  harness.store.bitrixInvoiceIds = ['changed-during-off-window-invoice'];
-  harness.store.state.lastInactiveAt = new Date('2026-10-20T21:30:00.000Z');
-  harness.store.state.lastActiveAt = new Date('2026-10-20T21:45:00.000Z');
+  const start = new Date('2026-10-19T22:00:00.000Z');
+  harness.store.modeTransitions = [
+    { id: 'baseline', fromMode: 'unknown', toMode: 'on', transitionedAt: start },
+    { id: 'off-1', fromMode: 'on', toMode: 'off', transitionedAt: new Date('2026-10-20T02:00:00.500Z') },
+    { id: 'on-1', fromMode: 'off', toMode: 'on', transitionedAt: new Date('2026-10-20T04:00:00.500Z') },
+    { id: 'off-2', fromMode: 'on', toMode: 'off', transitionedAt: new Date('2026-10-20T09:00:00.500Z') },
+    { id: 'on-2', fromMode: 'off', toMode: 'on', transitionedAt: new Date('2026-10-20T10:00:00.500Z') },
+  ];
+  harness.store.bitrixEvents = [
+    { id: 'contact-1', changedAt: '2026-10-20T01:00:00.000Z' },
+    { id: 'contact-1', changedAt: '2026-10-20T03:00:00.000Z' },
+    { id: 'contact-1', changedAt: '2026-10-20T05:00:00.000Z' },
+    { id: 'contact-1', changedAt: '2026-10-20T11:00:00.000Z' },
+  ];
   try {
     harness.service.onApplicationBootstrap();
-    await settleUntil(() => harness.store.state.nightlyStatus === 'skipped');
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
 
     assert.equal(harness.store.state.nightlyScheduledDate, '2026-10-21');
-    assert.match(harness.store.state.nightlyError, /OFF or PAUSE downtime/i);
-    assert.equal(harness.store.state.nightlyFrom, null);
-    assert.deepEqual(harness.store.providerCalls, []);
-    assert.equal(harness.store.accepted.length, 0, 'no updated-feed item from an OFF-overlapping window is queued as catch-up');
+    assert.equal(harness.store.accepted.length, 3, 'active changes are queued while the change inside OFF is excluded');
+    assert.deepEqual(harness.store.state.nightlyActiveSegments.map((segment: { from: string; through: string }) => [new Date(segment.from).toISOString(), new Date(segment.through).toISOString()]), [
+      ['2026-10-19T22:00:00.000Z', '2026-10-20T02:00:00.499Z'],
+      ['2026-10-20T04:00:00.500Z', '2026-10-20T09:00:00.499Z'],
+      ['2026-10-20T10:00:00.500Z', '2026-10-20T22:00:00.000Z'],
+    ]);
+    assert.equal(harness.store.state.nightlySegmentIndex, 2);
+    assert.deepEqual([...new Set(harness.store.bitrixWindows.map(([from, through]) => `${from}/${through}`))].sort(), [
+      '2026-10-19T22:00:00.000Z/2026-10-20T02:00:00.499Z',
+      '2026-10-20T04:00:00.500Z/2026-10-20T09:00:00.499Z',
+      '2026-10-20T10:00:00.500Z/2026-10-20T22:00:00.000Z',
+    ]);
+    assert.ok(harness.store.moyskladWindows.includes('updated>=2026-10-20 07:00:01;updated<=2026-10-20 12:00:00'));
+    assert.ok(harness.store.moyskladWindows.includes('updated>=2026-10-20 13:00:01;updated<=2026-10-21 01:00:00'));
+    assert.deepEqual(harness.store.accepted.map((event) => (event.deliveryKey as string).match(/:segment:(\d+):/)?.[1]), ['0', '1', '2']);
   } finally {
     harness.close();
   }
@@ -255,7 +291,7 @@ test('nightly scheduler rechecks the previous Moscow 24 hours and deduplicates r
     assert.equal(harness.store.state.nightlyFrom.toISOString(), '2026-10-19T22:00:00.000Z');
     assert.equal(harness.store.state.nightlyThrough.toISOString(), '2026-10-20T22:00:00.000Z');
     assert.equal(harness.store.accepted.length, 1);
-    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:CONTACT:contact-1');
+    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:segment:0:CONTACT:contact-1');
     assert.equal(harness.store.dispatched.length, 1);
 
     const providerCallCount = harness.store.providerCalls.length;
@@ -280,7 +316,7 @@ test('nightly accepted-event recheck deduplicates one entity represented by mult
     await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
 
     assert.equal(harness.store.accepted.length, 1);
-    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:CONTACT:ONCRMCONTACTUPDATE:ACTIVE:contact-1');
+    assert.equal(harness.store.accepted[0].deliveryKey, 'nightly:2026-10-21:segment:0:CONTACT:ONCRMCONTACTUPDATE:ACTIVE:contact-1');
     assert.equal(harness.store.dispatched.length, 1);
     assert.equal(harness.store.state.nightlyStatus, 'awaiting_processing');
   } finally {
@@ -313,7 +349,7 @@ test('nightly accepted-event recheck keeps the latest action when an identity cr
         assert.equal(harness.store.accepted.length, 1);
         assert.equal(harness.store.accepted[0].eventType, scenario.laterType);
         assert.equal(harness.store.accepted[0].externalEntityId, 'contact-1');
-        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:CONTACT:${scenario.laterType}:ACTIVE:contact-1`);
+        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:segment:0:CONTACT:${scenario.laterType}:ACTIVE:contact-1`);
         assert.equal((harness.store.accepted[0].payload as Record<string, unknown>).acceptedEventId, scenario.laterId);
         assert.equal(harness.store.dispatched.length, 1);
       } finally {
@@ -390,7 +426,7 @@ test('nightly accepted DELETE rechecks active and tombstoned pairs using the exa
         assert.equal(harness.store.accepted.length, 1);
         assert.equal(harness.store.accepted[0].eventType, candidate.eventType);
         assert.equal(harness.store.accepted[0].externalEntityId, candidate.sourceId);
-        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:${candidate.entity}:${candidate.eventType}:${lifecycleStatus}:${candidate.sourceId}`);
+        assert.equal(harness.store.accepted[0].deliveryKey, `nightly:2026-10-21:segment:0:${candidate.entity}:${candidate.eventType}:${lifecycleStatus}:${candidate.sourceId}`);
         assert.deepEqual(harness.store.accepted[0].payload, {
           recovery: 'nightly', entity: candidate.entity, acceptedEventId: `accepted-delete-${candidate.source}-${lifecycleStatus}`,
         });
@@ -545,7 +581,7 @@ test('nightly configured catalog product feed uses the processor event contract 
     assert.equal(productEvent.source, 'BITRIX24');
     assert.equal(productEvent.externalEntityType, 'product');
     assert.equal(productEvent.externalEntityId, 'product-22');
-    assert.equal(productEvent.deliveryKey, 'nightly:2026-10-21:product:product-22');
+    assert.equal(productEvent.deliveryKey, 'nightly:2026-10-21:segment:0:product:product-22');
     assert.deepEqual(productEvent.payload, {
       event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 'product-22' } }, recovery: 'nightly',
     });
