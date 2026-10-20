@@ -36,6 +36,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
   private readonly active = new Set<string>();
   private readonly gateway?: ClientSyncGateway;
   private readonly candidateGateway?: WritableClientCandidateGateway;
+  private readonly childResources?: ClientChildResourceSync;
   constructor(
     private readonly database: DatabaseService,
     private readonly settings: FieldSettingsService,
@@ -43,11 +44,17 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     @Optional() @Inject(CLIENT_SYNC_GATEWAY) gateway?: ClientSyncGateway,
     @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) candidateGateway?: WritableClientCandidateGateway,
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
-    @Optional() private readonly childResources?: ClientChildResourceSync,
+    @Optional() childResources?: ClientChildResourceSync,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {
     this.gateway = gateway ? serviceModeBoundProvider(database, gateway) : undefined;
     this.candidateGateway = candidateGateway ? serviceModeBoundProvider(database, candidateGateway) : undefined;
+    this.childResources = childResources;
+    childResources?.setProviderModeGate(async (work) => {
+      const result = await withServiceModeOn(database, async () => work());
+      if (!result.enabled) throw new ServiceModeNotOnError();
+      return result.value;
+    });
   }
 
   async verifyServiceCounterparty(counterpartyId: string): Promise<boolean> {

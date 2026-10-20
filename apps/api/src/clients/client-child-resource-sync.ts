@@ -17,6 +17,7 @@ export interface ChildWriteJournal {
 }
 
 export type ClientChildResourceSyncOptions = { allowTestProviderOrigins?: boolean };
+export type ClientChildProviderModeGate = <T>(work: () => Promise<T>) => Promise<T>;
 
 type RecordValue = Record<string, unknown>;
 const REQUISITE_FIELDS = new Set(['RQ_COMPANY_NAME', 'RQ_COMPANY_FULL_NAME', 'RQ_INN', 'RQ_KPP', 'RQ_OGRN', 'RQ_OGRNIP', 'RQ_OKPO']);
@@ -33,11 +34,17 @@ const LEGAL_FIELD_PAIRS = new Set([
  * requisites/accounts, selects a primary bank account, or guesses a country/preset.
  */
 export class ClientChildResourceSync {
+  private providerModeGate: ClientChildProviderModeGate = async (work) => work();
+
   constructor(
     private readonly fetcher: typeof fetch = fetch,
     private readonly journal?: ChildWriteJournal,
     private readonly options: ClientChildResourceSyncOptions = {},
   ) {}
+
+  setProviderModeGate(gate: ClientChildProviderModeGate): void {
+    this.providerModeGate = gate;
+  }
 
   async syncForPair(input: {
     eventId: string; direction: ClientChildSyncDirection; bindings: ClientChildResourceBindingDto[] | undefined;
@@ -229,35 +236,43 @@ export class ClientChildResourceSync {
   private async bitrixRead(method: string, params: Record<string, string>): Promise<RecordValue> {
     const base = this.providerBase('BITRIX24', process.env.BITRIX24_REST_BASE_URL);
     const form = new URLSearchParams(params);
-    const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
-    const payload = await response.json().catch(() => null) as RecordValue | null;
-    const result = payload && isRecord(payload.result) ? payload.result : null;
-    if (!result || payload?.error) throw new ProviderFailure('BITRIX24', 400);
-    return result;
+    return this.providerModeGate(async () => {
+      const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+      if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+      const payload = await response.json().catch(() => null) as RecordValue | null;
+      const result = payload && isRecord(payload.result) ? payload.result : null;
+      if (!result || payload?.error) throw new ProviderFailure('BITRIX24', 400);
+      return result;
+    });
   }
 
   private async bitrixUpdate(method: string, id: string, fields: RecordValue) {
     const base = this.providerBase('BITRIX24', process.env.BITRIX24_REST_BASE_URL);
     const form = new URLSearchParams({ id });
     for (const [key, value] of Object.entries(fields)) form.append(`fields[${key}]`, String(value ?? ''));
-    const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
-    const payload = await response.json().catch(() => null) as RecordValue | null;
-    if (!payload || payload.error || payload.result !== true) throw new ProviderFailure('BITRIX24', 400);
+    await this.providerModeGate(async () => {
+      const response = await this.fetcher(new URL(method, base.endsWith('/') ? base : `${base}/`), { method: 'POST', body: form, headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+      if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+      const payload = await response.json().catch(() => null) as RecordValue | null;
+      if (!payload || payload.error || payload.result !== true) throw new ProviderFailure('BITRIX24', 400);
+    });
   }
 
   private async msRead(path: string): Promise<RecordValue> {
-    const response = await this.msRequest(path, 'GET');
-    const payload = await response.json().catch(() => null) as RecordValue | null;
-    if (!payload) throw new ProviderFailure('MOYSKLAD', null);
-    return payload;
+    return this.providerModeGate(async () => {
+      const response = await this.msRequest(path, 'GET');
+      const payload = await response.json().catch(() => null) as RecordValue | null;
+      if (!payload) throw new ProviderFailure('MOYSKLAD', null);
+      return payload;
+    });
   }
 
   private async msWrite(path: string, fields: RecordValue) {
-    const response = await this.msRequest(path, 'PUT', fields);
-    if (response.status === 204) return;
-    await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    await this.providerModeGate(async () => {
+      const response = await this.msRequest(path, 'PUT', fields);
+      if (response.status === 204) return;
+      await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    });
   }
 
   private async msRequest(path: string, method: 'GET' | 'PUT', fields?: RecordValue): Promise<Response> {
