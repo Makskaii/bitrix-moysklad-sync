@@ -3,6 +3,11 @@ import { test } from 'node:test';
 import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
 import { EventIntakeService } from '../src/events.controller';
 
+function modeOnTransaction() {
+  const tx = { $queryRaw: async () => [{ serviceMode: 'on' }] };
+  return { $transaction: async (callback: (transaction: typeof tx) => Promise<unknown>) => callback(tx) };
+}
+
 function mockLifecycleLocks() {
   const locks = new Map<string, string>();
   return {
@@ -77,7 +82,7 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   ];
   const updates: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => records.find((row) =>
         row.entityType === where.entityType && (row.bitrix24Id === where.bitrix24Id || row.moyskladId === where.moyskladId)) ?? null,
@@ -169,7 +174,7 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
   const event = { id: 'event-1', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', externalEntityId: 'ms-1', payload: {}, status: 'RECEIVED', attempts: 0 };
   const leaseRows = new Map<string, string>();
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => where.entityType === 'COMPANY' && where.moyskladId === 'ms-1' ? pair : null,
       update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); updates.push(data); return pair; },
@@ -245,7 +250,7 @@ test('MoySklad lifecycle tombstones resolve a shared native ID by exact entity k
   const pairs = [product, servicePair];
   let lookup: Record<string, unknown> | undefined;
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
         lookup = where;
@@ -259,7 +264,7 @@ test('MoySklad lifecycle tombstones resolve a shared native ID by exact entity k
     },
     operationalLog: { create: async () => ({}) },
   };
-  const service = new ClientLifecycleService({ $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx) } as never);
+  const service = new ClientLifecycleService({ ...modeOnTransaction(), $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback({ ...tx, $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }] }) } as never);
   const result = await service.tombstoneByNativeId('MOYSKLAD', 'PRODUCT', 'shared-ms-id', 'confirmed deletion', 'service');
   assert.equal(result.status, 'TOMBSTONED');
   assert.equal(result.pairId, 'active-service');
@@ -286,6 +291,7 @@ test('deletion marker uses configured entity field code, is idempotent, and reje
     return Response.json({ result: true });
   };
   const database = {
+    ...modeOnTransaction(),
     entityPair: {
       findUnique: async () => pair,
       findMany: async () => [],
@@ -328,6 +334,7 @@ test('MoySklad provider outage remains retryable and does not tombstone the pair
   const event = { id: 'event-2', source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: 'counterparty', externalEntityId: 'ms-1', payload: {}, status: 'RECEIVED', attempts: 0 };
   const database = {
     entityPair: { findUnique: async () => pair, findFirst: async () => pair },
+    $transaction: async (callback: (transaction: { $queryRaw: () => Promise<Array<{ serviceMode: string }>> }) => Promise<unknown>) => callback({ $queryRaw: async () => [{ serviceMode: 'on' }] }),
     inboundEntityLock: {
       updateMany: async () => ({ count: 0 }), create: async () => ({}), deleteMany: async () => ({ count: 1 }),
     },
@@ -354,7 +361,7 @@ test('MoySklad provider outage remains retryable and does not tombstone the pair
 test('restore keeps the same native IDs and requires verified provider identity plus confirmation', async () => {
   const pair = { id: 'pair-restore', entityType: 'COMPANY', bitrix24Id: 'b24-restore', moyskladId: 'ms-restore', moyskladType: 'counterparty', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED', tombstonedAt: null, tombstoneSource: null, tombstoneReason: null, deletionMarkerStatus: 'NOT_CONFIGURED' };
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findUnique: async () => pair,
       findFirst: async () => null,
@@ -393,11 +400,11 @@ test('restore keeps the same native IDs and requires verified provider identity 
 
 test('restore refuses when a provider read returns another identity', async () => {
   const pair = { id: 'pair-restore', entityType: 'COMPANY', bitrix24Id: 'b24-restore', moyskladId: 'ms-restore', moyskladType: 'counterparty', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED', deletionMarkerStatus: 'NOT_CONFIGURED' };
-  let transactionStarted = false;
+  const tx = { $queryRaw: async () => [{ serviceMode: 'on' }] };
   const database = {
     entityPair: { findUnique: async () => pair },
     ...mockLifecycleLocks(),
-    $transaction: async () => { transactionStarted = true; throw new Error('unexpected transaction'); },
+    $transaction: async (callback: (transaction: typeof tx) => Promise<unknown>) => callback(tx),
   };
   const gateway = {
     readBitrix: async () => ({ ID: 'different-b24-id' }),
@@ -405,7 +412,6 @@ test('restore refuses when a provider read returns another identity', async () =
   };
   const service = new ClientLifecycleService(database as never, gateway as never);
   await assert.rejects(() => service.restore('pair-restore', true, 'BITRIX24_USER:42'), /PAIR_IDENTITY_VERIFICATION_FAILED/);
-  assert.equal(transactionStarted, false);
   assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
 });
 
@@ -419,7 +425,7 @@ test('restore clears the configured Bitrix24 marker before reactivating the exac
   let body = '';
   globalThis.fetch = async (_input, init) => { body = String(init?.body); return Response.json({ result: true }); };
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findUnique: async () => pair,
       findFirst: async () => null,
@@ -456,7 +462,7 @@ test('catalog product and service reads confirm only the documented missing-item
   const oldBase = process.env.BITRIX24_REST_BASE_URL;
   const oldFetch = globalThis.fetch;
   process.env.BITRIX24_REST_BASE_URL = 'https://fixture.invalid/rest/test/';
-  const service = new ClientLifecycleService({} as never);
+  const service = new ClientLifecycleService(modeOnTransaction() as never);
   const readState = (service as unknown as {
     readDeletionState(source: 'BITRIX24', entity: 'PRODUCT', nativeType: string, id: string, payload: unknown): Promise<string>;
   }).readDeletionState.bind(service);
@@ -525,7 +531,7 @@ test('catalog service lifecycle uses service endpoints for deletion checks, mark
   };
 
   const tx = {
-    $queryRaw: async () => [{ locked: 1 }],
+    $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
     entityPair: {
       findUnique: async () => pair,
       findFirst: async () => null,

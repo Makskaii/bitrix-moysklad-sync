@@ -68,6 +68,7 @@ before(async () => {
   process.env.BITRIX24_REST_BASE_URL = 'https://bitrix-fixture.invalid/rest/test/';
   database = new DatabaseService();
   await database.$connect();
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
   service = new ClientLifecycleService(database, makeGateway() as never);
   await database.entityPair.create({ data: {
     id: companyPairId, entityType: 'COMPANY', bitrix24Id: b24CompanyId, moyskladId: msId,
