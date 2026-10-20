@@ -157,14 +157,19 @@ test('missing product hardpair opens manual review without guessing or creating 
 
 test('catalog ADD creates a persisted pair only after exact configured price, currency and tax match', async () => {
   const bitrixId = '807';
-  const candidateId = '32345678-1234-1234-1234-123456789abc';
+  const candidateId = '92345678-1234-1234-1234-123456789abc';
+  const newerCandidateId = '12345678-1234-1234-1234-123456789abc';
   const row: Record<string, unknown> = { id: 'event-match', source: 'BITRIX24', eventType: 'CATALOG.PRODUCT.ON.ADD', externalEntityType: 'product',
     externalEntityId: bitrixId, payload: { event: 'CATALOG.PRODUCT.ON.ADD', data: { FIELDS: { ID: bitrixId, TYPE: 1 } } }, status: 'RECEIVED', attempts: 0 };
   const pairs: Array<Record<string, unknown>> = [];
+  const operationalLogs: Array<{ message: string }> = [];
   const api = {
     readBitrix24: async () => ({ name: 'Exact name', createdAt: '2026-10-10T00:00:00Z', prices: [{ priceId: 'p1', typeId: '2', value: 10, currency: 'RUB' }], taxSemantics: '{"rate":20,"enabled":true,"included":false}', detailText: null, unitId: null, updatedAt: null }),
-    findMoyskladProductsByExactName: async () => [{ id: candidateId, name: 'Exact name', createdAt: '2026-10-01T00:00:00Z' }],
-    readMoysklad: async () => ({ name: 'Exact name', createdAt: '2026-10-01T00:00:00Z', prices: [{ priceId: 't1', typeId: 'price-type', value: 10, currency: 'RUB' }], taxSemantics: '{"rate":20,"enabled":true,"included":false}', detailText: null, unitId: null, updatedAt: null }),
+    findMoyskladProductsByExactName: async () => [
+      { id: newerCandidateId, name: 'Exact name', createdAt: '2026-10-02T00:00:00Z' },
+      { id: candidateId, name: 'Exact name', createdAt: '2026-10-01T00:00:00Z' },
+    ],
+    readMoysklad: async (id: string) => ({ name: 'Exact name', createdAt: id === candidateId ? '2026-10-01T00:00:00Z' : '2026-10-02T00:00:00Z', prices: [{ priceId: 't1', typeId: 'price-type', value: 10, currency: 'RUB' }], taxSemantics: '{"rate":20,"enabled":true,"included":false}', detailText: null, unitId: null, updatedAt: null }),
   };
   const database: any = {
     inboundEvent: { findUnique: async () => structuredClone(row), updateMany: async ({ data }: any) => { Object.assign(row, data); return { count: 1 }; } },
@@ -174,7 +179,7 @@ test('catalog ADD creates a persisted pair only after exact configured price, cu
       create: async ({ data }: any) => { const pair = { id: 'auto-pair', entityType: 'PRODUCT', active: true, ...data }; pairs.push(pair); return { id: pair.id }; },
     },
     manualReviewCase: { upsert: async () => undefined, updateMany: async () => ({ count: 0 }) },
-    operationalLog: { create: async () => undefined },
+    operationalLog: { create: async ({ data }: any) => { operationalLogs.push(data); } },
     $queryRaw: async () => [{ locked: 1 }],
     $transaction: async (operation: (transaction: unknown) => Promise<unknown>) => operation(database),
   };
@@ -192,6 +197,7 @@ test('catalog ADD creates a persisted pair only after exact configured price, cu
   assert.equal(pairs[0]?.moyskladId, candidateId);
   assert.equal(pairs[0]?.source, 'AUTO');
   assert.deepEqual(runtimeCalls.map((call) => call.pairId), ['auto-pair']);
+  assert.equal(JSON.parse(operationalLogs[0]!.message).selectionReason, 'EARLIEST_CREATION_DATE');
 });
 
 test('product event rolls back terminal status when the worker lease is lost at transactional fence', async () => {

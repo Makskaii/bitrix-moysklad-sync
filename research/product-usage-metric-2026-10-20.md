@@ -2,11 +2,11 @@
 
 ## Decision
 
-No production usage counter was wired in this branch. The official turnover report can filter by a product and return turnover operations, but that is not the required frequency of appearance in customer documents: its documented operation types exclude customer orders, and its assortment contract covers products and variants rather than services. No complete local document-position usage index was found. Treating turnover, item quantity, or a partial local count as the requested frequency would silently change the metric. Candidate selection therefore remains on the approved creation-date and native-ID fallback until the owner selects a metric or a complete source is built.
+The owner has explicitly removed usage frequency from product-candidate selection. For new, unpaired exact name/price candidates, the canonical original is the candidate with the earliest reliable creation date. Equal or unavailable candidate creation dates use deterministic native ID and log the reason. Existing saved pairs and aliases retain precedence and are never redefined by candidate ranking. This is the final selection rule; no usage metric is pending implementation.
 
 ## Evidence
 
-- The issue #79 implementation brief requires highest *actual comparable usage*, then earliest creation when the metric is tied or unavailable. It rejects zero for unknown usage, partial local history presented as complete, and a synchronous scan of roughly 1.8 million customer orders.
+- This investigation was initiated under an earlier brief that proposed customer-document frequency. The owner superseded that proposal with the explicit date-only rule above; this note is retained as rationale for not substituting a different metric.
 - The catalog candidate producer in `apps/api/src/products/product-card-event.processor.ts` passes `usage: null` for both the incoming Bitrix24 product and each MoySklad candidate. The policy in `product-catalog-match-policy.ts` accepts usage evidence, but the producer supplies none.
 - A bounded authenticated read of `GET https://api.moysklad.ru/api/remap/1.2/entity/product?limit=1` succeeded against the configured MoySklad account. The probe used `Accept: application/json;charset=utf-8`, `Accept-Encoding: gzip`, HTTPS, and did not emit business records or identifiers.
 - The official [Remap turnover report reference](https://dev.moysklad.ru/doc/api/remap/1.2/#/reports/report-turnover) documents `GET /report/turnover/byoperations`, filter `product=<full product entity href>`, and operation types `supply`, `purchasereturn`, `demand`, `salesreturn`, `loss`, `enter`, `move`, `processing`, `retaildemand`, `retailsalesreturn`, and `productionstagecompletion`. `customerorder` is not among the documented types. The response rows contain an `operation` document reference and a `quantity`; that quantity is not document frequency.
@@ -18,11 +18,10 @@ No production usage counter was wired in this branch. The official turnover repo
 
 ## Why turnover cannot rank candidates for this rule
 
-The report provides a supported API-side aggregate/detail path for turnover operations, but issue #79 asks for frequency in documents. The documented report has no customer-order operation type and does not cover services. Using it would rank on a different population of documents and could yield incomparable evidence for product versus service candidates. The customer-order positions API has no product filter, so full order frequency requires a resumable historical index or background inventory of order IDs and their positions. The existing inventory cannot be repurposed as complete coverage.
+The report provides an API-side aggregate/detail path for turnover operations, but turnover is not frequency of use in documents and could choose a different canonical candidate. The documented report also lacks customer-order operations and does not cover services. The customer-order positions API has no product filter, so full order frequency would require a resumable historical index or background inventory of order IDs and their positions; existing inventory is incomplete. These limits motivated removal of usage from the decision rather than a metric substitution or incomplete local count.
 
 ## Concrete options
 
-1. Keep the approved date/ID fallback, or approve an alternate metric (for example, turnover operations for products only) with its narrower meaning, operation set, and service behavior.
-2. To retain customer-document frequency, add a persistent local index whose source includes all relevant orders and positions. Populate it via a resumable background job, then keep it current from every applicable accepted document event. Record a coverage boundary/revision and use usage ranking only when every compared candidate has complete coverage over the same interval. Treat candidates outside that coverage as unavailable and fall back to date/ID for the whole candidate set. Do not perform a 1.8-million-order scan in webhook handling.
+No metric implementation options remain open for this matching rule. Reconsidering usage frequency would require a separate explicit product decision and a comparable source for products and services; turnover or partial cache counts must not silently replace the date-only rule.
 
-Until the metric definition/source is resolved, the approved unavailable-metric fallback remains the creation-date/native-ID ordering. No external writes were performed.
+The bounded provider probes described above were read-only. No external writes were performed.
