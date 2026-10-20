@@ -24,6 +24,7 @@ let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 
 let omitContactNameFieldType = false;
 let fakeMoyskladAttributeType: string | undefined = 'string';
 let fakeMoyskladUnitListAsArray = false;
+let fakeMoyskladPriceListHasMalformedRow = false;
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -146,7 +147,7 @@ before(async () => {
       const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project'].some((path) => url.pathname.endsWith(path));
       // MoySklad's company-settings price-type endpoint returns a bare JSON
       // array, unlike entity list endpoints that return { rows, meta }.
-      const body = isPriceList ? rows
+      const body = isPriceList ? fakeMoyskladPriceListHasMalformedRow ? [...rows, null] : rows
         : isUnitList ? fakeMoyskladUnitListAsArray ? rows : { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
@@ -505,7 +506,7 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   const pricePage = await pricePageResponse.json() as { items: Array<{ id: string; code: string; label: string }>; nextCursor: string | null };
   assert.equal(pricePageResponse.status, 200, 'the public catalog endpoint accepts the provider native price-type list response');
   assert.equal(pricePage.items.length, fakeMsPriceIds.length);
-  assert.ok(pricePage.items.some((item) => item.id === fakeMsPriceIds[0]));
+  assert.deepEqual(pricePage.items.map((item) => item.id), fakeMsPriceIds, 'all provider price types remain visible in provider order');
   assert.equal(pricePage.nextCursor, null);
 
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
@@ -530,6 +531,7 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.equal(saveResponse.status, 200);
   assert.equal(saved.config.references.units.find((unit) => unit.bitrix24Id === 14)?.moyskladId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
   assert.equal(saved.config.references.priceTypes.length, active.config.references.priceTypes.length, 'price types survive the settings version roundtrip');
+  assert.deepEqual(saved.config.references.priceTypes, config.references.priceTypes, 'the complete approved price-type mapping survives settings save');
   assert.deepEqual(saved.config.references.dictionaries, active.config.references.dictionaries, 'service and payment dictionary pairs survive the settings version roundtrip');
   assert.deepEqual(saved.config.references.namedPairs, config.references.namedPairs, 'all named reference kinds and confirmation states survive the settings version roundtrip');
 
@@ -558,6 +560,17 @@ test('entity list catalogs still fail closed when they return an unexpected top-
     assert.match(await response.text(), /invalid catalog/);
   } finally {
     fakeMoyskladUnitListAsArray = false;
+  }
+});
+
+test('price-type catalogs fail closed when their native array contains a malformed row', async () => {
+  fakeMoyskladPriceListHasMalformedRow = true;
+  try {
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=priceTypes&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /invalid catalog/);
+  } finally {
+    fakeMoyskladPriceListHasMalformedRow = false;
   }
 });
 

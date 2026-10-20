@@ -442,11 +442,15 @@ export class ReadOnlyFieldDataProvider {
       // Unlike entity list resources, this company-settings endpoint returns
       // the price types as a bare JSON array (verified against the live API).
       const isPriceTypeCatalog = url.pathname.endsWith('/context/companysettings/pricetype');
-      let pageRows: unknown[] | null = null;
-      if (isPriceTypeCatalog && Array.isArray(payload)) pageRows = payload;
-      else if (isRecord(payload) && Array.isArray(payload.rows)) pageRows = payload.rows;
+      let pageRows: Array<Record<string, unknown>> | null = null;
+      if (isPriceTypeCatalog && Array.isArray(payload)) {
+        if (!payload.every(isRecord)) throw new ServiceUnavailableException('MoySklad returned an invalid catalog');
+        pageRows = payload;
+      } else if (isRecord(payload) && Array.isArray(payload.rows)) {
+        pageRows = payload.rows.filter(isRecord);
+      }
       if (!pageRows) throw new ServiceUnavailableException('MoySklad returned an invalid catalog');
-      rows.push(...pageRows.filter(isRecord));
+      rows.push(...pageRows);
       const nextHref = isRecord(payload) && isRecord(payload.meta) && typeof payload.meta.nextHref === 'string' ? payload.meta.nextHref : '';
       if (!nextHref) return rows;
       url = new URL(nextHref);
