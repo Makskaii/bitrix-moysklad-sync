@@ -16,6 +16,10 @@ const createdPairIds: string[] = [];
 const fakeUpstreamMethods: string[] = [];
 const fakeB24ListTypes: Array<{ id: string; type: string }> = [];
 const fakeB24UserFieldStarts: number[] = [];
+let fakeB24DealCategories: Array<{ id: number; name: string }> = [];
+let fakeB24DealStatuses: Record<string, Array<{ STATUS_ID: string; NAME: string }>> = {
+  DEAL_STAGE: [{ STATUS_ID: 'NEW', NAME: 'Новая сделка' }],
+};
 let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
 let omitContactNameFieldType = false;
 let fakeMoyskladAttributeType: string | undefined = 'string';
@@ -106,9 +110,9 @@ before(async () => {
             : method === 'catalog.product.get.json'
               ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
             : method === 'crm.category.list.json'
-              ? []
+              ? fakeB24DealCategories
               : method === 'crm.status.list.json'
-                ? [{ STATUS_ID: 'NEW', NAME: 'Новая сделка' }]
+                ? fakeB24DealStatuses[form.get('filter[ENTITY_ID]') ?? ''] ?? []
               : method === 'user.get.json'
                 ? [{ ID: 1, NAME: 'Ada', LAST_NAME: 'Lovelace' }]
               : method === 'crm.currency.list.json'
@@ -132,16 +136,18 @@ before(async () => {
       const isPriceList = url.pathname.endsWith('/companysettings/pricetype');
       const serviceDirectory = url.pathname.endsWith('/entity/customentity/f0177126-8e74-11e3-b761-002590a28eca');
       const paymentDirectory = url.pathname.endsWith('/entity/customentity/0ecffb86-d8a3-11eb-0a80-0dbc000256e5');
+      const orderStateMetadata = url.pathname.endsWith('/entity/customerorder/metadata');
       const ids = isUnitList ? fakeMsUnitIds : fakeMsPriceIds;
       const rows = ids.map((id, index) => ({ id, code: `m${index + 1}`, name: `MS ${index + 1}`, externalCode: `m${index + 1}` }));
       const dictionaryRows = serviceDirectory
         ? APPROVED_DICTIONARY_PAIRS.service.map(([, id]) => ({ id, name: `MS service ${id}` }))
         : paymentDirectory ? APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([, id]) => ({ id, name: `MS payment ${id}` })) : [];
-      const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project', '/entity/customerorder/metadata/states'].some((path) => url.pathname.endsWith(path));
+      const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project'].some((path) => url.pathname.endsWith(path));
       const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
-        : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: url.pathname.endsWith('/metadata/states') ? 'Новая сделка' : 'Demo reference', code: 'REF' }], meta: { size: 1 } }
+        : orderStateMetadata ? { states: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Новая сделка' }] }
+        : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Demo reference', code: 'REF' }], meta: { size: 1 } }
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', ...(fakeMoyskladAttributeType === undefined ? {} : { type: fakeMoyskladAttributeType }), writable: true }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
@@ -480,7 +486,7 @@ test('live reference catalogs include both systems, keep exact-name matches as s
   }
   assert.ok(fakeUpstreamMethods.includes('crm.category.list.json'));
   assert.ok(fakeUpstreamMethods.includes('crm.status.list.json'));
-  assert.ok(fakeUpstreamMethods.includes('states'), 'MySklad order states are loaded as read-only metadata');
+  assert.ok(fakeUpstreamMethods.includes('metadata'), 'MySklad order states are loaded as read-only metadata');
   assert.ok(fakeUpstreamMethods.length > before);
 });
 
@@ -584,6 +590,108 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   const missingRequiredProductName = structuredClone(config);
   missingRequiredProductName.dealOrderRuntime.moyskladProductFields = ['code'];
   assert.equal((await save(missingRequiredProductName)).status, 400, 'new product cards require the explicitly allowed source name');
+});
+
+test('saving a raw main-pipeline stage confirms its single category-qualified catalog key', async () => {
+  const previousCategories = fakeB24DealCategories;
+  const previousStatuses = fakeB24DealStatuses;
+  let originalConfig: Record<string, any> | undefined;
+  try {
+    fakeB24DealCategories = [];
+    fakeB24DealStatuses = { DEAL_STAGE: [{ STATUS_ID: 'PREPARATION', NAME: 'Подготовка' }] };
+
+    const active = await fetch(`${apiUrl}/api/admin/field-settings`).then((response) => response.json()) as { config: Record<string, any> };
+    originalConfig = structuredClone(active.config);
+    const catalogs = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`).then((response) => response.json()) as {
+      namedReferences: { dealStages: { sources: Array<{ source: { id: string; label: string } }>; targets: Array<{ id: string; label: string }> } };
+    };
+    const source = catalogs.namedReferences.dealStages.sources.find((candidate) => candidate.source.id === '0:PREPARATION')?.source;
+    const activeStage = active.config.references.namedPairs.find((pair: any) => pair.kind === 'dealStages' && pair.status === 'confirmed' && pair.moyskladId);
+    assert.ok(source, 'the catalog adapter should expose main-pipeline key 0:PREPARATION');
+    assert.ok(activeStage?.moyskladId, 'the fixture starts with an existing confirmed MySklad order state');
+    const target = catalogs.namedReferences.dealStages.targets.find((candidate) => candidate.id === activeStage.moyskladId);
+    assert.ok(target, 'the selected MySklad state must still exist in the live catalog');
+
+    const config = structuredClone(active.config);
+    config.references.namedPairs = config.references.namedPairs.filter((pair: any) => pair.kind !== 'dealStages');
+    config.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: source.id, bitrix24Label: source.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    config.dealOrderRuntime = {
+      ...config.dealOrderRuntime,
+      stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: target.id, creationEnabled: true }],
+    };
+
+    const save = async (candidate: unknown) => fetch(`${apiUrl}/api/admin/field-settings`, {
+      method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+      body: JSON.stringify({ config: candidate }),
+    });
+    const response = await save(config);
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    const saved = JSON.parse(body) as { config: { dealOrderRuntime: { stages: Array<{ bitrix24StageId: string; moyskladId: string }> }; references: { namedPairs: Array<{ kind: string; bitrix24Id: string; moyskladId: string }> } } };
+    assert.deepEqual(saved.config.dealOrderRuntime.stages, [{ bitrix24StageId: 'PREPARATION', moyskladId: target.id, creationEnabled: true }]);
+    assert.deepEqual(saved.config.references.namedPairs.filter((pair) => pair.kind === 'dealStages'), [{
+      kind: 'dealStages', bitrix24Id: '0:PREPARATION', bitrix24Label: source.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    }]);
+
+    const wrongTarget = structuredClone(config);
+    wrongTarget.dealOrderRuntime.stages[0].moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    assert.equal((await save(wrongTarget)).status, 400, 'raw-stage matching must not loosen exact target confirmation');
+
+    fakeB24DealCategories = [{ id: 2, name: 'Pipeline 2' }];
+    fakeB24DealStatuses = {
+      DEAL_STAGE: [],
+      DEAL_STAGE_2: [{ STATUS_ID: 'C2:PREPARATION', NAME: 'Подготовка воронки 2' }],
+    };
+    const customCatalog = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`).then((result) => result.json()) as {
+      namedReferences: { dealStages: { sources: Array<{ source: { id: string; label: string } }> } };
+    };
+    const customSource = customCatalog.namedReferences.dealStages.sources.find((candidate) => candidate.source.id === '2:C2:PREPARATION')?.source;
+    assert.ok(customSource, 'only an explicit C<n>:status runtime ID can derive its matching custom-category catalog key');
+    const customActive = await fetch(`${apiUrl}/api/admin/field-settings`).then((result) => result.json()) as { config: Record<string, any> };
+    const customConfig = structuredClone(customActive.config);
+    customConfig.references.namedPairs = customConfig.references.namedPairs.filter((pair: any) => pair.kind !== 'dealStages');
+    customConfig.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: customSource.id, bitrix24Label: customSource.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    customConfig.dealOrderRuntime = {
+      ...customConfig.dealOrderRuntime,
+      stages: [{ bitrix24StageId: 'C2:PREPARATION', moyskladId: target.id, creationEnabled: true }],
+    };
+    const customSave = await save(customConfig);
+    assert.equal(customSave.status, 200, await customSave.text());
+
+    const wrongCategory = structuredClone(customConfig);
+    wrongCategory.dealOrderRuntime.stages[0].bitrix24StageId = 'C1:PREPARATION';
+    const wrongCategoryResponse = await save(wrongCategory);
+    const wrongCategoryBody = await wrongCategoryResponse.text();
+    assert.equal(wrongCategoryResponse.status, 400, 'a different custom category cannot inherit the selected target');
+    assert.match(wrongCategoryBody, /one confirmed named reference/);
+
+    const ambiguous = structuredClone(customConfig);
+    ambiguous.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: 'C2:PREPARATION', bitrix24Label: customSource.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    const ambiguousResponse = await save(ambiguous);
+    const ambiguousBody = await ambiguousResponse.text();
+    assert.equal(ambiguousResponse.status, 400, 'two candidate source keys for one raw stage are ambiguous even when their targets are equal');
+    assert.match(ambiguousBody, /one confirmed named reference/);
+  } finally {
+    fakeB24DealCategories = previousCategories;
+    fakeB24DealStatuses = previousStatuses;
+    if (originalConfig) {
+      const restore = await fetch(`${apiUrl}/api/admin/field-settings`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+        body: JSON.stringify({ config: originalConfig }),
+      });
+      assert.equal(restore.status, 200, await restore.text());
+    }
+  }
 });
 
 test('saving creates an immutable version and activates it for future events only', async () => {
