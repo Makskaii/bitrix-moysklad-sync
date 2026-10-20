@@ -28,6 +28,7 @@
     "test:deal-order-runtime-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-preparer.unit.js ../../dist/apps/api-test/test/deal-order-position-runtime.unit.js ../../dist/apps/api-test/test/deal-order-money.unit.js ../../dist/apps/api-test/test/deal-order-client-change.unit.js",
     "test:deal-order-reverse-postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-reverse-create.postgres.integration.js",
     "test:deal-order-create-postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-create.postgres.integration.js",
+    "test:deal-order-header-mode-gate:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-header-mode-gate.postgres.integration.js",
     "test:deal-order-position-postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/deal-order-position-runtime.postgres.integration.js",
     "test:contactsync": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/contact-sync.integration.js",
     "test:pairs": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/pair-resolution.integration.js",
