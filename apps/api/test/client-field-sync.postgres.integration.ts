@@ -62,8 +62,8 @@ before(async () => {
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
-        bitrix24: ['ID', 'TITLE', 'NAME', 'SECOND_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'UF_READONLY', 'UF_NUM_CRITICAL', 'UF_NUM_OPTIONAL'].map((code) => ({ code, writable: code !== 'ID' && code !== 'UF_READONLY' })),
-        moysklad: ['id', 'meta', 'name', 'phone', 'email', 'calculated', 'unmapped', 'amount', 'amountOptional'].map((code) => ({ code, writable: !['id', 'meta', 'calculated'].includes(code) })),
+        bitrix24: ['ID', 'TITLE', 'NAME', 'SECOND_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'UF_READONLY', 'UF_NUM_CRITICAL', 'UF_NUM_OPTIONAL'].map((code) => ({ code, type: ['PHONE', 'EMAIL'].includes(code) ? 'crm_multifield' : 'string', cardinality: ['PHONE', 'EMAIL'].includes(code) ? 'multiple' : 'single', shape: ['PHONE', 'EMAIL'].includes(code) ? 'object' : 'scalar', writable: code !== 'ID' && code !== 'UF_READONLY' })),
+        moysklad: ['id', 'meta', 'name', 'phone', 'email', 'calculated', 'unmapped', 'amount', 'amountOptional'].map((code) => ({ code, type: code.startsWith('amount') ? 'number' : code === 'meta' ? 'object' : 'string', cardinality: 'single', shape: code === 'meta' ? 'object' : 'scalar', writable: !['id', 'meta', 'calculated'].includes(code) })),
       };
     },
   } as never, {} as EntityPairService);
@@ -91,8 +91,8 @@ before(async () => {
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
     },
-    { id: 'field53-critical-number', entity: 'contacts-companies', sourceField: 'UF_NUM_CRITICAL', targetField: 'amount', criticality: 'critical', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
-    { id: 'field53-optional-number', entity: 'contacts-companies', sourceField: 'UF_NUM_OPTIONAL', targetField: 'amountOptional', criticality: 'optional', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }],
+    { id: 'field53-critical-number', entity: 'companies', sourceField: 'UF_NUM_CRITICAL', targetField: 'amount', criticality: 'critical', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
+    { id: 'field53-optional-number', entity: 'companies', sourceField: 'UF_NUM_OPTIONAL', targetField: 'amountOptional', criticality: 'optional', bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal' } }, moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }],
     childResourceBindings: [{
         id: 'field53-company-legal-bank', entity: 'companies', bitrix24CompanyId: companySourceId, bitrix24RequisiteId: '482',
       moyskladCounterpartyId: companyTargetId,
@@ -125,8 +125,8 @@ before(async () => {
 
   b24 = { ID: sourceId, NAME: 'Ada', LAST_NAME: 'Lovelace', SECOND_NAME: '', PHONE: [{ VALUE: '+7 111', VALUE_TYPE: 'WORK' }, { VALUE: '+7 222', VALUE_TYPE: 'MOBILE' }], EMAIL: [{ VALUE: 'ada@example.test', VALUE_TYPE: 'WORK' }], UF_READONLY: 'must-not-write', UF_NUM_CRITICAL: '41', UF_NUM_OPTIONAL: '20' };
   moysklad = { id: targetId, name: 'Old Name', phone: '+7 000', email: 'old@example.test', calculated: 'server-owned', unmapped: 'leave', amount: 41, amountOptional: 7 };
-  companyB24 = { ID: companySourceId, TITLE: 'Old Co', PHONE: [{ VALUE: '+7 100' }], EMAIL: [] };
-  companyMs = { id: companyTargetId, companyType: 'legal', name: 'Old Co', phone: '+7 000', email: 'old@example.test', inn: '2222222222' };
+  companyB24 = { ID: companySourceId, TITLE: 'Old Co', PHONE: [{ VALUE: '+7 100' }], EMAIL: [], UF_NUM_CRITICAL: '41', UF_NUM_OPTIONAL: '20' };
+  companyMs = { id: companyTargetId, companyType: 'legal', name: 'Old Co', phone: '+7 000', email: 'old@example.test', inn: '2222222222', amount: 41, amountOptional: 7 };
   const journal = new DryRunWriteJournal(database);
   const gateway = new HttpClientSyncGateway(async (input, init = {}) => {
     const url = String(input);
@@ -188,9 +188,6 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
   assert.equal(proposal.phone, '+7 333 | +7 444');
   assert.equal(proposal.email, '', 'configured empty multifield clears the destination');
   assert.equal(proposal.name, 'Lovelace Augusta Ada');
-  assert.equal(proposal.amount, 42, 'critical numeric field is converted using the shared transform');
-  assert.equal('amountOptional' in proposal, false, 'invalid optional conversion does not write null or an empty value');
-  assert.equal(moysklad.amountOptional, 7, 'invalid optional conversion preserves the current target');
   assert.equal('calculated' in proposal, false);
   assert.equal('unmapped' in proposal, false);
   moysklad = { ...moysklad, ...proposal };
@@ -224,10 +221,13 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
 
   const companyForward = await event(`client-field-company-forward-${suffix}`, 'BITRIX24', companySourceId, 'company');
   companyForwardEventId = companyForward.id;
-  companyB24 = { ...companyB24, TITLE: 'New Co', PHONE: [{ VALUE: '+7 200' }, { VALUE: '+7 201' }], EMAIL: [{ VALUE: 'new@company.test' }] };
+  companyB24 = { ...companyB24, TITLE: 'New Co', PHONE: [{ VALUE: '+7 200' }, { VALUE: '+7 201' }], EMAIL: [{ VALUE: 'new@company.test' }], UF_NUM_CRITICAL: '42', UF_NUM_OPTIONAL: 'not a number' };
   assert.equal(await processor.process(companyForwardEventId), 'SYNCED');
   const companyProposal = (await database.dryRunWriteProposal.findFirstOrThrow({ where: { provider: 'MOYSKLAD', entityId: companyTargetId } })).fields as Record<string, unknown>;
   assert.equal(companyProposal.name, 'New Co');
+  assert.equal(companyProposal.amount, 42, 'critical numeric field is converted using the shared transform');
+  assert.equal('amountOptional' in companyProposal, false, 'invalid optional conversion does not write null or an empty value');
+  assert.equal(companyMs.amountOptional, 7, 'invalid optional conversion preserves the current target');
   assert.equal(companyProposal.phone, '+7 200 | +7 201');
   assert.equal(companyProposal.email, 'new@company.test');
   assert.equal('inn' in companyProposal, false, 'mismatching INN is not inferred as a configured field');
@@ -244,12 +244,13 @@ test('pinned settings, baseline, bidirectional typed field transforms, journal r
   assert.deepEqual(companyB24Proposal.EMAIL, [{ VALUE: 'first@company.test', VALUE_TYPE: 'WORK' }, { VALUE: 'second@company.test', VALUE_TYPE: 'WORK' }]);
   assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: companyPairId } })).moyskladId, companyTargetId);
 
-  b24 = { ...b24, UF_NUM_CRITICAL: 'not a number' };
-  const invalidCriticalTransform = await event(`client-field-invalid-critical-${suffix}`, 'BITRIX24', sourceId, 'contact');
+  companyB24 = { ...companyB24, UF_NUM_CRITICAL: 'not a number' };
+  const invalidCriticalTransform = await event(`client-field-invalid-critical-${suffix}`, 'BITRIX24', companySourceId, 'company');
   invalidCriticalTransformEventId = invalidCriticalTransform.id;
-  const proposalsBeforeInvalidCritical = await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: targetId } });
-  assert.equal(await processor.process(invalidCriticalTransformEventId), 'REVIEW', 'invalid critical conversion stops the event before a write');
-  assert.equal(await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: targetId } }), proposalsBeforeInvalidCritical);
+  const proposalsBeforeInvalidCritical = await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: companyTargetId } });
+  const invalidCriticalResult = await processor.process(invalidCriticalTransformEventId);
+  assert.equal(invalidCriticalResult, 'REVIEW', JSON.stringify({ result: invalidCriticalResult, event: await database.inboundEvent.findUnique({ where: { id: invalidCriticalTransformEventId } }) }));
+  assert.equal(await database.dryRunWriteProposal.count({ where: { provider: 'MOYSKLAD', entityId: companyTargetId } }), proposalsBeforeInvalidCritical);
 });
 
 test('missing saved target remains paired and fails safe without candidate search or replacement creation', async () => {

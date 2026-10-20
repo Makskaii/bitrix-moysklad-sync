@@ -547,12 +547,12 @@ test('invoice group saved through field settings is reloaded and consumed by inv
   const provider = {
     fieldCatalogs: async (_token: string, entity: string) => entity === 'smart-invoices' ? {
       bitrix24: [
-        { code: 'title', writable: true }, { code: 'description', writable: true },
-        { code: 'parentId2', writable: true },
+        { code: 'title', type: 'string', writable: true }, { code: 'description', type: 'string', writable: true },
+        { code: 'parentId2', type: 'integer', writable: true },
       ],
       moysklad: [
-        { code: 'name', writable: true }, { code: 'description', writable: true },
-        { code: 'customerOrder', writable: true },
+        { code: 'name', type: 'string', writable: true }, { code: 'description', type: 'string', writable: true },
+        { code: 'customerOrder', type: 'object', writable: true },
       ],
     } : { bitrix24: [], moysklad: [] },
   };
