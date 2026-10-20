@@ -405,7 +405,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
     const response = await this.fetcher(url, {
-      method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+      method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000),
     }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));

@@ -146,7 +146,9 @@ export function registerControlledTargetReadback(provider: ControlledProvider, t
  * in the target entity's own name/title field, not merely in arbitrary text. */
 export function assertControlledCreateMarker(provider: string, path: string, bodyText: string, entity: string | undefined): void {
   const scope = scopeStorage.getStore();
-  if (!scope || scope.phase === 'SOURCE_READ' || !scope.admittedSourceName || entity !== scope.entity) {
+  const markerEntityMatchesScope = entity === scope?.entity ||
+    provider === 'MOYSKLAD' && entity === 'client:COUNTERPARTY' && scope?.entity === 'client:COMPANY';
+  if (!scope || scope.phase === 'SOURCE_READ' || !scope.admittedSourceName || !markerEntityMatchesScope) {
     throw new Error('CONTROLLED_LIVE_TEST_CREATE_SCOPE_INVALID');
   }
   let name: unknown;

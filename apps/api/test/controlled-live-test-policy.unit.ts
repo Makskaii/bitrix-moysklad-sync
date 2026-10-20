@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createControlledLiveTestPolicy as createPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
+import { assertControlledCreateMarker, createControlledLiveTestPolicy as createPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from '../src/controlled-live-test-policy';
 import { assertApplyExternalWrite, assertControlledExternalRead, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
@@ -393,6 +393,100 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
     }
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('company CREATE through the final fetch guard accepts the counterparty endpoint alias', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue79-company-create-alias-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const originalFetch = globalThis.fetch;
+  const previous = {
+    mode: process.env.CONTROLLED_LIVE_TEST_MODE,
+    instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
+    manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST,
+    database: process.env.DATABASE_URL,
+    sync: process.env.SYNC_MODE,
+    msBase: process.env.MOYSKLAD_API_BASE_URL,
+    msToken: process.env.MOYSKLAD_API_TOKEN,
+    b24Base: process.env.BITRIX24_REST_BASE_URL,
+  };
+  const createRecord = { ...manifest.records[0], targetNativeId: null, allowedActions: ['CREATE'] as const };
+  const createManifest = { ...manifest, records: [createRecord] };
+  let transportCalls = 0;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.SYNC_MODE = 'apply';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://guarded-ms.invalid/api/';
+  process.env.MOYSKLAD_API_TOKEN = 'test-token-not-a-credential';
+  process.env.BITRIX24_REST_BASE_URL = 'https://guarded-bitrix.invalid/rest/';
+  await writeFile(manifestPath, JSON.stringify({ ...createManifest, providerNamespace: testProviderNamespace }), 'utf8');
+  const requests: Request[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    transportCalls++;
+    const request = new Request(input, init);
+    requests.push(request);
+    if (request.method === 'POST') {
+      assert.equal(new URL(request.url).pathname, '/api/entity/counterparty');
+      const body = await request.json() as Record<string, unknown>;
+      assert.equal(body.name, createRecord.name);
+      return new Response(JSON.stringify({ id: 'ms-new-company' }), { status: 200 });
+    }
+    assert.equal(request.method, 'GET');
+    assert.equal(new URL(request.url).pathname, '/api/entity/counterparty/ms-new-company');
+    return new Response(JSON.stringify({ id: 'ms-new-company', name: createRecord.name, created: '2026-10-19T02:00:00Z' }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    setControlledLiveTestWriteCheck(createPolicy(createManifest, testDatabaseUrl));
+    installControlledLiveFetchGuard(testProviderNamespace);
+    await withControlledLiveEventScope({
+      ...scope,
+      targetNativeId: null,
+      admittedSourceName: createRecord.name,
+    }, async () => {
+      const candidate = new HttpClientCandidateGateway({} as any);
+      assert.equal(await candidate.createTarget({
+        entity: 'COMPANY', targetSystem: 'MOYSKLAD', targetType: 'counterparty', parentId: null,
+        source: { TITLE: createRecord.name }, configuredFields: {}, eventId: scope.eventId,
+      }), 'ms-new-company');
+      registerControlledTargetReadback('MOYSKLAD', 'ms-new-company');
+      const syncGateway = new HttpClientSyncGateway();
+      assert.equal((await syncGateway.readMoysklad('counterparty', 'ms-new-company', null)).id, 'ms-new-company');
+    });
+    assert.equal(transportCalls, 2);
+    for (const request of requests) {
+      assert.equal(request.headers.get('accept'), 'application/json;charset=utf-8');
+      assert.equal(request.headers.get('accept-encoding'), 'gzip');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    for (const [key, value] of Object.entries({
+      CONTROLLED_LIVE_TEST_MODE: previous.mode,
+      CONTROLLED_LIVE_TEST_INSTANCE: previous.instance,
+      CONTROLLED_LIVE_TEST_MANIFEST: previous.manifest,
+      DATABASE_URL: previous.database,
+      SYNC_MODE: previous.sync,
+      MOYSKLAD_API_BASE_URL: previous.msBase,
+      MOYSKLAD_API_TOKEN: previous.msToken,
+      BITRIX24_REST_BASE_URL: previous.b24Base,
+    })) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('counterparty create-marker alias is company-only; contactperson marker remains exact', () => {
+  const marker = JSON.stringify({ name: manifest.records[0].name });
+  withControlledLiveEventScope({ ...scope, targetNativeId: null }, () => {
+    assert.doesNotThrow(() => assertControlledCreateMarker('MOYSKLAD', 'entity/counterparty', marker, 'client:COUNTERPARTY'));
+  });
+  const contactScope = { ...scope, entity: 'client:CONTACT', targetNativeId: null };
+  withControlledLiveEventScope(contactScope, () => {
+    assert.throws(() => assertControlledCreateMarker('MOYSKLAD', 'entity/counterparty', marker, 'client:COUNTERPARTY'), /CREATE_SCOPE_INVALID/);
+    assert.doesNotThrow(() => assertControlledCreateMarker('MOYSKLAD', 'entity/counterparty', JSON.stringify({ name: manifest.records[0].name, companyType: 'individual' }), 'client:CONTACT'));
+  });
 });
 
 test('lifecycle delete scope can only be reconstructed from a previously readback-bound manifest pair', async () => {
