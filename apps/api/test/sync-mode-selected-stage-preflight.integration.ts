@@ -84,6 +84,21 @@ test('forward preflight resolves the selected primary-stage catalog ID to the ru
   }
 });
 
+test('forward preflight accepts duplicate enumeration of the same canonical selected stage ID', async () => {
+  const previousToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
+  process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-test-token';
+  try {
+    const report = await serviceFor({ stages: ['0:PREPARATION', '0:PREPARATION'] }).preflightEntityDirection(
+      'deals-orders', 'bitrix24ToMoysklad', 'synthetic-admin-token',
+    );
+    assert.equal(report.canEnable, true, JSON.stringify(report.blockers));
+    assert.deepEqual(report.blockers, []);
+  } finally {
+    if (previousToken === undefined) delete process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
+    else process.env.BITRIX24_EVENT_APPLICATION_TOKEN = previousToken;
+  }
+});
+
 test('forward preflight blocks when the selected stage is missing from the live catalog or its pair is unconfirmed', async () => {
   const previousToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-test-token';
