@@ -10,12 +10,12 @@ function assertProductTestDatabaseTarget(databaseUrl: string, isolatedFlag: stri
   assert.equal(isolatedFlag, '1', 'set PRODUCT_TEST_ISOLATED=1 only for a fresh disposable product test database');
   const parsedUrl = new URL(databaseUrl);
   assert.ok(['localhost', '127.0.0.1', '::1'].includes(parsedUrl.hostname), 'refusing a non-local product-card test database');
-  assert.match(parsedUrl.pathname, /^\/(?:aerosystems_product|issue61)_[a-z0-9_]+_test$/i, 'requires a dedicated product test database name');
+  assert.match(parsedUrl.pathname, /^\/(?:(?:aerosystems_product|issue61)_[a-z0-9_]+_test|sync_issue79_integration_products_test)$/i, 'requires a dedicated product test database name');
   assert.equal(parsedUrl.searchParams.get('schema'), 'issue15_product_test', 'refusing to run product-card tests outside issue15_product_test schema');
 }
 
 test('product PostgreSQL test harness only permits an explicitly isolated loopback database and dedicated schema', () => {
-  const safe = 'postgresql://local-test@127.0.0.1:5432/aerosystems_product_issue61_test?schema=issue15_product_test';
+  const safe = 'postgresql://local-test@127.0.0.1:5432/sync_issue79_integration_products_test?schema=issue15_product_test';
   assert.doesNotThrow(() => assertProductTestDatabaseTarget(safe, '1'));
   assert.throws(() => assertProductTestDatabaseTarget(safe, undefined), /PRODUCT_TEST_ISOLATED/);
   assert.throws(() => assertProductTestDatabaseTarget('postgresql://local-test@example.invalid:5432/aerosystems_product_issue61_test?schema=issue15_product_test', '1'), /non-local/);

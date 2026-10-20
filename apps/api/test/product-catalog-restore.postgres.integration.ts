@@ -17,7 +17,7 @@ function assertIsolatedTarget(value: string, enabled: string | undefined) {
   assert.equal(enabled, '1', 'PRODUCT_CATALOG_TEST_ISOLATED=1 is required');
   const url = new URL(value);
   assert.ok(['localhost', '127.0.0.1', '::1'].includes(url.hostname), 'test DB must be loopback');
-  assert.match(url.pathname, /^\/sync_issue79_catalog_test$/i, 'test must use the dedicated issue-79 DB');
+  assert.match(url.pathname, /^\/sync_issue79_integration_catalog_test$/i, 'test must use the dedicated issue-79 integration DB');
   assert.equal(url.searchParams.get('schema'), 'issue79_catalog_test', 'test must use the dedicated issue-79 schema');
 }
 

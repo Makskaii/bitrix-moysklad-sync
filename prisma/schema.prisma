@@ -123,6 +123,7 @@ model InboundEvent {
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+  @@index([status, retryAfter])
 }
 
 model ControlledTestAdmission {
@@ -329,7 +330,7 @@ model ClientDependencyRetry {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  @@unique([eventId, sourceSystem, sourceEntityId, companySourceId])
+  @@unique([eventId, sourceSystem, sourceEntityId, companySourceId], map: "ClientDependencyRetry_eventId_sourceSystem_sourceEntityId_compa")
   @@index([status, retryAfter])
 }
 
@@ -421,6 +422,26 @@ model DealOrderCreateOperation {
   @@index([status, updatedAt])
 }
 
+model DependencyCreateOperation {
+  id              String   @id @default(cuid())
+  entityType      String
+  bitrix24Id      String
+  targetEntityType String
+  syncId          String   @unique
+  payload         Json
+  status          String   @default("PENDING")
+  moyskladId      String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  lastErrorCategory String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([entityType, bitrix24Id])
+  @@index([status, updatedAt])
+}
+
 model DealOrderReverseCreateOperation {
   moyskladOrderId String   @id
   syncId          String   @unique
@@ -473,7 +494,7 @@ model DealOrderReversePositionOperation {
   updatedAt           DateTime @updatedAt
   operation           DealOrderReverseCreateOperation @relation(fields: [moyskladOrderId], references: [moyskladOrderId], onDelete: Cascade)
 
-  @@unique([moyskladOrderId, moyskladPositionId])
+  @@unique([moyskladOrderId, moyskladPositionId], map: "DealOrderReversePositionOperation_moyskladOrderId_moyskladPosit")
   @@index([status, updatedAt])
 }
 
@@ -621,7 +642,7 @@ model HistoricalDealOrderMatchResult {
   updatedAt      DateTime                       @updatedAt
   run            HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
-  @@unique([runId, sourceSystem, sourceEntityId])
+  @@unique([runId, sourceSystem, sourceEntityId], map: "HistoricalDealOrderMatchResult_runId_sourceSystem_sourceEntityI")
   @@index([runId, category, id])
   @@index([runId, linkedEntityId])
 }
