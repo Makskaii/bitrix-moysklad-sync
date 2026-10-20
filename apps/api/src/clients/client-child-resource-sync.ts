@@ -42,6 +42,7 @@ export class ClientChildResourceSync {
   async syncForPair(input: {
     eventId: string; direction: ClientChildSyncDirection; bindings: ClientChildResourceBindingDto[] | undefined;
     bitrix24CompanyId: string; moyskladCounterpartyId: string; fallbackMatch?: 'exact_name_and_phone'; prior?: ClientChildResourceSnapshot | null;
+    revisionFields?: Array<{ bitrix24Field: string; moyskladField: string }>;
     assertLease?: AssertClientChildSyncLease;
   }): Promise<ClientChildSyncResult> {
     const matches = (input.bindings ?? []).filter((binding) => binding.bitrix24CompanyId === input.bitrix24CompanyId && binding.moyskladCounterpartyId === input.moyskladCounterpartyId);
@@ -58,9 +59,11 @@ export class ClientChildResourceSync {
     moyskladCounterpartyId: string;
     fallbackMatch?: 'exact_name_and_phone';
     prior?: ClientChildResourceSnapshot | null;
+    revisionFields?: Array<{ bitrix24Field: string; moyskladField: string }>;
     assertLease?: AssertClientChildSyncLease;
   }): Promise<ClientChildSyncResult> {
     const { binding } = input;
+    const prior = input.prior ?? emptySnapshot();
     if (!binding) return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_BINDING_MISSING' };
     if (binding.bitrix24CompanyId !== input.bitrix24CompanyId || binding.moyskladCounterpartyId !== input.moyskladCounterpartyId) {
       return { status: 'MANUAL_REVIEW', reason: 'CHILD_RESOURCE_ID_MISSING', bindingId: binding.id };
@@ -97,17 +100,18 @@ export class ClientChildResourceSync {
     }
     if (legalEnabled) {
       currentRequisite = requisite; currentCounterparty = counterparty;
-      if (input.prior) {
+      if (input.prior || input.revisionFields?.some((field) => binding.legalFields.some((mapped) => mapped.bitrix24Field === field.bitrix24Field && mapped.moyskladField === field.moyskladField))) {
       const result = await this.transfer({
         eventId: input.eventId, bindingId: binding.id, direction: input.direction,
         source: isForward ? requisite : counterparty, target: isForward ? counterparty : requisite,
-        previousSource: isForward ? input.prior.bitrix24.requisite : input.prior.moysklad.counterparty,
-        previousTarget: isForward ? input.prior.moysklad.counterparty : input.prior.bitrix24.requisite,
+        previousSource: isForward ? prior.bitrix24.requisite : prior.moysklad.counterparty,
+        previousTarget: isForward ? prior.moysklad.counterparty : prior.bitrix24.requisite,
         fields: binding.legalFields, b24Allowed: REQUISITE_FIELDS, msAllowed: COUNTERPARTY_FIELDS,
         targetResource: isForward ? 'MOYSKLAD_COUNTERPARTY' : 'BITRIX24_REQUISITE',
         parentId: isForward ? input.moyskladCounterpartyId : input.bitrix24CompanyId,
         childId: isForward ? '' : binding.bitrix24RequisiteId,
         fallbackSuppressInn: Boolean(input.fallbackMatch && isForward),
+        revisionFields: input.revisionFields,
         assertLease: input.assertLease,
       });
       changed.push(...result);
@@ -123,17 +127,18 @@ export class ClientChildResourceSync {
       assertRecordId(account, 'id', binding.bankDetail.moyskladAccountId, 'MOYSKLAD_ACCOUNT_ID_MISMATCH');
       assertParent(bankDetail, 'ENTITY_ID', binding.bitrix24RequisiteId, 'BITRIX24_BANK_DETAIL_PARENT_MISMATCH');
       currentBankDetail = bankDetail; currentAccount = account;
-      if (input.prior) {
+      if (input.prior || input.revisionFields?.some((field) => binding.bankDetail?.fields.some((mapped) => mapped.bitrix24Field === field.bitrix24Field && mapped.moyskladField === field.moyskladField))) {
       const result = await this.transfer({
         eventId: input.eventId, bindingId: binding.id, direction: input.direction,
         source: isForward ? bankDetail : account, target: isForward ? account : bankDetail,
-        previousSource: isForward ? input.prior.bitrix24.bankDetail : input.prior.moysklad.account,
-        previousTarget: isForward ? input.prior.moysklad.account : input.prior.bitrix24.bankDetail,
+        previousSource: isForward ? prior.bitrix24.bankDetail : prior.moysklad.account,
+        previousTarget: isForward ? prior.moysklad.account : prior.bitrix24.bankDetail,
         fields: binding.bankDetail.fields, b24Allowed: BANK_FIELDS, msAllowed: ACCOUNT_FIELDS,
         targetResource: isForward ? 'MOYSKLAD_ACCOUNT' : 'BITRIX24_BANK_DETAIL',
         parentId: isForward ? input.moyskladCounterpartyId : binding.bitrix24RequisiteId,
         childId: isForward ? binding.bankDetail.moyskladAccountId : binding.bankDetail.bitrix24Id,
         fallbackSuppressInn: false,
+        revisionFields: input.revisionFields,
         assertLease: input.assertLease,
       });
       changed.push(...result);
@@ -150,16 +155,19 @@ export class ClientChildResourceSync {
     fields: Array<{ bitrix24Field: string; moyskladField: string }>; b24Allowed: Set<string>; msAllowed: Set<string>;
     targetResource: 'MOYSKLAD_COUNTERPARTY' | 'MOYSKLAD_ACCOUNT' | 'BITRIX24_REQUISITE' | 'BITRIX24_BANK_DETAIL';
     parentId: string; childId: string; fallbackSuppressInn: boolean;
+    revisionFields?: Array<{ bitrix24Field: string; moyskladField: string }>;
     assertLease?: AssertClientChildSyncLease;
   }): Promise<string[]> {
     const output: RecordValue = {};
     for (const field of input.fields) {
+      if (input.revisionFields && !input.revisionFields.some((mapping) => mapping.bitrix24Field === field.bitrix24Field && mapping.moyskladField === field.moyskladField)) continue;
       const sourceField = input.direction === 'BITRIX24_TO_MOYSKLAD' ? field.bitrix24Field : field.moyskladField;
       const targetField = input.direction === 'BITRIX24_TO_MOYSKLAD' ? field.moyskladField : field.bitrix24Field;
       if (!(sourceField in input.source)) continue;
-      if (same(input.source[sourceField], input.previousSource[sourceField])) continue;
-      // If both sides changed since baseline, preserve the existing policy: MySklad wins.
-      if (!same(input.target[targetField], input.previousTarget[targetField])) continue;
+      const forced = input.revisionFields?.some((mapping) => mapping.bitrix24Field === field.bitrix24Field && mapping.moyskladField === field.moyskladField) === true;
+      if (!forced && same(input.source[sourceField], input.previousSource[sourceField])) continue;
+      // During a semantic settings revision, newly/changed mappings start from MySklad authority.
+      if (!forced && !same(input.target[targetField], input.previousTarget[targetField])) continue;
       if (input.fallbackSuppressInn && field.bitrix24Field === 'RQ_INN' && field.moyskladField === 'inn' && !present(input.target.inn)) continue;
       if (!input.b24Allowed.has(field.bitrix24Field) || !input.msAllowed.has(field.moyskladField)) {
         throw new BadRequestException(`Unsupported or read-only child field mapping ${field.bitrix24Field} → ${field.moyskladField}`);
@@ -297,12 +305,13 @@ export async function syncPinnedClientChildResources(input: {
   settings: { eventConfig(eventId: string): Promise<{ version: number; config: { childResourceBindings?: ClientChildResourceBindingDto[] } }> };
   eventId: string; direction: ClientChildSyncDirection; bitrix24CompanyId: string; moyskladCounterpartyId: string;
   prior?: ClientChildResourceSnapshot | null; fallbackMatch?: 'exact_name_and_phone';
+  revisionFields?: Array<{ bitrix24Field: string; moyskladField: string }>;
   assertLease?: AssertClientChildSyncLease;
 }): Promise<{ settingsVersion: number; result: ClientChildSyncResult }> {
   const pinned = await input.settings.eventConfig(input.eventId);
   const result = await input.adapter.syncForPair({ eventId: input.eventId, direction: input.direction,
     bindings: pinned.config.childResourceBindings, bitrix24CompanyId: input.bitrix24CompanyId,
-    moyskladCounterpartyId: input.moyskladCounterpartyId, prior: input.prior, fallbackMatch: input.fallbackMatch, assertLease: input.assertLease });
+    moyskladCounterpartyId: input.moyskladCounterpartyId, prior: input.prior, fallbackMatch: input.fallbackMatch, revisionFields: input.revisionFields, assertLease: input.assertLease });
   return { settingsVersion: pinned.version, result };
 }
 
