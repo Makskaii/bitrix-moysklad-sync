@@ -24,6 +24,11 @@ let base = '';
 let posts = 0;
 let failNextB24DealRead = true;
 let b24OrderNumber: string | null = null;
+let activeOrderId = ids.order;
+let nextNumberReadBarrier: { started: () => void; wait: Promise<void> } | null = null;
+let offAcknowledged = false;
+let requestsAfterOff = 0;
+let numberUpdates = 0;
 const suffix = randomUUID();
 let companyPairId = '';
 let productPairId = '';
@@ -59,8 +64,57 @@ after(async () => {
   if (server) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
+test('durable OFF acknowledged after number read blocks the next B24 provider request', async () => {
+  const previousMode = (await db.syncSetting.findUniqueOrThrow({ where: { id: 'global' } })).serviceMode;
+  const bitrix24DealId = String(Date.now());
+  activeOrderId = randomUUID();
+  posts = 0;
+  failNextB24DealRead = false;
+  b24OrderNumber = null;
+  numberUpdates = 0;
+  requestsAfterOff = 0;
+  offAcknowledged = false;
+  let resolveReadStarted!: () => void;
+  const readStarted = new Promise<void>((resolve) => { resolveReadStarted = resolve; });
+  let unblockRead!: () => void;
+  const readBarrier = new Promise<void>((resolve) => { unblockRead = resolve; });
+  nextNumberReadBarrier = { started: resolveReadStarted, wait: readBarrier };
+
+  const creation = service.createAndPair(preparedInput(bitrix24DealId)).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  try {
+    await readStarted;
+    const off = db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'off' } }).then((row) => {
+      offAcknowledged = true;
+      return row;
+    });
+    unblockRead();
+    await off;
+    const error = await creation;
+    assert.ok(error instanceof Error, 'the gated source-number write must stop after OFF');
+    assert.equal(numberUpdates, 0, 'no B24 update starts after the gated read releases');
+    assert.equal(requestsAfterOff, 0, 'no provider request starts after durable OFF acknowledgement');
+    assert.equal(posts, 1, 'the already-created MySklad order is not duplicated or rolled back');
+    assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId } })).moyskladOrderId, activeOrderId);
+  } finally {
+    unblockRead();
+    nextNumberReadBarrier = null;
+    await creation;
+    const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', bitrix24Id: bitrix24DealId }, select: { id: true } });
+    if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+    await db.entityPair.deleteMany({ where: { entityType: 'DEAL', bitrix24Id: bitrix24DealId } });
+    await db.dealOrderCreateOperation.deleteMany({ where: { bitrix24DealId } });
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: previousMode } });
+    activeOrderId = ids.order;
+    offAcknowledged = false;
+  }
+});
+
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
   posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
+  activeOrderId = ids.order;
   const input = preparedInput();
   input.skippedRows = [{ sourceRowId: '302', reason: 'UNIT_UNMAPPED' }];
   const firstError = await service.createAndPair(input).then(() => null, (error: unknown) => error);
@@ -82,9 +136,9 @@ test('MySklad order ID persists after remote create and retry reuses it rather t
   assert.equal(b24OrderNumber, 'SO-54');
 });
 
-function preparedInput(): any {
+function preparedInput(bitrix24DealId = '901'): any {
   return {
-    bitrix24DealId: '901', bitrix24CompanyId: '902', bitrix24ContactId: null, confirmedCustomerPairIds: [companyPairId],
+    bitrix24DealId, bitrix24CompanyId: '902', bitrix24ContactId: null, confirmedCustomerPairIds: [companyPairId],
     eventId: `b24-event-${suffix}`, settingsVersion: 4, sourceProductIds: ['904'], sourceRowIds: ['301'],
     sourceRowValues: [{ id: '301', productId: 904, quantity: 2, price: 0, measureCode: 796 }], sourceMeasureCodes: [796],
     unitMappings: [{ bitrix24Id: 796, moyskladId: ids.unit, status: 'configured' }],
@@ -103,12 +157,13 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const text = Buffer.concat(chunks).toString('utf8');
   const body = text ? new URLSearchParams(text) : new URLSearchParams();
   const url = new URL(request.url ?? '/', base);
+  if (offAcknowledged) requestsAfterOff++;
   if (url.pathname === '/api/remap/1.2/entity/customerorder' && request.method === 'POST') {
     posts++;
-    return send(response, { id: ids.order, meta: { type: 'customerorder' } });
+    return send(response, { id: activeOrderId, meta: { type: 'customerorder' } });
   }
-  if (url.pathname === `/api/remap/1.2/entity/customerorder/${ids.order}`) return send(response, {
-    id: ids.order, name: 'SO-54', meta: { type: 'customerorder' }, positions: { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` } }, quantity: 2, price: 0, discount: 0, vat: 0, vatEnabled: false }] },
+  if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) return send(response, {
+    id: activeOrderId, name: 'SO-54', meta: { type: 'customerorder' }, positions: { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` } }, quantity: 2, price: 0, discount: 0, vat: 0, vatEnabled: false }] },
   });
   const entity = url.pathname.match(/\/entity\/(counterparty|organization|store|employee|currency)\/([0-9a-f-]{36})$/);
   if (entity) return send(response, { id: entity[2], meta: { type: entity[1] } });
@@ -117,10 +172,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const product = url.pathname.match(/\/entity\/product\/([0-9a-f-]{36})$/);
   if (product) return send(response, { id: product[1], meta: { type: 'product' }, uom: { id: ids.unit } });
   if (url.pathname === '/rest/crm.deal.get.json') {
+    if (nextNumberReadBarrier) {
+      const barrier = nextNumberReadBarrier;
+      nextNumberReadBarrier = null;
+      barrier.started();
+      await barrier.wait;
+    }
     if (failNextB24DealRead) { failNextB24DealRead = false; response.writeHead(500); response.end('{}'); return; }
-    return send(response, { result: { ID: '901', UF_CRM_1729757435964: b24OrderNumber } });
+    return send(response, { result: { ID: body.get('id'), UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
+    numberUpdates++;
     b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
     return send(response, { result: true });
   }

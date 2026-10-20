@@ -63,6 +63,31 @@ export class DealOrderCreateOperationService {
     return result.value;
   }
 
+  private async writeBitrixOrderNumber(input: DealOrderPreparedInput, leaseToken: string, assertWorkerLease: (() => Promise<boolean>) | undefined, orderName: string) {
+    const base = bitrixBase();
+    const read = async () => {
+      const body = await this.providerRead(new URL('crm.deal.get.json', withSlash(base)), {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id: input.bitrix24DealId }),
+      }).catch((error: unknown) => {
+        if (error instanceof ServiceModeNotOnError) throw error;
+        throw new Error('Bitrix24 customer-order number read failed');
+      });
+      if (!isRecord(body) || body.error || !isRecord(body.result)) throw new Error('Bitrix24 customer-order number read failed');
+      return body.result;
+    };
+    const current = await read();
+    if (current.UF_CRM_1729757435964 !== orderName) {
+      const body = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('crm.deal.update.json', withSlash(base)), {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName }),
+      }));
+      if (!isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
+    }
+    const verified = await read();
+    if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
+  }
+
   /** Record that a new B24 deal is waiting for complete dependencies. This is
    * deliberately separate from the vendor POST: no external document exists
    * until the preparer has validated every required row/reference. */
@@ -190,7 +215,7 @@ export class DealOrderCreateOperationService {
         await this.controlledAdmission.bindCreatedTarget(input.eventId, orderId, orderId, order.name, createdAt, scope.runId);
       }
       const shouldWriteSourceNumber = !this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled' || await this.controlledAdmission.allowsSourceSideWrite(input.eventId);
-      if (shouldWriteSourceNumber) await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => writeBitrixOrderNumber(input.bitrix24DealId, order.name));
+      if (shouldWriteSourceNumber) await this.writeBitrixOrderNumber(input, leaseToken, assertWorkerLease, order.name);
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
     } catch (error) {
@@ -549,31 +574,6 @@ function moyskladBase(): URL {
     if ((base.protocol !== 'https:' && !(local && base.protocol === 'http:')) || base.username || base.password) throw new Error();
     return base;
   } catch { throw new Error('Customer-order API endpoint is invalid'); }
-}
-
-async function writeBitrixOrderNumber(dealId: string, orderName: string) {
-  const base = bitrixBase();
-  const read = async () => {
-    const response = await fetch(new URL('crm.deal.get.json', withSlash(base)), {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id: dealId }), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new Error('Bitrix24 customer-order number read failed'); });
-    const body: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(body) || body.error || !isRecord(body.result)) throw new Error('Bitrix24 customer-order number read failed');
-    return body.result;
-  };
-  const current = await read();
-  if (current.UF_CRM_1729757435964 !== orderName) {
-    const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id: dealId, 'fields[UF_CRM_1729757435964]': orderName }),
-      redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new Error('Bitrix24 customer-order number update failed'); });
-    const body: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
-  }
-  const verified = await read();
-  if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
 }
 
 function bitrixBase(): URL {
