@@ -19,6 +19,11 @@ class NightlyStore {
   leaseLost = false;
   acceptedRows: Array<Record<string, any>> = [];
   bitrixIds: string[] = [];
+  bitrixDealIds: string[] = [];
+  bitrixInvoiceIds: string[] = [];
+  bitrixProductIds: string[] = [];
+  productCatalogConfigured = false;
+  moyskladTotal = 0;
   failBitrix = false;
   pairLifecycleStatus = 'ACTIVE';
   pairEntityType = 'CONTACT';
@@ -144,12 +149,19 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
       if (store.loseLeaseAfterProviderResponse) store.leaseLost = true;
       if (store.failBitrix) return new Response('{}', { status: 503, headers: { 'retry-after': '3600' } });
       const request = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({ result: { items: request.entityTypeId === 3 ? store.bitrixIds.map((id) => ({ id })) : [] } }), { status: 200 });
+      if (url.includes('catalog.product.list')) return new Response(JSON.stringify({ result: { products: store.bitrixProductIds.map((id) => ({ id })) } }), { status: 200 });
+      const ids = request.entityTypeId === 2 ? store.bitrixDealIds : request.entityTypeId === 3 ? store.bitrixIds : request.entityTypeId === 31 ? store.bitrixInvoiceIds : [];
+      return new Response(JSON.stringify({ result: { items: ids.map((id) => ({ id })) } }), { status: 200 });
     }
-    return new Response(JSON.stringify({ rows: [], meta: { size: 0, limit: 1000, offset: 0 } }), { status: 200 });
+    const requestUrl = new URL(url);
+    const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
+    const count = Math.max(0, Math.min(1000, store.moyskladTotal - offset));
+    const rows = Array.from({ length: count }, (_, index) => ({ id: `counterparty-${offset + index + 1}` }));
+    return new Response(JSON.stringify({ rows, meta: { size: store.moyskladTotal, limit: 1000, offset } }), { status: 200 });
   };
   const syncMode = new SyncModeService(store as never);
   const fieldSettings = {
+    active: async () => ({ config: { productCatalogRuntime: store.productCatalogConfigured ? { bitrix24CatalogId: '23' } : null } }),
     saveAcceptedEvent: async (event: Record<string, unknown>) => {
       const key = `${event.source}:${event.deliveryKey}`;
       const existing = store.queued.get(key);
@@ -208,6 +220,8 @@ test('nightly scheduler skips OFF and PAUSE and does not catch up after resume i
 
 test('nightly scheduler skips an inactive interval overlapping the window even after resume to On', async () => {
   const harness = await createHarness('on');
+  harness.store.bitrixDealIds = ['changed-during-off-window'];
+  harness.store.bitrixInvoiceIds = ['changed-during-off-window-invoice'];
   harness.store.state.lastInactiveAt = new Date('2026-10-20T21:30:00.000Z');
   harness.store.state.lastActiveAt = new Date('2026-10-20T21:45:00.000Z');
   try {
@@ -218,6 +232,7 @@ test('nightly scheduler skips an inactive interval overlapping the window even a
     assert.match(harness.store.state.nightlyError, /OFF or PAUSE downtime/i);
     assert.equal(harness.store.state.nightlyFrom, null);
     assert.deepEqual(harness.store.providerCalls, []);
+    assert.equal(harness.store.accepted.length, 0, 'no updated-feed item from an OFF-overlapping window is queued as catch-up');
   } finally {
     harness.close();
   }
@@ -449,6 +464,65 @@ test('a Bitrix24 nightly outage leaves its retry due while the MoySklad feed com
     assert.equal(harness.store.state.nightlyStatus, 'failed');
     assert.ok(harness.store.providerCalls.some((url) => url.includes('moysklad.example.test/api/entity/counterparty')));
     assert.equal(harness.store.state.nightlyRetryAfter.toISOString(), '2026-10-20T23:00:01.000Z');
+  } finally {
+    harness.close();
+  }
+});
+
+test('nightly MoySklad counterparty feed checkpoints bounded pages beyond 1,000 rows', async () => {
+  const harness = await createHarness('on');
+  harness.store.moyskladTotal = 1001;
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    const offsets = harness.store.providerCalls
+      .filter((url) => url.includes('entity/counterparty'))
+      .map((url) => Number(new URL(url).searchParams.get('offset')));
+    assert.deepEqual(offsets, [0, 1000]);
+    assert.equal(harness.store.state.nightlyMoyskladStatus, 'complete');
+    assert.equal(harness.store.state.nightlyMoyskladOffset, 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test('nightly Bitrix24 updated feeds enqueue unpaired deals and type-31 invoices with native event identity', async () => {
+  const harness = await createHarness('on');
+  harness.store.bitrixDealIds = ['deal-not-yet-paired'];
+  harness.store.bitrixInvoiceIds = ['invoice-not-yet-paired'];
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    const queued = harness.store.accepted.filter((event) => event.source === 'BITRIX24');
+    assert.ok(queued.some((event) => event.eventType === 'ONCRMDEALUPDATE' && event.externalEntityType === 'deal' && event.externalEntityId === 'deal-not-yet-paired'));
+    assert.ok(queued.some((event) => event.eventType === 'ONCRMDYNAMICITEMUPDATE' && event.externalEntityType === 'invoice' && event.externalEntityId === 'invoice-not-yet-paired'));
+    assert.ok(queued.every((event) => (event.deliveryKey as string).startsWith('nightly:2026-10-21:')));
+    assert.equal(harness.store.dispatched.length, 2);
+  } finally {
+    harness.close();
+  }
+});
+
+test('nightly configured catalog product feed uses the processor event contract and deduplicated delivery key', async () => {
+  const harness = await createHarness('on');
+  harness.store.productCatalogConfigured = true;
+  harness.store.bitrixProductIds = ['product-22'];
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    const productEvent = harness.store.accepted.find((event) => event.eventType === 'CATALOG.PRODUCT.ON.UPDATE');
+    assert.ok(productEvent);
+    assert.equal(productEvent.source, 'BITRIX24');
+    assert.equal(productEvent.externalEntityType, 'product');
+    assert.equal(productEvent.externalEntityId, 'product-22');
+    assert.equal(productEvent.deliveryKey, 'nightly:2026-10-21:product:product-22');
+    assert.deepEqual(productEvent.payload, {
+      event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 'product-22' } }, recovery: 'nightly',
+    });
+    assert.equal(harness.store.dispatched.length, 1);
   } finally {
     harness.close();
   }

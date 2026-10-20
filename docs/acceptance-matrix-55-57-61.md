@@ -26,3 +26,12 @@ Candidate base: `fd9109a` (`origin/main`). Candidate source and integration-test
 The temporary PostgreSQL 18 runtime is loopback-only. Test execution used only fresh, disposable databases and isolated schemas; never point these suites at an existing application database. The product suite now requires explicit `PRODUCT_TEST_ISOLATED=1`, a loopback URL, an allowed disposable database name, and its dedicated schema. It rejects missing opt-in, non-loopback, shared `/sync`, and public targets before connecting. The ignored `.env.integration.local` points elsewhere and is not valid test configuration for this runtime. Do not put connection strings or credentials in source control or reports.
 
 Successful offline checks do not authorize enabling Apply, publishing, merging, production cutover, live CRM writes, or webhook subscription changes. The full atomic #60 trace and controlled live plan remain tracked in [issue-60-detailed-coverage.md](issue-60-detailed-coverage.md) and [issue-60-live-test-plan.md](issue-60-live-test-plan.md); those documents are not evidence that the live test ran.
+
+## Issue #79 runtime/recovery acceptance (work in progress)
+
+| Slice | Current evidence | Remaining acceptance |
+| --- | --- | --- |
+| Runtime email candidate lookup | Resolver/gateway focused tests cover normalized company and contact email, name mismatch, parent scope, shared/occupied candidates and conflicting keys. Initial UUID inventory behavior remains separate. | Add/complete public webhook HTTP → persisted resolution/pair → fake external readback trace; isolated PostgreSQL, restart/race and secret-safe diagnostic checks. |
+| Settings revisions/rebase | Requirement is recorded in [runtime/recovery evidence](issue-79-runtime-recovery-research.md). | Not yet implemented/accepted across deal/order fields, headers, rows/totals and invoices. Require pair-lock, revision audit, old-event pinning, partial-write recovery and safe MS-authoritative readback. |
+| Scheduled recovery | Requirements and current server constraints documented. | Not yet accepted as discovery for supported never-intaken deal/order/invoice/catalog updates. Verify each provider filter and pagination contract, >1000 behavior, cursor restart, retry, OFF/PAUSE, exact entity type 31, idempotency and truthful deletion limitations. |
+| Production setup | Read-only inspection: service OFF; PREPARATION configured; UC_DZSNZ0 absent. | No production changes or live acceptance performed by this branch. Root coordinates deployment and dedicated test manifest after combined review. |
