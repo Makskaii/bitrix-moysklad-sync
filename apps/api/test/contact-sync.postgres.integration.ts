@@ -5,7 +5,7 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http
 import { randomUUID } from 'node:crypto';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { AdminAccessGuard } from '../src/admin/admin-access.guard';
 import { AdminController } from '../src/admin/admin.controller';
 import { ContactSyncStatusController } from '../src/admin/contact-sync-status.controller';
@@ -71,6 +71,7 @@ before(async () => {
       serviceMode: 'pause', lastInactiveAt: null, lastActiveAt: null,
       modeHistoryTrackedFrom: null,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+      nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
       nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3,
       nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyMoyskladEntity: 'counterparty', nightlyBitrixStatus: 'skipped',
       nightlyMoyskladStatus: 'skipped', nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
@@ -111,6 +112,7 @@ before(async () => {
     where: { id: 'global' }, create: { serviceMode: 'on' }, update: {
       serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+      nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
       nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3,
       nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyBitrixStatus: 'pending',
       nightlyMoyskladStatus: 'pending', nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
@@ -521,6 +523,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
     where: { id: 'global' },
     data: {
       serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle',
+      nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
       nightlyFrom: null, nightlyThrough: null, nightlyProvider: 'BITRIX24',
       nightlyBitrixStart: 0, nightlyMoyskladOffset: 0, nightlyRetryAfter: null,
       nightlyAttempts: 0, nightlyError: null,
@@ -581,7 +584,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
 test('nightly schedule is skipped while paused and is not backfilled after resume', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
-    where: { id: 'global' }, data: { serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
+    where: { id: 'global' }, data: { serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull },
   });
   nightlyProviderQueries.length = 0;
   freezeTime('2026-10-06T21:59:00.000Z');
@@ -611,6 +614,7 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
   await database.syncSetting.update({
     where: { id: 'global' }, data: {
       serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle',
+      nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
       nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending', nightlyFrom: null, nightlyThrough: null,
     },
   });
@@ -683,6 +687,7 @@ test('nightly rechecks accepted events only for an enabled scope with an active 
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending', nightlyRetryAfter: null,
   } });
   nightlyBitrixCompanyIds = [];
@@ -711,7 +716,7 @@ test('nightly rechecks accepted events only for an enabled scope with an active 
 test('nightly schedule is skipped while Off', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({
-    where: { id: 'global' }, data: { serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle' },
+    where: { id: 'global' }, data: { serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null, nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull },
   });
   nightlyProviderQueries.length = 0;
   freezeTime('2026-10-07T21:59:00.000Z');
@@ -720,6 +725,8 @@ test('nightly schedule is skipped while Off', async () => {
     freezeTime('2026-10-07T22:00:00.000Z');
     await waitForNightlyStatus('skipped');
     assert.equal(nightlyProviderQueries.length, 0);
+    await waitForNightlyLeaseRelease();
+    app.get(SyncRecoveryService).onModuleDestroy();
   } finally {
     restoreTime();
   }
@@ -730,27 +737,29 @@ test('nightly provider failure leaves independent feed completed and retryable',
   await database.syncSetting.update({
     where: { id: 'global' }, data: {
       serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null,
-      nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyBitrixStatus: 'pending',
-      nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyFrom: null, nightlyThrough: null,
+      nightlyScheduledDate: '2026-10-20', nightlyStatus: 'pending',
+      nightlyFrom: new Date('2026-10-18T22:00:00.000Z'), nightlyThrough: new Date('2026-10-19T22:00:00.000Z'),
+      nightlyBitrixStatus: 'pending',
+      nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
+      nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty',
       nightlyRetryAfter: null, nightlyBitrixStart: 0, nightlyMoyskladOffset: 0,
     },
   });
   nightlyProviderQueries.length = 0;
   failNightlyBitrixFeed = true;
   try {
-    await seedNightlyOnHistory(database, '2026-10-08T22:00:00.000Z');
-    freezeTime('2026-10-09T22:00:00.000Z');
-    await waitForNightlyStatus('failed');
-    let status = await readRecoveryStatus();
-    const deadline = NativeDate.now() + 8_000;
-    while (status.nightly.moyskladStatus !== 'complete' && NativeDate.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      status = await readRecoveryStatus();
-    }
+    // This case verifies independent feed failure handling. The public scheduled
+    // startup path is covered above; drive this lower-level run once so no timer
+    // tick can overlap later fixtures.
+    app.get(SyncRecoveryService).onModuleDestroy();
+    await seedNightlyOnHistory(database, '2026-10-18T22:00:00.000Z');
+    freezeTime('2026-10-19T22:00:00.000Z');
+    await (app.get(SyncRecoveryService) as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const status = await readRecoveryStatus();
     assert.equal(status.nightly.bitrixStatus, 'failed');
     assert.equal(status.nightly.moyskladStatus, 'complete');
     assert.ok(nightlyProviderQueries.some((query) => query.includes('/api/entity/counterparty?')));
-    assert.equal(new Date(status.nightly.retryAfter!).getTime(), Date.parse('2026-10-09T23:00:00.000Z'));
+    assert.equal(new Date(status.nightly.retryAfter!).getTime(), Date.parse('2026-10-19T23:00:00.000Z'));
   } finally {
     restoreTime();
     failNightlyBitrixFeed = false;
@@ -760,9 +769,13 @@ test('nightly provider failure leaves independent feed completed and retryable',
 
 test('nightly run lease fences two API instances from querying and advancing the same cursors', async () => {
   const database = app.get(DatabaseService);
+  // This is a direct two-instance lease test; stop the scheduler interval so
+  // its independent tick cannot become a third concurrent nightly runner.
+  app.get(SyncRecoveryService).onModuleDestroy();
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-10', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-09T22:00:00.000Z'), nightlyThrough: new Date('2026-10-10T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0,
     nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
@@ -776,8 +789,10 @@ test('nightly run lease fences two API instances from querying and advancing the
   const run = (service: SyncRecoveryService) => (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
   await Promise.all([run(first), run(second)]);
   const status = await readRecoveryStatus();
-  assert.equal(status.nightly.status, 'complete_with_limitations');
-  assert.equal(nightlyProviderQueries.filter((query) => query.startsWith('{')).length, 2);
+  assert.equal(status.nightly.status, 'awaiting_processing');
+  const bitrixEntityReads = nightlyProviderQueries.filter((query) => query.startsWith('{'))
+    .map((query) => (JSON.parse(query) as { entityTypeId: number }).entityTypeId);
+  assert.deepEqual(bitrixEntityReads, [3, 4, 31]);
   assert.equal(nightlyProviderQueries.filter((query) => query.includes('/api/entity/counterparty?')).length, 1);
   const stored = await database.syncSetting.findUnique({ where: { id: 'global' } });
   assert.equal(stored?.nightlyLeaseToken, null);
@@ -794,6 +809,7 @@ test('lease loss during a provider call replays the page without duplicate durab
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-11', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-10T22:00:00.000Z'), nightlyThrough: new Date('2026-10-11T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0,
     nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
@@ -844,6 +860,7 @@ test('Bitrix keyset pagination survives a moving result set between pages', asyn
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-12', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-11T22:00:00.000Z'), nightlyThrough: new Date('2026-10-12T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
     nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
@@ -878,6 +895,7 @@ test('MoySklad pagination beyond one documented page fails closed without checkp
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-13', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-12T22:00:00.000Z'), nightlyThrough: new Date('2026-10-13T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
     nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
@@ -917,6 +935,7 @@ test('nightly MoySklad contact-person feed pages active company collections and 
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
     nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
@@ -959,6 +978,7 @@ test('nightly MoySklad contact-person feed rejects invalid timestamps without qu
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
     nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
@@ -981,6 +1001,7 @@ test('mid-run PAUSE preserves the provider cursor and resumes without losing fee
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-14', nightlyStatus: 'pending',
+    nightlyActiveSegments: Prisma.JsonNull, nightlySegmentIndex: 0, nightlyCoverage: Prisma.JsonNull,
     nightlyFrom: new Date('2026-10-13T22:00:00.000Z'), nightlyThrough: new Date('2026-10-14T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
     nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
@@ -1186,6 +1207,18 @@ async function waitForNightlyStatus(expected: string) {
     status = await readRecoveryStatus();
   }
   assert.equal(status.nightly.status, expected, `nightly status did not reach ${expected}: ${JSON.stringify(status.nightly)}`);
+}
+
+async function waitForNightlyLeaseRelease() {
+  const database = app.get(DatabaseService);
+  const deadline = NativeDate.now() + 10_000;
+  let setting = await database.syncSetting.findUnique({ where: { id: 'global' }, select: { nightlyLeaseToken: true } });
+  while (setting?.nightlyLeaseToken && NativeDate.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    setting = await database.syncSetting.findUnique({ where: { id: 'global' }, select: { nightlyLeaseToken: true } });
+  }
+  assert.equal(setting?.nightlyLeaseToken, null, 'nightly scheduled run did not release its durable lease');
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 async function setAdminMode(mode: 'on' | 'pause' | 'off') {
