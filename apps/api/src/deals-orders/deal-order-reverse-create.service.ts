@@ -11,6 +11,7 @@ import { resolveDictionaryValue } from './deal-order-field-runtime.service';
 import { moySkladMoneyToBitrix } from './deal-order-money';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -31,6 +32,14 @@ export class DealOrderReverseCreateService {
     @Optional() private readonly productCatalogCreate?: ProductCatalogCreateService,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
+
+  private async providerRequest(url: URL, init: RequestInit): Promise<unknown> {
+    const result = await withServiceModeOn(this.database, async () => requestJson(url, init));
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
+  private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
   async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
     if (!isUuid(input.moyskladOrderId)) throw new Error('Customer-order identity is invalid');
@@ -82,10 +91,12 @@ export class DealOrderReverseCreateService {
     const prepared = deserializePrepared(operation.payload);
     const leaseToken = randomUUID();
     const now = new Date();
-    const claim = await this.database.dealOrderReverseCreateOperation.updateMany({
+    const gatedClaim = await withServiceModeOn(this.database, (transaction) => transaction.dealOrderReverseCreateOperation.updateMany({
       where: { moyskladOrderId: input.moyskladOrderId, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] },
       data: { leaseToken, attemptedAt: operation.attemptedAt ?? now, leaseUntil: new Date(now.getTime() + 60_000) },
-    });
+    }));
+    if (!gatedClaim.enabled) throw new ServiceModeNotOnError();
+    const claim = gatedClaim.value;
     if (claim.count !== 1) throw new Error('Reverse deal create is already in progress');
     try {
       const dealId = operation.bitrix24DealId ?? await this.createOrRecoverDeal(prepared, leaseToken, input.assertWorkerLease);
@@ -99,6 +110,7 @@ export class DealOrderReverseCreateService {
       await this.createRows(prepared, leaseToken, input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined);
       return await this.persistPair(prepared, dealId, leaseToken);
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'REVERSE_CREATE_RETRYABLE' } }).catch(() => undefined);
       throw error;
     }
@@ -124,7 +136,7 @@ export class DealOrderReverseCreateService {
         throw new DealOrderReverseManualReviewError('Pending reverse row-add source positions changed');
       }
     } else {
-      const existingB24Rows = await b24AllRows(input.bitrix24DealId);
+      const existingB24Rows = await b24AllRows(input.bitrix24DealId, this.providerGate);
       const nextSort = existingB24Rows.reduce((highest, row) => Math.max(highest, Number(row.sort) || 0), 0) + 1;
       const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, writePair: { id: pair.id, entityType: 'DEAL' } });
       frozen = { ...prepared, rows: prepared.rows.map((row, index) => ({ ...row, fields: { ...row.fields, sort: nextSort + index } })), skippedRows: prepared.skippedRows.filter((row) => input.positionIds.includes(row.sourceRowId)) };
@@ -157,13 +169,15 @@ export class DealOrderReverseCreateService {
       update: { status: 'SKIPPED', skipReason: skipped.reason },
     });
     const leaseToken = randomUUID(); const now = new Date();
-    const claim = await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] },
-      data: { attemptedAt: operation.attemptedAt ?? now, leaseToken, leaseUntil: new Date(now.getTime() + 60_000) } });
+    const gatedClaim = await withServiceModeOn(this.database, (transaction) => transaction.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] },
+      data: { attemptedAt: operation.attemptedAt ?? now, leaseToken, leaseUntil: new Date(now.getTime() + 60_000) } }));
+    if (!gatedClaim.enabled) throw new ServiceModeNotOnError();
+    const claim = gatedClaim.value;
     if (claim.count !== 1) throw new Error('Reverse row-add lease was lost');
     try {
       await this.createRows(frozen, leaseToken, input.assertPairLease, { id: pair.id, entityType: 'DEAL' });
       const operations = await this.database.dealOrderReversePositionOperation.findMany({ where: { moyskladOrderId: input.moyskladOrderId, moyskladPositionId: { in: frozen.rows.map((row) => row.msPositionId) } } });
-      const liveRows = await b24AllRows(input.bitrix24DealId);
+      const liveRows = await b24AllRows(input.bitrix24DealId, this.providerGate);
       await this.database.$transaction(async (transaction) => {
         const currentPair = await transaction.entityPair.findFirst({ where: { id: input.pairId, entityType: 'DEAL', active: true, bitrix24Id: input.bitrix24DealId, moyskladId: input.moyskladOrderId }, select: { id: true } });
         if (!currentPair) throw new Error('Existing pair changed before row-link persistence');
@@ -183,6 +197,7 @@ export class DealOrderReverseCreateService {
       }, { timeout: 30_000 });
       return skippedRows.length ? { status: 'PARTIAL', skippedRows } : { status: 'ROWS_ADDED' };
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'REVERSE_ROW_ADD_RETRYABLE' } }).catch(() => undefined);
       throw error;
     }
@@ -191,7 +206,7 @@ export class DealOrderReverseCreateService {
   private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
     const config = input.eventConfig.config.dealOrderRuntime;
     if (!config || !config.nativeOrderNumberingVerified) throw new DealOrderReverseManualReviewError('Deal-order runtime settings or native numbering confirmation are missing');
-    const order = await msGet(`entity/customerorder/${input.moyskladOrderId}?expand=agent,state,rate.currency`);
+      const order = await msGet(`entity/customerorder/${input.moyskladOrderId}?expand=agent,state,rate.currency`, this.providerGate);
     if (!isRecord(order) || order.id !== input.moyskladOrderId || !isRecord(order.agent) || !isRecord(order.agent.meta) || !isUuid(order.agent.id) || !isRecord(order.state) || !isUuid(order.state.id) || !isRecord(order.rate) || !isRecord(order.rate.currency) || !isUuid(order.rate.currency.id) || typeof order.name !== 'string' || !order.name.trim()) {
       throw new DealOrderReverseManualReviewError('Customer-order header is incomplete');
     }
@@ -210,7 +225,7 @@ export class DealOrderReverseCreateService {
       companyId = client.pair.bitrix24Id;
     }
 
-    const positions = await msGetAllPositions(input.moyskladOrderId);
+    const positions = await msGetAllPositions(input.moyskladOrderId, this.providerGate);
     const sourceIds = positions.map((position) => readId(position.id)).filter((id): id is string => !!id);
     if (sourceIds.length !== positions.length || new Set(sourceIds).size !== sourceIds.length) throw new DealOrderReverseManualReviewError('Customer-order position identity is incomplete or ambiguous');
     const rows: PreparedRow[] = [];
@@ -237,7 +252,7 @@ export class DealOrderReverseCreateService {
         if (!productPairs.length && !config.bitrix24ProductCatalogId) {
           throw new DealOrderReverseManualReviewError('A confirmed Bitrix24 product catalog is required to create a missing product pair');
         }
-        const product = await msGet(`entity/product/${encodeURIComponent(assortmentId)}`);
+        const product = await msGet(`entity/product/${encodeURIComponent(assortmentId)}`, this.providerGate);
         if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== 'product') {
           throw new DealOrderReverseManualReviewError(`MySklad assortment ${assortmentId} is not a readable product`);
         }
@@ -299,12 +314,12 @@ export class DealOrderReverseCreateService {
   }
 
   private async createOrRecoverDeal(prepared: Prepared, leaseToken: string, assertWorkerLease?: () => Promise<void>): Promise<string> {
-    const items = await b24FindOriginDeals(prepared.orderId);
+    const items = await b24FindOriginDeals(prepared.orderId, this.providerGate);
     if (items.length > 1) throw new DealOrderReverseManualReviewError('Multiple Bitrix24 deals already reference this MySklad customer order');
     let dealId = items.length === 1 ? readNumericId(items[0].id) : null;
     if (items.length === 1 && (items[0].originId !== prepared.orderId || items[0].originatorId !== 'MOYSKLAD')) throw new DealOrderReverseManualReviewError('Bitrix24 deal recovery identity is ambiguous');
     if (!dealId) {
-      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true }));
+      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true }, this.providerGate));
       const item = isRecord(created) && isRecord(created.item) ? created.item : null;
       dealId = item ? readNumericId(item.id) : null;
       if (!dealId) throw new Error('Bitrix24 deal create response did not include a numeric ID');
@@ -323,7 +338,7 @@ export class DealOrderReverseCreateService {
   }
 
   private async verifyDeal(dealId: string, prepared: Prepared): Promise<Row> {
-    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: true });
+    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: true }, this.providerGate);
     const item = isRecord(result) && isRecord(result.item) ? result.item : null;
     if (!item || String(item.id) !== dealId || item.title !== prepared.fields.title || item.originatorId !== 'MOYSKLAD' || item.originId !== prepared.orderId || String(item.UF_CRM_1729757435964 ?? '') !== String(prepared.sourceSnapshot.name)) {
       throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
@@ -334,7 +349,7 @@ export class DealOrderReverseCreateService {
   private async createRows(prepared: Prepared, leaseToken: string, assertPairLease?: () => Promise<boolean>, writePair?: { id: string; entityType: string }) {
     const dealId = (await this.database.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: prepared.orderId }, select: { bitrix24DealId: true } })).bitrix24DealId;
     if (!dealId) throw new Error('Reverse deal ID is not persisted');
-    const rows = await b24AllRows(dealId);
+    const rows = await b24AllRows(dealId, this.providerGate);
     for (const preparedRow of prepared.rows) {
       const operation = await this.database.dealOrderReversePositionOperation.findUnique({ where: { moyskladOrderId_moyskladPositionId: { moyskladOrderId: prepared.orderId, moyskladPositionId: preparedRow.msPositionId } } });
       if (!operation) throw new Error('Reverse position operation is missing');
@@ -350,7 +365,7 @@ export class DealOrderReverseCreateService {
         if (!sameRow(bySort[0], preparedRow.fields, dealId)) throw new DealOrderReverseManualReviewError('Bitrix24 product row recovery slot has different values');
         rowId = String(bySort[0].id);
       } else {
-        const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await this.assertOperationLease(prepared.orderId, leaseToken); return !assertPairLease || await assertPairLease(); }, writePair, () => b24('crm.item.productrow.add', { fields: { ...preparedRow.fields, ownerId: Number(dealId) } }));
+        const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await this.assertOperationLease(prepared.orderId, leaseToken); return !assertPairLease || await assertPairLease(); }, writePair, () => b24('crm.item.productrow.add', { fields: { ...preparedRow.fields, ownerId: Number(dealId) } }, this.providerGate));
         const row = isRecord(created) && isRecord(created.productRow) ? created.productRow : null;
         const id = row && readNumericId(row.id);
         if (!id) throw new Error('Bitrix24 product row create response did not include an ID');
@@ -453,13 +468,15 @@ function mapConfiguredFields(config: VersionedFieldSettingsDto, source: Row, fie
   }
   return fields;
 }
-async function msGet(path: string): Promise<unknown> {
+type ProviderGate = (url: URL, init: RequestInit) => Promise<unknown>;
+
+async function msGet(path: string, gate: ProviderGate = requestJson): Promise<unknown> {
   const base = configuredBase('MOYSKLAD_API_BASE_URL');
   const token = process.env.MOYSKLAD_API_TOKEN;
   if (!token) throw new Error('MySklad API read is not configured');
-  return requestJson(new URL(path, ensureSlash(base)), { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+  return gate(new URL(path, ensureSlash(base)), { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
 }
-async function msGetAllPositions(orderId: string): Promise<Row[]> {
+async function msGetAllPositions(orderId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const all: Row[] = [];
   const base = configuredBase('MOYSKLAD_API_BASE_URL');
   const token = process.env.MOYSKLAD_API_TOKEN;
@@ -467,7 +484,7 @@ async function msGetAllPositions(orderId: string): Promise<Row[]> {
   for (let offset = 0; offset < 10_000;) {
     const url = new URL(`entity/customerorder/${orderId}/positions`, ensureSlash(base));
     url.searchParams.set('limit', '100'); url.searchParams.set('offset', String(offset));
-    const body = await requestJson(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+    const body = await gate(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
     const rows = isRecord(body) && Array.isArray(body.rows) ? body.rows.filter(isRecord) : null;
     if (!rows) throw new Error('MySklad positions response is invalid');
     all.push(...rows); if (rows.length < 100) return all;
@@ -475,20 +492,20 @@ async function msGetAllPositions(orderId: string): Promise<Row[]> {
   }
   throw new Error('MySklad customer order contains too many positions');
 }
-async function b24(method: string, params: Row): Promise<unknown> {
+async function b24(method: string, params: Row, gate: ProviderGate = requestJson): Promise<unknown> {
   const base = configuredBase('BITRIX24_REST_BASE_URL');
   const url = new URL(method, ensureSlash(base));
-  return requestJson(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(params) }).then((response) => {
+  return gate(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(params) }).then((response) => {
     if (!isRecord(response) || response.error) throw new Error(`Bitrix24 ${method} failed`);
     const result = response.result;
     if (isRecord(result) && typeof response.total === 'number' && result.total === undefined) return { ...result, total: response.total };
     return result;
   });
 }
-async function b24AllRows(dealId: string): Promise<Row[]> {
+async function b24AllRows(dealId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const result: Row[] = [];
   for (let start = 0; start < 10_000;) {
-    const value = await b24('crm.item.productrow.list', { filter: { ownerId: Number(dealId), ownerType: 'D' }, select: ['*'], start });
+    const value = await b24('crm.item.productrow.list', { filter: { ownerId: Number(dealId), ownerType: 'D' }, select: ['*'], start }, gate);
     const rows = isRecord(value) && Array.isArray(value.productRows) ? value.productRows.filter(isRecord) : null;
     if (!rows) throw new Error('Bitrix24 product-row readback is invalid');
     result.push(...rows);
@@ -498,10 +515,10 @@ async function b24AllRows(dealId: string): Promise<Row[]> {
   }
   throw new Error('Bitrix24 returned too many product rows');
 }
-async function b24FindOriginDeals(orderId: string): Promise<Row[]> {
+async function b24FindOriginDeals(orderId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const result: Row[] = [];
   for (let start = 0; start < 10_000;) {
-    const value = await b24('crm.item.list', { entityTypeId: 2, select: ['id', 'title', 'originatorId', 'originId'], filter: { originatorId: 'MOYSKLAD', originId: orderId }, start });
+    const value = await b24('crm.item.list', { entityTypeId: 2, select: ['id', 'title', 'originatorId', 'originId'], filter: { originatorId: 'MOYSKLAD', originId: orderId }, start }, gate);
     const page = isRecord(value) && Array.isArray(value.items) ? value.items.filter(isRecord) : null;
     if (!page) throw new Error('Bitrix24 origin-deal search response is invalid');
     result.push(...page);

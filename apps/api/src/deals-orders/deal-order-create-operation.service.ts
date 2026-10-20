@@ -5,6 +5,7 @@ import { DatabaseService } from '../database.service';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
 type CustomerOrderPosition = {
   assortment: { meta: { type: string; href: string } };
@@ -55,6 +56,12 @@ export class DealOrderPairConflictError extends Error {
 @Injectable()
 export class DealOrderCreateOperationService {
   constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
+
+  private async providerRead(url: URL, init: RequestInit): Promise<unknown> {
+    const result = await withServiceModeOn(this.database, async () => requestJson(url, init));
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
 
   /** Record that a new B24 deal is waiting for complete dependencies. This is
    * deliberately separate from the vendor POST: no external document exists
@@ -136,10 +143,12 @@ export class DealOrderCreateOperationService {
     const payload = operation.payload as unknown as DealOrderPreparedInput['payload'];
     const leaseToken = randomUUID();
     const leaseNow = new Date();
-    const lease = await this.database.dealOrderCreateOperation.updateMany({
+    const gatedLease = await withServiceModeOn(this.database, (transaction) => transaction.dealOrderCreateOperation.updateMany({
       where: { bitrix24DealId: input.bitrix24DealId, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lte: leaseNow } }] },
       data: { attemptedAt: operation.attemptedAt ?? leaseNow, leaseToken, leaseUntil: new Date(leaseNow.getTime() + 60_000) },
-    });
+    }));
+    if (!gatedLease.enabled) throw new ServiceModeNotOnError();
+    const lease = gatedLease.value;
     if (lease.count !== 1) throw new Error('Customer-order create is already in progress');
     const base = moyskladBase();
     const token = process.env.MOYSKLAD_API_TOKEN;
@@ -163,7 +172,7 @@ export class DealOrderCreateOperationService {
       }
 
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('MOYSKLAD', orderId);
-      const order = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
+      const order = await this.providerRead(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
       const expectedNativeFields = {
@@ -185,6 +194,7 @@ export class DealOrderCreateOperationService {
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       await this.database.dealOrderCreateOperation.updateMany({
         where: { bitrix24DealId: input.bitrix24DealId, leaseToken },
         data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'CREATE_RETRYABLE' },
@@ -232,7 +242,7 @@ export class DealOrderCreateOperationService {
       [input.payload.rate.currency, 'currency'],
       [input.payload.state, 'state'],
     ] as Array<[Reference, string]>) {
-      const result = await requestJson(new URL(reference.meta.href), {
+      const result = await this.providerRead(new URL(reference.meta.href), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
       const expectedId = referenceId(reference.meta.href);
@@ -266,7 +276,7 @@ export class DealOrderCreateOperationService {
         continue;
       }
       const pathType = positions[index].assortment.meta.type;
-      const product = await requestJson(new URL(`entity/${pathType}/${encodeURIComponent(targetId)}`, withSlash(moyskladBase())), {
+      const product = await this.providerRead(new URL(`entity/${pathType}/${encodeURIComponent(targetId)}`, withSlash(moyskladBase())), {
         method: 'GET', headers: { authorization: `Bearer ${process.env.MOYSKLAD_API_TOKEN ?? ''}`, accept: 'application/json' },
       });
       if (!isRecord(product) || product.id !== targetId || !isRecord(product.meta) || product.meta.type !== pathType ||
