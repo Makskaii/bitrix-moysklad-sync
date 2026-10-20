@@ -22,14 +22,17 @@ const priceRows = new Map<string, Array<{ id: string; productId: number; catalog
 const fakeDocumentRows = [{ orderId: 'synthetic-existing-order', rowId: 'synthetic-existing-row', productId: 'seed-product', quantity: 2, price: 17.5 }];
 let documentWriteAttempts = 0;
 let sourceRecords = new Map<string, Record<string, unknown>>();
+const bitrixCatalogRecords = new Map<string, Record<string, unknown>>();
+const moyskladCandidates = new Map<string, Array<{ id: string; created: string | null }>>();
 let nextCardId = 80_000_000 + Math.floor(Math.random() * 10_000_000);
 const oldEnv = new Map<string, string | undefined>();
 
 function assertIsolatedTarget(value: string) {
   const target = new URL(value);
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
-  assert.match(target.searchParams.get('schema') ?? '', /^issue61_create_event_[a-z0-9_]+$/, 'requires a fresh issue61_create_event_* schema');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_codex_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  const schema = target.searchParams.get('schema') ?? '';
+  assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_codex_test' && schema === 'issue79_date_codex', 'requires a dedicated fresh test schema');
 }
 
 before(async () => {
@@ -85,9 +88,11 @@ after(async () => {
 
 test('product-create event harness accepts only its dedicated loopback databases and fresh schemas', () => {
   assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'));
+  assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_codex_test?schema=issue79_date_codex'));
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_codex_test?schema=public'), /dedicated fresh test schema/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/production?schema=issue61_create_event_issue79'), /allowlisted disposable database/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@example.invalid:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'), /non-local/);
-  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=public'), /fresh issue61/);
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=public'), /dedicated fresh test schema/);
 });
 
 test('post-boundary product and service CREATE intake creates/readbacks one card and durable native-kind pair; repeats and pre-boundary events do not duplicate', { skip: !databaseUrl }, async () => {
@@ -169,6 +174,93 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
   assert.equal(requests.length, providerCallsBeforeDisabledPrice, 'the disabled Bitrix24 price direction cannot read or write catalog/document APIs');
 
   assert.equal(requests.some(({ path }) => /crm\.deal|customerorder|invoiceout|document/i.test(path)), false, 'catalog create and retries do not touch document APIs');
+});
+
+test('public Bitrix24 catalog webhook persists earliest-date, deterministic ties, and never redefines a saved pair', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const database = app.get(DatabaseService);
+  const settingsVersion = 1_200_000 + Math.floor(Math.random() * 80_000);
+  const priceType = randomUUID();
+  await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config: {
+    schemaVersion: 1, productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name'] },
+    rules: [{ id: 'catalog-name-date-test', entity: 'catalog', sourceField: 'name', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+    groups: [], references: { units: [], priceTypes: [{ bitrix24Id: 2, moyskladId: priceType, status: 'configured' }], dictionaries: [], namedPairs: [] }, serviceCounterpartyId: null,
+  } } });
+  await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
+
+  async function setupCandidates(name: string, b24Id: string, rows: Array<{ id: string; createdAt: string | null }>) {
+    const b24Created = '2026-10-10T00:00:00.000Z';
+    bitrixCatalogRecords.set(b24Id, { id: Number(b24Id), type: 1, name, dateCreate: b24Created, iblockId: 77, vatId: 2, vatIncluded: false });
+    priceRows.set(b24Id, [{ id: String(Number(b24Id) + 50), productId: Number(b24Id), catalogGroupId: 2, price: 25, currency: 'RUB' }]);
+    moyskladCandidates.set(name, rows.map(({ id, createdAt }) => ({ id, created: createdAt })));
+    for (const { id, createdAt } of rows) sourceRecords.set(id, {
+      id, meta: { type: 'product' }, name, created: createdAt, updated: '2026-10-18T00:00:00.000Z', vatEnabled: true, vatIncluded: false, vat: 20,
+      salePrices: [{ value: 25, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/12345678-1234-1234-1234-123456789abc` } }, priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }],
+    });
+  }
+  const freshB24Id = () => String(8_000_000_000_000_000 + Math.floor(Math.random() * 500_000_000_000_000));
+  const orderedCandidateIds = () => [randomUUID(), randomUUID()].sort();
+  async function postCatalogAdd(id: string, requestId: string) {
+    const response = await fetch(`${apiUrl}/webhooks/bitrix24`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event: 'CATALOG.PRODUCT.ON.ADD', data: { FIELDS: { ID: id, TYPE: 1 } }, auth: { application_token: 'synthetic-b24-event-token' } }) });
+    assert.equal(response.status, 200);
+    const eventId = oneEventId(await response.json());
+    await waitForStatus(database, eventId, 'SUCCEEDED');
+    return { eventId, requestId };
+  }
+
+  requests.length = 0;
+  const [newer, earliest] = orderedCandidateIds();
+  const earliestB24Id = freshB24Id();
+  const earliestName = `date-earliest synthetic ${randomUUID()}`;
+  await setupCandidates(earliestName, earliestB24Id, [
+    { id: newer, createdAt: '2026-10-02T00:00:00.000Z' }, { id: earliest, createdAt: '2026-10-01T00:00:00.000Z' },
+  ]);
+  const earliestEvent = await postCatalogAdd(earliestB24Id, 'earliest');
+  const earliestPair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', bitrix24Id: earliestB24Id, active: true } });
+  assert.equal(earliestPair.moyskladId, earliest, 'public webhook persisted the earliest-created exact candidate despite its greater native ID');
+  const earliestLog = await database.operationalLog.findFirstOrThrow({ where: { message: { contains: `"bitrix24Id":"${earliestB24Id}"` } } });
+  assert.equal(JSON.parse(earliestLog.message).selectionReason, 'EARLIEST_CREATION_DATE');
+
+  const [equalB, equalA] = orderedCandidateIds();
+  const equalB24Id = freshB24Id();
+  const equalName = `date-tie synthetic ${randomUUID()}`;
+  await setupCandidates(equalName, equalB24Id, [
+    { id: equalA, createdAt: '2026-10-01T00:00:00.000Z' }, { id: equalB, createdAt: '2026-10-01T00:00:00.000Z' },
+  ]);
+  const equalEvent = await postCatalogAdd(equalB24Id, 'equal');
+  const equalPair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', bitrix24Id: equalB24Id, active: true } });
+  assert.equal(equalPair.moyskladId, equalB);
+  const equalLog = await database.operationalLog.findFirstOrThrow({ where: { message: { contains: `"bitrix24Id":"${equalB24Id}"` } } });
+  assert.equal(JSON.parse(equalLog.message).selectionReason, 'CREATION_DATE_TIED_NATIVE_ID');
+
+  const [missingB, missingA] = orderedCandidateIds();
+  const missingB24Id = freshB24Id();
+  const missingName = `date-missing synthetic ${randomUUID()}`;
+  await setupCandidates(missingName, missingB24Id, [
+    { id: missingA, createdAt: null }, { id: missingB, createdAt: null },
+  ]);
+  const missingEvent = await postCatalogAdd(missingB24Id, 'missing');
+  const missingPair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', bitrix24Id: missingB24Id, active: true } });
+  assert.equal(missingPair.moyskladId, missingB);
+  const missingLog = await database.operationalLog.findFirstOrThrow({ where: { message: { contains: `"bitrix24Id":"${missingB24Id}"` } } });
+  assert.equal(JSON.parse(missingLog.message).selectionReason, 'CREATION_DATE_UNAVAILABLE_NATIVE_ID');
+
+  const [earlierUnpaired, savedPairCandidate] = orderedCandidateIds();
+  const savedB24Id = freshB24Id();
+  const savedName = `saved-pair synthetic ${randomUUID()}`;
+  await setupCandidates(savedName, savedB24Id, [
+    { id: earlierUnpaired, createdAt: '2026-09-01T00:00:00.000Z' }, { id: savedPairCandidate, createdAt: '2026-10-01T00:00:00.000Z' },
+  ]);
+  const saved = await database.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: savedB24Id, moyskladId: savedPairCandidate, moyskladType: 'product', source: 'MANUAL', active: true } });
+  const savedEvent = await postCatalogAdd(savedB24Id, 'saved-pair');
+  const stillSaved = await database.entityPair.findFirstOrThrow({ where: { id: saved.id, active: true } });
+  assert.equal(stillSaved.moyskladId, savedPairCandidate, 'existing pair wins before exact candidate ranking');
+  assert.equal(await database.productDuplicateAlias.count({ where: { duplicateBitrix24Id: savedB24Id } }), 0);
+  assert.equal(requests.some(({ method, path }) => method === 'PUT' || path.includes('.update.json')), false, 'matching and restoration make no provider writes');
+  assert.ok(savedEvent.eventId);
 });
 
 test('MySklad product UPDATE applies confirmed price and UOM mappings through the webhook runtime without touching document rows', { skip: !databaseUrl }, async () => {
@@ -305,6 +397,29 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   response.setHeader('content-type', 'application/json');
   const pathname = new URL(path, fakeBase).pathname;
   const method = pathname.replace(/\.json$/i, '');
+  const parsedPath = new URL(path, fakeBase);
+  if (method.endsWith('catalog.product.get')) {
+    const id = new URLSearchParams(body).get('id') ?? '';
+    const record = bitrixCatalogRecords.get(id);
+    if (record) { response.writeHead(200); response.end(JSON.stringify({ result: { product: record } })); return; }
+  }
+  if (method.endsWith('catalog.price.list')) {
+    const id = new URLSearchParams(body).get('filter[productId]') ?? '';
+    const prices = priceRows.get(id) ?? [];
+    response.writeHead(200); response.end(JSON.stringify({ result: { prices, total: prices.length } })); return;
+  }
+  if (method.endsWith('catalog.catalog.get')) {
+    response.writeHead(200); response.end(JSON.stringify({ result: { catalog: { vatId: 2 } } })); return;
+  }
+  if (method.endsWith('catalog.vat.get')) {
+    response.writeHead(200); response.end(JSON.stringify({ result: { vat: { rate: 20 } } })); return;
+  }
+  if (parsedPath.pathname.endsWith('/entity/product')) {
+    const filter = parsedPath.searchParams.get('filter') ?? '';
+    const name = filter.startsWith('name=') ? filter.slice('name='.length) : '';
+    const rows = (moyskladCandidates.get(name) ?? []).map(({ id, created }) => ({ id, name, created, meta: { type: 'product' } }));
+    response.writeHead(200); response.end(JSON.stringify({ rows, meta: { size: rows.length, limit: 26, offset: 0 } })); return;
+  }
   if (pathname.includes('/entity/product/') || pathname.includes('/entity/service/')) {
     const id = pathname.split('/').at(-1)!;
     const record = sourceRecords.get(id);
