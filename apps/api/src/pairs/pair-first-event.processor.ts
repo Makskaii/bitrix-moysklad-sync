@@ -38,9 +38,8 @@ type DocumentDependencyResult =
 
 /**
  * Resolves persisted deal/order webhook events before any sync work can be
- * considered. This temporary intake gate deliberately has no writer: it
- * resolves pair identity only, while downstream baseline readiness belongs to
- * the baseline processor. Unresolved identities are durably held for review.
+ * considered. Eligible unpaired Bitrix deal ADD/UPDATE events may create one
+ * durable customer order; other unresolved identities are held for review.
  */
 @Injectable()
 export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
@@ -226,6 +225,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       sourceSystem: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
       externalId: event.externalEntityId,
       eventId: event.id,
+      eventType: event.eventType,
     };
 
     let result: PairResolutionResult;

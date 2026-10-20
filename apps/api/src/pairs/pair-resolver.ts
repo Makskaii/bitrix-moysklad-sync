@@ -17,6 +17,7 @@ export type PairResolutionInput = {
   sourceSystem: PairSourceSystem;
   externalId: string;
   eventId?: string;
+  eventType?: string | null;
 };
 
 export type PairResolutionResult =

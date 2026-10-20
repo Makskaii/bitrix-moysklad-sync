@@ -49,6 +49,11 @@ before(async () => {
   await app.get(DatabaseService).syncSetting.upsert({
     where: { id: 'global' }, create: { serviceMode: 'on' }, update: { serviceMode: 'on', offSince: null },
   });
+  await app.get(DatabaseService).syncDirectionSetting.upsert({
+    where: { entityKey: 'deals-orders' },
+    create: { entityKey: 'deals-orders', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+  });
 });
 
 after(async () => {
@@ -87,6 +92,58 @@ test('concurrent first-event resolutions converge on one open review case', asyn
   const reviews = await database.pairReviewCase.findMany({ where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: input.externalId, status: 'OPEN' } });
   assert.equal(reviews.length, 1);
   createdReviewIds.push(reviews[0].id);
+});
+
+test('only a fresh unpaired Bitrix deal ADD or UPDATE is eligible for first-order creation', async () => {
+  const provider = app.get(PairResolutionProvider);
+  const addId = `eligible-add-${suffix}`;
+  const updateId = `eligible-update-${suffix}`;
+  const deleteId = `ineligible-delete-${suffix}`;
+  const [add, update, deletion] = await Promise.all([
+    provider.resolve({ entityType: 'DEAL', sourceSystem: 'BITRIX24', externalId: addId, eventType: 'ONCRMDEALADD' }),
+    provider.resolve({ entityType: 'DEAL', sourceSystem: 'BITRIX24', externalId: updateId, eventType: 'ONCRMDEALUPDATE' }),
+    provider.resolve({ entityType: 'DEAL', sourceSystem: 'BITRIX24', externalId: deleteId, eventType: 'ONCRMDEALDELETE' }),
+  ]);
+
+  assert.deepEqual(add, { status: 'unmatched', reason: 'NO_CANDIDATES' });
+  assert.deepEqual(update, { status: 'unmatched', reason: 'NO_CANDIDATES' });
+  assert.equal(deletion.status, 'manual_review');
+  if (deletion.status === 'manual_review') assert.equal(deletion.reason, 'NO_APPROVED_MATCH_KEY');
+
+  const reviews = await app.get(DatabaseService).pairReviewCase.findMany({
+    where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: { in: [addId, updateId, deleteId] }, status: 'OPEN' },
+  });
+  assert.deepEqual(reviews.map((review) => review.sourceEntityId), [deleteId]);
+  createdReviewIds.push(...reviews.map((review) => review.id));
+});
+
+test('existing open review or inactive deal pair stays a manual review rather than becoming a create candidate', async () => {
+  const database = app.get(DatabaseService);
+  const provider = app.get(PairResolutionProvider);
+  const reviewedId = `reviewed-deal-${suffix}`;
+  const inactiveId = `inactive-deal-${suffix}`;
+  const review = await database.pairReviewCase.create({ data: {
+    entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: reviewedId, reason: 'OPERATOR_REVIEW_REQUIRED', status: 'OPEN',
+  } });
+  createdReviewIds.push(review.id);
+  const inactivePair = await database.entityPair.create({ data: {
+    entityType: 'DEAL', bitrix24Id: inactiveId, moyskladId: `inactive-order-${suffix}`, active: false,
+    lifecycleStatus: 'INACTIVE', source: 'MANUAL',
+  } });
+  createdPairIds.push(inactivePair.id);
+
+  const [reviewed, inactive] = await Promise.all([
+    provider.resolve({ entityType: 'DEAL', sourceSystem: 'BITRIX24', externalId: reviewedId, eventType: 'ONCRMDEALUPDATE' }),
+    provider.resolve({ entityType: 'DEAL', sourceSystem: 'BITRIX24', externalId: inactiveId, eventType: 'ONCRMDEALUPDATE' }),
+  ]);
+
+  assert.equal(reviewed.status, 'manual_review');
+  if (reviewed.status === 'manual_review') assert.equal(reviewed.reviewCaseId, review.id);
+  assert.equal(inactive.status, 'manual_review');
+  if (inactive.status === 'manual_review') assert.equal(inactive.reason, 'PAIR_INACTIVE');
+  assert.equal(await database.pairReviewCase.count({ where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: reviewedId, status: 'OPEN' } }), 1);
+  const updatedInactivePair = await database.entityPair.findUnique({ where: { id: inactivePair.id } });
+  assert.equal(updatedInactivePair?.active, false);
 });
 
 test('assignment racing first-event resolution leaves the persisted pair authoritative and no orphan review', async () => {
@@ -135,8 +192,12 @@ async function waitForEventStatus(database: DatabaseService, eventId: string, ex
   return event;
 }
 
-test('public webhook invokes first-event resolution and durably holds unresolved event for manual review', async () => {
+test('public deal webhook durably preserves an existing open review', async () => {
   const id = `deal-${suffix}`;
+  const existingReview = await app.get(DatabaseService).pairReviewCase.create({ data: {
+    entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: id, reason: 'OPERATOR_REVIEW_REQUIRED', status: 'OPEN',
+  } });
+  createdReviewIds.push(existingReview.id);
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ event: 'ONCRMDEALADD', 'auth[application_token]': 'synthetic-b24-event-token', 'data[FIELDS][ID]': id }),
@@ -153,8 +214,8 @@ test('public webhook invokes first-event resolution and durably holds unresolved
   assert.equal(event?.status, 'MANUAL_REVIEW');
   assert.equal(event?.lastErrorCategory, 'PAIR_REVIEW_REQUIRED');
   const review = await database.pairReviewCase.findFirst({ where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: id, status: 'OPEN' } });
-  assert.ok(review);
-  createdReviewIds.push(review.id);
+  assert.equal(review?.id, existingReview.id);
+  assert.equal(review?.eventId, ack.eventId);
 });
 
 test('typed manual CONTACT pair resolves on a subsequent event and leaves prior events untouched', async () => {
