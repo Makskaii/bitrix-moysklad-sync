@@ -25,13 +25,17 @@ let sourceRecords = new Map<string, Record<string, unknown>>();
 let nextCardId = 80_000_000 + Math.floor(Math.random() * 10_000_000);
 const oldEnv = new Map<string, string | undefined>();
 
+function assertIsolatedTarget(value: string) {
+  const target = new URL(value);
+  assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  assert.match(target.searchParams.get('schema') ?? '', /^issue61_create_event_[a-z0-9_]+$/, 'requires a fresh issue61_create_event_* schema');
+}
+
 before(async () => {
   if (!databaseUrl) return;
   for (const key of ['DATABASE_URL', 'SYNC_MODE', 'ADMIN_PREVIEW', 'BITRIX24_EVENT_APPLICATION_TOKEN', 'BITRIX24_REST_BASE_URL', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN', 'MOYSKLAD_WEBHOOK_SECRET']) oldEnv.set(key, process.env[key]);
-  const target = new URL(databaseUrl);
-  assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.equal(target.pathname, '/aerosystems_offline_acceptance_test', 'requires the dedicated disposable offline acceptance database');
-  assert.match(target.searchParams.get('schema') ?? '', /^issue61_create_event_[a-z0-9_]+$/, 'requires a fresh issue61_create_event_* schema');
+  assertIsolatedTarget(databaseUrl);
   process.env.DATABASE_URL = databaseUrl;
   process.env.SYNC_MODE = 'apply';
   process.env.ADMIN_PREVIEW = '1';
@@ -77,6 +81,13 @@ after(async () => {
   for (const [key, value] of oldEnv) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
+});
+
+test('product-create event harness accepts only its dedicated loopback databases and fresh schemas', () => {
+  assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'));
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/production?schema=issue61_create_event_issue79'), /allowlisted disposable database/);
+  assert.throws(() => assertIsolatedTarget('postgresql://x@example.invalid:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'), /non-local/);
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=public'), /fresh issue61/);
 });
 
 test('post-boundary product and service CREATE intake creates/readbacks one card and durable native-kind pair; repeats and pre-boundary events do not duplicate', { skip: !databaseUrl }, async () => {
