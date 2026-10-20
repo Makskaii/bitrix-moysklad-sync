@@ -38,6 +38,7 @@ model SyncSetting {
   nightlyBitrixEntityTypeId Int       @default(3)
   nightlyBitrixLastId       String?
   nightlyMoyskladOffset     Int       @default(0)
+  nightlyMoyskladEntity     String    @default("counterparty")
   nightlyBitrixStatus       String    @default("pending")
   nightlyMoyskladStatus     String    @default("pending")
   nightlyLeaseToken         String?
@@ -289,6 +290,7 @@ model EntityPair {
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
+  settingsRevisions EntityPairSettingsRevision[]
   dealOrderPositions DealOrderPositionPair[]
   dealOrderPositionAdds DealOrderPositionAddOperation[]
 
@@ -382,6 +384,24 @@ model EntityPairSyncState {
   childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model EntityPairSettingsRevision {
+  id                   String     @id @default(cuid())
+  pairId               String
+  fromSettingsVersion  Int?
+  toSettingsVersion    Int
+  status               String     @default("PREPARED")
+  semanticFingerprint  String
+  previousBaseline     Json
+  currentBaseline      Json?
+  errorCategory        String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  pair                 EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, toSettingsVersion])
+  @@index([status, updatedAt])
 }
 
 model DealOrderCreateOperation {

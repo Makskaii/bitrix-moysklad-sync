@@ -32,6 +32,9 @@ let bitrixCompanyId = '0';
 let moyskladAgentId: string | null = null;
 let bitrixOpportunity = '1';
 let moyskladOrderSum: number | string = 1;
+let runtimeCompanyId = '';
+let runtimeCompanyMoyskladId = '';
+let runtimeCompanyEmail = 'Match.Email@Example.Test';
 let opportunityWrites = 0;
 let bitrixRowPrice = 1;
 let moyskladPositionPrice = 100;
@@ -626,6 +629,42 @@ test('dry first-event baseline uses the isolated dry database and performs reads
   assert.equal(externalRequests.filter(isWrite).length, writesBefore, 'dry mode performs no external synchronization writes');
 });
 
+test('public company webhook pairs by unique normalized email and reads back both native records', async () => {
+  const database = app.get(DatabaseService);
+  runtimeCompanyId = `email-match-${randomUUID()}`;
+  runtimeCompanyMoyskladId = randomUUID();
+  runtimeCompanyEmail = 'Match.Email@Example.Test';
+  const settingsVersion = 1_200_000 + Math.floor(Math.random() * 100_000);
+  await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config: {
+    schemaVersion: 1, rules: [], groups: [],
+    references: { units: [], priceTypes: [], dictionaries: [] }, serviceCounterpartyId,
+  } } });
+  await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  await database.syncDirectionSetting.upsert({
+    where: { entityKey: 'contacts-companies' },
+    create: { entityKey: 'contacts-companies', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+  });
+
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMCOMPANYADD', data: { FIELDS: { ID: runtimeCompanyId } }, auth: { application_token: 'synthetic-event-token' } }),
+  });
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  await waitForEventStatus(database, eventId, 'SUCCEEDED');
+
+  const pair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'COMPANY', bitrix24Id: runtimeCompanyId, active: true } });
+  assert.equal(pair.moyskladId, runtimeCompanyMoyskladId);
+  assert.match(pair.reason ?? '', /normalized_email/i);
+  assert.match(pair.reason ?? '', /no name or phone match was required/i);
+  assert.ok(externalRequests.some(({ path }) => path.startsWith('/ms/api/remap/1.2/entity/counterparty?') && path.toLowerCase().includes('email=match.email%40example.test')));
+  assert.ok(externalRequests.some(({ path }) => path === '/b24/rest/crm.company.get.json'));
+  assert.ok(externalRequests.some(({ path }) => path === `/ms/api/remap/1.2/entity/counterparty/${runtimeCompanyMoyskladId}`));
+  assert.equal(externalRequests.some(isWrite), false, 'the email match must not create a target or issue a field write');
+});
+
 async function createConfirmedPairAndSettings(database: DatabaseService, settingsVersion: number) {
   bitrixCompanyId = '0'; moyskladAgentId = null;
   bitrixOpportunity = '1'; moyskladOrderSum = 1;
@@ -675,7 +714,15 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMPANY_ID: bitrixCompanyId, COMMENTS: bitrixComments, OPPORTUNITY: bitrixOpportunity, CURRENCY_ID: 'RUB', DATE_CREATE: '2026-10-05T10:00:00+00:00', DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
   } else if (path === '/b24/rest/crm.company.get.json' && request.method === 'POST') {
     const id = new URLSearchParams(body).get('id') ?? '';
-    response.writeHead(200); response.end(JSON.stringify({ result: { ID: id, TITLE: `Company ${id}` } }));
+    response.writeHead(200); response.end(JSON.stringify({ result: {
+      ID: id, TITLE: id === runtimeCompanyId ? 'Bitrix name intentionally differs' : `Company ${id}`,
+      EMAIL: id === runtimeCompanyId ? [{ VALUE: runtimeCompanyEmail.toUpperCase(), VALUE_TYPE: 'WORK' }] : [], PHONE: [],
+      DATE_CREATE: '2026-10-05T10:00:00+00:00', DATE_MODIFY: '2026-10-06T10:00:00+00:00',
+    } }));
+  } else if (path === '/b24/rest/crm.requisite.list.json' && request.method === 'POST') {
+    response.writeHead(200); response.end(JSON.stringify({ result: [], total: 0 }));
+  } else if (path === '/b24/rest/crm.company.update.json' && request.method === 'POST') {
+    response.writeHead(200); response.end(JSON.stringify({ result: true }));
   } else if (path === '/b24/rest/crm.deal.update.json' && request.method === 'POST') {
     if (failNextBitrixWriteRetryAfter) {
       const retryAfter = failNextBitrixWriteRetryAfter;
@@ -700,9 +747,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, sum: moyskladOrderSum, currency: { isoCode: 'RUB' }, vatIncluded: false, created: '2026-10-05 13:00:00', updated: '2026-10-07T10:00:00+00:00' };
     if (moyskladAgentId) order.agent = { id: moyskladAgentId, meta: { href: `${fakeBase}/entity/counterparty/${moyskladAgentId}`, type: 'counterparty' } };
     response.writeHead(200); response.end(JSON.stringify(order));
+  } else if (new URL(path, fakeBase).pathname === '/ms/api/remap/1.2/entity/counterparty' && request.method === 'GET') {
+    const filter = new URL(path, fakeBase).searchParams.get('filter')?.toLowerCase() ?? '';
+    const rows = filter.includes('email=match.email@example.test')
+      ? [{ id: runtimeCompanyMoyskladId, meta: { type: 'counterparty' }, companyType: 'legal', name: 'MySklad name intentionally differs', phone: null, email: 'match.email@example.test', created: '2025-01-01 10:00:00' }]
+      : [];
+    response.writeHead(200); response.end(JSON.stringify({ rows, meta: { size: rows.length, limit: 1000, offset: 0 } }));
+  } else if (new URL(path, fakeBase).pathname === '/ms/api/remap/1.2/entity/customerorder' && request.method === 'GET') {
+    response.writeHead(200); response.end(JSON.stringify({ rows: [], meta: { size: 0, limit: 1, offset: 0 } }));
   } else if (/^\/ms\/api\/remap\/1\.2\/entity\/counterparty\/[0-9a-f-]+$/i.test(path) && request.method === 'GET') {
     const id = path.split('/').at(-1)!;
-    response.writeHead(200); response.end(JSON.stringify({ id, meta: { type: 'counterparty' }, name: id === serviceCounterpartyId ? 'Service counterparty' : 'Company' }));
+    response.writeHead(200); response.end(JSON.stringify({ id, meta: { type: 'counterparty' }, name: id === serviceCounterpartyId ? 'Service counterparty' : 'MySklad name intentionally differs', email: id === runtimeCompanyMoyskladId ? 'match.email@example.test' : undefined, updated: '2026-10-06T10:00:00+00:00' }));
   } else if (new URL(path, 'http://127.0.0.1').pathname === '/b24/rest/crm.item.productrow.list' && request.method === 'POST') {
     response.writeHead(200); response.end(JSON.stringify({ result: { productRows: [{ id: '90000001', productId: bitrixProductId, measureCode: 796, quantity: 1, price: bitrixRowPrice, priceNetto: bitrixRowPrice, discountTypeId: 1, discountRate: 0, discountSum: 0, taxRate: 0, taxIncluded: 'N' }] }, total: 1 }));
   } else if (path === `/ms/api/remap/1.2/entity/customerorder/${moyskladId}/positions/${moyskladPositionId}` && request.method === 'GET') {
@@ -756,7 +811,7 @@ async function waitForEventStatus(database: DatabaseService, id: string, status:
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   const finalState = await database.inboundEvent.findUnique({ where: { id }, select: { status: true, lastErrorCategory: true, retryAfter: true } });
-  assert.fail(`timed out waiting for event ${id} to reach ${status}; final=${JSON.stringify(finalState)}`);
+  assert.fail(`timed out waiting for event ${id} to reach ${status}; final=${JSON.stringify(finalState)}; fake requests=${JSON.stringify(externalRequests)}`);
 }
 
 async function waitForEventAttempt(database: DatabaseService, id: string, attempts: number) {

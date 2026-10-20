@@ -348,6 +348,13 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         }
         documentClient = dependencyResult?.client;
         const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig, attempt });
+        if (baseline.status === 'STALE_PINNED_EVENT') {
+          // Preserve the event's immutable historical pin, but never let an
+          // older retry overwrite a newer pair baseline or compare snapshots
+          // from incompatible semantic projections.
+          await this.finish(event.id, 'UNCHANGED', 'SETTINGS_PIN_SUPERSEDED', workerLease);
+          return result;
+        }
         if (baseline.status !== 'READY') {
           if (baseline.status === 'DATABASE_FAILURE') {
             // Leave the claimed PROCESSING row untouched. The lease-expiry

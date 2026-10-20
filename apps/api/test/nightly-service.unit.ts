@@ -24,6 +24,7 @@ class NightlyStore {
   bitrixProductIds: string[] = [];
   productCatalogConfigured = false;
   moyskladTotal = 0;
+  moyskladEntityIds: Record<string, string[]> = {};
   failBitrix = false;
   pairLifecycleStatus = 'ACTIVE';
   pairEntityType = 'CONTACT';
@@ -41,7 +42,7 @@ class NightlyStore {
       lastInactiveAt: mode === 'on' ? null : new Date('2026-10-20T21:30:00.000Z'), lastActiveAt: null,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
       nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3, nightlyBitrixLastId: null,
-      nightlyMoyskladOffset: 0, nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending',
+      nightlyMoyskladOffset: 0, nightlyMoyskladEntity: 'counterparty', nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending',
       nightlyLeaseToken: null, nightlyLeaseExpiresAt: null, nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
       resumeStatus: 'idle', resumeFrom: null, resumeThrough: null, resumeProvider: 'BITRIX24',
       resumeBitrixStart: 0, resumeMoyskladOffset: 0, resumeRetryAfter: null, resumeAttempts: 0, resumeError: null,
@@ -155,9 +156,14 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
     }
     const requestUrl = new URL(url);
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
-    const count = Math.max(0, Math.min(1000, store.moyskladTotal - offset));
-    const rows = Array.from({ length: count }, (_, index) => ({ id: `counterparty-${offset + index + 1}` }));
-    return new Response(JSON.stringify({ rows, meta: { size: store.moyskladTotal, limit: 1000, offset } }), { status: 200 });
+    const entity = requestUrl.pathname.split('/').filter(Boolean).at(-1) ?? 'counterparty';
+    const total = entity === 'counterparty' ? store.moyskladTotal : (store.moyskladEntityIds[entity] ?? []).length;
+    const count = Math.max(0, Math.min(1000, total - offset));
+    const rows = Array.from({ length: count }, (_, index) => ({
+      id: store.moyskladEntityIds[entity]?.[offset + index] ?? `${entity}-${offset + index + 1}`,
+      updated: '2026-10-20 20:00:00',
+    }));
+    return new Response(JSON.stringify({ rows, meta: { size: total, limit: 1000, offset } }), { status: 200 });
   };
   const syncMode = new SyncModeService(store as never);
   const fieldSettings = {
@@ -477,11 +483,32 @@ test('nightly MoySklad counterparty feed checkpoints bounded pages beyond 1,000 
     await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
 
     const offsets = harness.store.providerCalls
-      .filter((url) => url.includes('entity/counterparty'))
+      .filter((url) => new URL(url).pathname.endsWith('/entity/counterparty'))
       .map((url) => Number(new URL(url).searchParams.get('offset')));
     assert.deepEqual(offsets, [0, 1000]);
     assert.equal(harness.store.state.nightlyMoyskladStatus, 'complete');
     assert.equal(harness.store.state.nightlyMoyskladOffset, 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test('nightly MySklad updated feeds preserve exact document and catalog entity types', async () => {
+  const harness = await createHarness('on');
+  harness.store.moyskladEntityIds = {
+    customerorder: ['order-11'], invoiceout: ['invoice-31'], product: ['product-3'], service: ['service-4'],
+  };
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(() => harness.store.state.nightlyStatus === 'awaiting_processing');
+
+    const events = harness.store.accepted.filter((event) => event.source === 'MOYSKLAD');
+    assert.deepEqual(events.map((event) => [event.externalEntityType, event.externalEntityId]), [
+      ['customerorder', 'order-11'], ['invoiceout', 'invoice-31'], ['product', 'product-3'], ['service', 'service-4'],
+    ]);
+    assert.ok(events.every((event) => event.eventType === 'UPDATE'));
+    assert.ok(events.every((event) => (event.payload as { meta?: { href?: string } }).meta?.href?.includes('/entity/')));
+    assert.equal(harness.store.state.nightlyMoyskladEntity, 'complete');
   } finally {
     harness.close();
   }

@@ -59,7 +59,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         resumeProvider: true, resumeBitrixStart: true, resumeMoyskladOffset: true, resumeError: true,
         resumeRetryAfter: true, resumeAttempts: true,
         nightlyScheduledDate: true, nightlyStatus: true, nightlyFrom: true, nightlyThrough: true,
-        nightlyProvider: true, nightlyBitrixStart: true, nightlyMoyskladOffset: true,
+        nightlyProvider: true, nightlyBitrixStart: true, nightlyMoyskladOffset: true, nightlyMoyskladEntity: true,
         nightlyBitrixEntityTypeId: true, nightlyBitrixLastId: true, nightlyBitrixStatus: true, nightlyMoyskladStatus: true,
         nightlyRetryAfter: true, nightlyAttempts: true, nightlyError: true,
       },
@@ -84,6 +84,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         bitrixEntityTypeId: setting.nightlyBitrixEntityTypeId,
         bitrixLastId: setting.nightlyBitrixLastId,
         moyskladOffset: setting.nightlyMoyskladOffset,
+        moyskladEntity: setting.nightlyMoyskladEntity,
         bitrixStatus: setting.nightlyBitrixStatus,
         moyskladStatus: setting.nightlyMoyskladStatus,
         retryAfter: setting.nightlyRetryAfter,
@@ -155,6 +156,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         nightlyBitrixEntityTypeId: 2,
         nightlyBitrixLastId: null,
         nightlyMoyskladOffset: 0,
+        nightlyMoyskladEntity: 'counterparty',
         nightlyBitrixStatus: enabled ? 'pending' : 'skipped',
         nightlyMoyskladStatus: enabled ? 'pending' : 'skipped',
         nightlyRetryAfter: null,
@@ -291,23 +293,30 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (setting.nightlyMoyskladStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
-      while (true) {
+      const feeds = ['counterparty', 'customerorder', 'invoiceout', 'product', 'service'] as const;
+      while (setting.nightlyMoyskladEntity !== 'complete') {
+        const queriedEntity = setting.nightlyMoyskladEntity as typeof feeds[number];
+        if (!feeds.includes(queriedEntity)) throw new Error('Unsupported MoySklad nightly entity cursor');
         const queriedOffset = setting.nightlyMoyskladOffset;
         await this.renewNightlyLease(leaseToken);
-        const page = await this.readMoyskladPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
+        const page = await this.readMoyskladUpdatedPage(queriedEntity, setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
         await this.renewNightlyLease(leaseToken);
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
-        await this.saveChangedEvents('MOYSKLAD', 'COMPANY', page.ids, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+        if (queriedEntity === 'counterparty') {
+          await this.saveChangedEvents('MOYSKLAD', 'COMPANY', page.ids, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+        } else {
+          await this.saveMoyskladUpdatedEvents(queriedEntity, page.ids, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+        }
+        const nextEntity = page.hasNext ? queriedEntity : feeds[feeds.indexOf(queriedEntity) + 1] ?? 'complete';
         const result = await this.database.syncSetting.updateMany({
-          where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() }, nightlyMoyskladOffset: queriedOffset },
+          where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() }, nightlyMoyskladOffset: queriedOffset, nightlyMoyskladEntity: queriedEntity },
           data: page.hasNext
             ? { nightlyMoyskladOffset: setting.nightlyMoyskladOffset + page.count }
-            : { nightlyMoyskladOffset: 0 },
+            : { nightlyMoyskladOffset: 0, nightlyMoyskladEntity: nextEntity },
         });
         if (result.count !== 1) throw new Error('Nightly lease or MoySklad cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
-        if (!page.hasNext) break;
       }
       await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
       const latest = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
@@ -717,14 +726,14 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     return { ids: productIds, nextId: productIds.length === 50 ? productIds[productIds.length - 1] : null };
   }
 
-  private async readMoyskladPage(from: Date, through: Date, offset: number): Promise<{ ids: string[]; count: number; hasNext: boolean }> {
+  private async readMoyskladUpdatedPage(entity: 'counterparty' | 'customerorder' | 'invoiceout' | 'product' | 'service', from: Date, through: Date, offset: number): Promise<{ ids: string[]; count: number; hasNext: boolean }> {
     if (!Number.isInteger(offset) || offset < 0 || offset % MOYSKLAD_PAGE_SIZE !== 0) {
       throw new UnsupportedPaginationError('MoySklad cursor is not aligned to a supported collection page; feed stopped without enqueue or cursor advancement.');
     }
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('MoySklad API is not configured');
-    const url = new URL('entity/counterparty', base.endsWith('/') ? base : `${base}/`);
+    const url = new URL(`entity/${entity}`, base.endsWith('/') ? base : `${base}/`);
     url.searchParams.set('filter', `updated>=${moyskladDate(from)};updated<=${moyskladDate(through)}`);
     url.searchParams.set('order', 'updated,asc');
     url.searchParams.set('limit', String(MOYSKLAD_PAGE_SIZE));
@@ -737,18 +746,21 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
-      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', null, false);
+      await this.recordApiAttempt('MOYSKLAD', `entity/${entity}`, 'GET', null, false);
       throw error;
     }
-    await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', response.status, response.ok);
+    await this.recordApiAttempt('MOYSKLAD', `entity/${entity}`, 'GET', response.status, response.ok);
     if (!response.ok) throw providerFeedError(response);
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) || typeof payload.meta.size !== 'number' ||
         typeof payload.meta.limit !== 'number' || typeof payload.meta.offset !== 'number') {
-      throw new Error('Invalid MoySklad changed-record page');
+      throw new Error(`Invalid MoySklad ${entity} changed-record page`);
     }
-    const ids = payload.rows.map((row) => isRecord(row) ? readId(row.id) : null);
-    if (ids.some((id) => id === null)) throw new Error('Invalid MoySklad changed-record row');
+    const ids = payload.rows.map((row) => {
+      if (!isRecord(row) || typeof row.updated !== 'string' || moyskladMoment(row.updated) === null) return null;
+      return readId(row.id);
+    });
+    if (ids.some((id) => id === null)) throw new Error(`Invalid MoySklad ${entity} changed-record row`);
     if (payload.meta.limit !== MOYSKLAD_PAGE_SIZE || payload.meta.offset !== offset) {
       throw new UnsupportedPaginationError('MoySklad returned unexpected limit/offset metadata; feed stopped without enqueue or cursor advancement.');
     }
@@ -868,6 +880,45 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       } catch (error) { failures.push(error); }
     }
     if (failures.length) throw new Error(`Could not durably queue ${failures.length} changed client pair event(s)`);
+  }
+
+  /**
+   * Queue timestamp-discovered MySklad changes through the ordinary accepted
+   * event pipeline. No historical imports are performed here: event processors
+   * apply their normal pair/create eligibility gates and exact entity types.
+   */
+  private async saveMoyskladUpdatedEvents(
+    entity: 'counterparty' | 'customerorder' | 'invoiceout' | 'product' | 'service',
+    ids: string[],
+    jobKey: string,
+    leaseToken: string,
+  ) {
+    if (!ids.length || !this.fieldSettings || !this.dispatcher) return;
+    const scope: NightlyScope = entity === 'counterparty' ? 'contacts-companies'
+      : entity === 'customerorder' ? 'deals-orders'
+        : entity === 'invoiceout' ? 'invoices' : 'products-variations';
+    const directionEnabled = await this.syncMode.isDirectionEnabled(scope, 'moyskladToBitrix24');
+    const base = process.env.MOYSKLAD_API_BASE_URL;
+    if (!base) throw new Error('MoySklad API is not configured');
+    const root = base.endsWith('/') ? base : `${base}/`;
+    const uniqueIds = [...new Set(ids)];
+    for (const id of uniqueIds) {
+      const event = await this.fieldSettings.saveAcceptedEvent({
+        source: 'MOYSKLAD',
+        deliveryKey: `${jobKey}:moysklad:${entity}:${id}`,
+        eventType: 'UPDATE',
+        externalEntityType: entity,
+        externalEntityId: id,
+        payload: {
+          recovery: 'nightly', entity,
+          meta: { href: new URL(`entity/${entity}/${encodeURIComponent(id)}`, root).href },
+        } as Prisma.InputJsonValue,
+        directionDisabled: !directionEnabled,
+        requireServiceNotOff: true,
+        nightlyLeaseToken: leaseToken,
+      });
+      if (directionEnabled) await this.dispatcher.dispatch(event.id);
+    }
   }
 
   private async recordApiAttempt(provider: string, operation: string, method: string, statusCode: number | null, succeeded: boolean) {
