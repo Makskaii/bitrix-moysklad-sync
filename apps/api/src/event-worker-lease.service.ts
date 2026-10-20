@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { withServiceModeOn } from './service-mode-transaction';
 
 const MAX_CONCURRENT_EVENT_WORKERS = 4;
 const EVENT_WORKER_LEASE_MS = 60_000;
@@ -55,19 +56,24 @@ export class EventWorkerLeaseService {
   private async acquire(eventId: string): Promise<Lease | null> {
     const now = new Date();
     const ownerToken = randomUUID();
-    for (let slot = 0; slot < MAX_CONCURRENT_EVENT_WORKERS; slot++) {
-      await this.database.$executeRaw`
-        INSERT INTO "EventWorkerLease" ("slot", "ownerToken", "eventId", "leaseExpiresAt", "updatedAt")
-        VALUES (${slot}, '', '', ${new Date(0)}, NOW())
-        ON CONFLICT ("slot") DO NOTHING
-      `;
-      const claimed = await this.database.eventWorkerLease.updateMany({
-        where: { slot, leaseExpiresAt: { lte: now } },
-        data: { ownerToken, eventId, leaseExpiresAt: new Date(now.getTime() + EVENT_WORKER_LEASE_MS) },
-      });
-      if (claimed.count === 1) return { slot, ownerToken };
-    }
-    return null;
+    // Serialize new persistent semaphore leases with ON→OFF; never hold this lock
+    // across worker execution. Renewal and release of an existing lease stay ungated.
+    const result = await withServiceModeOn(this.database, async (transaction) => {
+      for (let slot = 0; slot < MAX_CONCURRENT_EVENT_WORKERS; slot++) {
+        await transaction.$executeRaw`
+          INSERT INTO "EventWorkerLease" ("slot", "ownerToken", "eventId", "leaseExpiresAt", "updatedAt")
+          VALUES (${slot}, '', '', ${new Date(0)}, NOW())
+          ON CONFLICT ("slot") DO NOTHING
+        `;
+        const claimed = await transaction.eventWorkerLease.updateMany({
+          where: { slot, leaseExpiresAt: { lte: now } },
+          data: { ownerToken, eventId, leaseExpiresAt: new Date(now.getTime() + EVENT_WORKER_LEASE_MS) },
+        });
+        if (claimed.count === 1) return { slot, ownerToken };
+      }
+      return null;
+    });
+    return result.enabled ? result.value : null;
   }
 
   private async renew(lease: Lease): Promise<boolean> {
