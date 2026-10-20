@@ -17,6 +17,8 @@ const fakeUpstreamMethods: string[] = [];
 const fakeB24ListTypes: Array<{ id: string; type: string }> = [];
 const fakeB24UserFieldStarts: number[] = [];
 let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
+let omitContactNameFieldType = false;
+let fakeMoyskladAttributeType: string | undefined = 'string';
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -140,7 +142,7 @@ before(async () => {
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
         : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: url.pathname.endsWith('/metadata/states') ? 'Новая сделка' : 'Demo reference', code: 'REF' }], meta: { size: 1 } }
-        : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string', writable: true }] }
+        : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', ...(fakeMoyskladAttributeType === undefined ? {} : { type: fakeMoyskladAttributeType }), writable: true }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
         : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test', opaqueField: 'opaque' };
@@ -313,6 +315,42 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.get.json'), 'enumeration options are recovered from the official per-field metadata method when not present in list results');
   assert.deepEqual(fakeB24UserFieldStarts, [0, 50]);
   assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
+});
+
+test('unknown or missing live MySklad metadata types fail closed with HTTP 400, not a server error', async () => {
+  const unknownTarget = 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  fakeMoyskladAttributeType = 'unknown';
+  const unknownCatalogResponse = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const unknownCatalogBody = await unknownCatalogResponse.text();
+  assert.equal(unknownCatalogResponse.status, 200, unknownCatalogBody);
+  const unknownCatalog = JSON.parse(unknownCatalogBody) as { moysklad: Array<{ code: string; type: string; shape: string }> };
+  const unknownField = unknownCatalog.moysklad.find((field) => field.code === unknownTarget);
+  assert.equal(unknownField?.type, 'unknown');
+  assert.equal(unknownField?.shape, 'unknown');
+
+  const current = await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } }).then((response) => response.json()) as { config: Record<string, unknown> };
+  const config = structuredClone(current.config) as { rules: unknown[]; groups: unknown[]; [key: string]: unknown };
+  config.groups = [];
+  config.rules = [{
+    id: 'unknown-live-target-type', entity: 'contacts', sourceField: 'NAME', targetField: unknownTarget,
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }];
+  const unknownSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
+  });
+  const unknownSaveBody = await unknownSave.text();
+  assert.equal(unknownSave.status, 400, unknownSaveBody);
+  assert.match(unknownSaveBody, /exact type and cardinality compatibility/i);
+
+  fakeMoyskladAttributeType = undefined;
+  const missingSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
+  });
+  const missingSaveBody = await missingSave.text();
+  assert.equal(missingSave.status, 400, missingSaveBody);
+  assert.match(missingSaveBody, /not available as a moysklad field/i);
+  fakeMoyskladAttributeType = 'string';
 });
 
 test('admin HTTP rejects an enabled copy rule whose provider field types do not match', async () => {

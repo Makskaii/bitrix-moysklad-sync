@@ -190,17 +190,25 @@ test('nightly PostgreSQL scan preserves the latest accepted DELETE when it cross
   const createdEventIds = Array.from({ length: 501 }, (_, index) => `${eventPrefix}${String(index).padStart(4, '0')}`);
   const now = new Date();
   const scheduledDate = now.toISOString().slice(0, 10);
+  const activeFrom = new Date(now.getTime() - 2 * 60 * 60 * 1000);
   const receivedAt = new Date(now.getTime() - 60 * 60 * 1000);
   const settings = new SyncModeService(database);
   const fieldSettings = new FieldSettingsService(database, {} as never, {} as never);
   const service = new SyncRecoveryService(database, settings, {} as never, undefined, fieldSettings, undefined);
 
   try {
-    await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
+    await database.syncSetting.upsert({
+      where: { id: 'global' },
+      create: { id: 'global', serviceMode: 'on', modeHistoryTrackedFrom: activeFrom },
+      update: { serviceMode: 'on', modeHistoryTrackedFrom: activeFrom },
+    });
+    await database.syncModeTransition.create({ data: {
+      id: `nightly-test-on-${randomUUID()}`, fromMode: 'unknown', toMode: 'on', transitionedAt: activeFrom,
+    } });
     await database.syncSetting.update({
       where: { id: 'global' },
       data: {
-        nightlyScheduledDate: scheduledDate, nightlyStatus: 'running', nightlyFrom: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        nightlyScheduledDate: scheduledDate, nightlyStatus: 'running', nightlyFrom: activeFrom,
         nightlyThrough: new Date(now.getTime() + 60_000), nightlyProvider: 'BITRIX24', nightlyBitrixStatus: 'pending',
         nightlyMoyskladStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
         nightlyMoyskladOffset: 0, nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
@@ -232,13 +240,13 @@ test('nightly PostgreSQL scan preserves the latest accepted DELETE when it cross
     }
     assert.equal(finalState?.nightlyStatus, 'awaiting_processing', finalState?.nightlyError ?? 'nightly run did not finish');
     const nightlyRows = await database.inboundEvent.findMany({
-      where: { deliveryKey: { startsWith: `nightly:${finalState?.nightlyScheduledDate}:CONTACT:` }, externalEntityId: sourceId },
+      where: { deliveryKey: { startsWith: `nightly:${finalState?.nightlyScheduledDate}:segment:` }, externalEntityId: sourceId },
       select: { eventType: true, externalEntityId: true, externalEntityType: true, deliveryKey: true, payload: true, status: true },
     });
     assert.equal(nightlyRows.length, 1, 'the cross-page identity must stage only its last accepted action');
     assert.deepEqual(nightlyRows[0], {
       eventType: 'ONCRMCONTACTDELETE', externalEntityId: sourceId, externalEntityType: 'contact',
-      deliveryKey: `nightly:${finalState?.nightlyScheduledDate}:CONTACT:ONCRMCONTACTDELETE:ACTIVE:${sourceId}`,
+      deliveryKey: `nightly:${finalState?.nightlyScheduledDate}:segment:0:CONTACT:ONCRMCONTACTDELETE:ACTIVE:${sourceId}`,
       payload: { recovery: 'nightly', entity: 'CONTACT', acceptedEventId: deletedEventId }, status: 'RECEIVED',
     });
   } finally {

@@ -22,9 +22,9 @@ function assertIsolatedTarget(value: string, enabled: string | undefined) {
 }
 
 test('product restore end-to-end harness rejects a non-isolated database target', () => {
-  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:5432/production?schema=public', '1'), /dedicated issue-79 DB/);
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:5432/production?schema=public', '1'), /dedicated issue-79 integration DB/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@example.invalid:5432/sync_issue79_catalog_test?schema=issue79_catalog_test', '1'), /loopback/);
-  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:5432/sync_issue79_catalog_test?schema=public', '1'), /dedicated issue-79 schema/);
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:5432/sync_issue79_integration_catalog_test?schema=public', '1'), /dedicated issue-79 schema/);
 });
 
 test('public form-urlencoded product signal restores only Bitrix24 from an active MySklad pair and is idempotent', { skip: !databaseUrl }, async () => {

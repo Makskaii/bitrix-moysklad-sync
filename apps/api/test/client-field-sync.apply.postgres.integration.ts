@@ -35,8 +35,8 @@ before(async () => {
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
-        bitrix24: [{ code: 'TITLE', writable: true }],
-        moysklad: [{ code: 'name', writable: true }],
+        bitrix24: [{ code: 'TITLE', type: 'string', shape: 'scalar', cardinality: 'single', writable: true }],
+        moysklad: [{ code: 'name', type: 'string', shape: 'scalar', cardinality: 'single', writable: true }],
       };
     },
   } as never, {} as EntityPairService);
