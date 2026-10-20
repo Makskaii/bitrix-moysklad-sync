@@ -69,13 +69,15 @@ before(async () => {
     where: { id: 'global' }, create: { serviceMode: 'pause' },
     update: {
       serviceMode: 'pause', lastInactiveAt: null, lastActiveAt: null,
+      modeHistoryTrackedFrom: null,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
       nightlyProvider: 'BITRIX24', nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 3,
-      nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyBitrixStatus: 'skipped',
+      nightlyBitrixLastId: null, nightlyMoyskladOffset: 0, nightlyMoyskladEntity: 'counterparty', nightlyBitrixStatus: 'skipped',
       nightlyMoyskladStatus: 'skipped', nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
       nightlyRetryAfter: null, nightlyAttempts: 0, nightlyError: null,
     },
   });
+  await setupDatabase.syncModeTransition.deleteMany({});
   await setupDatabase.$disconnect();
 
   mockServer = createServer((request, response) => { void handleExternalRequest(request, response); });
@@ -526,10 +528,26 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   });
   nightlyProviderQueries.length = 0;
   try {
+    await seedNightlyOnHistory(database, '2026-10-04T22:00:00.000Z');
     freezeTime('2026-10-05T22:00:00.000Z');
     await waitForNightlyStatus('awaiting_processing');
     const status = await readRecoveryStatus();
-    assert.deepEqual(status.nightly, {
+    assert.deepEqual({
+      scheduledDate: status.nightly.scheduledDate,
+      status: status.nightly.status,
+      from: status.nightly.from,
+      through: status.nightly.through,
+      provider: status.nightly.provider,
+      bitrixStart: status.nightly.bitrixStart,
+      bitrixEntityTypeId: status.nightly.bitrixEntityTypeId,
+      bitrixLastId: status.nightly.bitrixLastId,
+      moyskladOffset: status.nightly.moyskladOffset,
+      bitrixStatus: status.nightly.bitrixStatus,
+      moyskladStatus: status.nightly.moyskladStatus,
+      retryAfter: status.nightly.retryAfter,
+      attempts: status.nightly.attempts,
+      error: status.nightly.error,
+    }, {
       scheduledDate: '2026-10-06',
       status: 'awaiting_processing',
       from: '2026-10-04T22:00:00.000Z',
@@ -543,11 +561,13 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
       moyskladStatus: 'complete',
       retryAfter: null,
       attempts: 1,
-      error: 'Provider feeds are queued for active pairs; waiting for event processing. Delete and archival changes remain outside this slice.',
+      error: 'Active interval feeds are queued for processing. Skipped intervals are shown in coverage; delete and archival changes remain outside this slice.',
     });
     const bitrixQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query));
-    assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [3, 4]);
+    assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [2, 3, 4, 31]);
     assert.deepEqual(bitrixQueries.map((query) => [query.filter['>=updatedTime'], query.filter['<=updatedTime']]), [
+      ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
+      ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
       ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
       ['2026-10-04T22:00:00.000Z', '2026-10-05T22:00:00.000Z'],
     ]);
@@ -597,6 +617,7 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
   nightlyBitrixCompanyIds = [bitrixCompanyId, bitrixCompanyId, `unpaired-${randomUUID()}`];
   nightlyProviderQueries.length = 0;
   try {
+    await seedNightlyOnHistory(database, '2026-10-07T22:00:00.000Z');
     freezeTime('2026-10-08T22:00:00.000Z');
     await waitForNightlyStatus('awaiting_processing');
     const events = await database.inboundEvent.findMany({ where: { source: 'BITRIX24', externalEntityId: bitrixCompanyId } });
@@ -644,7 +665,7 @@ test('nightly rechecks accepted events only for an enabled scope with an active 
     create: { entityKey: 'contacts-companies', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
     update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
   });
-  const acceptedAt = new Date('2026-10-18T23:00:00.000Z');
+  const acceptedAt = new Date('2026-10-18T21:00:00.000Z');
   const originalEvents = await database.inboundEvent.createMany({ data: [activeId, inactiveId].map((id) => ({
     source: 'BITRIX24', deliveryKey: `accepted-recheck:${id}`, eventType: 'ONCRMCONTACTUPDATE',
     externalEntityType: 'contact', externalEntityId: id, payload: { event: 'ONCRMCONTACTUPDATE' },
@@ -668,10 +689,11 @@ test('nightly rechecks accepted events only for an enabled scope with an active 
   nightlyBitrixSecondPageIds = [];
   nightlyMoyskladMetaSize = 0;
   try {
+    await seedNightlyOnHistory(database, '2026-10-17T22:00:00.000Z');
     freezeTime('2026-10-18T22:00:00.000Z');
     await waitForNightlyStatus('awaiting_processing');
     const rechecks = await database.inboundEvent.findMany({
-      where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } },
+      where: { deliveryKey: { startsWith: 'nightly:2026-10-19:segment:0:CONTACT:' } },
       select: { externalEntityId: true, eventType: true, status: true, payload: true },
     });
     assert.deepEqual(rechecks.map((event) => event.externalEntityId), [activeId]);
@@ -681,7 +703,7 @@ test('nightly rechecks accepted events only for an enabled scope with an active 
   } finally {
     restoreTime();
     await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `accepted-recheck:` } } });
-    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } } });
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: 'nightly:2026-10-19:segment:0:CONTACT:' } } });
     await database.entityPair.deleteMany({ where: { id: { in: [activePair.id, inactivePair.id, skippedPair.id, productPair.id] } } });
   }
 });
@@ -709,13 +731,14 @@ test('nightly provider failure leaves independent feed completed and retryable',
     where: { id: 'global' }, data: {
       serviceMode: 'on', offSince: null, lastInactiveAt: null, lastActiveAt: null,
       nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyBitrixStatus: 'pending',
-      nightlyMoyskladStatus: 'pending', nightlyFrom: null, nightlyThrough: null,
+      nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyFrom: null, nightlyThrough: null,
       nightlyRetryAfter: null, nightlyBitrixStart: 0, nightlyMoyskladOffset: 0,
     },
   });
   nightlyProviderQueries.length = 0;
   failNightlyBitrixFeed = true;
   try {
+    await seedNightlyOnHistory(database, '2026-10-08T22:00:00.000Z');
     freezeTime('2026-10-09T22:00:00.000Z');
     await waitForNightlyStatus('failed');
     let status = await readRecoveryStatus();
@@ -742,7 +765,7 @@ test('nightly run lease fences two API instances from querying and advancing the
     nightlyScheduledDate: '2026-10-10', nightlyStatus: 'pending',
     nightlyFrom: new Date('2026-10-09T22:00:00.000Z'), nightlyThrough: new Date('2026-10-10T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0,
-    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   nightlyProviderQueries.length = 0;
@@ -773,7 +796,7 @@ test('lease loss during a provider call replays the page without duplicate durab
     nightlyScheduledDate: '2026-10-11', nightlyStatus: 'pending',
     nightlyFrom: new Date('2026-10-10T22:00:00.000Z'), nightlyThrough: new Date('2026-10-11T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0,
-    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   nightlyBitrixCompanyIds = [bitrixId];
@@ -857,7 +880,7 @@ test('MoySklad pagination beyond one documented page fails closed without checkp
     nightlyScheduledDate: '2026-10-13', nightlyStatus: 'pending',
     nightlyFrom: new Date('2026-10-12T22:00:00.000Z'), nightlyThrough: new Date('2026-10-13T22:00:00.000Z'),
     nightlyBitrixStatus: 'pending', nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null,
-    nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   nightlyMoyskladMetaSize = 1_001;
@@ -868,7 +891,7 @@ test('MoySklad pagination beyond one documented page fails closed without checkp
     assert.equal(status.nightly.bitrixStatus, 'complete');
     assert.equal(status.nightly.moyskladStatus, 'failed');
     assert.ok(status.nightly.error);
-    assert.match(status.nightly.error!, /stable keyset pagination is not verified/);
+    assert.match(status.nightly.error!, /changed-record total is inconsistent with the returned page/);
     const state = await database.syncSetting.findUnique({ where: { id: 'global' } });
     assert.equal(state?.nightlyMoyskladOffset, 0);
     assert.equal(await database.inboundEvent.count({ where: { source: 'MOYSKLAD', payload: { path: ['recovery'], equals: 'nightly' } } }), 0);
@@ -895,7 +918,7 @@ test('nightly MoySklad contact-person feed pages active company collections and 
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
     nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
-    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   nightlyProviderQueries.length = 0;
@@ -937,7 +960,7 @@ test('nightly MoySklad contact-person feed rejects invalid timestamps without qu
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
     nightlyScheduledDate: '2026-10-06', nightlyStatus: 'pending',
     nightlyFrom: new Date('2026-10-04T22:00:00.000Z'), nightlyThrough: new Date('2026-10-05T22:00:00.000Z'),
-    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladOffset: 0,
+    nightlyBitrixStatus: 'complete', nightlyMoyskladStatus: 'pending', nightlyMoyskladEntity: 'counterparty', nightlyMoyskladOffset: 0,
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   try {
@@ -953,7 +976,7 @@ test('nightly MoySklad contact-person feed rejects invalid timestamps without qu
   }
 });
 
-test('mid-run PAUSE marks unfinished provider feeds skipped and preserves completed feeds', async () => {
+test('mid-run PAUSE preserves the provider cursor and resumes without losing feed progress', async () => {
   const database = app.get(DatabaseService);
   await database.syncSetting.update({ where: { id: 'global' }, data: {
     serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
@@ -964,6 +987,7 @@ test('mid-run PAUSE marks unfinished provider feeds skipped and preserves comple
     nightlyRetryAfter: null, nightlyLeaseToken: null, nightlyLeaseExpiresAt: null,
   } });
   nightlyCompanyFeedArrived = false;
+  nightlyProviderQueries.length = 0;
   holdNightlyCompanyFeed = true;
   const service = app.get(SyncRecoveryService);
   const run = (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
@@ -974,10 +998,25 @@ test('mid-run PAUSE marks unfinished provider feeds skipped and preserves comple
     await setAdminMode('pause');
     releaseNightlyCompanyFeed();
     await run;
+    holdNightlyCompanyFeed = false;
     const status = await readRecoveryStatus();
-    assert.equal(status.nightly.status, 'skipped');
-    assert.equal(status.nightly.bitrixStatus, 'skipped');
-    assert.equal(status.nightly.moyskladStatus, 'skipped');
+    assert.equal(status.nightly.status, 'running');
+    assert.equal(status.nightly.bitrixStatus, 'pending');
+    assert.equal(status.nightly.bitrixEntityTypeId, 4);
+    assert.equal(status.nightly.moyskladStatus, 'pending');
+    const pausedSetting = await database.syncSetting.findUnique({ where: { id: 'global' } });
+    assert.equal(pausedSetting?.nightlyLeaseToken, null);
+    assert.deepEqual(nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query).entityTypeId), [4]);
+
+    // PAUSE stops progress after the in-flight request; resume retries that same
+    // cursor before advancing and completes the durable nightly window.
+    await setAdminMode('on');
+    await (service as unknown as { runNightlyJob(): Promise<void> }).runNightlyJob();
+    const resumed = await readRecoveryStatus();
+    assert.equal(resumed.nightly.status, 'awaiting_processing');
+    assert.equal(resumed.nightly.bitrixStatus, 'complete');
+    assert.equal(resumed.nightly.moyskladStatus, 'complete');
+    assert.equal(nightlyProviderQueries.filter((query) => query.startsWith('{') && JSON.parse(query).entityTypeId === 4).length, 2);
   } finally {
     releaseNightlyCompanyFeed();
     holdNightlyCompanyFeed = false;
@@ -1036,7 +1075,7 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
     });
   }
   if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty/') && request.url.includes('/contactpersons?')) {
-    nightlyProviderQueries.push(request.url);
+    nightlyProviderQueries.push(request.url!);
     const url = new URL(request.url, 'http://127.0.0.1');
     const parts = url.pathname.split('/');
     const parentId = decodeURIComponent(parts[parts.indexOf('counterparty') + 1] ?? '');
@@ -1061,11 +1100,18 @@ async function handleExternalRequest(request: IncomingMessage, response: ServerR
       updated: destinationEmail === 'before@example.test' ? '2026-10-02T09:00:00.000' : '2026-10-02T10:00:03.000',
     });
   }
-  if (request.method === 'GET' && request.url?.startsWith('/api/entity/counterparty?')) {
-    nightlyProviderQueries.push(request.url);
+  if (request.method === 'GET' && /^\/api\/entity\/(counterparty|customerorder|invoiceout|product|service)\?/.test(request.url ?? '')) {
+    nightlyProviderQueries.push(request.url!);
     return sendJson(response, 200, { rows: [], meta: { size: nightlyMoyskladMetaSize, limit: 1_000, offset: 0 } });
   }
   return sendJson(response, 404, {});
+}
+
+async function seedNightlyOnHistory(database: DatabaseService, windowFrom: string) {
+  const onSince = new Date(Date.parse(windowFrom) - 1_000);
+  await database.syncModeTransition.deleteMany({});
+  await database.syncModeTransition.create({ data: { fromMode: 'off', toMode: 'on', transitionedAt: onSince } });
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on', modeHistoryTrackedFrom: onSince } });
 }
 
 async function restartApp() {
@@ -1132,13 +1178,14 @@ async function readRecoveryStatus() {
 }
 
 async function waitForNightlyStatus(expected: string) {
-  const deadline = NativeDate.now() + 8_000;
+  // The feed intentionally probes five MoySklad collections at a 1 request/s cap.
+  const deadline = NativeDate.now() + 20_000;
   let status = await readRecoveryStatus();
   while (status.nightly.status !== expected && NativeDate.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     status = await readRecoveryStatus();
   }
-  assert.equal(status.nightly.status, expected);
+  assert.equal(status.nightly.status, expected, `nightly status did not reach ${expected}: ${JSON.stringify(status.nightly)}`);
 }
 
 async function setAdminMode(mode: 'on' | 'pause' | 'off') {

@@ -104,9 +104,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   async process(eventId: string) {
-    // The optional global semaphore is transient coordination only; this precheck
-    // avoids acquiring it during stable OFF, while durable event/entity claims are
-    // independently serialized with OFF inside withServiceModeOn below.
+    // Avoid attempting work during stable OFF. EventWorkerLeaseService persists
+    // its operational semaphore lease and gates each new acquire against the
+    // durable mode row; business event/entity claims and provider calls are
+    // independently gated below.
     if (!await this.isApplyEnabled()) return;
     if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
     return this.processWithLease(eventId);
