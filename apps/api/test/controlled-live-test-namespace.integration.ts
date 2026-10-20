@@ -3,9 +3,9 @@ import { strict as assert } from 'node:assert';
 import { createServer, Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { after, before, test } from 'node:test';
-import { verifyControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
+import { parseExpectedNamespace, verifyControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
-const accountId = 'b0b309ee-13e3-11e9-9109-f8fc0001f188';
+const accountId = '11111111-1111-1111-63af-111111111111';
 let server: Server;
 let origin = '';
 let currentBitrixUserId = '42';
@@ -55,12 +55,18 @@ test('provider namespace verification matches portal origin and read-only curren
   assert.deepEqual(observed, ['POST /rest/user.current.json', 'GET /api/remap/1.2/context/employee']);
 });
 
+test('provider account IDs accept UUID-shaped MoySklad values without RFC variant assumptions', async () => {
+  const verified = await verifyControlledLiveProviderNamespace(manifest(), options());
+  assert.equal(verified.moyskladAccountId, accountId);
+  assert.throws(() => parseExpectedNamespace({ ...manifest(), moyskladAccountId: 'not-a-provider-account-id' }), /PROVIDER_NAMESPACE_INVALID/);
+});
+
 test('provider namespace verification rejects wrong portal, wrong current principal, and wrong account', async () => {
   await assert.rejects(verifyControlledLiveProviderNamespace({ ...manifest(), bitrix24PortalOrigin: 'https://other.example' }, options()), /BITRIX24_PORTAL_ORIGIN_MISMATCH/);
   currentBitrixUserId = '43';
   await assert.rejects(verifyControlledLiveProviderNamespace(manifest(), options()), /BITRIX24_CREDENTIAL_IDENTITY_MISMATCH/);
   currentBitrixUserId = '42';
-  currentMoyskladAccountId = 'a0b309ee-13e3-11e9-9109-f8fc0001f188';
+  currentMoyskladAccountId = '21111111-1111-1111-63af-111111111111';
   await assert.rejects(verifyControlledLiveProviderNamespace(manifest(), options()), /MOYSKLAD_ACCOUNT_IDENTITY_MISMATCH/);
   currentMoyskladAccountId = accountId;
 });

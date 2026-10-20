@@ -63,7 +63,7 @@ export async function verifyControlledLiveProviderNamespace(
 export function parseExpectedNamespace(value: unknown, allowLoopbackHttp = false): ControlledLiveProviderNamespace {
   if (!isRecord(value) || typeof value.bitrix24PortalOrigin !== 'string' || typeof value.bitrix24UserId !== 'string' ||
       !/^\d{1,20}$/.test(value.bitrix24UserId) || typeof value.moyskladAccountId !== 'string' ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.moyskladAccountId)) {
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.moyskladAccountId)) {
     throw new Error('CONTROLLED_LIVE_TEST_PROVIDER_NAMESPACE_INVALID');
   }
   let portal: URL;
