@@ -53,7 +53,8 @@ export class FieldSettingsService {
     const active = await this.active();
     const riskChanges = fieldRuleRiskChanges(active.config, config);
     const referencesChanged = JSON.stringify(config.references) !== JSON.stringify(active.config.references) ||
-      JSON.stringify(config.dealOrderRuntime) !== JSON.stringify(active.config.dealOrderRuntime);
+      JSON.stringify(config.dealOrderRuntime) !== JSON.stringify(active.config.dealOrderRuntime) ||
+      JSON.stringify(config.productCatalogRuntime) !== JSON.stringify(active.config.productCatalogRuntime);
     if (referencesChanged) {
     const catalogs = await this.readOnlyData.catalogs(bitrixAccessToken);
     const namedCatalogs = await this.readOnlyData.referenceCatalogs(bitrixAccessToken);
@@ -62,6 +63,10 @@ export class FieldSettingsService {
     const productCatalogId = config.dealOrderRuntime?.bitrix24ProductCatalogId ?? null;
     if (productCatalogId && !catalogs.productCatalogs.some((candidate) => candidate.id === productCatalogId)) {
       throw new BadRequestException(`Bitrix24 product catalog ${productCatalogId} no longer exists`);
+    }
+    const catalogRuntimeId = config.productCatalogRuntime?.bitrix24CatalogId ?? null;
+    if (catalogRuntimeId && !catalogs.productCatalogs.some((candidate) => candidate.id === catalogRuntimeId)) {
+      throw new BadRequestException(`Bitrix24 product catalog ${catalogRuntimeId} no longer exists`);
     }
     const dictionaryCatalogs = await this.readOnlyData.dictionaryCatalogs(bitrixAccessToken);
     for (const mapping of config.references.dictionaries) {
@@ -198,10 +203,19 @@ export class FieldSettingsService {
       if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
       return entry.entity;
     });
-    const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'catalog']);
+    const supported = new Set(['contacts', 'contacts-companies', 'companies', 'deals-orders', 'smart-invoices', 'catalog']);
     for (const entity of ruleEntities) if (!supported.has(entity)) throw new BadRequestException(`Entity ${entity} is not supported for field mappings`);
+    for (const group of config.groups) {
+      if (group.entity === 'smart-invoices' && group.transform.kind !== 'join-non-empty') {
+        throw new BadRequestException('Smart invoices support only join-non-empty field groups');
+      }
+      if (group.entity === 'smart-invoices' &&
+        [group.targetField, ...group.sourceFields].some((field) => ['customerOrder', 'parentId2'].includes(field))) {
+        throw new BadRequestException('Invoice order relationship fields cannot be configured as field groups');
+      }
+    }
     const entities = [...new Set(ruleEntities)];
-    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null }>; moysklad: Array<{ code: string; writable: boolean | null }> }>>();
+    const catalogsByEntity = new Map<string, Array<{ bitrix24: Array<{ code: string; writable: boolean | null; type: string; category?: string }>; moysklad: Array<{ code: string; writable: boolean | null; type: string; category?: string }> }>>();
     for (const entity of entities) {
       catalogsByEntity.set(entity, [await this.readOnlyData.fieldCatalogs(bitrixAccessToken, entity)]);
     }
@@ -218,10 +232,26 @@ export class FieldSettingsService {
     for (const candidate of config.rules) {
       const rule = candidate as unknown as JsonRecord;
       const entity = String(rule.entity);
+      if (entity === 'catalog' && rule.sourceField === 'xmlId') {
+        throw new BadRequestException('Catalog xmlId is reserved for durable product-create recovery and cannot be mapped');
+      }
       requireField(entity, 'bitrix24', rule.sourceField, false);
       requireField(entity, 'moysklad', rule.targetField, false);
       const forward = rule.bitrix24ToMoysklad as JsonRecord;
       const reverse = rule.moyskladToBitrix24 as JsonRecord;
+      if (entity === 'catalog' && (forward.enabled === true || reverse.enabled === true)) {
+        const catalogs = catalogsByEntity.get(entity) ?? [];
+        const b24Field = catalogs[0]?.bitrix24.find((field) => field.code === rule.sourceField);
+        const msField = catalogs[0]?.moysklad.find((field) => field.code === rule.targetField);
+        if (isRecord(forward.transform) && forward.transform.kind === 'copy' || isRecord(reverse.transform) && reverse.transform.kind === 'copy') {
+          if (b24Field?.category === 'custom' || msField?.category === 'custom') {
+            throw new BadRequestException('Catalog custom fields require a dedicated adapter and cannot use standard scalar copy rules');
+          }
+          if (!b24Field || !msField || !compatibleCatalogScalarTypes(b24Field.type, msField.type)) {
+            throw new BadRequestException(`Catalog fields ${String(rule.sourceField)} and ${String(rule.targetField)} do not have compatible scalar types`);
+          }
+        }
+      }
       if (entity === 'catalog' && forward.enabled === true) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }
@@ -232,6 +262,9 @@ export class FieldSettingsService {
       const group = candidate as unknown as JsonRecord;
       const entity = String(group.entity);
       const b24ToMs = group.direction === 'BITRIX24_TO_MOYSKLAD';
+      if (entity === 'catalog' && (b24ToMs ? (group.sourceFields as string[]).includes('xmlId') : group.targetField === 'xmlId')) {
+        throw new BadRequestException('Catalog xmlId is reserved for durable product-create recovery and cannot be mapped');
+      }
       if (entity === 'catalog' && b24ToMs) {
         throw new BadRequestException('Bitrix24 catalog products and services are read-only; catalog writes must originate in MySklad');
       }
@@ -447,6 +480,22 @@ export class FieldSettingsService {
   }
 }
 
+function compatibleCatalogScalarTypes(bitrixType: string, moyskladType: string): boolean {
+  const scalarFamily = (type: string) => {
+    const normalized = type.trim().toLowerCase();
+    if (['string', 'text', 'varchar'].includes(normalized)) return 'string';
+    if (['double', 'number', 'decimal', 'float', 'integer', 'int'].includes(normalized)) return 'number';
+    if (['boolean', 'bool'].includes(normalized)) return 'boolean';
+    if (['datetime', 'date'].includes(normalized)) return 'datetime';
+    // B24 char can represent flags, but its metadata does not establish that
+    // a particular field is Boolean; require an explicit typed transform.
+    return null;
+  };
+  const left = scalarFamily(bitrixType);
+  const right = scalarFamily(moyskladType);
+  return left !== null && left === right;
+}
+
 function serializeVersion(row: VersionRow): VersionedFieldSettingsDto {
   const config = normalizePersistedConfig(row.config);
   return {
@@ -472,13 +521,35 @@ function validateConfiguration(value: unknown): FieldSettingsConfig {
       ? value.serviceCounterpartyId
       : (() => { throw new BadRequestException('serviceCounterpartyId must be a MoySklad counterparty UUID or empty'); })();
   const dealOrderRuntime = value.dealOrderRuntime === undefined ? undefined : validateDealOrderRuntime(value.dealOrderRuntime, namedPairs);
+  const productCatalogRuntime = value.productCatalogRuntime === undefined ? undefined : validateProductCatalogRuntime(value.productCatalogRuntime);
   const rules = value.rules.map(validateRule);
   const groups = value.groups.map(validateGroup);
   const childBindingError = validateChildResourceBindings(value.childResourceBindings);
   if (childBindingError) throw new BadRequestException(childBindingError);
   assertUniqueIds(rules, 'Field rule');
   assertUniqueIds(groups, 'Field group');
-  return { ...value, serviceCounterpartyId, dealOrderRuntime, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+  return { ...value, serviceCounterpartyId, productCatalogRuntime, dealOrderRuntime, rules, groups, references: { ...references, units, priceTypes, dictionaries, namedPairs } } as FieldSettingsConfig;
+}
+
+function validateProductCatalogRuntime(value: unknown): NonNullable<FieldSettingsConfigDto['productCatalogRuntime']> {
+  if (!isRecord(value)) throw new BadRequestException('productCatalogRuntime must be an object');
+  const catalogId = value.bitrix24CatalogId === undefined || value.bitrix24CatalogId === null || value.bitrix24CatalogId === ''
+    ? null
+    : isString(value.bitrix24CatalogId) && /^\d+$/.test(value.bitrix24CatalogId)
+      ? value.bitrix24CatalogId
+      : (() => { throw new BadRequestException('productCatalogRuntime.bitrix24CatalogId must be a numeric catalog ID or empty'); })();
+  const sectionId = value.bitrix24DefaultSectionId === undefined || value.bitrix24DefaultSectionId === null || value.bitrix24DefaultSectionId === ''
+    ? null
+    : isString(value.bitrix24DefaultSectionId) && /^\d+$/.test(value.bitrix24DefaultSectionId)
+      ? value.bitrix24DefaultSectionId
+      : (() => { throw new BadRequestException('productCatalogRuntime.bitrix24DefaultSectionId must be a numeric section ID or empty'); })();
+  const allowed = ['name', 'code', 'description'] as const;
+  const fields = value.moyskladFields === undefined ? ['name'] : value.moyskladFields;
+  if (!Array.isArray(fields) || fields.some((field) => !allowed.includes(field as typeof allowed[number])) || new Set(fields).size !== fields.length || (catalogId && !fields.includes('name'))) {
+    throw new BadRequestException('productCatalogRuntime.moyskladFields must be unique supported fields and include name when a catalog is selected');
+  }
+  if (sectionId && !catalogId) throw new BadRequestException('A Bitrix24 default product section requires an explicitly selected product catalog');
+  return { bitrix24CatalogId: catalogId, bitrix24DefaultSectionId: sectionId, moyskladFields: fields as Array<'name' | 'code' | 'description'> };
 }
 
 function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair[]): NonNullable<FieldSettingsConfigDto['dealOrderRuntime']> {
@@ -491,6 +562,12 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     : isString(value.bitrix24ProductCatalogId) && /^\d+$/.test(value.bitrix24ProductCatalogId)
       ? value.bitrix24ProductCatalogId
       : (() => { throw new BadRequestException('bitrix24ProductCatalogId must be a numeric Bitrix24 catalog ID or empty'); })();
+  const productSectionId = value.bitrix24DefaultProductSectionId === undefined || value.bitrix24DefaultProductSectionId === null || value.bitrix24DefaultProductSectionId === ''
+    ? null
+    : isString(value.bitrix24DefaultProductSectionId) && /^\d+$/.test(value.bitrix24DefaultProductSectionId)
+      ? value.bitrix24DefaultProductSectionId
+      : (() => { throw new BadRequestException('bitrix24DefaultProductSectionId must be a numeric Bitrix24 section ID or empty'); })();
+  if (productSectionId && !productCatalogId) throw new BadRequestException('A Bitrix24 default product section requires an explicitly selected product catalog');
   const allowedProductFields = ['name', 'code', 'description'] as const;
   const moyskladProductFields = value.moyskladProductFields === undefined ? ['name'] : value.moyskladProductFields;
   if (!Array.isArray(moyskladProductFields) || moyskladProductFields.some((field) => !allowedProductFields.includes(field as typeof allowedProductFields[number])) || new Set(moyskladProductFields).size !== moyskladProductFields.length || (productCatalogId && !moyskladProductFields.includes('name'))) {
@@ -537,7 +614,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {
@@ -851,6 +928,7 @@ function entityTypeForFieldEntity(entity: string): EntityType {
     case 'contacts-companies': return 'CONTACT';
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
+    case 'smart-invoices': return 'INVOICE';
     case 'catalog': return 'PRODUCT';
     default: throw new BadRequestException('This entity type has no field metadata provider');
   }

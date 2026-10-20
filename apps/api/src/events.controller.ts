@@ -70,13 +70,17 @@ export class EventIntakeService {
     const data = isRecord(safePayload.data) ? safePayload.data : {};
     const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
     const eventType = typeof safePayload.event === 'string' ? safePayload.event : null;
-    const directionDisabled = eventType?.startsWith('ONCRMCONTACT') === true &&
-      !await this.syncMode.isDirectionEnabled('contacts-companies', 'bitrix24ToMoysklad');
+    const externalEntityType = bitrixEntityType(eventType, safePayload);
+    const direction = getEventDirection('BITRIX24', eventType, externalEntityType);
+    const directionDisabled = direction === 'products-variations:bitrix24ToMoysklad' ||
+      (direction !== null && !await this.syncMode.isDirectionEnabled(
+        direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
+      ));
 
     const event = {
       eventType,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
-      externalEntityType: bitrixEntityType(eventType),
+      externalEntityType,
       payload: safePayload,
     };
     // Bitrix's webhook body has no documented stable delivery ID. A payload hash
@@ -141,8 +145,10 @@ export class EventIntakeService {
         // No stable key means at-least-once intake: retain every arrival rather
         // than risk dropping a later real change with an identical envelope.
         : `delivery:${randomUUID()}`;
-      const directionDisabled = event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty' &&
-        !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
+      const direction = getEventDirection('MOYSKLAD', event.eventType, event.externalEntityType);
+      const directionDisabled = direction !== null && !await this.syncMode.isDirectionEnabled(
+        direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
+      );
       const acknowledgement = await this.save('MOYSKLAD', deliveryKey, queueEvent, directionDisabled);
       eventIds.push(acknowledgement.eventId);
       if (event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty') {
@@ -385,11 +391,49 @@ function safeDealEventType(value: string | null): string | null {
   return value && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(value) ? value : null;
 }
 
-function bitrixEntityType(value: string | null): string | null {
-  if (value === 'CATALOG.PRODUCT.ON.DELETE') return 'product';
+function bitrixEntityType(value: string | null, payload: EventPayload): string | null {
+  if (value?.startsWith('CATALOG.PRODUCT.')) return 'product';
+  if (value?.startsWith('CATALOG.PRICE.')) return 'catalogprice';
+  if (/^ONCRMDYNAMICITEM(?:ADD|UPDATE|DELETE)$/.test(value ?? '') && bitrixEntityTypeId(payload) === 31) return 'invoice';
   if (value?.startsWith('ONCRMDEAL')) return 'deal';
   if (value?.startsWith('ONCRMCONTACT')) return 'contact';
   if (value?.startsWith('ONCRMCOMPANY')) return 'company';
+  return null;
+}
+
+function bitrixEntityTypeId(payload: EventPayload): number | null {
+  const data = isRecord(payload.data) ? payload.data : {};
+  const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
+  const value = fields.ENTITY_TYPE_ID ?? data.ENTITY_TYPE_ID ?? payload.ENTITY_TYPE_ID;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function getEventDirection(
+  source: InboundSource,
+  eventType: string | null,
+  externalEntityType: string | null,
+): string | null {
+  if (source === 'BITRIX24') {
+    if (externalEntityType === 'contact' || externalEntityType === 'company') return 'contacts-companies:bitrix24ToMoysklad';
+    if (externalEntityType === 'deal') return 'deals-orders:bitrix24ToMoysklad';
+    if (externalEntityType === 'invoice') return 'invoices:bitrix24ToMoysklad';
+    if (externalEntityType === 'product' || externalEntityType === 'catalogprice') return 'products-variations:bitrix24ToMoysklad';
+    return null;
+  }
+  if (['counterparty', 'contactperson'].includes(externalEntityType ?? '') && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'contacts-companies:moyskladToBitrix24';
+  }
+  if (externalEntityType === 'customerorder' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'deals-orders:moyskladToBitrix24';
+  }
+  if (externalEntityType === 'invoiceout' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'invoices:moyskladToBitrix24';
+  }
+  if (['product', 'service'].includes(externalEntityType ?? '') && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'products-variations:moyskladToBitrix24';
+  }
   return null;
 }
 

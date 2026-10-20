@@ -48,6 +48,8 @@ export interface ClientCandidateGateway {
   findPair(entity: ClientEntity, sourceId: string, sourceSystem?: ClientSystem, companyTargetId?: string | null): Promise<{ targetId: string; targetType: ClientTargetType | 'company' | 'contact' } | null>;
   companyByInn(inn: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   companyByExactNameAndPhone(name: string, phone: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
+  companyByEmail(email: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
+  contactByEmail(email: string, companyId?: string | null, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   contactByCompanyAndNamePhone(companyId: string, normalizedName: string, normalizedPhone: string, email?: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   contactByCompanyAndNameEmail(companyId: string, normalizedName: string, normalizedEmail: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
   contactByStandaloneNamePhone(normalizedName: string, normalizedPhone: string, email?: string, targetSystem?: ClientSystem): Promise<ClientCandidate[]>;
@@ -70,14 +72,27 @@ export class ClientRuntimeResolver {
 
   private async resolveCompany(source: ClientSource, targetSystem: ClientSystem): Promise<ClientResolution> {
     const inn = nonEmpty(source.inn);
-    if (!nonEmpty(source.name)) return { action: 'MANUAL_REVIEW', reason: 'MISSING_REQUIRED_NAME', candidates: [] };
+    const email = normalizeEmail(source.email);
+    if (!nonEmpty(source.name) && !email) return { action: 'MANUAL_REVIEW', reason: 'MISSING_REQUIRED_NAME', candidates: [] };
+    const emailMatches = email ? await this.gateway.companyByEmail(email, targetSystem) : [];
+    const conflictingEmail = emailMatches.filter((candidate) => candidate.occupiedByPair || candidate.duplicateMarked === true ||
+      Boolean(inn && nonEmpty(candidate.inn) && candidate.inn !== inn));
+    if (conflictingEmail.length) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: conflictingEmail.map((candidate) => candidate.id) };
+    if (emailMatches.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: emailMatches.map((candidate) => candidate.id) };
+    const emailMatch = emailMatches[0];
     const exactInn = inn ? await this.gateway.companyByInn(inn, targetSystem) : [];
     // A search result with no INN is not an exact-INN match and must not be
     // selected (nor populated with the source's INN as a side effect).
     const innMatches = exactInn.filter((candidate) => !candidate.occupiedByPair && candidate.inn === inn);
     const permittedByInn = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(innMatches) : innMatches;
     const innChoice = chooseCandidate(permittedByInn, 'exact_inn', targetSystem);
-    if (innChoice) return innChoice;
+    if (permittedByInn.length) {
+      if (emailMatch && !permittedByInn.some((candidate) => candidate.id === emailMatch.id)) {
+        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permittedByInn.map((candidate) => candidate.id), emailMatch.id])] };
+      }
+      if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
+      if (innChoice) return innChoice;
+    }
     if (inn && permittedByInn.length) return permittedByInn.length > 1
       ? { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permittedByInn.map((candidate) => candidate.id) }
       : permittedByInn[0] ? candidateResolution(permittedByInn[0], 'exact_inn', false, targetSystem) : { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : 'company', targetSystem, reason: 'NO_CANDIDATE' };
@@ -88,9 +103,16 @@ export class ClientRuntimeResolver {
     const fallbackMatches = fallback.filter((candidate) => !candidate.occupiedByPair && (!nonEmpty(candidate.inn) || !inn || candidate.inn === inn));
     const permitted = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(fallbackMatches) : fallbackMatches;
     const choice = chooseCandidate(permitted, 'exact_name_and_phone', targetSystem);
-    if (choice) return choice;
+    if (permitted.length) {
+      if (emailMatch && !permitted.some((candidate) => candidate.id === emailMatch.id)) {
+        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted.map((candidate) => candidate.id), emailMatch.id])] };
+      }
+      if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
+      if (choice) return choice;
+    }
     if (permitted.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permitted.map((candidate) => candidate.id) };
     if (permitted.length === 1) return candidateResolution(permitted[0], 'exact_name_and_phone', false, targetSystem);
+    if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
     return { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : 'company', targetSystem, reason: 'NO_CANDIDATE' };
   }
 
@@ -101,17 +123,26 @@ export class ClientRuntimeResolver {
     if (source.companyId && !primaryCompanyTargetId) {
       return { action: 'MANUAL_REVIEW', reason: 'PRIMARY_COMPANY_UNRESOLVED', candidates: [] };
     }
-    if (!name) return { action: 'MANUAL_REVIEW', reason: 'MISSING_REQUIRED_NAME', candidates: [] };
-    if (!name || (!phone && !email)) return { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? primaryCompanyTargetId ? 'contactperson' : 'counterparty' : 'contact', targetSystem, reason: 'NO_CONTACT_KEYS' };
+    if (!name && !email) return { action: 'MANUAL_REVIEW', reason: 'MISSING_REQUIRED_NAME', candidates: [] };
+    if (!name && !phone && !email) return { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? primaryCompanyTargetId ? 'contactperson' : 'counterparty' : 'contact', targetSystem, reason: 'NO_CONTACT_KEYS' };
 
-    const candidates = primaryCompanyTargetId
+    const keyedCandidates = name && (phone || email) ? primaryCompanyTargetId
       ? phone
         ? await this.gateway.contactByCompanyAndNamePhone(primaryCompanyTargetId, name, phone, email ?? undefined, targetSystem)
         : await this.gateway.contactByCompanyAndNameEmail(primaryCompanyTargetId, name, email!, targetSystem)
       : phone
         ? await this.gateway.contactByStandaloneNamePhone(name, phone, email ?? undefined, targetSystem)
-        : await this.gateway.contactByStandaloneNameEmail(name, email!, targetSystem);
-    const permitted = candidates.filter((candidate) => !candidate.occupiedByPair);
+        : await this.gateway.contactByStandaloneNameEmail(name, email!, targetSystem) : [];
+    const emailCandidates = email ? await this.gateway.contactByEmail(email, primaryCompanyTargetId ?? null, targetSystem) : [];
+    if (emailCandidates.some((candidate) => candidate.occupiedByPair) || emailCandidates.length > 1) {
+      return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: emailCandidates.map((candidate) => candidate.id) };
+    }
+    const emailMatch = emailCandidates[0];
+    const permitted = keyedCandidates.filter((candidate) => !candidate.occupiedByPair);
+    if (emailMatch && permitted.some((candidate) => candidate.id !== emailMatch.id)) {
+      return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted.map((candidate) => candidate.id), emailMatch.id])] };
+    }
+    if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
     const choice = chooseCandidate(permitted, phone ? 'normalized_name_and_phone' : 'normalized_name_and_email', targetSystem);
     if (choice) return choice;
     if (permitted.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permitted.map((candidate) => candidate.id) };
@@ -153,6 +184,16 @@ export function chooseCandidate(candidates: ClientCandidate[], matchedBy: string
 }
 
 function candidateResolution(candidate: ClientCandidate, matchedBy: string, usageMetricDegraded: boolean, targetSystem: ClientSystem): ClientResolution {
+  if (matchedBy === 'normalized_email') {
+    return {
+      action: 'USE_CANDIDATE', targetId: candidate.id, targetType: candidate.type, targetSystem,
+      reason: 'Matched by unique normalized exact email; no name or phone match was required.',
+      evidence: {
+        usageCount: candidate.usageCount, filledFields: candidate.filledFields,
+        createdAt: candidate.createdAt, usageMetricDegraded, criteria: ['normalized_email'],
+      },
+    };
+  }
   const criteria = [matchedBy];
   if (!usageMetricDegraded) criteria.push('usage_count');
   criteria.push('filled_fields', 'earliest_created_at');
@@ -184,7 +225,8 @@ function normalizePhone(value: string | null | undefined): string | null {
 }
 
 function normalizeEmail(value: string | null | undefined): string | null {
-  return nonEmpty(value)?.toLocaleLowerCase('en-US') ?? null;
+  const normalized = nonEmpty(value)?.normalize('NFKC').toLocaleLowerCase('en-US') ?? null;
+  return normalized && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) ? normalized : null;
 }
 
 function nonEmpty(value: string | null | undefined): string | null {

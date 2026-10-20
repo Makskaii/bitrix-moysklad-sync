@@ -8,8 +8,13 @@
     "test:admin-operations:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-operations.postgres.integration.js",
     "test:events": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/events-intake.integration.js",
     "test:sync-mode-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode.service.unit.js",
+    "test:sync-mode-preflight-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/sync-mode-preflight.unit.js",
     "test:event-dispatcher-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-dispatcher.unit.js",
     "test:event-worker-lease-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-worker-lease.unit.js",
+    "test:nightly-accepted-recheck-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/nightly-accepted-event-recheck.unit.js",
+    "test:nightly-service-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/nightly-service.unit.js",
+    "test:manual-review-details-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/manual-review-details.unit.js",
+    "test:event-reliability:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/event-reliability.postgres.integration.js",
     "test:provider-failure-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/provider-failure.unit.js",
     "test:database-recovery": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/database-recovery.unit.js ../../dist/apps/api-test/test/database-recovery.postgres.integration.js",
     "test:product-runtime-gate-unit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-runtime-gate.unit.js",
@@ -39,7 +44,10 @@
     "test:historical-inventory": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-inventory.integration.js",
     "test:historical-inventory:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/historical-inventory.postgres.integration.js",
     "test:productcards": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-card-api.integration.js ../../dist/apps/api-test/test/product-card-event.integration.js ../../dist/apps/api-test/test/product-card-sync.integration.js ../../dist/apps/api-test/test/product-card-state.postgres.integration.js",
-    "test:fake-provider-e2e": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/fake-provider-e2e.integration.js"
+    "test:product-create-event:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/product-catalog-create-event.postgres.integration.js",
+    "test:fake-provider-e2e": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/fake-provider-e2e.integration.js",
+    "test:invoices": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/invoice-contract.unit.js ../../dist/apps/api-test/test/invoice-field-plan.unit.js ../../dist/apps/api-test/test/invoice-http-api.unit.js ../../dist/apps/api-test/test/invoice-intake-dispatch.integration.js ../../dist/apps/api-test/test/invoice-processor-routing.unit.js ../../dist/apps/api-test/test/invoice-lifecycle-webhook.integration.js",
+    "test:invoices:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/invoice-runtime.postgres.integration.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

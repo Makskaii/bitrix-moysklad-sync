@@ -43,6 +43,18 @@ test('field settings select, save, and reload field pairs while preview stays re
     const query = new URL(route.request().url()).searchParams;
     expect(query.get('pairId')).toBeNull();
     const entity = query.get('entity') ?? 'contacts';
+    if (entity === 'smart-invoices') return route.fulfill({ json: { entity,
+      bitrix24: [
+        { code: 'title', title: 'Заголовок счёта', type: 'string', writable: true, category: 'standard' },
+        { code: 'description', title: 'Описание счёта', type: 'string', writable: true, category: 'standard' },
+        { code: 'parentId2', title: 'Связанная сделка', type: 'integer', writable: true, category: 'standard' },
+      ],
+      moysklad: [
+        { code: 'name', title: 'Наименование счёта', type: 'string', writable: true, category: 'standard' },
+        { code: 'description', title: 'Комментарий счёта', type: 'string', writable: true, category: 'standard' },
+        { code: 'customerOrder', title: 'Заказ покупателя', type: 'object', writable: true, category: 'standard' },
+      ],
+    } });
     return route.fulfill({ json: { entity,
       bitrix24: [
         { code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true, category: 'standard' },
@@ -92,7 +104,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByText('Версия 1', { exact: true })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'Bitrix24' })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'МойСклад' })).toBeVisible();
-  await expect(page.locator('option[value="smart-invoices"]').first()).toHaveAttribute('disabled', '');
+  await expect(page.getByLabel('Пара сущностей группы').locator('option[value="smart-invoices"]')).toBeEnabled();
   await page.locator('details.field-advanced-settings > summary').click();
   await expect(page.getByRole('heading', { name: 'Услуги и способы оплаты' })).toBeVisible();
   await expect(page.getByLabel('Пара сущностей группы')).toHaveValue('contacts');
@@ -128,7 +140,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByLabel('Критичность EMAIL → email').selectOption('critical');
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveValue('EMAIL');
   await expect(page.getByLabel('Поле МойСклад').last()).toHaveValue('email');
-  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
+  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', /Email · EMAIL · crm_multifield/);
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
   await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
   await mappingRow.getByText('Технические коды').click();
@@ -214,4 +226,25 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByText('Версия 3', { exact: true })).toBeVisible();
   await expect(page.getByLabel('ID реквизита Bitrix24 1')).toHaveValue('9001');
   await expect(page.getByLabel('UUID счёта МойСклад 1')).toHaveValue('ffffffff-ffff-4fff-8fff-ffffffffffff');
+
+  await page.locator('details.field-advanced-settings > summary').click();
+  await page.getByLabel('Пара сущностей группы').selectOption('smart-invoices');
+  const invoiceSources = page.getByLabel('Поля источники группы');
+  await expect(invoiceSources.locator('option[value="title"]')).toHaveText('Заголовок счёта · title · string · запись разрешена');
+  await expect(invoiceSources.locator('option[value="parentId2"]')).toHaveCount(0);
+  await expect(page.getByLabel('Поле результат группы').locator('option[value="customerOrder"]')).toHaveCount(0);
+  await invoiceSources.selectOption(['title', 'description']);
+  await page.getByLabel('Поле результат группы').selectOption('name');
+  await expect(page.getByLabel('Преобразование группы').locator('option[value="split-non-empty"]')).toHaveJSProperty('disabled', true);
+  await page.getByRole('button', { name: 'Добавить составное правило' }).click();
+  await expect(page.getByText('title + description → name')).toBeVisible();
+  await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
+  await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
+  await expect(page.getByText('Версия 4', { exact: true })).toBeVisible();
+  expect(config.groups).toEqual([expect.objectContaining({ entity: 'smart-invoices', sourceFields: ['title', 'description'], targetField: 'name', transform: { kind: 'join-non-empty', separator: ' ' } })]);
+  await page.reload();
+  await page.getByRole('button', { name: 'Соответствия полей' }).click();
+  await expect(page.getByText('Версия 4', { exact: true })).toBeVisible();
+  await page.locator('details.field-advanced-settings > summary').click();
+  await expect(page.getByText('title + description → name')).toBeVisible();
 });

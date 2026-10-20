@@ -1,6 +1,6 @@
 export const PAIR_RESOLVER = Symbol('PAIR_RESOLVER');
 
-export const ENTITY_TYPES = ['CONTACT', 'COMPANY', 'DEAL', 'PRODUCT'] as const;
+export const ENTITY_TYPES = ['CONTACT', 'COMPANY', 'DEAL', 'PRODUCT', 'INVOICE'] as const;
 export type EntityType = (typeof ENTITY_TYPES)[number];
 export type PairSourceSystem = 'BITRIX24' | 'MOYSKLAD';
 export type PairResolutionReason =
