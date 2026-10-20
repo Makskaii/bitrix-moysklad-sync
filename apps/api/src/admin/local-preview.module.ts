@@ -55,6 +55,8 @@ import { ProductCardHttpApi } from '../products/product-card-api';
 import { ProductCardRuntimeService } from '../products/product-card-runtime.service';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
 import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from '../clients/client-lifecycle.service';
+import { InvoiceEventProcessor } from '../invoices/invoice-event.processor';
+import { InvoiceHttpApi } from '../invoices/invoice-http-api';
 
 @Module({})
 export class LocalAdminPreviewModule {
@@ -83,8 +85,9 @@ export class LocalAdminPreviewModule {
           { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
           { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
           ProductCardHttpApi, ProductCatalogCreateService, ProductCardRuntimeService, ProductDuplicateAliasService, ProductCardEventProcessor, ClientLifecycleService,
+          InvoiceHttpApi, InvoiceEventProcessor,
           { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
-          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
+          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,
