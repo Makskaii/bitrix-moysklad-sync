@@ -45,6 +45,7 @@ function createDatabase(baselineVersion: number, baselineAppearsAfterCapture = f
       },
       createMany: async () => ({ count: 0 }),
     },
+    $queryRaw: async () => [{ serviceMode: 'on' }],
     $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work(database),
   };
   return {
@@ -182,7 +183,10 @@ test('pair-first workers leave durable events unclaimed while paused', async () 
     { inboundEvent: {
       findUnique: async () => { reads++; return event; },
       updateMany: async () => { claims++; return { count: 1 }; },
-    } } as never,
+    },
+      $queryRaw: async () => [{ serviceMode: 'on' }],
+      $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work({ $queryRaw: async () => [{ serviceMode: 'on' }] }),
+    } as never,
     { resolve: async () => { resolutions++; return { status: 'unavailable', reason: 'unused' }; } } as never,
     undefined, undefined, undefined, undefined,
     { read: async () => ({ mode: 'pause' }) } as never,
@@ -312,6 +316,7 @@ test('controlled deal event verifies the current source, persists admission, the
   const admissions = new Map<string, any>();
   const database: any = {
     inboundEvent: { findUnique: async () => event, updateMany: async ({ data }: any) => { Object.assign(event, data); return { count: 1 }; } },
+    $queryRaw: async () => [{ serviceMode: 'on' }],
     $transaction: async (work: (transaction: unknown) => Promise<unknown>) => work(database),
     controlledTestAdmission: {
       findMany: async ({ where }: any) => [...admissions.values()].filter((row) => row.runId === where.runId && row.entity === where.entity),

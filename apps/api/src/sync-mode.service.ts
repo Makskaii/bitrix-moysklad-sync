@@ -6,6 +6,7 @@ import { ClientLifecycleService } from './clients/client-lifecycle.service';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { ReadOnlyFieldDataProvider } from './field-settings/read-only-field-data.provider';
 import { EnablePreflightReport, SyncModeDirection, evaluateEnablePreflight } from './sync-mode-preflight';
+import { withServiceModeOn } from './service-mode-transaction';
 
 export type ServiceMode = 'on' | 'pause' | 'off';
 export type DealOrderWriteDirection = 'bitrix24ToMoysklad' | 'moyskladToBitrix24';
@@ -314,8 +315,15 @@ export class SyncModeService {
     mutation: () => Promise<T>,
   ): Promise<T> {
     const run = async () => {
-      await this.assertDealOrderExternalWriteAllowed(direction, assertLease, pair);
-      return mutation();
+      const guarded = await withServiceModeOn(this.database, async () => {
+        await this.assertDealOrderExternalWriteAllowed(direction, assertLease, pair);
+        return mutation();
+      });
+      if (!guarded.enabled) {
+        const mode = await this.read().catch(() => null);
+        throw new DealOrderWriteGateError(mode?.mode === 'pause' ? 'PAUSE' : mode ? 'OFF' : 'RECOVERY');
+      }
+      return guarded.value;
     };
     const pairs = (pair ? (Array.isArray(pair) ? pair : [pair]) : [])
       .filter((item) => ['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'].includes(item.entityType))
