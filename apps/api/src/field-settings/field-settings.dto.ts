@@ -1,3 +1,5 @@
+import { FieldTransform } from './field-transform';
+
 export type UnitReference = {
   bitrix24Id: number;
   bitrix24Code: string;
@@ -39,8 +41,8 @@ export type FieldRuleDto = {
   sourceField: string;
   targetField: string;
   criticality: 'critical' | 'optional' | 'tbd';
-  bitrix24ToMoysklad: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
-  moyskladToBitrix24: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
+  bitrix24ToMoysklad: { enabled: boolean; transform: FieldTransform };
+  moyskladToBitrix24: { enabled: boolean; transform: FieldTransform };
 };
 
 export type FieldGroupDto = {

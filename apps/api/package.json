@@ -35,6 +35,7 @@
     "test:monitoring": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/monitoring.integration.js ../../dist/apps/api-test/test/rotating-file.logger.integration.js",
     "test:monitoring:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/monitoring.postgres.integration.js",
     "test:field-settings": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/field-settings.integration.js",
+    "test:field-transform": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/field-transform.unit.js",
     "test:client-field-transform": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/client-field-transform.unit.js",
     "test:client-field-sync:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/client-field-sync.postgres.integration.js",
     "test:client-field-sync:apply:postgres": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/client-field-sync.apply.postgres.integration.js",

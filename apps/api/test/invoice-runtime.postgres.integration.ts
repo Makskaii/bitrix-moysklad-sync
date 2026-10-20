@@ -30,7 +30,7 @@ let db: DatabaseService;
 let server: Server;
 let base = '';
 let processor: InvoiceEventProcessor;
-let settingsAdapter: { eventConfig: (eventId: string) => Promise<unknown>; transformField: typeof FieldSettingsService.prototype.transformField };
+let settingsAdapter: { eventConfig: (eventId: string) => Promise<unknown>; transformFieldResult: typeof FieldSettingsService.prototype.transformFieldResult };
 let oldMode: string | undefined;
 let oldBitrixBase: string | undefined;
 let oldMoyskladBase: string | undefined;
@@ -78,7 +78,7 @@ before(async () => {
   process.env.MOYSKLAD_API_TOKEN = 'invoice-fake-provider-only';
   settingsAdapter = {
     eventConfig: async () => ({ version: 1, config: activeFieldConfig }),
-    transformField: FieldSettingsService.prototype.transformField,
+    transformFieldResult: FieldSettingsService.prototype.transformFieldResult,
   };
   const recovery = { launchBoundary: async () => launchBoundary, assertReady: async () => true };
   processor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db), recovery as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db));
@@ -376,30 +376,39 @@ test('invoice field conflicts use the configured MySklad-wins baseline policy an
 });
 
 test('invoice processor applies every configured field rule in each enabled direction', async () => {
-  activeFieldConfig = { rules: [...fieldConfig.rules, {
+  activeFieldConfig = { rules: [...fieldConfig.rules.map((rule) => rule.id === 'invoice-title' ? {
+    ...rule,
+    criticality: 'critical',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'string-to-number' as const, numberType: 'decimal' as const } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'number-to-string' as const } },
+  } : rule), {
     id: 'invoice-description', entity: 'smart-invoices', sourceField: 'description', targetField: 'description',
     bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
     moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
   }], groups: [] };
   try {
     const sourceId = String(++invoiceCounter);
-    bitrixInvoices.set(sourceId, { id: sourceId, title: 'Configured title', description: 'Initial note', parentId2: Number(dealId), createdTime: createdAfterBoundary });
+    bitrixInvoices.set(sourceId, { id: sourceId, title: '123.5', description: 'Initial note', parentId2: Number(dealId), createdTime: createdAfterBoundary });
     const create = await createEvent(`configured-fields-create-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
     assert.equal((await processor.process(create.id))?.status, 'SUCCEEDED');
     const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
     const moysklad = moyskladInvoices.get(pair.moyskladId)!;
-    assert.equal(moysklad.name, 'Configured title');
+    assert.equal(moysklad.name, 123.5, 'invoice creation uses the shared explicit number transform');
     assert.equal(moysklad.description, 'Initial note');
 
+    bitrixInvoices.get(sourceId)!.title = '456.75';
     bitrixInvoices.get(sourceId)!.description = 'Updated in Bitrix';
     const bitrixUpdate = await createEvent(`configured-fields-b24-update-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
     assert.equal((await processor.process(bitrixUpdate.id))?.status, 'SUCCEEDED');
     assert.equal(moysklad.description, 'Updated in Bitrix');
+    assert.equal(moysklad.name, 456.75, 'invoice update uses the same transform contract as creation');
 
+    moysklad.name = 789.25;
     moysklad.description = 'Updated in MySklad';
     const moyskladUpdate = await createEvent(`configured-fields-ms-update-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
     assert.equal((await processor.process(moyskladUpdate.id))?.status, 'SUCCEEDED');
     assert.equal(bitrixInvoices.get(sourceId)?.description, 'Updated in MySklad');
+    assert.equal(bitrixInvoices.get(sourceId)?.title, '789.25', 'reverse invoice updates use the configured number-to-string transform');
   } finally {
     activeFieldConfig = fieldConfig;
   }
@@ -538,12 +547,12 @@ test('invoice group saved through field settings is reloaded and consumed by inv
   const provider = {
     fieldCatalogs: async (_token: string, entity: string) => entity === 'smart-invoices' ? {
       bitrix24: [
-        { code: 'title', writable: true }, { code: 'description', writable: true },
-        { code: 'parentId2', writable: true },
+        { code: 'title', type: 'string', writable: true }, { code: 'description', type: 'string', writable: true },
+        { code: 'parentId2', type: 'integer', writable: true },
       ],
       moysklad: [
-        { code: 'name', writable: true }, { code: 'description', writable: true },
-        { code: 'customerOrder', writable: true },
+        { code: 'name', type: 'string', writable: true }, { code: 'description', type: 'string', writable: true },
+        { code: 'customerOrder', type: 'object', writable: true },
       ],
     } : { bitrix24: [], moysklad: [] },
   };

@@ -19,7 +19,7 @@ test('MySklad wins concurrent invoice field edits and disabled mappings hold cha
   assert.deepEqual(planInvoiceField({ rule, bitrix24: 'new', moysklad: 'old', baselineBitrix24: 'old', baselineMoysklad: 'old', directions: { bitrix24ToMoysklad: false, moyskladToBitrix24: true } }), { action: 'HOLD', reason: 'DIRECTION_DISABLED' });
 });
 
-test('invoice field plan refuses non-copy transforms and non-scalar values', () => {
+test('invoice field plan holds unconfigured transforms and leaves typed conversion to the shared transform contract', () => {
   assert.deepEqual(planInvoiceField({ rule: { ...rule, bitrix24ToMoysklad: { enabled: true, transform: { kind: 'tbd' } } }, bitrix24: 'new', moysklad: 'old', baselineBitrix24: 'old', baselineMoysklad: 'old', directions: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } }), { action: 'HOLD', reason: 'TRANSFORM_NOT_SUPPORTED' });
-  assert.deepEqual(planInvoiceField({ rule, bitrix24: { id: 4 }, moysklad: null, baselineBitrix24: null, baselineMoysklad: null, directions: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } }), { action: 'HOLD', reason: 'FIELD_VALUE_NOT_SCALAR' });
+  assert.deepEqual(planInvoiceField({ rule, bitrix24: { id: 4 }, moysklad: null, baselineBitrix24: null, baselineMoysklad: null, directions: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } }), { action: 'WRITE', direction: 'BITRIX24_TO_MOYSKLAD', value: { id: 4 } });
 });
