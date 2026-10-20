@@ -1,0 +1,7 @@
+prisma/migrations/20261007140000_deal_order_create_operation/migration.sql -text
+prisma/migrations/20261007150000_deal_order_create_attempted_at/migration.sql -text
+prisma/migrations/20261007160000_deal_order_create_lease/migration.sql -text
+prisma/migrations/20261007170000_deal_order_position_pairs/migration.sql -text
+prisma/migrations/20261007180000_deal_order_position_add_operations/migration.sql -text
+prisma/migrations/20261008110000_dependency_create_operation/migration.sql -text
+prisma/migrations/20261008120000_deal_order_customer_pair_refs/migration.sql -text
