@@ -1043,18 +1043,25 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
       // The documented conflict policy is deterministic: MoySklad's current
       // value wins even when the event was triggered by the Bitrix24 edit.
       if (direction === 'MOYSKLAD_TO_BITRIX24') {
-        const transformed = settings.transformField(config, entity, direction, destField, sourceNow);
-        if (transformed && !transformed.error) bitrix24[destField] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, direction, destField, sourceNow);
+        if (transformed?.status === 'mapped') bitrix24[destField] = transformed.value;
+        else if (transformed?.status === 'error' && rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${destField}:${transformed.reason}`;
       } else {
         const sourceField = rule.sourceField;
-        const transformed = settings.transformField(config, entity, 'MOYSKLAD_TO_BITRIX24', sourceField, ms);
-        if (transformed && !transformed.error) bitrix24[sourceField] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, 'MOYSKLAD_TO_BITRIX24', sourceField, ms);
+        if (transformed?.status === 'mapped') bitrix24[sourceField] = transformed.value;
+        else if (transformed?.status === 'error' && rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${sourceField}:${transformed.reason}`;
       }
       continue;
     }
     if (!sourceChanged || equal(sourceNow[srcField], targetNow[destField])) continue;
-    const transformed = settings.transformField(config, entity, direction, destField, sourceNow);
-    if (!transformed || transformed.error) continue;
+    const transformed = settings.transformFieldResult(config, entity, direction, destField, sourceNow);
+    if (!transformed || transformed.status === 'skip') continue;
+    if (transformed.status === 'error') {
+      if (rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${destField}:${transformed.reason}`;
+      else logger.warn(`Optional field transform skipped (${entity}; ${destField}): ${transformed.reason}`);
+      continue;
+    }
     if (rule.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[destField])) {
       criticalClears.push({ fieldTitle: destField, previousValue: targetNow[destField], restoreValue: targetNow[destField], sourceProposedValue: transformed.value });
       continue;
@@ -1069,16 +1076,18 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
     const targetChanged = !equal(targetNow[group.targetField], targetPrior[group.targetField]);
     if (targetChanged && !equal(targetNow[group.targetField], sourceNow[group.targetField])) {
       if (direction === 'BITRIX24_TO_MOYSKLAD') {
-        const transformed = settings.transformField(config, entity, 'MOYSKLAD_TO_BITRIX24', group.sourceFields[0], ms);
-        if (transformed?.error) ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.error}`;
-        else if (transformed) bitrix24[group.sourceFields[0]] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, 'MOYSKLAD_TO_BITRIX24', group.sourceFields[0], ms);
+        if (transformed?.status === 'error' && group.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`;
+        else if (transformed?.status === 'mapped') bitrix24[group.sourceFields[0]] = transformed.value;
       }
       continue;
     }
     if (targetChanged) continue;
-    const transformed = settings.transformField(config, entity, direction, group.targetField, sourceNow);
-    if (transformed?.error) ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.error}`;
-    else if (transformed && !equal(transformed.value, targetNow[group.targetField])) {
+    const transformed = settings.transformFieldResult(config, entity, direction, group.targetField, sourceNow);
+    if (transformed?.status === 'error') {
+      if (group.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`;
+      else logger.warn(`Optional field group transform skipped (${entity}; ${group.targetField}): ${transformed.reason}`);
+    } else if (transformed?.status === 'mapped' && !equal(transformed.value, targetNow[group.targetField])) {
       if (group.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[group.targetField])) {
         criticalClears.push({ fieldTitle: group.targetField, previousValue: targetNow[group.targetField], restoreValue: targetNow[group.targetField], sourceProposedValue: transformed.value });
       } else defaultTarget[group.targetField] = transformed.value;
@@ -1146,14 +1155,16 @@ function configuredCreateFields(config: unknown, entity: string, direction: 'BIT
     const configKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!isRecord(rule[configKey]) || rule[configKey].enabled !== true) continue;
     const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
-    const transformed = settings.transformField(config, entity, direction, targetField, source);
-    if (transformed && !transformed.error) output[targetField] = transformed.value;
+    const transformed = settings.transformFieldResult(config, entity, direction, targetField, source);
+    if (transformed?.status === 'mapped') output[targetField] = transformed.value;
+    else if (transformed?.status === 'error' && rule.criticality === 'critical') throw new Error(`CLIENT_FIELD_TRANSFORM_FAILED:${targetField}:${transformed.reason}`);
   }
   const groups = Array.isArray(config.groups) ? config.groups : [];
   for (const group of groups) {
     if (!isRecord(group) || group.entity !== entity || group.direction !== direction || typeof group.targetField !== 'string') continue;
-    const transformed = settings.transformField(config, entity, direction, group.targetField, source);
-    if (transformed && !transformed.error) output[group.targetField] = transformed.value;
+    const transformed = settings.transformFieldResult(config, entity, direction, group.targetField, source);
+    if (transformed?.status === 'mapped') output[group.targetField] = transformed.value;
+    else if (transformed?.status === 'error' && group.criticality === 'critical') throw new Error(`CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`);
   }
   return output;
 }

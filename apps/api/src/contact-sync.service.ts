@@ -457,7 +457,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
 
     let value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
-    const configuredTransform = this.fieldSettings?.transformField(
+    const configuredTransform = this.fieldSettings?.transformFieldResult(
       pinnedConfig,
       'contacts',
       direction,
@@ -465,10 +465,15 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       direction === 'BITRIX24_TO_MOYSKLAD' ? { EMAIL: bitrixContact.EMAIL, email: bitrixEmail } : { email: moyskladEmail },
     );
     if (configuredTransform) {
-      if (configuredTransform.error || typeof configuredTransform.value !== 'string' || !configuredTransform.value.trim()) {
-        throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, snapshotRevision: snapshot.revision });
+      if (configuredTransform.status === 'error') {
+        throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, reason: configuredTransform.reason, snapshotRevision: snapshot.revision });
       }
-      value = configuredTransform.value;
+      if (configuredTransform.status === 'mapped') {
+        if (typeof configuredTransform.value !== 'string' || !configuredTransform.value.trim()) {
+          throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, snapshotRevision: snapshot.revision });
+        }
+        value = configuredTransform.value;
+      }
     }
     const configuredDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!await this.syncMode.isDirectionEnabled('contacts-companies', configuredDirection)) {
