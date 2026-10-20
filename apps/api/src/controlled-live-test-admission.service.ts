@@ -43,38 +43,72 @@ export class ControlledLiveTestAdmissionService {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
     const scopedEntity = controlledManifestEntity(source.entity);
     if (!source.currentNativeId || source.currentNativeId !== source.sourceNativeId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_ID_MISMATCH');
-    const priorAdmissions = await this.database.controlledTestAdmission.findMany({ where: { runId: this.manifest.runId, entity: scopedEntity } });
-    const match = this.manifest.records.map((candidate: any) => {
+    const priorBindings = await this.database.controlledTestSourceBinding.findMany({ where: { runId: this.manifest.runId, entity: scopedEntity } });
+    const matches = this.manifest.records.map((candidate: any) => {
       if (candidate.entity !== scopedEntity || candidate.syntheticOnly !== true || candidate.name !== source.currentName ||
           !source.currentName.includes('тест') || !source.currentName.includes(this.manifest.runId) ||
           source.sourceCreatedAt.getTime() < new Date(candidate.createdAfterUtc).getTime() || source.sourceCreatedAt.getTime() > Date.now()) return null;
       if (candidate.sourceSystem === source.sourceSystem &&
-          candidate.sourceNativeId === source.sourceNativeId) return { record: candidate, reversed: false, prior: null };
+          candidate.sourceNativeId === source.sourceNativeId) return { record: candidate, reversed: false };
       if (candidate.direction === 'BOTH' && candidate.targetSystem === source.sourceSystem) {
-        const prior = priorAdmissions.find((row: any) => row.sourceSystem === candidate.sourceSystem &&
-          row.sourceNativeId === candidate.sourceNativeId &&
-          row.targetSystem === source.sourceSystem && row.targetNativeId === source.sourceNativeId);
-        if (prior) return { record: candidate, reversed: true, prior };
+        const prior = priorBindings.find((row: any) => bindingMatchesManifestPair(row, candidate));
+        if (prior && candidate.targetNativeId === source.sourceNativeId) return { record: candidate, reversed: true };
       }
       return null;
-    }).find((item: any) => item !== null);
-    if (!match) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_NOT_ADMITTED');
-    const { record, reversed, prior } = match;
+    }).filter((item: any) => item !== null);
+    if (matches.length !== 1) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_NOT_ADMITTED');
+    const { record, reversed } = matches[0];
+    const pair = canonicalProviderIds(record);
+    const expectedSourceSide = source.sourceSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+    const existingForSource = priorBindings.find((binding: any) => binding[expectedSourceSide] === source.sourceNativeId);
+    let binding = existingForSource;
+    if (binding) {
+      if (!bindingMatchesExpected(binding, this.manifest.runId, record, pair, this.providerNamespace!, source, reversed)) {
+        throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_CONFLICT');
+      }
+    } else {
+      if (reversed) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_NOT_ADMITTED');
+      try {
+        binding = await this.database.controlledTestSourceBinding.create({ data: {
+          runId: this.manifest.runId, entity: scopedEntity,
+          bitrix24NativeId: pair.bitrix24NativeId, moyskladNativeId: pair.moyskladNativeId,
+          bitrix24PortalOrigin: this.providerNamespace!.bitrix24PortalOrigin, bitrix24UserId: this.providerNamespace!.bitrix24UserId,
+          moyskladAccountId: this.providerNamespace!.moyskladAccountId,
+          sourceName: source.currentName, sourceCreatedAt: source.sourceCreatedAt,
+        } });
+      } catch (error) {
+        if (!isUniqueConstraintError(error)) throw error;
+        const raced = await this.database.controlledTestSourceBinding.findMany({ where: {
+          runId: this.manifest.runId, entity: scopedEntity,
+          OR: [
+            ...(pair.bitrix24NativeId ? [{ bitrix24NativeId: pair.bitrix24NativeId }] : []),
+            ...(pair.moyskladNativeId ? [{ moyskladNativeId: pair.moyskladNativeId }] : []),
+          ],
+        } });
+        const sameSource = raced.find((candidate: any) => candidate[expectedSourceSide] === source.sourceNativeId);
+        if (!sameSource || !bindingMatchesExpected(sameSource, this.manifest.runId, record, pair, this.providerNamespace!, source, reversed)) {
+          throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_CONFLICT');
+        }
+        binding = sameSource;
+      }
+    }
+    const eventTargetSystem = reversed ? record.sourceSystem : record.targetSystem;
+    const targetNativeId = eventTargetSystem === 'BITRIX24' ? binding.bitrix24NativeId : binding.moyskladNativeId;
     await this.database.controlledTestAdmission.upsert({
       where: { eventId },
       create: { eventId, runId: this.manifest.runId, entity: scopedEntity, sourceSystem: source.sourceSystem,
-        sourceNativeId: source.sourceNativeId, targetSystem: reversed ? record.sourceSystem : record.targetSystem,
-        targetNativeId: reversed ? prior.sourceNativeId : record.targetNativeId,
+        sourceNativeId: source.sourceNativeId, targetSystem: eventTargetSystem,
+        targetNativeId,
         bitrix24PortalOrigin: this.providerNamespace!.bitrix24PortalOrigin, bitrix24UserId: this.providerNamespace!.bitrix24UserId,
         moyskladAccountId: this.providerNamespace!.moyskladAccountId,
-        sourceName: source.currentName, sourceCreatedAt: source.sourceCreatedAt },
+        sourceName: source.currentName, sourceCreatedAt: source.sourceCreatedAt, bindingId: binding.id },
       update: {},
     });
     const existing = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     if (!existing || existing.runId !== this.manifest.runId || existing.entity !== scopedEntity ||
         existing.sourceSystem !== source.sourceSystem || existing.sourceNativeId !== source.sourceNativeId ||
-        existing.targetSystem !== (reversed ? record.sourceSystem : record.targetSystem) ||
-        existing.targetNativeId !== (reversed ? prior.sourceNativeId : record.targetNativeId) ||
+        existing.targetSystem !== eventTargetSystem ||
+        existing.targetNativeId !== targetNativeId || existing.bindingId !== binding.id ||
         existing.bitrix24PortalOrigin !== this.providerNamespace!.bitrix24PortalOrigin ||
         existing.bitrix24UserId !== this.providerNamespace!.bitrix24UserId ||
         existing.moyskladAccountId !== this.providerNamespace!.moyskladAccountId ||
@@ -132,14 +166,34 @@ export class ControlledLiveTestAdmissionService {
         !Number.isFinite(targetCreatedAt.getTime()) || targetCreatedAt.getTime() < new Date(record.createdAfterUtc).getTime() || targetCreatedAt.getTime() > Date.now()) {
       throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID');
     }
-    const existing = await this.database.controlledTestAdmission.findFirst({ where: {
-      runId: admission.runId, targetSystem: admission.targetSystem, targetNativeId, NOT: { eventId },
-    } });
-    if (existing) throw new Error('CONTROLLED_LIVE_TEST_TARGET_ALREADY_BOUND');
-    const changed = await this.database.controlledTestAdmission.updateMany({
-      where: { eventId, targetNativeId: null }, data: { targetNativeId },
-    });
-    if (changed.count !== 1 && admission.targetNativeId !== targetNativeId) throw new Error('CONTROLLED_LIVE_TEST_TARGET_BIND_CONFLICT');
+    const binding = await this.database.controlledTestSourceBinding.findUnique({ where: { id: admission.bindingId } });
+    if (!binding) throw new Error('CONTROLLED_LIVE_TEST_TARGET_BINDING_MISSING');
+    const targetField = admission.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+    const targetBefore = binding[targetField];
+    if (targetBefore !== null && targetBefore !== targetNativeId) throw new Error('CONTROLLED_LIVE_TEST_TARGET_BIND_CONFLICT');
+    if (binding.createReservedByEventId !== eventId) throw new Error('CONTROLLED_LIVE_TEST_CREATE_RESERVATION_REQUIRED');
+    try {
+      if (targetBefore === null) {
+        const changed = await this.database.controlledTestSourceBinding.updateMany({
+          where: { id: binding.id, [targetField]: null, createReservedByEventId: eventId } as any,
+          data: { [targetField]: targetNativeId },
+        });
+        if (changed.count !== 1) {
+          const current = await this.database.controlledTestSourceBinding.findUnique({ where: { id: binding.id } });
+          if (!current || current[targetField] !== targetNativeId || current.createReservedByEventId !== eventId) {
+            throw new Error('CONTROLLED_LIVE_TEST_TARGET_BIND_CONFLICT');
+          }
+        }
+      }
+    } catch (error) {
+      if (isUniqueConstraintError(error)) throw new Error('CONTROLLED_LIVE_TEST_TARGET_ALREADY_BOUND');
+      throw error;
+    }
+    if (admission.targetNativeId === null) {
+      await this.database.controlledTestAdmission.updateMany({ where: { eventId, targetNativeId: null }, data: { targetNativeId } });
+    } else if (admission.targetNativeId !== targetNativeId) {
+      throw new Error('CONTROLLED_LIVE_TEST_TARGET_BIND_CONFLICT');
+    }
     bindControlledLiveTarget(targetNativeId);
   }
 
@@ -164,6 +218,21 @@ export class ControlledLiveTestAdmissionService {
       candidate.targetSystem === targetSystem && candidate.targetNativeId === null);
     if (!admission || !record || admission.targetNativeId !== null || admission.targetSystem !== targetSystem || admission.entity !== entity) {
       throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
+    }
+    const binding = await this.database.controlledTestSourceBinding.findUnique({ where: { id: admission.bindingId } });
+    const targetField = targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+    if (!binding || binding[targetField] !== null) throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
+    const claimed = await this.database.controlledTestSourceBinding.updateMany({
+      where: { id: binding.id, [targetField]: null, OR: [
+        { createReservedByEventId: null }, { createReservedByEventId: eventId },
+      ] } as any,
+      data: { createReservedByEventId: eventId },
+    });
+    if (claimed.count !== 1) {
+      const current = await this.database.controlledTestSourceBinding.findUnique({ where: { id: binding.id } });
+      if (!current || current[targetField] !== null || current.createReservedByEventId !== eventId) {
+        throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
+      }
     }
   }
 
@@ -339,4 +408,38 @@ function manifestMatchesAdmission(record: any, admission: any): boolean {
   const reverse = record.direction === 'BOTH' && record.targetSystem === admission.sourceSystem && (record.targetNativeId === null || record.targetNativeId === admission.sourceNativeId) &&
     record.sourceSystem === admission.targetSystem && record.sourceNativeId === admission.targetNativeId;
   return forward || reverse;
+}
+
+function canonicalProviderIds(record: any): { bitrix24NativeId: string | null; moyskladNativeId: string | null } {
+  return {
+    bitrix24NativeId: record.sourceSystem === 'BITRIX24' ? record.sourceNativeId : record.targetNativeId,
+    moyskladNativeId: record.sourceSystem === 'MOYSKLAD' ? record.sourceNativeId : record.targetNativeId,
+  };
+}
+
+function bindingMatchesManifestPair(binding: any, record: any): boolean {
+  const pair = canonicalProviderIds(record);
+  return binding.entity === record.entity && binding.bitrix24NativeId === pair.bitrix24NativeId &&
+    binding.moyskladNativeId === pair.moyskladNativeId && binding.sourceName === record.name;
+}
+
+function bindingMatchesExpected(binding: any, runId: string, record: any,
+  pair: { bitrix24NativeId: string | null; moyskladNativeId: string | null },
+  namespace: ControlledLiveProviderNamespace, source: VerifiedControlledSource, reversed: boolean): boolean {
+  const sourceField = source.sourceSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetSystem = reversed ? record.sourceSystem : record.targetSystem;
+  const targetField = targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetExpected = reversed ? record.sourceNativeId : record.targetNativeId;
+  return binding.runId === runId && binding.entity === record.entity &&
+    binding[sourceField] === source.sourceNativeId &&
+    (pair.bitrix24NativeId === null || binding.bitrix24NativeId === pair.bitrix24NativeId) &&
+    (pair.moyskladNativeId === null || binding.moyskladNativeId === pair.moyskladNativeId) &&
+    (targetExpected === null || binding[targetField] === targetExpected) &&
+    binding.bitrix24PortalOrigin === namespace.bitrix24PortalOrigin &&
+    binding.bitrix24UserId === namespace.bitrix24UserId && binding.moyskladAccountId === namespace.moyskladAccountId &&
+    binding.sourceName === source.currentName && binding.sourceCreatedAt.getTime() === source.sourceCreatedAt.getTime();
+}
+
+function isUniqueConstraintError(error: unknown): error is { code: string } {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'P2002';
 }
