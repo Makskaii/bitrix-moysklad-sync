@@ -538,4 +538,4 @@ function configuredBase(name: string, localHttpAllowed: boolean): URL {
 }
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
 function msHref(base: URL, path: string): string { return new URL(path, withSlash(base)).href; }
-function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error('MySklad read token unavailable'); return { authorization: `Bearer ${token}`, accept: 'application/json' }; }
+function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error('MySklad read token unavailable'); return { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' }; }

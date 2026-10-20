@@ -30,6 +30,8 @@ let rows: Record<string, unknown>[] = [];
 let deal: Record<string, unknown>;
 let requestCount = 0;
 let nextRowId = 1;
+let requireExactMoyskladReadHeaders = false;
+let observedMoyskladReferenceHeaders: Array<{ accept: string | null; acceptEncoding: string | null }> = [];
 
 before(() => {
   for (const key of ['BITRIX24_REST_BASE_URL', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN']) originalEnv.set(key, process.env[key]);
@@ -59,6 +61,24 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.sourceRowValues.length, 2);
   assert.equal(result.input.payload.organization.meta.href, msRef('organization', uuids.organization));
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
+});
+
+test('deal-order reference probes use the required MySklad JSON charset and gzip headers', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  requireExactMoyskladReadHeaders = true;
+  observedMoyskladReferenceHeaders = [];
+  try {
+    const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-ms-reference-headers', eventConfig: eventConfig() });
+    assert.equal(result.status, 'READY');
+    assert.equal(observedMoyskladReferenceHeaders.length, 5);
+    assert.deepEqual(observedMoyskladReferenceHeaders, Array.from({ length: 5 }, () => ({
+      accept: 'application/json;charset=utf-8',
+      acceptEncoding: 'gzip',
+    })));
+  } finally {
+    requireExactMoyskladReadHeaders = false;
+  }
 });
 
 test('creation includes supported scalar custom attributes and holds unsupported configured mappings before order creation', async () => {
@@ -200,6 +220,16 @@ async function fakeFetch(input: string | URL | Request, init?: RequestInit): Pro
     return json({ rows: [{ id: uuids.product, meta: { type: 'product', href: msRef('product', uuids.product) }, uom: { id: uuids.unit } }] });
   }
   if (url.hostname === 'moysklad.test') {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers || undefined).forEach((value, name) => headers.set(name, value));
+    const isReferenceProbe = /\/entity\/(organization|store|employee|currency)\//.test(url.pathname) || /\/entity\/customerorder\/metadata\/states\//.test(url.pathname);
+    if (isReferenceProbe) {
+      observedMoyskladReferenceHeaders.push({ accept: headers.get('accept'), acceptEncoding: headers.get('accept-encoding') });
+      if (requireExactMoyskladReadHeaders &&
+          (headers.get('accept') !== 'application/json;charset=utf-8' || headers.get('accept-encoding') !== 'gzip')) {
+        return json({ errors: [{ code: 1062 }] }, 400);
+      }
+    }
     const state = url.pathname.match(/\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/);
     if (state) return json({ id: state[1], meta: { type: 'state' } });
     const entity = url.pathname.match(/\/entity\/(organization|store|employee|currency)\/([0-9a-f-]{36})$/);

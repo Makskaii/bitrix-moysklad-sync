@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
+import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
 import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
 
 process.env.SYNC_MODE ??= 'apply';
@@ -29,6 +30,8 @@ let nextNumberReadBarrier: { started: () => void; wait: Promise<void> } | null =
 let offAcknowledged = false;
 let requestsAfterOff = 0;
 let numberUpdates = 0;
+let headerContractDealId: string | null = null;
+let headerContractRequests: Array<{ path: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
 const suffix = randomUUID();
 let companyPairId = '';
 let productPairId = '';
@@ -112,6 +115,56 @@ test('durable OFF acknowledged after number read blocks the next B24 provider re
   }
 });
 
+test('production preparer validates MySklad refs and assortment with required headers under the PostgreSQL mode gate', async () => {
+  const mode = await db.syncSetting.findUniqueOrThrow({ where: { id: 'global' }, select: { serviceMode: true } });
+  assert.equal(mode.serviceMode, 'on');
+  headerContractDealId = `903${Date.now()}`;
+  headerContractRequests = [];
+  const resolver = {
+    async resolveForDocument() {
+      const pair = await db.entityPair.findUniqueOrThrow({ where: { id: companyPairId } });
+      return { status: 'RESOLVED', pair, companyPair: pair, selectedSourceId: '902', reason: 'TEST_FIXTURE' } as const;
+    },
+    async scheduleOptionalContactRetry() {},
+    async verifyServiceCounterparty() { return true; },
+  };
+  const preparer = new DealOrderCreationPreparer(database, resolver as never);
+  const settings = {
+    version: 4,
+    createdAt: new Date(0),
+    config: {
+      schemaVersion: 1,
+      rules: [],
+      groups: [],
+      references: {
+        units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }],
+        priceTypes: [], dictionaries: [],
+      },
+      dealOrderRuntime: {
+        nativeOrderNumberingVerified: true,
+        defaultOrganizationId: ids.organization,
+        defaultStoreId: ids.store,
+        defaultEmployeeId: ids.employee,
+        defaultProductGroupId: null,
+        currencies: [{ bitrix24Code: 'RUB', moyskladId: ids.currency }],
+        stages: [{ bitrix24StageId: 'NEW', moyskladId: ids.state, creationEnabled: true }],
+        organizations: [], stores: [], employees: [],
+      },
+    },
+    references: { units: [], priceTypes: [], dictionaries: [] },
+  } as never;
+  try {
+    const result = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `headers-${suffix}`, eventConfig: settings });
+    assert.equal(result.status, 'READY');
+    if (result.status === 'READY') assert.deepEqual(result.input.sourceRowIds, ['301'], 'the synthetic product row must reach the verified assortment endpoint');
+    assert.equal(headerContractRequests.length, 6, 'five named refs and one product assortment are read through the preparer');
+    assert.ok(headerContractRequests.every((request) => request.accept === 'application/json;charset=utf-8' && request.acceptEncoding === 'gzip'));
+  } finally {
+    headerContractDealId = null;
+    headerContractRequests = [];
+  }
+});
+
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
   posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
   activeOrderId = ids.order;
@@ -165,13 +218,34 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) return send(response, {
     id: activeOrderId, name: 'SO-54', meta: { type: 'customerorder' }, positions: { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` } }, quantity: 2, price: 0, discount: 0, vat: 0, vatEnabled: false }] },
   });
+  if (url.pathname === '/api/remap/1.2/entity/assortment' && headerContractDealId) {
+    captureHeaderContractRequest(request, url.pathname);
+    if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
+    return send(response, { rows: [{ id: ids.product, meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` }, uom: { id: ids.unit } }] });
+  }
   const entity = url.pathname.match(/\/entity\/(counterparty|organization|store|employee|currency)\/([0-9a-f-]{36})$/);
-  if (entity) return send(response, { id: entity[2], meta: { type: entity[1] } });
+  if (entity) {
+    if (headerContractDealId) {
+      captureHeaderContractRequest(request, url.pathname);
+      if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
+    }
+    return send(response, { id: entity[2], meta: { type: entity[1] } });
+  }
   const state = url.pathname.match(/\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/);
-  if (state) return send(response, { id: state[1], meta: { type: 'state' } });
+  if (state) {
+    if (headerContractDealId) {
+      captureHeaderContractRequest(request, url.pathname);
+      if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
+    }
+    return send(response, { id: state[1], meta: { type: 'state' } });
+  }
   const product = url.pathname.match(/\/entity\/product\/([0-9a-f-]{36})$/);
   if (product) return send(response, { id: product[1], meta: { type: 'product' }, uom: { id: ids.unit } });
   if (url.pathname === '/rest/crm.deal.get.json') {
+    if (body.get('id') === headerContractDealId) return send(response, { result: {
+      ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,
+      OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture',
+    } });
     if (nextNumberReadBarrier) {
       const barrier = nextNumberReadBarrier;
       nextNumberReadBarrier = null;
@@ -181,6 +255,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (failNextB24DealRead) { failNextB24DealRead = false; response.writeHead(500); response.end('{}'); return; }
     return send(response, { result: { ID: body.get('id'), UF_CRM_1729757435964: b24OrderNumber } });
   }
+  if (url.pathname === '/rest/crm.item.productrow.list' && body.get('filter[=ownerId]') === headerContractDealId) {
+    return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: 796, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
+  }
   if (url.pathname === '/rest/crm.deal.update.json') {
     numberUpdates++;
     b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
@@ -188,4 +265,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   response.writeHead(404); response.end('{}');
 }
-function send(response: ServerResponse, value: unknown) { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)); }
+function send(response: ServerResponse, value: unknown, status = 200) { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)); }
+function captureHeaderContractRequest(request: IncomingMessage, path: string) {
+  headerContractRequests.push({ path, accept: request.headers.accept, acceptEncoding: request.headers['accept-encoding'] });
+}
+function hasRequiredMySkladReadHeaders(request: IncomingMessage) {
+  return request.headers.accept === 'application/json;charset=utf-8' && request.headers['accept-encoding'] === 'gzip';
+}
