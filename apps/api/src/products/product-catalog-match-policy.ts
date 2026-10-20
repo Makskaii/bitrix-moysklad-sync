@@ -1,9 +1,3 @@
-export type CatalogUsage = {
-  count: number;
-  source: string;
-  coverage: string;
-} | null;
-
 export type ProductCatalogCandidate = {
   id: string;
   name: string | null;
@@ -13,12 +7,11 @@ export type ProductCatalogCandidate = {
   currency: string | null;
   taxSemantics: string | null;
   createdAt: string | Date | null;
-  usage: CatalogUsage;
 };
 
 export type ProductCatalogSelection =
   | { status: 'none' }
-  | { status: 'selected'; candidateId: string; usageSource: string; usageCoverage: string; tieBreak: 'usage' | 'creation' | 'creation-and-id' };
+  | { status: 'selected'; candidateId: string; selectionReason: 'EARLIEST_CREATION_DATE' | 'CREATION_DATE_TIED_NATIVE_ID' | 'CREATION_DATE_UNAVAILABLE_NATIVE_ID' };
 
 /** Exact identity/price comparison. The caller supplies values from the same configured price-type pair. */
 export function comparableCatalogPrice(left: ProductCatalogCandidate, right: ProductCatalogCandidate): boolean {
@@ -32,43 +25,29 @@ export function comparableCatalogPrice(left: ProductCatalogCandidate, right: Pro
 
 /**
  * The incoming item must already have passed exact configured price comparability.
- * Usage is ranked only when every candidate has a value from the same source and
- * coverage declaration; otherwise creation time is the only defensible fallback.
+ * Existing pairs are resolved by the caller before this policy is invoked.
+ * Among exact unpaired candidates, the earliest reliable creation date wins;
+ * ties or unavailable dates use native ID for deterministic selection.
  */
 export function chooseProductCatalogCandidate(candidates: ProductCatalogCandidate[]): ProductCatalogSelection {
   const eligible = candidates.filter((candidate) => candidate.id.length > 0 && candidate.name !== null);
   if (!eligible.length) return { status: 'none' };
 
-  const firstUsage = eligible[0]?.usage;
-  const comparableUsage = !!firstUsage && Number.isSafeInteger(firstUsage.count) && firstUsage.count >= 0 &&
-    eligible.every((candidate) => candidate.usage && Number.isSafeInteger(candidate.usage.count) && candidate.usage.count >= 0 &&
-      candidate.usage.source === firstUsage.source && candidate.usage.coverage === firstUsage.coverage);
-
-  let ranked = eligible;
-  let tieBreak: ProductCatalogSelection extends infer _ ? 'usage' | 'creation' | 'creation-and-id' : never = 'creation';
-  if (comparableUsage) {
-    const highest = Math.max(...eligible.map((candidate) => candidate.usage!.count));
-    ranked = eligible.filter((candidate) => candidate.usage!.count === highest);
-    if (ranked.length === 1) {
-      const winner = ranked[0]!;
-      return { status: 'selected', candidateId: winner.id, usageSource: firstUsage!.source, usageCoverage: firstUsage!.coverage, tieBreak: 'usage' };
-    }
-  }
-
-  const withCreation = ranked.map((candidate) => ({ candidate, time: validDate(candidate.createdAt) }));
+  const withCreation = eligible.map((candidate) => ({ candidate, time: validDate(candidate.createdAt) }));
   const validTimes = withCreation.flatMap(({ time }) => time === null ? [] : [time]);
   const creationUnavailable = validTimes.length !== withCreation.length;
+  let selectionReason: Extract<ProductCatalogSelection, { status: 'selected' }>['selectionReason'];
+  let ranked = eligible;
   if (validTimes.length && !creationUnavailable) {
     const earliest = Math.min(...validTimes);
     ranked = withCreation.filter(({ time }) => time === earliest).map(({ candidate }) => candidate);
+    selectionReason = ranked.length > 1 ? 'CREATION_DATE_TIED_NATIVE_ID' : 'EARLIEST_CREATION_DATE';
+  } else {
+    selectionReason = 'CREATION_DATE_UNAVAILABLE_NATIVE_ID';
   }
-  const byId = [...ranked].sort((left, right) => left.id.localeCompare(right.id));
+  const byId = [...ranked].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
   const winner = byId[0]!;
-  const creationTied = byId.length > 1 || creationUnavailable;
-  tieBreak = creationTied ? 'creation-and-id' : 'creation';
-  const source = comparableUsage ? firstUsage!.source : 'unavailable';
-  const coverage = comparableUsage ? firstUsage!.coverage : 'unavailable';
-  return { status: 'selected', candidateId: winner.id, usageSource: source, usageCoverage: coverage, tieBreak };
+  return { status: 'selected', candidateId: winner.id, selectionReason };
 }
 
 function validDate(value: string | Date | null): number | null {

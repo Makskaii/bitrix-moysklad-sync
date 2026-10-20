@@ -10,9 +10,7 @@ export type ProductDuplicateEvidence = {
   priceEqual: true;
   currencyVerified: true;
   taxComparable: true;
-  usageSource: string;
-  usageCoverage: string;
-  tieBreak: 'usage' | 'creation' | 'creation-and-id';
+  selectionReason: 'EARLIEST_CREATION_DATE' | 'CREATION_DATE_TIED_NATIVE_ID' | 'CREATION_DATE_UNAVAILABLE_NATIVE_ID';
   duplicateCreatedAt: string | null;
   canonicalCreatedAt: string | null;
   selectionCandidateCreatedAt?: string | null;
@@ -68,9 +66,7 @@ export class ProductDuplicateAliasService {
       duplicateBitrix24Id: alias.duplicateBitrix24Id,
       canonicalBitrix24Id: alias.canonicalBitrix24Id,
       canonicalMoyskladId: alias.canonicalMoyskladId,
-      usageSource: input.evidence.usageSource,
-      usageCoverage: input.evidence.usageCoverage,
-      tieBreak: input.evidence.tieBreak,
+      selectionReason: input.evidence.selectionReason,
     }), alias.id);
     return alias;
   }

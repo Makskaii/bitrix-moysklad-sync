@@ -364,10 +364,10 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const targetPrices = target.prices.filter((price) => price.typeId === mapping.moyskladId);
       if (targetPrices.length !== 1) continue;
       available.push({ id: candidate.id, name: candidate.name, kind, priceTypeKey: String(mapping.bitrix24Id), price: targetPrices[0]!.value,
-        currency: targetPrices[0]!.currency, taxSemantics: target.taxSemantics, createdAt: candidate.createdAt, usage: null });
+        currency: targetPrices[0]!.currency, taxSemantics: target.taxSemantics, createdAt: candidate.createdAt });
     }
     const incoming: ProductCatalogCandidate = { id: `b24:${productId}`, name: source.name, kind, priceTypeKey: String(mapping.bitrix24Id),
-      price: sourcePrice[0]!.value, currency: sourcePrice[0]!.currency, taxSemantics: source.taxSemantics, createdAt: source.createdAt ?? null, usage: null };
+      price: sourcePrice[0]!.value, currency: sourcePrice[0]!.currency, taxSemantics: source.taxSemantics, createdAt: source.createdAt ?? null };
     const eligible = available.filter((candidate) => comparableCatalogPrice(incoming, candidate));
     const selection = chooseProductCatalogCandidate(eligible);
     if (selection.status !== 'selected') return null;
@@ -379,7 +379,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       await this.duplicateAliases.record({ duplicateBitrix24Id: productId, canonicalPairId: pair.id, moyskladType: kind,
         reason: 'EXACT_NAME_CONFIGURED_PRICE_CURRENCY_AND_TAX_MATCH', evidence: {
           nameExact: true, configuredPriceType: String(mapping.bitrix24Id), priceEqual: true, currencyVerified: true, taxComparable: true,
-          usageSource: selection.usageSource, usageCoverage: selection.usageCoverage, tieBreak: selection.tieBreak,
+          selectionReason: selection.selectionReason,
           duplicateCreatedAt: source.createdAt ?? null,
           canonicalCreatedAt: (await this.bitrixApi.readBitrix24(pair.bitrix24Id, kind).catch(() => null))?.createdAt ?? null,
           selectionCandidateCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
@@ -398,8 +398,8 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     });
     if (created) await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_EXACT_CATALOG_PAIR_CREATED', pairId: created,
       bitrix24Id: productId, moyskladId: targetCandidate.id, kind, nameExact: true, configuredPriceType: String(mapping.bitrix24Id),
-      priceEqual: true, currencyVerified: true, taxComparable: true, usageSource: selection.usageSource, usageCoverage: selection.usageCoverage,
-      tieBreak: selection.tieBreak, moyskladCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
+      priceEqual: true, currencyVerified: true, taxComparable: true, selectionReason: selection.selectionReason,
+      moyskladCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
     }), eventId);
     return created;
   }

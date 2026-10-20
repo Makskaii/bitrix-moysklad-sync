@@ -96,7 +96,7 @@ test('public form-urlencoded product signal restores only Bitrix24 from an activ
 
     const aliases = duplicateAliases;
     const evidence = { nameExact: true as const, configuredPriceType: '2', priceEqual: true as const, currencyVerified: true as const,
-      taxComparable: true as const, usageSource: 'unavailable', usageCoverage: 'unavailable', tieBreak: 'creation' as const,
+      taxComparable: true as const, selectionReason: 'EARLIEST_CREATION_DATE' as const,
       duplicateCreatedAt: null, canonicalCreatedAt: null, selectionCandidateCreatedAt: null, selectionCandidateCreatedAtSource: 'unavailable' };
     const alias = await aliases.record({ duplicateBitrix24Id: '9001', canonicalPairId: pairId, moyskladType: 'product',
       reason: 'EXACT_NAME_CONFIGURED_PRICE_CURRENCY_AND_TAX_MATCH', evidence });
