@@ -7,11 +7,13 @@ import { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
+import { LocalPreviewFixtureFieldDataProvider } from '../src/admin/local-preview-fixtures';
 import { DatabaseService } from '../src/database.service';
 import { DatabaseRecoveryService } from '../src/database-recovery.service';
 import { DealOrderHeaderSyncProcessor } from '../src/deals-orders/deal-order-header-sync.processor';
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
+import { DEFAULT_FIELD_SETTINGS } from '../src/field-settings/approved-mappings';
 
 let app: INestApplication;
 let apiUrl = '';
@@ -27,7 +29,9 @@ const moyskladPositionId = '32345678-1234-1234-1234-123456789abc';
 const moyskladUnitId = '42345678-1234-1234-1234-123456789abc';
 const oldEnv = new Map<string, string | undefined>();
 let bitrixComments = 'B24 initial';
+let bitrixTitle = 'B24 title initial';
 let moyskladDescription = 'MS initial';
+let moyskladName = 'MS title initial';
 let bitrixCompanyId = '0';
 let moyskladAgentId: string | null = null;
 let bitrixOpportunity = '1';
@@ -73,7 +77,7 @@ before(async () => {
   await setupDatabase.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
   await setupDatabase.$disconnect();
 
-  app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
+  app = await NestFactory.create(LocalAdminPreviewModule.register(DatabaseService, LocalPreviewFixtureFieldDataProvider), { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
   const database = app.get(DatabaseService);
@@ -96,7 +100,9 @@ before(async () => {
 
 beforeEach(async () => {
   bitrixComments = 'B24 initial';
+  bitrixTitle = 'B24 title initial';
   moyskladDescription = 'MS initial';
+  moyskladName = 'MS title initial';
   bitrixCompanyId = '0';
   moyskladAgentId = null;
   bitrixOpportunity = '1';
@@ -595,8 +601,14 @@ test('dry first-event baseline uses the isolated dry database and performs reads
   await drySetupDatabase.entityPairBaseline.deleteMany({});
   await drySetupDatabase.entityPairSyncState.deleteMany({});
   await drySetupDatabase.entityPair.deleteMany({ where: { entityType: 'DEAL' } });
+  await drySetupDatabase.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
+  await drySetupDatabase.syncDirectionSetting.upsert({
+    where: { entityKey: 'deals-orders' },
+    create: { entityKey: 'deals-orders', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+  });
   await drySetupDatabase.$disconnect();
-  app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false });
+  app = await NestFactory.create(LocalAdminPreviewModule.register(DatabaseService, LocalPreviewFixtureFieldDataProvider), { logger: false });
   await app.listen(0, '127.0.0.1');
   apiUrl = await app.getUrl();
   const database = app.get(DatabaseService);
@@ -653,16 +665,88 @@ test('public company webhook pairs by unique normalized email and reads back bot
   });
   assert.equal(response.status, 200);
   const { eventId } = await response.json() as { eventId: string };
-  await waitForEventStatus(database, eventId, 'SUCCEEDED');
+  await waitForEventStatus(database, eventId, 'UNCHANGED');
 
   const pair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'COMPANY', bitrix24Id: runtimeCompanyId, active: true } });
   assert.equal(pair.moyskladId, runtimeCompanyMoyskladId);
   assert.match(pair.reason ?? '', /normalized_email/i);
   assert.match(pair.reason ?? '', /no name or phone match was required/i);
-  assert.ok(externalRequests.some(({ path }) => path.startsWith('/ms/api/remap/1.2/entity/counterparty?') && path.toLowerCase().includes('email=match.email%40example.test')));
+  assert.ok(externalRequests.some(({ path }) => {
+    const request = new URL(path, fakeBase);
+    return request.pathname === '/ms/api/remap/1.2/entity/counterparty' && request.searchParams.get('filter') === 'email=match.email@example.test';
+  }));
   assert.ok(externalRequests.some(({ path }) => path === '/b24/rest/crm.company.get.json'));
   assert.ok(externalRequests.some(({ path }) => path === `/ms/api/remap/1.2/entity/counterparty/${runtimeCompanyMoyskladId}`));
   assert.equal(externalRequests.some(isWrite), false, 'the email match must not create a target or issue a field write');
+});
+
+test('public V1-pinned event, HTTP V2 save and webhook revision preserve the V2 baseline when an old retry resumes', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_500_000_000 + Math.floor(Math.random() * 1_000_000));
+  moyskladId = randomUUID();
+  const settingsVersion = 1_350_000 + Math.floor(Math.random() * 10_000);
+  const pair = await createPairAndSettings(database, settingsVersion, false);
+  await createProductPair(database);
+  const testReferences = {
+    ...structuredClone(DEFAULT_FIELD_SETTINGS.references),
+    units: [...structuredClone(DEFAULT_FIELD_SETTINGS.references.units), { bitrix24Id: 796, bitrix24Code: '796', moyskladId: moyskladUnitId, moyskladCode: '796', status: 'configured' as const }],
+  };
+  const initialVersion = await app.get(FieldSettingsService).version(settingsVersion);
+  await database.fieldSettingsVersion.update({ where: { version: settingsVersion }, data: { config: { ...initialVersion.config, references: testReferences } } });
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  const initialResponse = await postB24(bitrixId, bitrixComments, 'initial-v1-baseline');
+  assert.equal(initialResponse.status, 200);
+  const { eventId: initialEventId } = await initialResponse.json() as { eventId: string };
+  await waitForEventStatus(database, initialEventId, 'SUCCEEDED');
+  assert.equal((await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, settingsVersion);
+
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } });
+
+  const oldResponse = await postB24(bitrixId, bitrixComments, 'old-v1-pending');
+  assert.equal(oldResponse.status, 200);
+  const { eventId: oldEventId } = await oldResponse.json() as { eventId: string };
+  assert.equal((await app.get(FieldSettingsService).eventConfig(oldEventId)).version, settingsVersion, 'the durable event keeps its original V1 pin');
+  await database.inboundEvent.update({ where: { id: oldEventId }, data: { status: 'RETRYABLE_FAILURE', retryAfter: new Date(Date.now() + 3_600_000), lastErrorCategory: 'SYNTHETIC_DEFERRED_RETRY' } });
+
+  const v1 = await app.get(FieldSettingsService).version(settingsVersion);
+  const v2Config = {
+    ...v1.config,
+    references: testReferences,
+    rules: [...v1.config.rules, {
+      id: 'deal-title-from-ms', entity: 'deals-orders', sourceField: 'TITLE', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+    }],
+  };
+  const saveResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ config: v2Config }),
+  });
+  const savedConfigResponse = await saveResponse.json() as { version?: number; config?: { rules?: Array<{ id: string }> }; message?: string };
+  assert.equal(saveResponse.status, 200, savedConfigResponse.message);
+  const v2 = savedConfigResponse as { version: number; config: { rules: Array<{ id: string }> } };
+  assert.equal(v2.version, settingsVersion + 1);
+  assert.ok(v2.config.rules.some((rule) => rule.id === 'deal-title-from-ms'));
+
+  moyskladName = 'MS V2 authority';
+  await database.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  const newResponse = await postB24(bitrixId, bitrixComments, 'new-v2-webhook');
+  assert.equal(newResponse.status, 200);
+  const { eventId: newEventId } = await newResponse.json() as { eventId: string };
+  await waitForEventStatus(database, newEventId, 'SUCCEEDED');
+  assert.equal(bitrixTitle, 'MS V2 authority', 'the new mapping writes MS authority to Bitrix24 and observes it on readback');
+  const baselineV2 = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.equal(baselineV2.settingsVersion, v2.version);
+  assert.equal((baselineV2.bitrix24Values as Record<string, unknown>)['rule:deal-title-from-ms'], 'MS V2 authority', 'the V2 mapping was reconciled from MySklad authority and read back');
+  assert.equal((await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, v2.version);
+  const revision = await database.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId: pair.id, toSettingsVersion: v2.version } } });
+  assert.equal(revision.status, 'COMPLETE');
+
+  await database.inboundEvent.update({ where: { id: oldEventId }, data: { retryAfter: new Date(Date.now() - 1_000) } });
+  await waitForEventStatus(database, oldEventId, 'UNCHANGED');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: oldEventId } })).lastErrorCategory, 'SETTINGS_PIN_SUPERSEDED');
+  const afterOldRetry = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.equal(afterOldRetry.settingsVersion, v2.version, 'resumed V1 work cannot roll the pair back');
+  assert.equal((await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } })).settingsVersion, v2.version);
 });
 
 async function createConfirmedPairAndSettings(database: DatabaseService, settingsVersion: number) {
@@ -711,7 +795,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       return;
       }
     }
-    response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMPANY_ID: bitrixCompanyId, COMMENTS: bitrixComments, OPPORTUNITY: bitrixOpportunity, CURRENCY_ID: 'RUB', DATE_CREATE: '2026-10-05T10:00:00+00:00', DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
+    response.writeHead(200); response.end(JSON.stringify({ result: { ID: bitrixId, COMPANY_ID: bitrixCompanyId, COMMENTS: bitrixComments, TITLE: bitrixTitle, OPPORTUNITY: bitrixOpportunity, CURRENCY_ID: 'RUB', DATE_CREATE: '2026-10-05T10:00:00+00:00', DATE_MODIFY: '2026-10-06T10:00:00+00:00' } }));
   } else if (path === '/b24/rest/crm.company.get.json' && request.method === 'POST') {
     const id = new URLSearchParams(body).get('id') ?? '';
     response.writeHead(200); response.end(JSON.stringify({ result: {
@@ -719,7 +803,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       EMAIL: id === runtimeCompanyId ? [{ VALUE: runtimeCompanyEmail.toUpperCase(), VALUE_TYPE: 'WORK' }] : [], PHONE: [],
       DATE_CREATE: '2026-10-05T10:00:00+00:00', DATE_MODIFY: '2026-10-06T10:00:00+00:00',
     } }));
-  } else if (path === '/b24/rest/crm.requisite.list.json' && request.method === 'POST') {
+  } else if (path === '/b24/rest/crm.requisite.list' && request.method === 'POST') {
     response.writeHead(200); response.end(JSON.stringify({ result: [], total: 0 }));
   } else if (path === '/b24/rest/crm.company.update.json' && request.method === 'POST') {
     response.writeHead(200); response.end(JSON.stringify({ result: true }));
@@ -733,6 +817,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     const form = new URLSearchParams(body);
     bitrixComments = form.get('fields[COMMENTS]') ?? bitrixComments;
+    bitrixTitle = form.get('fields[TITLE]') ?? bitrixTitle;
     bitrixCompanyId = form.get('fields[COMPANY_ID]') ?? bitrixCompanyId;
     if (form.has('fields[OPPORTUNITY]')) { bitrixOpportunity = form.get('fields[OPPORTUNITY]') ?? bitrixOpportunity; opportunityWrites++; }
     response.writeHead(200); response.end(JSON.stringify({ result: true }));
@@ -744,7 +829,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
       return;
     }
-    const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription, sum: moyskladOrderSum, currency: { isoCode: 'RUB' }, vatIncluded: false, created: '2026-10-05 13:00:00', updated: '2026-10-07T10:00:00+00:00' };
+    const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, name: moyskladName, description: moyskladDescription, sum: moyskladOrderSum, currency: { isoCode: 'RUB' }, vatIncluded: false, created: '2026-10-05 13:00:00', updated: '2026-10-07T10:00:00+00:00' };
     if (moyskladAgentId) order.agent = { id: moyskladAgentId, meta: { href: `${fakeBase}/entity/counterparty/${moyskladAgentId}`, type: 'counterparty' } };
     response.writeHead(200); response.end(JSON.stringify(order));
   } else if (new URL(path, fakeBase).pathname === '/ms/api/remap/1.2/entity/counterparty' && request.method === 'GET') {
@@ -780,7 +865,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(429, { 'content-type': 'text/plain' }); response.end('temporarily rate limited');
       return;
     }
-    const payload = JSON.parse(body) as { description?: string; agent?: { meta?: { href?: string } } };
+    const payload = JSON.parse(body) as { name?: string; description?: string; agent?: { meta?: { href?: string } } };
+    if (typeof payload.name === 'string') moyskladName = payload.name;
     if (typeof payload.description === 'string') moyskladDescription = payload.description;
     if (payload.agent?.meta?.href) moyskladAgentId = new URL(payload.agent.meta.href).pathname.split('/').at(-1) ?? null;
     response.writeHead(200); response.end(JSON.stringify({ id: moyskladId, meta: { type: 'customerorder' }, description: moyskladDescription }));
