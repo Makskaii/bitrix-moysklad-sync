@@ -64,6 +64,7 @@ import { readFileSync } from 'node:fs';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from './external-write-guard';
 import { verifyControlledLiveProviderNamespace } from './controlled-live-test-namespace';
 import { createControlledLiveTestPolicy } from './controlled-live-test-policy';
+import { resolveApiBindHost } from './api-bind-host';
 import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
 import { InvoiceHttpApi } from './invoices/invoice-http-api';
 import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
@@ -103,6 +104,7 @@ class AppController {
 class AppModule {}
 
 async function bootstrap() {
+  const apiBindHost = resolveApiBindHost(process.env.API_BIND_HOST);
   if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
     if (process.env.CONTROLLED_LIVE_TEST_INSTANCE !== 'isolated') {
       throw new Error('CONTROLLED_LIVE_TEST_REQUIRES_ISOLATED_INSTANCE');
@@ -126,7 +128,7 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
   await app.get(DatabaseRecoveryService).initialize();
   app.useStaticAssets(resolve(__dirname, '../../../../apps/web/dist'));
-  await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
+  await app.listen(process.env.PORT ?? 3000, apiBindHost);
 }
 
 void bootstrap();

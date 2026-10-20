@@ -2,6 +2,7 @@
   "name": "@sync/api",
   "private": true,
   "scripts": {
+    "test:api-bind-host": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/api-bind-host.unit.js",
     "build": "tsc -p tsconfig.build.json",
     "test:admin": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-access.integration.js",
     "test:admin-audit": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/admin-audit.integration.js",
