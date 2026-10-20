@@ -135,6 +135,9 @@ export class EventIntakeService {
 
     await this.ensureIntakeEnabled();
     if (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 200)) {
+      if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        return { accepted: false, eventIds: [], contactEventIds: [], pairEventIds: [], rejectedCount: 1, reason: 'controlled_scope_rejected' };
+      }
       throw new BadRequestException('MoySklad requestId must be a non-empty string when provided');
     }
 

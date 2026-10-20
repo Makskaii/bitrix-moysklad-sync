@@ -211,15 +211,19 @@ test('controlled BOTH direction requires the exact opposite native ID and retain
 test('controlled MoySklad malformed and empty batches are acknowledged without persistence or dispatch', async () => {
   const beforeRows = stored.length;
   const beforeDispatch = processorEnqueued.length;
-  for (const body of [{ events: [] }, { events: [null, 'malformed'] }]) {
-    const response = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-ingress-test-secret`, {
+  for (const { body, suffix, expectedRejected } of [
+    { body: { events: [] }, suffix: '', expectedRejected: 1 },
+    { body: { events: [null, 'malformed'] }, suffix: '', expectedRejected: 2 },
+    { body: { events: [] }, suffix: '?requestId=', expectedRejected: 1 },
+  ]) {
+    const response = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-ingress-test-secret${suffix}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
     assert.equal(response.status, 200);
     const ack = await response.json() as { accepted: boolean; rejectedCount: number; reason: string };
     assert.equal(ack.accepted, false);
     assert.equal(ack.reason, 'controlled_scope_rejected');
-    assert.equal(ack.rejectedCount, body.events.length || 1);
+    assert.equal(ack.rejectedCount, expectedRejected);
   }
   assert.equal(stored.length, beforeRows);
   assert.equal(processorEnqueued.length, beforeDispatch);
