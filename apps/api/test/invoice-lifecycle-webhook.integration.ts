@@ -143,7 +143,7 @@ const inboundEntityLock = {
 };
 
 const tx = {
-  $queryRaw: async () => [{ locked: 1 }],
+  $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
   entityPair,
   pairReviewCase: { findFirst: async () => null, create: async () => ({}) },
   operationalLog: { create: async () => ({}) },
