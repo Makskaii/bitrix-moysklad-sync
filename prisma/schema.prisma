@@ -119,9 +119,30 @@ model InboundEvent {
   lastErrorCategory   String?
   retryAfter          DateTime?
   settings            InboundEventSettings?
+  controlledTestAdmission ControlledTestAdmission?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+}
+
+model ControlledTestAdmission {
+  eventId       String       @id
+  runId         String
+  entity        String
+  sourceSystem  String
+  sourceNativeId String
+  targetSystem  String
+  targetNativeId String?
+  bitrix24PortalOrigin String?
+  bitrix24UserId String?
+  moyskladAccountId String?
+  sourceName    String
+  sourceCreatedAt DateTime
+  admittedAt    DateTime     @default(now())
+  event         InboundEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, entity, sourceSystem, sourceNativeId], map: "ctl_test_admission_source_uq")
+  @@unique([runId, entity, targetSystem, targetNativeId], map: "ctl_test_admission_target_uq")
 }
 
 model FieldSettingsVersion {

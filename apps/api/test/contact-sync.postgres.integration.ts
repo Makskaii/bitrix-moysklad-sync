@@ -527,11 +527,11 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
   nightlyProviderQueries.length = 0;
   try {
     freezeTime('2026-10-05T22:00:00.000Z');
-    await waitForNightlyStatus('complete_with_limitations');
+    await waitForNightlyStatus('awaiting_processing');
     const status = await readRecoveryStatus();
     assert.deepEqual(status.nightly, {
       scheduledDate: '2026-10-06',
-      status: 'complete_with_limitations',
+      status: 'awaiting_processing',
       from: '2026-10-04T22:00:00.000Z',
       through: '2026-10-05T22:00:00.000Z',
       provider: 'COMPLETE',
@@ -543,7 +543,7 @@ test('nightly reconciliation runs at 01:00 Moscow for the previous 24 hours', as
       moyskladStatus: 'complete',
       retryAfter: null,
       attempts: 1,
-      error: 'Nightly feeds cover active Bitrix24 contact/company pairs and MoySklad contact persons attached to active company pairs. Delete and archival changes remain outside this slice.',
+      error: 'Provider feeds are queued for active pairs; waiting for event processing. Delete and archival changes remain outside this slice.',
     });
     const bitrixQueries = nightlyProviderQueries.filter((query) => query.startsWith('{')).map((query) => JSON.parse(query));
     assert.deepEqual(bitrixQueries.map((query) => query.entityTypeId), [3, 4]);
@@ -598,7 +598,7 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
   nightlyProviderQueries.length = 0;
   try {
     freezeTime('2026-10-08T22:00:00.000Z');
-    await waitForNightlyStatus('complete_with_limitations');
+    await waitForNightlyStatus('awaiting_processing');
     const events = await database.inboundEvent.findMany({ where: { source: 'BITRIX24', externalEntityId: bitrixCompanyId } });
     assert.equal(events.length, 1);
     assert.equal(events[0].eventType, 'ONCRMCOMPANYUPDATE');
@@ -613,6 +613,76 @@ test('nightly changed IDs are deduplicated, limited to active pairs, and pinned 
     nightlyBitrixCompanyIds = [];
     await database.inboundEvent.deleteMany({ where: { externalEntityId: bitrixCompanyId } });
     await database.entityPair.delete({ where: { id: pair.id } });
+  }
+});
+
+test('nightly rechecks accepted events only for an enabled scope with an active exact-ID pair', async () => {
+  const database = app.get(DatabaseService);
+  const suffix = randomUUID();
+  const activeId = `accepted-contact-${suffix}`;
+  const inactiveId = `inactive-contact-${suffix}`;
+  const directionSkippedId = `skipped-contact-${suffix}`;
+  const unreadyProductId = `accepted-product-${suffix}`;
+  const activePair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: activeId, moyskladId: `accepted-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  const inactivePair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: inactiveId, moyskladId: `inactive-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: false,
+  } });
+  const skippedPair = await database.entityPair.create({ data: {
+    entityType: 'CONTACT', bitrix24Id: directionSkippedId, moyskladId: `skipped-counterparty-${suffix}`,
+    moyskladType: 'counterparty', active: true,
+  } });
+  const productPair = await database.entityPair.create({ data: {
+    entityType: 'PRODUCT', bitrix24Id: unreadyProductId, moyskladId: `accepted-product-ms-${suffix}`,
+    moyskladType: 'product', active: true,
+  } });
+  await database.syncDirectionSetting.upsert({
+    where: { entityKey: 'contacts-companies' },
+    create: { entityKey: 'contacts-companies', bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+    update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true },
+  });
+  const acceptedAt = new Date('2026-10-18T23:00:00.000Z');
+  const originalEvents = await database.inboundEvent.createMany({ data: [activeId, inactiveId].map((id) => ({
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${id}`, eventType: 'ONCRMCONTACTUPDATE',
+    externalEntityType: 'contact', externalEntityId: id, payload: { event: 'ONCRMCONTACTUPDATE' },
+    status: 'SUCCEEDED', receivedAt: acceptedAt,
+  })) .concat([{
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${directionSkippedId}`, eventType: 'ONCRMCONTACTUPDATE',
+    externalEntityType: 'contact', externalEntityId: directionSkippedId, payload: { event: 'ONCRMCONTACTUPDATE' },
+    status: 'SKIPPED_DIRECTION_DISABLED', receivedAt: acceptedAt,
+  }, {
+    source: 'BITRIX24', deliveryKey: `accepted-recheck:${unreadyProductId}`, eventType: 'CATALOG.PRODUCT.ON.UPDATE',
+    externalEntityType: 'product', externalEntityId: unreadyProductId, payload: { event: 'CATALOG.PRODUCT.ON.UPDATE' },
+    status: 'SUCCEEDED', receivedAt: acceptedAt,
+  }]) });
+  assert.equal(originalEvents.count, 4);
+  await database.syncSetting.update({ where: { id: 'global' }, data: {
+    serviceMode: 'on', lastInactiveAt: null, lastActiveAt: null,
+    nightlyScheduledDate: null, nightlyStatus: 'idle', nightlyFrom: null, nightlyThrough: null,
+    nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending', nightlyRetryAfter: null,
+  } });
+  nightlyBitrixCompanyIds = [];
+  nightlyBitrixSecondPageIds = [];
+  nightlyMoyskladMetaSize = 0;
+  try {
+    freezeTime('2026-10-18T22:00:00.000Z');
+    await waitForNightlyStatus('awaiting_processing');
+    const rechecks = await database.inboundEvent.findMany({
+      where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } },
+      select: { externalEntityId: true, eventType: true, status: true, payload: true },
+    });
+    assert.deepEqual(rechecks.map((event) => event.externalEntityId), [activeId]);
+    assert.equal(rechecks[0]?.eventType, 'ONCRMCONTACTUPDATE');
+    assert.equal(rechecks[0]?.status, 'RECEIVED');
+    assert.equal((rechecks[0]?.payload as { recovery?: string }).recovery, 'nightly');
+  } finally {
+    restoreTime();
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: `accepted-recheck:` } } });
+    await database.inboundEvent.deleteMany({ where: { deliveryKey: { startsWith: 'nightly:2026-10-19:CONTACT:' } } });
+    await database.entityPair.deleteMany({ where: { id: { in: [activePair.id, inactivePair.id, skippedPair.id, productPair.id] } } });
   }
 });
 
@@ -730,7 +800,7 @@ test('lease loss during a provider call replays the page without duplicate durab
     holdNightlyCompanyFeed = false;
     await run();
     state = await database.syncSetting.findUnique({ where: { id: 'global' } });
-    assert.equal(state?.nightlyStatus, 'complete_with_limitations');
+    assert.equal(state?.nightlyStatus, 'awaiting_processing');
     assert.equal(await database.inboundEvent.count({ where: { source: 'BITRIX24', externalEntityId: bitrixId } }), 1);
   } finally {
     releaseNightlyCompanyFeed();

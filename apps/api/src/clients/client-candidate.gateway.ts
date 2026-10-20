@@ -11,6 +11,7 @@ import {
 export const CLIENT_CANDIDATE_GATEWAY = Symbol('CLIENT_CANDIDATE_GATEWAY');
 
 export interface WritableClientCandidateGateway extends ClientCandidateGateway {
+  readRecord(sourceSystem: ClientSystem, entity: ClientEntity, idValue: string, parentId?: string | null): Promise<Record<string, unknown>>;
   readCounterparty(id: string): Promise<Record<string, unknown>>;
   readCompanyInn(sourceSystem: ClientSystem, id: string): Promise<string | null>;
   unmarkedBitrixCompanyEquivalents(input: { id: string; name: string | null; phone: string | null; inn: string | null }): Promise<ClientCandidate[]>;
@@ -152,7 +153,9 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
         ? firstString(input.source.name, input.source.TITLE)
         : personName(input.source);
       if (!sourceName) throw new Error('CLIENT_CREATE_REQUIRED_NAME_MISSING');
-      const body: Record<string, unknown> = { name: sourceName, ...input.configuredFields };
+      const body: Record<string, unknown> = process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? { ...input.configuredFields, name: sourceName }
+        : { name: sourceName, ...input.configuredFields };
       if (input.entity === 'CONTACT' && input.targetType === 'counterparty') body.companyType = 'individual';
       const path = input.targetType === 'contactperson'
         ? `entity/counterparty/${encodeURIComponent(required(input.parentId, 'CLIENT_CONTACT_PARENT_REQUIRED'))}/contactpersons`
@@ -164,7 +167,7 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
         } });
         return targetId;
       }
-      assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CREATE');
+      assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CREATE', null, `client:${input.entity}`);
       const created = await this.moyskladRequest(path, 'POST', body);
       const resultId = isRecord(created) ? id(created.id) : null;
       if (!resultId) throw new Error('CLIENT_CREATE_RESPONSE_INVALID');
@@ -174,14 +177,16 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     const sourceName = input.entity === 'COMPANY' ? firstString(input.source.TITLE, input.source.name) : personName(input.source);
     if (!sourceName) throw new Error('CLIENT_CREATE_REQUIRED_NAME_MISSING');
     const fields = input.entity === 'COMPANY'
-      ? { TITLE: sourceName, ...input.configuredFields }
-      : { NAME: sourceName, ...input.configuredFields, ...(input.parentId ? { COMPANY_ID: input.parentId } : {}) };
+      ? process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? { ...input.configuredFields, TITLE: sourceName } : { TITLE: sourceName, ...input.configuredFields }
+      : process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+        ? { ...input.configuredFields, ...(input.parentId ? { COMPANY_ID: input.parentId } : {}), NAME: sourceName }
+        : { NAME: sourceName, ...input.configuredFields, ...(input.parentId ? { COMPANY_ID: input.parentId } : {}) };
     if (process.env.SYNC_MODE === 'dry' && this.dryWrites) {
       const targetId = `${Date.now()}${String(Math.floor(Math.random() * 1_000)).padStart(3, '0')}`;
       await this.dryWrites.propose({ eventId: input.eventId, provider: 'BITRIX24', entityType: input.entity.toLowerCase(), entityId: targetId, operation: 'CREATE', fields: { ID: targetId, ...fields } });
       return targetId;
     }
-    assertApplyExternalWrite('BITRIX24', 'CLIENT_CREATE');
+    assertApplyExternalWrite('BITRIX24', 'CLIENT_CREATE', null, `client:${input.entity}`);
     const result = await this.bitrixRequest(method, { fields });
     const createdId = id(result);
     if (!createdId) throw new Error('CLIENT_CREATE_RESPONSE_INVALID');
@@ -305,7 +310,11 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   private async bitrixJsonRequest(method: string, parameters: Record<string, unknown>): Promise<unknown> {
-    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CLIENT_CANDIDATE_REQUEST');
+    if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) {
+      const nativeId = /\.add(?:\.json)?$/i.test(method) ? null : String(parameters.id ?? '');
+      const entity = method.startsWith('crm.company.') ? 'client:COMPANY' : method.startsWith('crm.contact.') ? 'client:CONTACT' : undefined;
+      assertApplyExternalWrite('BITRIX24', /\.add(?:\.json)?$/i.test(method) ? 'CLIENT_CREATE' : 'CLIENT_CANDIDATE_REQUEST', nativeId, entity);
+    }
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
     const form = new URLSearchParams();
@@ -336,7 +345,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   }
 
   private async moyskladRequestUrl(url: URL, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<unknown> {
-    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CANDIDATE_REQUEST');
+    if (method !== 'GET') {
+      const nativeId = url.pathname.match(/\/(?:counterparty|contactpersons)\/([^/]+)$/)?.[1] ?? null;
+      const bodyIsIndividual = body?.companyType === 'individual';
+      const entity = url.pathname.includes('/contactpersons') || bodyIsIndividual ? 'client:CONTACT' : 'client:COMPANY';
+      assertApplyExternalWrite('MOYSKLAD', method === 'POST' ? 'CLIENT_CREATE' : 'CLIENT_CANDIDATE_REQUEST', nativeId ? decodeURIComponent(nativeId) : null, entity);
+    }
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
     const response = await this.fetcher(url, {

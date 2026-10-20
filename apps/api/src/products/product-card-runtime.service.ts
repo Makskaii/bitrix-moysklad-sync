@@ -68,7 +68,7 @@ export class ProductCardRuntimeService {
       [pair, versioned] = await Promise.all([
         this.database.entityPair.findFirst({
           where: { id: input.pairId, entityType: 'PRODUCT', active: true },
-          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, active: true, source: true, reason: true, createdAt: true },
+          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true },
         }),
         this.fieldSettings.version(input.settingsVersion),
       ]);
@@ -243,11 +243,11 @@ class LeaseBoundProductCardApi implements ProductCardApi {
     private readonly withLease: <T>(operation: () => Promise<T>) => Promise<T>,
   ) {}
 
-  readBitrix24(id: string) { return this.withLease(() => this.api.readBitrix24(id)); }
-  readMoysklad(id: string) { return this.withLease(() => this.api.readMoysklad(id)); }
-  updateBitrix24(id: string, fields: Record<string, unknown>) { return this.withLease(() => this.api.updateBitrix24(id, fields)); }
+  readBitrix24(id: string, kind?: 'product' | 'service') { return this.withLease(() => this.api.readBitrix24(id, kind)); }
+  readMoysklad(id: string, kind?: 'product' | 'service') { return this.withLease(() => this.api.readMoysklad(id, kind)); }
+  updateBitrix24(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service') { return this.withLease(() => this.api.updateBitrix24(id, fields, kind)); }
   updateBitrix24Price(priceId: string, value: number, currency: string) { return this.withLease(() => this.api.updateBitrix24Price(priceId, value, currency)); }
-  updateMoysklad(id: string, fields: Record<string, unknown>) { return this.withLease(() => this.api.updateMoysklad(id, fields)); }
+  updateMoysklad(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service') { return this.withLease(() => this.api.updateMoysklad(id, fields, kind)); }
 }
 
 function isUniqueConstraintError(error: unknown): boolean {

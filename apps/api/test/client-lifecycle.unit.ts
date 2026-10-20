@@ -27,10 +27,13 @@ test('delete processor supports each enabled durable pair entity and only explic
     ['BITRIX24', 'ONCRMCONTACTDELETE', 'contact'],
     ['BITRIX24', 'ONCRMDEALDELETE', 'deal'],
     ['BITRIX24', 'CATALOG.PRODUCT.ON.DELETE', 'product'],
+    ['BITRIX24', 'ONCRMDYNAMICITEMDELETE', 'invoice'],
     ['MOYSKLAD', 'DELETE', 'counterparty'],
     ['MOYSKLAD', 'DELETE', 'contactperson'],
     ['MOYSKLAD', 'DELETE', 'customerorder'],
     ['MOYSKLAD', 'DELETE', 'product'],
+    ['MOYSKLAD', 'DELETE', 'invoiceout'],
+    ['MOYSKLAD', 'DELETE', 'service'],
   ] as const) {
     assert.equal(service.supports({ id: 'event', source, eventType, externalEntityType, externalEntityId: 'native-id' }), true);
   }
@@ -70,13 +73,14 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   const records = [
     { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '42', moyskladId: 'ms-company', active: true, lifecycleStatus: 'ACTIVE' },
     { id: 'contact-pair', entityType: 'CONTACT', bitrix24Id: '42', moyskladId: 'ms-contact', active: true, lifecycleStatus: 'ACTIVE' },
+    { id: 'invoice-pair', entityType: 'INVOICE', bitrix24Id: '42', moyskladId: 'ms-invoice', active: true, lifecycleStatus: 'ACTIVE' },
   ];
   const updates: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
   const tx = {
     $queryRaw: async () => [{ locked: 1 }],
     entityPair: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => records.find((row) =>
-        row.entityType === where.entityType && row.bitrix24Id === where.bitrix24Id) ?? null,
+        row.entityType === where.entityType && (row.bitrix24Id === where.bitrix24Id || row.moyskladId === where.moyskladId)) ?? null,
       update: async (input: { where: { id: string }; data: Record<string, unknown> }) => {
         updates.push(input);
         const row = records.find((candidate) => candidate.id === input.where.id)!;
@@ -99,6 +103,12 @@ test('tombstone targets one entity-type/native-ID pair and repeats idempotently'
   assert.equal(records[0]?.lifecycleStatus, 'TOMBSTONED');
   assert.equal(records[1]?.active, true);
   assert.equal(records[1]?.lifecycleStatus, 'ACTIVE');
+
+  const invoice = await service.tombstoneByNativeId('MOYSKLAD', 'INVOICE', 'ms-invoice', 'CONFIRMED_PROVIDER_DELETION', 'invoiceout');
+  assert.deepEqual(invoice, { status: 'TOMBSTONED', pairId: 'invoice-pair', changed: true });
+  assert.equal(records[2]?.bitrix24Id, '42');
+  assert.equal(records[2]?.moyskladId, 'ms-invoice');
+  assert.equal(records[2]?.active, false, 'invoice tombstones preserve both native invoice IDs and only deactivate the exact pair');
 });
 
 test('pair write gate refuses tombstoned pairs and leaves unrelated active pairs usable', async () => {
@@ -204,12 +214,60 @@ test('MoySklad DELETE is tombstoned only after an exact native-ID read returns 4
     assert.equal(pair.moyskladId, 'ms-1');
     assert.equal(event.status, 'SUCCEEDED');
     assert.equal(updates.length, 1);
+
+    // A later exact-ID read that finds the native record present does not
+    // silently restore the tombstoned pair.
+    event.status = 'RECEIVED';
+    globalThis.fetch = async () => Response.json({ id: 'ms-1' });
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-1');
+    assert.equal(event.status, 'UNCHANGED');
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.active, false);
+    assert.equal(updates.length, 1);
+
+    event.status = 'RECEIVED';
+    globalThis.fetch = async () => { throw new Error('provider temporarily unavailable'); };
+    await (service as unknown as { processDeleteEvent(id: string): Promise<void> }).processDeleteEvent('event-1');
+    assert.equal(event.status, 'RETRYABLE_FAILURE');
+    assert.equal(pair.lifecycleStatus, 'TOMBSTONED');
+    assert.equal(pair.active, false);
   } finally {
     globalThis.fetch = oldFetch;
     if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
     if (oldBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldBase;
     if (oldToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldToken;
   }
+});
+
+test('MoySklad lifecycle tombstones resolve a shared native ID by exact entity kind', async () => {
+  const product = { id: 'historical-product', entityType: 'PRODUCT', bitrix24Id: 'b24-product', moyskladId: 'shared-ms-id', moyskladType: 'product', active: false, lifecycleStatus: 'TOMBSTONED' };
+  const servicePair = { id: 'active-service', entityType: 'PRODUCT', bitrix24Id: 'b24-service', moyskladId: 'shared-ms-id', moyskladType: 'service', active: true, lifecycleStatus: 'ACTIVE' };
+  const pairs = [product, servicePair];
+  let lookup: Record<string, unknown> | undefined;
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+        lookup = where;
+        return pairs.find((pair) => Object.entries(where).every(([key, value]) => pair[key as keyof typeof pair] === value)) ?? null;
+      },
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        const pair = pairs.find((candidate) => candidate.id === where.id)!;
+        Object.assign(pair, data);
+        return pair;
+      },
+    },
+    operationalLog: { create: async () => ({}) },
+  };
+  const service = new ClientLifecycleService({ $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx) } as never);
+  const result = await service.tombstoneByNativeId('MOYSKLAD', 'PRODUCT', 'shared-ms-id', 'confirmed deletion', 'service');
+  assert.equal(result.status, 'TOMBSTONED');
+  assert.equal(result.pairId, 'active-service');
+  assert.deepEqual(lookup, { entityType: 'PRODUCT', moyskladId: 'shared-ms-id', moyskladType: 'service' });
+  assert.equal(product.lifecycleStatus, 'TOMBSTONED', 'same-ID historical product remains untouched');
+  assert.equal(product.active, false);
+  assert.equal(servicePair.lifecycleStatus, 'TOMBSTONED');
+  await assert.rejects(() => service.tombstoneByNativeId('MOYSKLAD', 'PRODUCT', 'shared-ms-id', 'missing kind'), /CLIENT_LIFECYCLE_NATIVE_TYPE_REQUIRED/);
 });
 
 test('deletion marker uses configured entity field code, is idempotent, and rejects guessed/invalid codes', async () => {
@@ -391,5 +449,139 @@ test('restore clears the configured Bitrix24 marker before reactivating the exac
     globalThis.fetch = oldFetch;
     if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
     if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
+  }
+});
+
+test('catalog product and service reads confirm only the documented missing-item error', async () => {
+  const oldBase = process.env.BITRIX24_REST_BASE_URL;
+  const oldFetch = globalThis.fetch;
+  process.env.BITRIX24_REST_BASE_URL = 'https://fixture.invalid/rest/test/';
+  const service = new ClientLifecycleService({} as never);
+  const readState = (service as unknown as {
+    readDeletionState(source: 'BITRIX24', entity: 'PRODUCT', nativeType: string, id: string, payload: unknown): Promise<string>;
+  }).readDeletionState.bind(service);
+  const responseBody = (error: unknown, error_description: string) => ({ error, error_description });
+  try {
+    for (const scenario of [
+      { nativeType: 'product', description: 'The product does not exist' },
+      { nativeType: 'service', description: 'Услуга не существует' },
+    ]) {
+      globalThis.fetch = async () => Response.json(responseBody(0, scenario.description));
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'DELETED');
+
+      globalThis.fetch = async () => Response.json(responseBody('0', scenario.description), { status: 404 });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'DELETED');
+
+      globalThis.fetch = async () => Response.json(responseBody(0, 'Other errors (e.g., fatal errors)'));
+      await assert.rejects(() => readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), /BITRIX24_API_FAILURE/);
+
+      globalThis.fetch = async () => Response.json(responseBody('200040300040', 'Insufficient rights to read the information block element'));
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'UNCERTAIN');
+
+      globalThis.fetch = async () => Response.json({ error: 'ACCESS_DENIED', result: { [scenario.nativeType]: { id: '42' } } });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'UNCERTAIN');
+
+      globalThis.fetch = async () => Response.json({ result: { [scenario.nativeType]: { id: '42' } } });
+      assert.equal(await readState('BITRIX24', 'PRODUCT', scenario.nativeType, '42', {}), 'PRESENT');
+    }
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
+  }
+});
+
+test('catalog service lifecycle uses service endpoints for deletion checks, markers, and restore', async () => {
+  const oldMode = process.env.SYNC_MODE;
+  const oldBase = process.env.BITRIX24_REST_BASE_URL;
+  const oldMoyskladBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldMoyskladToken = process.env.MOYSKLAD_API_TOKEN;
+  const oldFetch = globalThis.fetch;
+  process.env.SYNC_MODE = 'apply';
+  process.env.BITRIX24_REST_BASE_URL = 'https://fixture.invalid/rest/test/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://fixture.invalid/api/remap/1.2';
+  process.env.MOYSKLAD_API_TOKEN = 'fixture-token';
+  const pair = {
+    id: 'service-pair', entityType: 'PRODUCT', bitrix24Id: 'b24-service-17', moyskladId: 'ms-service-29',
+    moyskladType: 'service', moyskladParentId: null, active: false, lifecycleStatus: 'TOMBSTONED',
+    tombstoneSource: 'MOYSKLAD', deletionMarkerStatus: 'PENDING', tombstonedAt: null,
+    tombstoneReason: null,
+  };
+  const calls: Array<{ url: string; method: string; body: URLSearchParams }> = [];
+  let serviceExists = true;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    const body = new URLSearchParams(String(init?.body ?? ''));
+    calls.push({ url, method, body });
+    if (url.includes('/entity/service/')) return Response.json({ id: pair.moyskladId });
+    if (url.endsWith('/catalog.product.get.json')) return Response.json({ result: { product: { id: 'b24-product-18' } } });
+    if (url.endsWith('/catalog.product.service.get.json')) {
+      return serviceExists
+        ? Response.json({ result: { service: { id: pair.bitrix24Id } } })
+        : Response.json({ error: '0', error_description: 'Услуга не существует' }, { status: 404 });
+    }
+    if (url.endsWith('/catalog.product.service.update.json')) return Response.json({ result: true });
+    throw new Error(`Unexpected Bitrix method ${url}`);
+  };
+
+  const tx = {
+    $queryRaw: async () => [{ locked: 1 }],
+    entityPair: {
+      findUnique: async () => pair,
+      findFirst: async () => null,
+      update: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return pair; },
+    },
+    adminAuditEntry: { create: async () => ({}) },
+  };
+  const database = {
+    entityPair: {
+      findUnique: async () => pair,
+      findMany: async () => [],
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(pair, data); return { count: 1 }; },
+    },
+    syncSetting: { findUnique: async () => ({ clientDeletionMarkerFields: { PRODUCT: 'UF_ARCHIVE_STATE' } }) },
+    ...mockLifecycleLocks(),
+    $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+  };
+  const gateway = {
+    readBitrix: async () => ({ ID: pair.bitrix24Id }),
+    readMoysklad: async (_type: string, id: string) => ({ id }),
+  };
+  const service = new ClientLifecycleService(database as never, gateway as never, { read: async () => ({ mode: 'on' }) } as never);
+  const readState = (service as unknown as { readDeletionState(source: 'BITRIX24', entity: 'PRODUCT', nativeType: string, id: string, payload: unknown): Promise<string> }).readDeletionState.bind(service);
+  try {
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'service', pair.bitrix24Id, {}), 'PRESENT');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.service.get.json'));
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'product', 'b24-product-18', {}), 'PRESENT');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.get.json'), 'ordinary products keep the product endpoint');
+    serviceExists = false;
+    assert.equal(await readState('BITRIX24', 'PRODUCT', 'service', pair.bitrix24Id, {}), 'DELETED');
+    assert.ok(calls.at(-1)?.url.endsWith('/catalog.product.service.get.json'));
+
+    serviceExists = true;
+    await (service as unknown as { ensureDeletionMarker(id: string, entity: 'PRODUCT'): Promise<void> }).ensureDeletionMarker(pair.id, 'PRODUCT');
+    const markerWrite = calls.at(-1)!;
+    assert.ok(markerWrite.url.endsWith('/catalog.product.service.update.json'));
+    assert.equal(markerWrite.body.get('id'), pair.bitrix24Id);
+    assert.equal(markerWrite.body.get('fields[UF_ARCHIVE_STATE]'), 'Удалён');
+
+    await service.restore(pair.id, true, 'BITRIX24_USER:42');
+    const serviceReads = calls.filter((call) => call.url.endsWith('/catalog.product.service.get.json'));
+    const serviceUpdates = calls.filter((call) => call.url.endsWith('/catalog.product.service.update.json'));
+    assert.ok(serviceReads.length >= 2, 'deletion recheck and restoration identity check read the service endpoint');
+    assert.equal(serviceReads.at(-1)?.body.get('id'), pair.bitrix24Id);
+    assert.ok(calls.some((call) => call.url.endsWith(`/entity/service/${pair.moyskladId}`)), 'restore verifies the exact MoySklad service ID');
+    assert.equal(serviceUpdates.length, 2, 'marker write and clear both update the service endpoint');
+    assert.equal(serviceUpdates.at(-1)?.body.get('id'), pair.bitrix24Id);
+    assert.equal(serviceUpdates.at(-1)?.body.get('fields[UF_ARCHIVE_STATE]'), '');
+    assert.equal(pair.bitrix24Id, 'b24-service-17');
+    assert.equal(pair.moyskladId, 'ms-service-29');
+    assert.equal(pair.lifecycleStatus, 'ACTIVE');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldMode === undefined) delete process.env.SYNC_MODE; else process.env.SYNC_MODE = oldMode;
+    if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL; else process.env.BITRIX24_REST_BASE_URL = oldBase;
+    if (oldMoyskladBase === undefined) delete process.env.MOYSKLAD_API_BASE_URL; else process.env.MOYSKLAD_API_BASE_URL = oldMoyskladBase;
+    if (oldMoyskladToken === undefined) delete process.env.MOYSKLAD_API_TOKEN; else process.env.MOYSKLAD_API_TOKEN = oldMoyskladToken;
   }
 });

@@ -23,6 +23,7 @@ import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-
 import { withDealOrderPairLock } from '../deals-orders/deal-order-pair-lock';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -64,6 +65,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly reverseCreate?: DealOrderReverseCreateService,
     @Optional() private readonly totalRuntime?: DealOrderTotalReconciliationHandler,
     @Optional() private readonly dryWrites?: DryRunWriteJournal,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
   onApplicationBootstrap() {
@@ -118,8 +120,39 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
   }
 
   async process(eventId: string): Promise<PairFirstResult | null> {
-    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
-    return this.processWithLease(eventId);
+    const execute = async (workerLease?: EventWorkerLeaseContext) => {
+      if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return this.processWithLease(eventId, workerLease);
+      const event = await this.database.inboundEvent.findUnique({ where: { id: eventId }, select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true } });
+      if (!event || !event.externalEntityId || !isDealOrderEvent(event)) return this.processWithLease(eventId, workerLease);
+      if (process.env.SYNC_MODE !== 'apply') {
+        await this.finishBeforeClaim(event, 'MANUAL_REVIEW', 'CONTROLLED_LIVE_TEST_APPLY_MODE_REQUIRED');
+        return null;
+      }
+      if (this.syncMode && (await this.syncMode.read()).mode !== 'on') return this.processWithLease(eventId, workerLease);
+      try {
+        await this.prepareControlledAdmission(event);
+      } catch (error) {
+        const retryable = error instanceof ProviderFailure && isRetryableFailure(error);
+        await this.finishBeforeClaim(event, retryable ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW', retryable ? 'CONTROLLED_LIVE_TEST_SOURCE_READ_RETRYABLE' : 'CONTROLLED_LIVE_TEST_ADMISSION_REQUIRED',
+          retryable ? retryAtForFailure(error, 1) : null);
+        return null;
+      }
+      return this.controlledAdmission.runForEvent(eventId, () => this.processWithLease(eventId, workerLease));
+    };
+    if (this.workerLease) return this.workerLease.run(eventId, execute);
+    return execute();
+  }
+
+  private async prepareControlledAdmission(event: { id: string; source: string; externalEntityId: string | null }) {
+    if (!this.controlledAdmission || !this.documentReader) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_SERVICE_UNAVAILABLE');
+    if (!event.externalEntityId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_ID_REQUIRED');
+    const sourceId = event.externalEntityId;
+    const sourceSystem = event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD';
+    const source = await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, sourceId, 'deal-order',
+      () => this.documentReader!.readDealOrderForControlledAdmission(sourceSystem, sourceId));
+    if (!source || source.nativeId !== sourceId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+    await this.controlledAdmission.admit(event.id, { entity: 'deal-order', sourceSystem, sourceNativeId: sourceId,
+      currentNativeId: source.nativeId, currentName: source.name, sourceCreatedAt: source.createdAt });
   }
 
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairFirstResult | null> {
@@ -216,6 +249,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             inactiveStage || unconfiguredStage ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
           return null;
         }
+        if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+          const scope = await this.controlledAdmission.scopeForEvent(event.id);
+          prepared.input.payload.description = scope.admittedSourceName;
+        }
         await workerLease?.assertOwned();
         const creation = await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
         partialDealOrderCreation = creation.status === 'PARTIAL';
@@ -236,7 +273,9 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        const reverseResult = await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined });
+        const reverseInput = { moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined,
+          ...(this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? { controlledSyntheticName: (await this.controlledAdmission.scopeForEvent(event.id)).admittedSourceName } : {}) };
+        const reverseResult = await this.reverseCreate.createAndPair(reverseInput);
         partialDealOrderCreation = reverseResult.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {

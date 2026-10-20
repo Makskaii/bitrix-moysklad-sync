@@ -7,10 +7,11 @@ import { InboundEventProcessor, InboundEventMetadata } from '../event-dispatcher
 import { ProviderFailure, retryAtForFailure } from '../provider-failure';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { SyncModeService } from '../sync-mode.service';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 
 export const CLIENT_LIFECYCLE_GATEWAY = Symbol('CLIENT_LIFECYCLE_GATEWAY');
 export type LifecycleSource = 'BITRIX24' | 'MOYSKLAD';
-type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT';
+type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT' | 'INVOICE';
 type EntityPairLease = { assertOwned(): Promise<void>; release(): Promise<void> };
 
 /** Pair tombstones preserve both native records and the exact confirmed relationship. */
@@ -23,6 +24,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     private readonly database: DatabaseService,
     @Optional() @Inject(CLIENT_LIFECYCLE_GATEWAY) private readonly gateway?: ClientSyncGateway,
     @Optional() private readonly syncMode?: SyncModeService,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
   onApplicationBootstrap() {
@@ -41,9 +43,10 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       ((event.externalEntityType === 'company' && event.eventType === 'ONCRMCOMPANYDELETE') ||
        (event.externalEntityType === 'contact' && event.eventType === 'ONCRMCONTACTDELETE') ||
        (event.externalEntityType === 'deal' && event.eventType === 'ONCRMDEALDELETE') ||
+       (event.externalEntityType === 'invoice' && event.eventType === 'ONCRMDYNAMICITEMDELETE') ||
        (event.externalEntityType === 'product' && event.eventType === 'CATALOG.PRODUCT.ON.DELETE'))) ||
       (event.source === 'MOYSKLAD' && event.eventType === 'DELETE' &&
-        (event.externalEntityType === 'counterparty' || event.externalEntityType === 'contactperson' || event.externalEntityType === 'customerorder' || event.externalEntityType === 'product'));
+        (event.externalEntityType === 'counterparty' || event.externalEntityType === 'contactperson' || event.externalEntityType === 'customerorder' || event.externalEntityType === 'product' || event.externalEntityType === 'service' || event.externalEntityType === 'invoiceout'));
   }
 
   enqueue(eventId: string) {
@@ -86,8 +89,8 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       where: {
         AND: [
           { OR: [
-            { source: 'BITRIX24', eventType: { in: ['ONCRMCOMPANYDELETE', 'ONCRMCONTACTDELETE', 'ONCRMDEALDELETE', 'CATALOG.PRODUCT.ON.DELETE'] } },
-            { source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'product'] } },
+            { source: 'BITRIX24', eventType: { in: ['ONCRMCOMPANYDELETE', 'ONCRMCONTACTDELETE', 'ONCRMDEALDELETE', 'ONCRMDYNAMICITEMDELETE', 'CATALOG.PRODUCT.ON.DELETE'] } },
+            { source: 'MOYSKLAD', eventType: 'DELETE', externalEntityType: { in: ['counterparty', 'contactperson', 'customerorder', 'product', 'service', 'invoiceout'] } },
           ] },
           { OR: [
             { status: 'RECEIVED' },
@@ -101,11 +104,12 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
 
     const pendingComments = await this.database.entityPair.findMany({
       where: { lifecycleStatus: 'TOMBSTONED', tombstoneSource: 'MOYSKLAD', deletionTimelineStatus: { in: ['PENDING', 'WRITING', 'PARTNER_UNAVAILABLE'] }, OR: [{ deletionTimelineLeaseUntil: null }, { deletionTimelineLeaseUntil: { lte: now } }] },
-      select: { id: true, entityType: true }, take: 50,
+      select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true }, take: 50,
     });
     for (const pair of pendingComments) {
-      if (!isCrmTimelineEntity(pair.entityType)) continue;
-      try { await this.ensureDeletionTimelineComment(pair.id, pair.entityType); } catch { /* retry on the next recovery scan */ }
+      if (!isLifecycleEntityType(pair.entityType) || !isCrmTimelineEntity(pair.entityType)) continue;
+      const entityType = pair.entityType;
+      try { await this.withControlledLifecyclePairScope(pair, () => this.ensureDeletionTimelineComment(pair.id, entityType)); } catch { /* retry on the next recovery scan */ }
     }
 
     const pendingMarkers = await this.database.entityPair.findMany({
@@ -113,18 +117,42 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         { deletionMarkerStatus: { in: ['PENDING', 'WRITING'] } },
         { deletionMarkerStatus: 'FAILED', OR: [{ deletionMarkerRetryAfter: null }, { deletionMarkerRetryAfter: { lte: now } }] },
       ] },
-      select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true }, take: 50,
+      select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true }, take: 50,
     });
     for (const pair of pendingMarkers) {
       if (!isLifecycleEntityType(pair.entityType)) continue;
+      const entityType = pair.entityType;
       let lease: EntityPairLease | undefined;
       try {
-        lease = await this.acquireEntityPairLease(pair, 'MOYSKLAD', pair.entityType, pair.moyskladId);
+        lease = await this.acquireEntityPairLease(pair, 'MOYSKLAD', entityType, pair.moyskladId);
         await lease.assertOwned();
-        await this.ensureDeletionMarker(pair.id, pair.entityType);
+        await this.withControlledLifecyclePairScope(pair, () => this.ensureDeletionMarker(pair.id, entityType));
       } catch { /* retry on the next recovery scan */ }
       finally { await lease?.release().catch(() => undefined); }
     }
+  }
+
+  private async withControlledLifecyclePairScope<T>(pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string; moyskladType: string | null }, action: () => Promise<T>): Promise<T> {
+    if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    if (!isLifecycleEntityType(pair.entityType)) throw new ProviderFailure('MOYSKLAD', 400);
+    return this.controlledAdmission.withExistingManifestPairScope({
+      eventId: `lifecycle-recovery-${pair.id}`, entity: lifecycleControlledManifestEntity(pair.entityType, pair.moyskladType),
+      sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId, targetSystem: 'BITRIX24', targetNativeId: pair.bitrix24Id,
+    }, action);
+  }
+
+  private async withControlledRestorePairScope<T>(pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string; moyskladType: string | null; tombstoneSource: string | null }, action: () => Promise<T>): Promise<T> {
+    if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    if (!isLifecycleEntityType(pair.entityType) || (pair.tombstoneSource !== 'BITRIX24' && pair.tombstoneSource !== 'MOYSKLAD')) {
+      throw new ProviderFailure('BITRIX24', 400);
+    }
+    const sourceSystem = pair.tombstoneSource;
+    const targetSystem = sourceSystem === 'MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+    return this.controlledAdmission.withExistingManifestPairScope({
+      eventId: `lifecycle-restore-${pair.id}`, entity: lifecycleControlledManifestEntity(pair.entityType, pair.moyskladType),
+      sourceSystem, sourceNativeId: sourceSystem === 'MOYSKLAD' ? pair.moyskladId : pair.bitrix24Id,
+      targetSystem, targetNativeId: targetSystem === 'MOYSKLAD' ? pair.moyskladId : pair.bitrix24Id,
+    }, action);
   }
 
   private async processDeleteEvent(eventId: string) {
@@ -146,38 +174,48 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
       if (claim.count !== 1) return;
       const entityType = lifecycleEntityForEvent(event.source, event.externalEntityType!);
       if (!entityType) throw new ProviderFailure(event.source as LifecycleSource, 400);
+      const nativeType = event.source === 'MOYSKLAD' ? event.externalEntityType! : undefined;
       const pair = await this.database.entityPair.findFirst({ where: event.source === 'BITRIX24'
         ? { entityType, bitrix24Id: event.externalEntityId }
-        : { entityType, moyskladId: event.externalEntityId },
-        select: { id: true, bitrix24Id: true, moyskladId: true },
+        : { entityType, moyskladId: event.externalEntityId, moyskladType: nativeType },
+        select: { id: true, bitrix24Id: true, moyskladId: true, moyskladType: true },
       });
       if (pair) pairLease = await this.acquireEntityPairLease(pair, event.source as LifecycleSource, entityType, event.externalEntityId);
-      const state = await this.readDeletionState(event.source as LifecycleSource, entityType, event.externalEntityType!, event.externalEntityId, event.payload);
-      if (state === 'PRESENT') {
-        await this.database.inboundEvent.update({ where: { id: eventId }, data: { status: 'UNCHANGED', processingStartedAt: null, lastErrorCategory: null } });
-        return;
-      }
-      if (state === 'UNCERTAIN') {
-        await this.database.$transaction(async (tx) => {
-          await lockEntityPairState(tx);
-          const existing = await tx.pairReviewCase.findFirst({ where: { entityType, sourceSystem: event.source, sourceEntityId: event.externalEntityId!, status: 'OPEN', reason: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
-          if (!existing) await tx.pairReviewCase.create({ data: { entityType, sourceSystem: event.source, sourceEntityId: event.externalEntityId!, eventId, reason: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
-          await tx.inboundEvent.update({ where: { id: eventId }, data: { status: 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
-        });
-        return;
-      }
-      await pairLease?.assertOwned();
-      const result = await this.tombstoneByNativeId(event.source as LifecycleSource, entityType, event.externalEntityId, 'CONFIRMED_PROVIDER_DELETION');
-      if (result.status === 'TOMBSTONED' && event.source === 'MOYSKLAD' && result.pairId) {
-        await this.ensureDeletionMarker(result.pairId, entityType);
-      }
-      if (result.status === 'TOMBSTONED' && event.source === 'MOYSKLAD' && result.pairId && isCrmTimelineEntity(entityType)) {
-        await this.ensureDeletionTimelineComment(result.pairId, entityType);
-      }
-      await this.database.inboundEvent.update({ where: { id: eventId }, data: {
-        status: result.status === 'UNPAIRED' ? 'UNCHANGED' : 'SUCCEEDED', processingStartedAt: null,
-        lastErrorCategory: null, lastSuccessfulAt: new Date(),
-      } });
+      const processConfirmedDeletion = async () => {
+        const readNativeType = event.source === 'BITRIX24' && entityType === 'PRODUCT' && pair?.moyskladType === 'service'
+          ? 'service' : event.externalEntityType!;
+        const state = await this.readDeletionState(event.source as LifecycleSource, entityType, readNativeType, event.externalEntityId!, event.payload);
+        if (state === 'PRESENT') {
+          await this.database.inboundEvent.update({ where: { id: eventId }, data: { status: 'UNCHANGED', processingStartedAt: null, lastErrorCategory: null } });
+          return;
+        }
+        if (state === 'UNCERTAIN') {
+          await this.database.$transaction(async (tx) => {
+            await lockEntityPairState(tx);
+            const existing = await tx.pairReviewCase.findFirst({ where: { entityType, sourceSystem: event.source, sourceEntityId: event.externalEntityId!, status: 'OPEN', reason: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
+            if (!existing) await tx.pairReviewCase.create({ data: { entityType, sourceSystem: event.source, sourceEntityId: event.externalEntityId!, eventId, reason: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
+            await tx.inboundEvent.update({ where: { id: eventId }, data: { status: 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: 'CLIENT_DELETE_STATE_UNCERTAIN' } });
+          });
+          return;
+        }
+        await pairLease?.assertOwned();
+        const result = await this.tombstoneByNativeId(event.source as LifecycleSource, entityType, event.externalEntityId!, 'CONFIRMED_PROVIDER_DELETION', nativeType);
+        if (result.status === 'TOMBSTONED' && event.source === 'MOYSKLAD' && result.pairId) await this.ensureDeletionMarker(result.pairId, entityType);
+        if (result.status === 'TOMBSTONED' && event.source === 'MOYSKLAD' && result.pairId && isCrmTimelineEntity(entityType)) await this.ensureDeletionTimelineComment(result.pairId, entityType);
+        await this.database.inboundEvent.update({ where: { id: eventId }, data: {
+          status: result.status === 'UNPAIRED' ? 'UNCHANGED' : 'SUCCEEDED', processingStartedAt: null,
+          lastErrorCategory: null, lastSuccessfulAt: new Date(),
+        } });
+      };
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        if (!pair) throw new ProviderFailure(event.source as LifecycleSource, 400);
+        const sourceSystem = event.source as LifecycleSource;
+        const targetSystem = sourceSystem === 'MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+        const sourceNativeId = sourceSystem === 'MOYSKLAD' ? pair.moyskladId : pair.bitrix24Id;
+        const targetNativeId = sourceSystem === 'MOYSKLAD' ? pair.bitrix24Id : pair.moyskladId;
+        const controlledEntity = lifecycleControlledManifestEntity(entityType, sourceSystem === 'MOYSKLAD' ? nativeType : pair.moyskladType);
+        await this.controlledAdmission.withExistingManifestPairScope({ eventId, entity: controlledEntity, sourceSystem, sourceNativeId, targetSystem, targetNativeId }, processConfirmedDeletion);
+      } else await processConfirmedDeletion();
     } catch (error) {
       if (error instanceof ProviderFailure && !error.retryable) {
         const currentEvent = await this.database.inboundEvent.findUnique({ where: { id: eventId } }).catch(() => null);
@@ -289,20 +327,29 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
 
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new ProviderFailure('BITRIX24', null);
-    const method = bitrixGetMethod(entityType);
+    const method = bitrixGetMethod(entityType, nativeType);
     let response: Response;
     try {
-      response = await fetch(new URL(method, withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ id: nativeId }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
+      response = await fetch(new URL(method, withSlash(base)), { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(entityType === 'INVOICE' ? { id: nativeId, entityTypeId: '31' } : { id: nativeId }), redirect: 'error', signal: AbortSignal.timeout(10_000) });
     } catch { throw new ProviderFailure('BITRIX24', null); }
     if (response.status === 408 || response.status === 429 || response.status >= 500) throw new ProviderFailure('BITRIX24', response.status);
-    if (!response.ok) return 'UNCERTAIN';
     const result: unknown = await response.json().catch(() => null);
     if (!isRecord(result)) return 'UNCERTAIN';
-    const nativeResult = isRecord(result.result) && isRecord(result.result.product) ? result.result.product : result.result;
+    const catalogKind = entityType === 'PRODUCT' && (nativeType === 'product' || nativeType === 'service') ? nativeType : null;
+    if (catalogKind && isBitrixCatalogItemMissing(result, catalogKind)) return 'DELETED';
+    if (catalogKind && response.ok && isBitrixAmbiguousCatalogError(result)) throw new ProviderFailure('BITRIX24', 503);
+    if (catalogKind && Object.hasOwn(result, 'error')) return 'UNCERTAIN';
+    if (!response.ok) {
+      const description = typeof result.error_description === 'string' ? result.error_description.trim().toLowerCase() : '';
+      const notFound = new Set(['not found', 'element not found', 'item not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'service is not found', 'company not found', 'contact not found', 'deal not found', 'product not found', 'service not found']);
+      if (!catalogKind && (result.error === 'NOT_FOUND' || (typeof result.error !== 'string' && notFound.has(description)))) return 'DELETED';
+      return 'UNCERTAIN';
+    }
+    const nativeResult = isRecord(result.result) && isRecord(result.result.product) ? result.result.product
+      : isRecord(result.result) && isRecord(result.result.service) ? result.result.service
+      : entityType === 'INVOICE' && isRecord(result.result) && isRecord(result.result.item) ? result.result.item : result.result;
     if (isRecord(nativeResult) && String(nativeResult.ID ?? nativeResult.id ?? '') === nativeId) return 'PRESENT';
-    const description = typeof result.error_description === 'string' ? result.error_description.trim().toLowerCase() : '';
-    const notFound = new Set(['not found', 'company is not found', 'contact is not found', 'deal is not found', 'product is not found', 'company not found', 'contact not found', 'deal not found', 'product not found']);
-    return typeof result.error === 'string' && notFound.has(description) ? 'DELETED' : 'UNCERTAIN';
+    return 'UNCERTAIN';
   }
 
   async listTombstones() {
@@ -314,12 +361,13 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
   }
 
   /** Call only after the provider's deletion event and current-state read agree. */
-  async tombstoneByNativeId(source: LifecycleSource, entityType: LifecycleEntityType, nativeId: string, reason: string) {
+  async tombstoneByNativeId(source: LifecycleSource, entityType: LifecycleEntityType, nativeId: string, reason: string, moyskladType?: string) {
     return this.database.$transaction(async (tx) => {
       await lockEntityPairState(tx);
+      if (source === 'MOYSKLAD' && !moyskladType) throw new Error('CLIENT_LIFECYCLE_NATIVE_TYPE_REQUIRED');
       const pair = await tx.entityPair.findFirst({ where: {
         entityType,
-        ...(source === 'BITRIX24' ? { bitrix24Id: nativeId } : { moyskladId: nativeId }),
+        ...(source === 'BITRIX24' ? { bitrix24Id: nativeId } : { moyskladId: nativeId, moyskladType }),
       } });
       if (!pair) return { status: 'UNPAIRED' as const };
       if (pair.lifecycleStatus === 'TOMBSTONED') return { status: 'TOMBSTONED' as const, pairId: pair.id, changed: false };
@@ -360,7 +408,10 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         return;
       }
       assertApplyExternalWrite('BITRIX24', 'CLIENT_DELETION_MARKER');
-      const result = await this.bitrixRest(bitrixUpdateMethod(entityType), { id: pair.bitrix24Id, [`fields[${fieldCode}]`]: 'Удалён' });
+      const result = await this.bitrixRest(bitrixUpdateMethod(entityType, pair.moyskladType === 'service' ? 'service' : undefined), {
+        ...(entityType === 'INVOICE' ? { entityTypeId: '31' } : {}),
+        id: pair.bitrix24Id, [`fields[${fieldCode}]`]: 'Удалён',
+      });
       if (result.result !== true && result.result !== 1) throw new ProviderFailure('BITRIX24', 400);
       await this.database.entityPair.updateMany({ where: { id: pairId, lifecycleStatus: 'TOMBSTONED', deletionMarkerStatus: 'WRITING' }, data: { deletionMarkerStatus: 'MARKED', deletionMarkerRetryAfter: null } });
     } catch (error) {
@@ -377,7 +428,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
 
   async saveDeletionMarkerFields(value: unknown) {
     if (!isRecord(value)) throw new ConflictException('DELETION_MARKER_FIELDS_INVALID');
-    const allowed = new Set(['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT']);
+    const allowed = new Set(['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT', 'INVOICE']);
     const fields: Partial<Record<LifecycleEntityType, string>> = {};
     for (const [entity, code] of Object.entries(value)) {
       if (!allowed.has(entity) || typeof code !== 'string' || !/^UF_[A-Z0-9_]{1,64}$/i.test(code)) throw new ConflictException('DELETION_MARKER_FIELDS_INVALID');
@@ -405,7 +456,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { clientDeletionMarkerFields: true } });
     if (!isRecord(setting?.clientDeletionMarkerFields)) return {};
     const fields: Partial<Record<LifecycleEntityType, string>> = {};
-    for (const entity of ['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'] as const) {
+    for (const entity of ['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT', 'INVOICE'] as const) {
       const code = setting.clientDeletionMarkerFields[entity];
       if (typeof code === 'string' && /^UF_[A-Z0-9_]{1,64}$/i.test(code)) fields[entity] = code;
     }
@@ -504,7 +555,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     const lease = await this.acquireEntityPairLease(pair, 'BITRIX24', pair.entityType, pair.bitrix24Id);
     try {
       await lease.assertOwned();
-      return await this.restoreWhileLeased(pairId, confirmed, actorId);
+      return await this.withControlledRestorePairScope(pair, () => this.restoreWhileLeased(pairId, confirmed, actorId));
     } finally {
       await lease.release();
     }
@@ -533,7 +584,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
         identityVerified = String(bitrix.ID ?? bitrix.id ?? '') === pair.bitrix24Id && String(moysklad.id ?? '') === pair.moyskladId;
       } else {
         const [bitrix, moysklad] = await Promise.all([
-          this.readDeletionState('BITRIX24', entity, bitrixNativeType(entity), pair.bitrix24Id, {}),
+          this.readDeletionState('BITRIX24', entity, entity === 'PRODUCT' && pair.moyskladType === 'service' ? 'service' : bitrixNativeType(entity), pair.bitrix24Id, {}),
           this.readDeletionState('MOYSKLAD', entity, msNativeType, pair.moyskladId, {}, pair.moyskladParentId),
         ]);
         identityVerified = bitrix === 'PRESENT' && moysklad === 'PRESENT';
@@ -554,7 +605,10 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
           throw new ServiceUnavailableException('Apply mode is required to clear the Bitrix24 deletion marker');
         }
         assertApplyExternalWrite('BITRIX24', 'CLIENT_DELETION_MARKER_CLEAR');
-        const clear = await this.bitrixRest(bitrixUpdateMethod(entity), { id: pair.bitrix24Id, [`fields[${markerField}]`]: '' });
+        const clear = await this.bitrixRest(bitrixUpdateMethod(entity, entity === 'PRODUCT' && pair.moyskladType === 'service' ? 'service' : undefined), {
+          ...(entity === 'INVOICE' ? { entityTypeId: '31' } : {}),
+          id: pair.bitrix24Id, [`fields[${markerField}]`]: '',
+        });
         if (clear.result !== true && clear.result !== 1) throw new ProviderFailure('BITRIX24', 400);
       } catch (error) {
         await this.database.entityPair.updateMany({ where: { id: pairId, lifecycleStatus: 'TOMBSTONED' }, data: { deletionMarkerStatus: 'CLEAR_FAILED' } }).catch(() => undefined);
@@ -604,6 +658,17 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
   }
 }
 
+function isBitrixCatalogItemMissing(payload: Record<string, unknown>, kind: 'product' | 'service'): boolean {
+  const error = payload.error;
+  const description = typeof payload.error_description === 'string' ? payload.error_description.trim().toLocaleLowerCase('en-US') : '';
+  const expectedDescription = kind === 'service' ? 'услуга не существует' : 'the product does not exist';
+  return (error === 0 || error === '0') && description === expectedDescription;
+}
+
+function isBitrixAmbiguousCatalogError(payload: Record<string, unknown>): boolean {
+  return (payload.error === 0 || payload.error === '0') && typeof payload.error_description === 'string';
+}
+
 function normalizeReason(value: string): string {
   return value.trim().slice(0, 500) || 'CONFIRMED_PROVIDER_DELETION';
 }
@@ -614,18 +679,29 @@ function lifecycleEntityForEvent(source: string, nativeType: string): LifecycleE
     if (nativeType === 'contact') return 'CONTACT';
     if (nativeType === 'deal') return 'DEAL';
     if (nativeType === 'product') return 'PRODUCT';
+    if (nativeType === 'invoice') return 'INVOICE';
+    if (nativeType === 'service') return 'PRODUCT';
   }
   if (source === 'MOYSKLAD') {
     if (nativeType === 'counterparty') return 'COMPANY';
     if (nativeType === 'contactperson') return 'CONTACT';
     if (nativeType === 'customerorder') return 'DEAL';
     if (nativeType === 'product') return 'PRODUCT';
+    if (nativeType === 'invoiceout') return 'INVOICE';
+    if (nativeType === 'service') return 'PRODUCT';
   }
   return null;
 }
 
+function lifecycleControlledManifestEntity(entity: LifecycleEntityType, moyskladType?: string | null): string {
+  if (entity === 'COMPANY' || entity === 'CONTACT') return `client:${entity}`;
+  if (entity === 'DEAL') return 'deal-order';
+  if (entity === 'INVOICE') return 'invoice';
+  return moyskladType === 'service' ? 'catalog-service' : 'catalog-product';
+}
+
 function isLifecycleEntityType(value: string): value is LifecycleEntityType {
-  return value === 'COMPANY' || value === 'CONTACT' || value === 'DEAL' || value === 'PRODUCT';
+  return value === 'COMPANY' || value === 'CONTACT' || value === 'DEAL' || value === 'PRODUCT' || value === 'INVOICE';
 }
 
 function isCrmTimelineEntity(value: string): value is 'COMPANY' | 'CONTACT' | 'DEAL' {
@@ -638,24 +714,27 @@ function bitrixNativeType(entity: LifecycleEntityType): string {
     case 'CONTACT': return 'contact';
     case 'DEAL': return 'deal';
     case 'PRODUCT': return 'product';
+    case 'INVOICE': return 'invoice';
   }
 }
 
-function bitrixGetMethod(entity: LifecycleEntityType): string {
+function bitrixGetMethod(entity: LifecycleEntityType, nativeType?: string): string {
   switch (entity) {
     case 'COMPANY': return 'crm.company.get.json';
     case 'CONTACT': return 'crm.contact.get.json';
     case 'DEAL': return 'crm.deal.get.json';
-    case 'PRODUCT': return 'catalog.product.get.json';
+    case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.get.json' : 'catalog.product.get.json';
+    case 'INVOICE': return 'crm.item.get.json';
   }
 }
 
-function bitrixUpdateMethod(entity: LifecycleEntityType): string {
+function bitrixUpdateMethod(entity: LifecycleEntityType, nativeType?: string): string {
   switch (entity) {
     case 'COMPANY': return 'crm.company.update.json';
     case 'CONTACT': return 'crm.contact.update.json';
     case 'DEAL': return 'crm.deal.update.json';
-    case 'PRODUCT': return 'catalog.product.update.json';
+    case 'PRODUCT': return nativeType === 'service' ? 'catalog.product.service.update.json' : 'catalog.product.update.json';
+    case 'INVOICE': return 'crm.item.update.json';
   }
 }
 
@@ -664,6 +743,8 @@ function moyskladNativeType(entity: LifecycleEntityType, configuredType: string 
   if (entity === 'CONTACT' && (configuredType === 'counterparty' || configuredType === 'contactperson')) return configuredType;
   if (entity === 'DEAL' && configuredType === 'customerorder') return configuredType;
   if (entity === 'PRODUCT' && configuredType === 'product') return configuredType;
+  if (entity === 'INVOICE' && configuredType === 'invoiceout') return configuredType;
+  if (entity === 'PRODUCT' && configuredType === 'service') return configuredType;
   return null;
 }
 
