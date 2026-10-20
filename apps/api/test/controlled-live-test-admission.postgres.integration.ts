@@ -8,8 +8,11 @@ import { test } from 'node:test';
 import { DatabaseService } from '../src/database.service';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { enterControlledLiveEventScope } from '../src/controlled-live-test-policy';
-import { assertApplyExternalWrite, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
+import { assertApplyExternalWrite, installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
+import { ClientLifecycleService } from '../src/clients/client-lifecycle.service';
+import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
+import { SyncModeService } from '../src/sync-mode.service';
 
 const isolated = process.env.CONTROLLED_LIVE_TEST_POSTGRES_ISOLATED === '1';
 test('controlled live source admission and target binding survive service restart in isolated PostgreSQL', { skip: !isolated }, async () => {
@@ -37,13 +40,21 @@ test('controlled live source admission and target binding survive service restar
   const previous = {
     mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE,
     manifest: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE,
+    b24Base: process.env.BITRIX24_REST_BASE_URL, msBase: process.env.MOYSKLAD_API_BASE_URL, msToken: process.env.MOYSKLAD_API_TOKEN,
   };
+  const originalFetch = globalThis.fetch;
   const oldDbUrl = process.env.DATABASE_URL;
+  let lifecyclePairId: string | null = null;
+  let unadmittedLifecyclePairId: string | null = null;
+  let controlledProviderRequests = 0;
   process.env.SYNC_MODE = 'apply';
   process.env.DATABASE_URL = databaseUrl;
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
   process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  process.env.BITRIX24_REST_BASE_URL = 'https://issue60-b24-test.invalid/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://issue60-ms-test.invalid/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'fake-only-token';
   await writeFile(manifestPath, JSON.stringify({ runId, testDatabaseName, testSchemaName, providerNamespace, records: entries.map((entry, index) => ({
     entity: entry.entity, direction: index === 0 ? 'BOTH' : 'BITRIX24_TO_MOYSKLAD', name: entry.name, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: index === 0 ? null : entry.sourceId, targetSystem: 'MOYSKLAD', targetNativeId: index === 0 ? null : entry.targetId,
@@ -70,6 +81,45 @@ test('controlled live source admission and target binding survive service restar
       bitrix24UserId: persisted?.bitrix24UserId,
       moyskladAccountId: persisted?.moyskladAccountId,
     }, providerNamespace, 'durable admission pins the verified provider namespace');
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      controlledProviderRequests += 1;
+      if (url.pathname.endsWith(`/entity/counterparty/ms-controlled-target`)) return Response.json({ id: 'ms-controlled-target' });
+      if (url.pathname.endsWith('/crm.company.get.json')) {
+        const form = new URLSearchParams(await request.clone().text());
+        return Response.json({ result: { ID: form.get('id') } });
+      }
+      if (url.pathname.endsWith('/crm.company.update.json')) {
+        const form = new URLSearchParams(await request.clone().text());
+        assert.equal(form.get('id'), 'b24-controlled-source');
+        assert.equal(form.get('fields[UF_SYNC_DELETION_STATE]'), '');
+        return Response.json({ result: true });
+      }
+      throw new Error(`Unexpected controlled lifecycle fake request: ${url.pathname}`);
+    }) as typeof fetch;
+    installControlledLiveFetchGuard(providerNamespace);
+    await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', clientDeletionMarkerFields: { COMPANY: 'UF_SYNC_DELETION_STATE' } }, update: { clientDeletionMarkerFields: { COMPANY: 'UF_SYNC_DELETION_STATE' } } });
+    const pairId = `issue60-restore-${randomUUID()}`;
+    lifecyclePairId = pairId;
+    await database.entityPair.create({ data: { id: pairId, entityType: 'COMPANY', bitrix24Id: 'b24-controlled-source', moyskladId: 'ms-controlled-target',
+      moyskladType: 'counterparty', active: false, lifecycleStatus: 'TOMBSTONED', tombstoneSource: 'MOYSKLAD', tombstonedAt: now,
+      deletionMarkerStatus: 'MARKED', deletionTimelineStatus: 'POSTED' } });
+    const lifecycle = new ClientLifecycleService(database, new HttpClientSyncGateway(), new SyncModeService(database), sourceAdmission);
+    assert.deepEqual(await lifecycle.restore(pairId, true, 'BITRIX24_USER:42'), { status: 'RESTORED', pairId });
+    const restoredPair = await database.entityPair.findUniqueOrThrow({ where: { id: pairId } });
+    assert.equal(restoredPair.lifecycleStatus, 'ACTIVE');
+    assert.equal(restoredPair.active, true);
+    await database.entityPair.delete({ where: { id: pairId } });
+    const unadmittedPairId = `issue60-restore-unadmitted-${randomUUID()}`;
+    unadmittedLifecyclePairId = unadmittedPairId;
+    await database.entityPair.create({ data: { id: unadmittedPairId, entityType: 'COMPANY', bitrix24Id: 'shared-b24-record', moyskladId: 'shared-ms-record',
+      moyskladType: 'counterparty', active: false, lifecycleStatus: 'TOMBSTONED', tombstoneSource: 'MOYSKLAD', tombstonedAt: now,
+      deletionMarkerStatus: 'MARKED', deletionTimelineStatus: 'POSTED' } });
+    const requestsBeforeUnadmittedRestore = controlledProviderRequests;
+    await assert.rejects(lifecycle.restore(unadmittedPairId, true, 'BITRIX24_USER:42'), /CONTROLLED_LIVE_TEST_LIFECYCLE_PAIR_NOT_ADMITTED/);
+    assert.equal(controlledProviderRequests, requestsBeforeUnadmittedRestore, 'unmanifested restore makes no provider identity reads or writes');
+    await database.entityPair.delete({ where: { id: unadmittedPairId } });
     for (const [index, entry] of entries.slice(1).entries()) {
       const eventId = eventIds[index + 1]!;
       const event = await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: randomUUID(),
@@ -98,9 +148,13 @@ test('controlled live source admission and target binding survive service restar
       'a durable admission cannot be replayed under a different provider namespace');
   } finally {
     await database.inboundEvent.deleteMany({ where: { id: { in: eventIds } } });
+    if (lifecyclePairId) await database.entityPair.deleteMany({ where: { id: lifecyclePairId } });
+    if (unadmittedLifecyclePairId) await database.entityPair.deleteMany({ where: { id: unadmittedLifecyclePairId } });
+    await database.syncSetting.updateMany({ where: { id: 'global' }, data: { clientDeletionMarkerFields: {} } });
     await database.$disconnect();
+    globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);
-    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.manifest], ['DATABASE_URL', oldDbUrl], ['SYNC_MODE', previous.sync]] as const) {
+    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.manifest], ['DATABASE_URL', oldDbUrl], ['SYNC_MODE', previous.sync], ['BITRIX24_REST_BASE_URL', previous.b24Base], ['MOYSKLAD_API_BASE_URL', previous.msBase], ['MOYSKLAD_API_TOKEN', previous.msToken]] as const) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     await rm(directory, { recursive: true, force: true });

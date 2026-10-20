@@ -141,6 +141,20 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     }, action);
   }
 
+  private async withControlledRestorePairScope<T>(pair: { id: string; entityType: string; bitrix24Id: string; moyskladId: string; moyskladType: string | null; tombstoneSource: string | null }, action: () => Promise<T>): Promise<T> {
+    if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    if (!isLifecycleEntityType(pair.entityType) || (pair.tombstoneSource !== 'BITRIX24' && pair.tombstoneSource !== 'MOYSKLAD')) {
+      throw new ProviderFailure('BITRIX24', 400);
+    }
+    const sourceSystem = pair.tombstoneSource;
+    const targetSystem = sourceSystem === 'MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+    return this.controlledAdmission.withExistingManifestPairScope({
+      eventId: `lifecycle-restore-${pair.id}`, entity: lifecycleControlledManifestEntity(pair.entityType, pair.moyskladType),
+      sourceSystem, sourceNativeId: sourceSystem === 'MOYSKLAD' ? pair.moyskladId : pair.bitrix24Id,
+      targetSystem, targetNativeId: targetSystem === 'MOYSKLAD' ? pair.moyskladId : pair.bitrix24Id,
+    }, action);
+  }
+
   private async processDeleteEvent(eventId: string) {
     if (this.active.has(eventId)) return;
     this.active.add(eventId);
@@ -541,7 +555,7 @@ export class ClientLifecycleService implements InboundEventProcessor, OnApplicat
     const lease = await this.acquireEntityPairLease(pair, 'BITRIX24', pair.entityType, pair.bitrix24Id);
     try {
       await lease.assertOwned();
-      return await this.restoreWhileLeased(pairId, confirmed, actorId);
+      return await this.withControlledRestorePairScope(pair, () => this.restoreWhileLeased(pairId, confirmed, actorId));
     } finally {
       await lease.release();
     }
