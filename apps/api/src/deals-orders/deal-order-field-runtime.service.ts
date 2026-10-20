@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { DictionaryReference, VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
+import { applyFieldTransform, semanticFieldGroup, semanticFieldRule } from '../field-settings/field-transform';
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { writeOperationalLog } from '../monitoring-log';
 import { assertApplyExternalWrite } from '../external-write-guard';
@@ -15,6 +16,9 @@ type RecordValue = Record<string, unknown>;
 type Rule = VersionedFieldSettingsDto['config']['rules'][number];
 type Direction = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
 type Result = { status: 'SYNCED'; heldRules: number } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
+export type RevisionMappingResult =
+  | { status: 'verified'; bitrix24Values: Record<string, unknown>; moyskladValues: Record<string, unknown> }
+  | { status: 'retry' | 'manual_review'; reason: string };
 
 const logger = new Logger('DealOrderFieldRuntimeService');
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
@@ -25,13 +29,113 @@ const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
 };
 
 /**
- * Applies only explicitly configured scalar copy rules on confirmed deal/order
- * pairs. Reference objects and non-copy transforms are intentionally held until
- * their value maps and encodings have an approved, verified implementation.
+ * Applies explicitly configured and validated field transforms on confirmed
+ * deal/order pairs. Unsupported shapes remain held rather than guessed.
  */
 @Injectable()
 export class DealOrderFieldRuntimeService {
   constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader, private readonly mode: SyncModeService) {}
+
+  /**
+   * Reconcile only semantically changed/new deal-order rules while the caller
+   * owns the pair lease. MySklad remains authoritative during a settings rebase.
+   * Returned maps contain verified `rule:<id>` values for merging into the new
+   * baseline; this method never persists baseline state itself.
+   */
+  async reconcileRevisionMappings(input: {
+    pair: ConfirmedPair;
+    eventId: string;
+    oldConfig: VersionedFieldSettingsDto;
+    newConfig: VersionedFieldSettingsDto;
+    assertLease: () => Promise<boolean>;
+  }): Promise<RevisionMappingResult> {
+    if (input.pair.entityType !== 'DEAL') return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_UNSUPPORTED_ENTITY' };
+    if (process.env.SYNC_MODE !== 'apply') return { status: 'manual_review', reason: 'SYNC_MODE_NOT_APPLY' };
+    const oldRules = input.oldConfig.config.rules.filter((rule) => rule.entity === 'deals-orders');
+    const newRules = input.newConfig.config.rules.filter((rule) => rule.entity === 'deals-orders');
+    const oldRuleBySemantic = new Set(oldRules.map((rule) => JSON.stringify(semanticFieldRule(rule))));
+    const changedRules = newRules.filter((rule) => (rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled) && !oldRuleBySemantic.has(JSON.stringify(semanticFieldRule(rule))));
+    const oldGroups = new Set(input.oldConfig.config.groups.filter((group) => group.entity === 'deals-orders').map((group) => JSON.stringify(semanticFieldGroup(group))));
+    const changedGroups = input.newConfig.config.groups.filter((group) => group.entity === 'deals-orders' && !oldGroups.has(JSON.stringify(semanticFieldGroup(group))));
+    if (changedGroups.length) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_GROUP_RUNTIME_UNSUPPORTED' };
+    if (changedRules.some((rule) => rule.bitrix24ToMoysklad.enabled && !rule.moyskladToBitrix24.enabled)) {
+      return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_REQUIRES_MOYSKLAD_AUTHORITY' };
+    }
+    if (!changedRules.length) return { status: 'verified', bitrix24Values: {}, moyskladValues: {} };
+
+    let bitrix24: RecordValue;
+    let moysklad: RecordValue;
+    try {
+      [bitrix24, moysklad] = await Promise.all([
+        this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id),
+        this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
+      ]);
+    } catch { return { status: 'retry', reason: 'DEAL_ORDER_REVISION_READ_FAILED' }; }
+    const bitrix24Values: Record<string, unknown> = {};
+    const moyskladValues: Record<string, unknown> = {};
+    for (const rule of changedRules) {
+      if (!rule.moyskladToBitrix24.enabled || !rule.targetField || !rule.sourceField) {
+        return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_DIRECTION_UNSUPPORTED' };
+      }
+      if (rule.sourceField === 'COMMENTS' && rule.targetField === 'description' ||
+          touchesExactOptionalStringEndpoint(rule.sourceField, rule.targetField) && !isExactOptionalStringMapping(rule.sourceField, rule.targetField) ||
+          touchesPlannedDeliveryDateEndpoint(rule.sourceField, rule.targetField) && !isPlannedDeliveryDateMapping(rule.sourceField, rule.targetField) ||
+          isQ26PaidSumField(rule) && !isReadOnlyPaidSumRule(rule)) {
+        return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_MAPPING_NOT_SUPPORTED' };
+      }
+      if (dictionaryForRule(input.newConfig, rule)) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_DICTIONARY_MAPPING_UNSUPPORTED' };
+      const currentB24 = readDealOrderRuleField(bitrix24, rule, 'BITRIX24');
+      const currentMs = readDealOrderRuleField(moysklad, rule, 'MOYSKLAD');
+      if (!currentB24.supported || !currentMs.supported) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_FIELD_SHAPE_UNSUPPORTED' };
+      const transformed = applyFieldTransform(rule.moyskladToBitrix24.transform, currentMs.value);
+      if (transformed.status === 'skip') return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_SOURCE_VALUE_MISSING' };
+      if (transformed.status === 'error' || !isFieldScalar(transformed.value)) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_TRANSFORM_INVALID' };
+      if (isExactOptionalStringMapping(rule.sourceField, rule.targetField) && (!isOptionalString(currentMs.value) || !isOptionalString(transformed.value))) {
+        return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_OPTIONAL_STRING_INVALID' };
+      }
+      if (isReadOnlyPaidSumRule(rule) && (!isFiniteNumber(currentMs.value) || !(transformed.value === null || isFiniteNumber(transformed.value)))) {
+        return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_PAID_SUM_INVALID' };
+      }
+      if (!sameJson(transformed.value, currentB24.value)) {
+        let latestB24: RecordValue;
+        let latestMs: RecordValue;
+        try {
+          [latestB24, latestMs] = await Promise.all([
+            this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id),
+            this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
+          ]);
+        } catch { return { status: 'retry', reason: 'DEAL_ORDER_REVISION_READ_BEFORE_WRITE_FAILED' }; }
+        const latestB24Field = readDealOrderRuleField(latestB24, rule, 'BITRIX24');
+        const latestMsField = readDealOrderRuleField(latestMs, rule, 'MOYSKLAD');
+        if (!latestB24Field.supported || !latestMsField.supported || !sameJson(latestB24Field.value, currentB24.value) || !sameJson(latestMsField.value, currentMs.value)) {
+          return { status: 'retry', reason: 'DEAL_ORDER_REVISION_FIELD_CHANGED_BEFORE_WRITE' };
+        }
+        if (!await input.assertLease()) return { status: 'retry', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+        try {
+          await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', input.assertLease, { id: input.pair.id, entityType: input.pair.entityType }, () => writeBitrix24Field(input.pair.bitrix24Id, rule.sourceField, transformed.value as string | number | boolean | null));
+        } catch (error) {
+          return { status: 'retry', reason: error instanceof DealOrderWriteGateError ? error.message : 'DEAL_ORDER_REVISION_WRITE_FAILED' };
+        }
+      }
+      let verifiedB24: RecordValue;
+      let verifiedMs: RecordValue;
+      try {
+        [verifiedB24, verifiedMs] = await Promise.all([
+          this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id),
+          this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
+        ]);
+      } catch { return { status: 'retry', reason: 'DEAL_ORDER_REVISION_READBACK_FAILED' }; }
+      const readbackB24 = readDealOrderRuleField(verifiedB24, rule, 'BITRIX24');
+      const readbackMs = readDealOrderRuleField(verifiedMs, rule, 'MOYSKLAD');
+      if (!readbackB24.supported || !readbackMs.supported || !sameJson(readbackB24.value, transformed.value) || !sameJson(readbackMs.value, currentMs.value)) {
+        return { status: 'retry', reason: 'DEAL_ORDER_REVISION_READBACK_MISMATCH' };
+      }
+      if (!await input.assertLease()) return { status: 'retry', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+      bitrix24Values[`rule:${rule.id}`] = readbackB24.value;
+      moyskladValues[`rule:${rule.id}`] = readbackMs.value;
+    }
+    return { status: 'verified', bitrix24Values, moyskladValues };
+  }
 
   async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
@@ -154,18 +258,31 @@ export class DealOrderFieldRuntimeService {
         this.logHeld(input.eventId, pair.id, rule.id, 'READ_ONLY_PAID_SUM_DIRECTION_INVALID');
         continue;
       }
-      if (mapping.transform.kind !== 'copy') {
-        heldRules++;
-        this.logHeld(input.eventId, pair.id, rule.id, 'TRANSFORM_NOT_SUPPORTED');
-        continue;
-      }
       const allowed = direction === 'BITRIX24_TO_MOYSKLAD' ? directions?.bitrix24ToMoysklad ?? true : directions?.moyskladToBitrix24 ?? true;
       if (!mapping.enabled || !allowed) {
         heldRules++;
         this.logHeld(input.eventId, pair.id, rule.id, 'DIRECTION_DISABLED');
         continue;
       }
-      const desired = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current.value : msCurrent.value;
+      const sourceValue = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current.value : msCurrent.value;
+      const transformResult = applyFieldTransform(mapping.transform, sourceValue);
+      if (transformResult.status === 'skip') {
+        logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, ruleId: rule.id, reason: `FIELD_VALUE_SKIPPED:${transformResult.reason}` }));
+        continue;
+      }
+      if (transformResult.status === 'error') {
+        this.logHeld(input.eventId, pair.id, rule.id, `FIELD_TRANSFORM_FAILED:${transformResult.reason}`);
+        if (rule.criticality === 'critical') return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_CRITICAL_FIELD_TRANSFORM_FAILED' };
+        logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, ruleId: rule.id, reason: `OPTIONAL_FIELD_TRANSFORM_SKIPPED:${transformResult.reason}` }));
+        continue;
+      }
+      if (!isFieldScalar(transformResult.value)) {
+        this.logHeld(input.eventId, pair.id, rule.id, 'FIELD_TRANSFORM_OUTPUT_SHAPE_UNSUPPORTED');
+        if (rule.criticality === 'critical') return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_CRITICAL_FIELD_TRANSFORM_OUTPUT_UNSUPPORTED' };
+        logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, ruleId: rule.id, reason: 'OPTIONAL_FIELD_TRANSFORM_OUTPUT_SHAPE_UNSUPPORTED' }));
+        continue;
+      }
+      const desired = transformResult.value;
       const targetCurrent = direction === 'BITRIX24_TO_MOYSKLAD' ? msCurrent.value : b24Current.value;
       if (!sameJson(desired, targetCurrent)) {
         try {
@@ -217,7 +334,11 @@ export class DealOrderFieldRuntimeService {
       const readBackMs = dictionary
         ? readDictionaryField(verifiedB24, verifiedMs, rule, dictionary, 'MOYSKLAD')
         : readDealOrderRuleField(verifiedMs, rule, 'MOYSKLAD');
-      if (!readBackB24.supported || !readBackMs.supported || !sameJson(readBackB24.value, desired) || !sameJson(readBackMs.value, desired)) {
+      const readBackSource = direction === 'BITRIX24_TO_MOYSKLAD' ? readBackB24 : readBackMs;
+      const readBackTarget = direction === 'BITRIX24_TO_MOYSKLAD' ? readBackMs : readBackB24;
+      const sourceBeforeWrite = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current.value : msCurrent.value;
+      if (!readBackB24.supported || !readBackMs.supported || !readBackSource.supported || !readBackTarget.supported ||
+          !sameJson(readBackSource.value, sourceBeforeWrite) || !sameJson(readBackTarget.value, desired)) {
         return { status: 'RETRY', reason: 'DEAL_ORDER_FIELD_READBACK_MISMATCH' };
       }
       if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
@@ -356,6 +477,7 @@ function isQ26PaidSumField(rule: Rule): boolean {
   return rule.sourceField === 'UF_CRM_1782196830070' || rule.targetField === 'payedSum';
 }
 function isFiniteNumber(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value); }
+function isFieldScalar(value: unknown): value is string | number | boolean | null { return value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'; }
 
 function readScalarField(record: RecordValue, field: string, system: 'bitrix24' | 'moysklad'):
   { supported: true; value: string | number | boolean | null } | { supported: false } {
