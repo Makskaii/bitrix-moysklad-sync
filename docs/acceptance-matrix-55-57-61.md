@@ -1,5 +1,7 @@
 # Combined candidate acceptance matrix (#55, #57, #61)
 
+Historical candidate snapshot; its candidate SHAs, migration counts, and runtime WIP statements are not current #79 status. Use the [Issue #79 scoped live scenarios (2026-10-20)](issue-79-scoped-live-scenarios-2026-10-20.md) and dated [Issue #79 live preflight](issue-79-live-preflight-2026-10-20.md) for the current plan and tenant observations. The historical test evidence below is preserved and does not establish live acceptance.
+
 Candidate base: `fd9109a` (`origin/main`). Candidate source and integration-test snapshot: `50e80f0b53a197085b8d300975004d69d765d4d5`. This is an isolated integration candidate, not a production activation or cutover approval.
 
 | Scope | Offline evidence on this candidate | Remaining status |
