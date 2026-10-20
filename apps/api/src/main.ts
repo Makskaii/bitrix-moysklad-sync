@@ -70,6 +70,7 @@ import { InvoiceHttpApi } from './invoices/invoice-http-api';
 import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 import { ProductDuplicatesController } from './admin/product-duplicates.controller';
 import { ProductDuplicateAliasService } from './products/product-duplicate-alias.service';
+import { ApplicationLaunchController } from './application-launch.controller';
 
 @Controller()
 class AppController {
@@ -84,7 +85,7 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, AdminAuditController, ClientLifecycleController, ProductDuplicatesController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
+  controllers: [AppController, ApplicationLaunchController, AdminController, AdminAuditController, ClientLifecycleController, ProductDuplicatesController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
     { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
     EventWorkerLeaseService, DatabaseRecoveryService,
