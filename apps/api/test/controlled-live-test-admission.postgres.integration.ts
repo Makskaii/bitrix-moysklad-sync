@@ -93,6 +93,9 @@ test('controlled live source admission and target binding survive service restar
     const echoAdmission = await database.controlledTestAdmission.findUnique({ where: { eventId: echoEvent.id } });
     assert.equal(echoAdmission?.sourceNativeId, 'ms-controlled-target');
     assert.equal(echoAdmission?.targetNativeId, 'b24-controlled-source');
+    await database.controlledTestAdmission.update({ where: { eventId: sourceEvent.id }, data: { bitrix24PortalOrigin: 'https://other-portal.invalid' } });
+    await assert.rejects(restarted.scopeForEvent(sourceEvent.id), /CONTROLLED_LIVE_TEST_ADMISSION_PROVIDER_NAMESPACE_MISMATCH/,
+      'a durable admission cannot be replayed under a different provider namespace');
   } finally {
     await database.inboundEvent.deleteMany({ where: { id: { in: eventIds } } });
     await database.$disconnect();
