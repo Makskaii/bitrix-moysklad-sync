@@ -20,6 +20,7 @@ model SyncSetting {
   offSince                  DateTime?
   lastInactiveAt            DateTime?
   lastActiveAt              DateTime?
+  modeHistoryTrackedFrom    DateTime?
   resumeStatus              String    @default("idle")
   resumeFrom                DateTime?
   resumeThrough             DateTime?
@@ -39,6 +40,9 @@ model SyncSetting {
   nightlyBitrixLastId       String?
   nightlyMoyskladOffset     Int       @default(0)
   nightlyMoyskladEntity     String    @default("counterparty")
+  nightlyActiveSegments     Json      @default("[]")
+  nightlySegmentIndex       Int       @default(0)
+  nightlyCoverage           Json      @default("{}")
   nightlyBitrixStatus       String    @default("pending")
   nightlyMoyskladStatus     String    @default("pending")
   nightlyLeaseToken         String?
@@ -47,6 +51,15 @@ model SyncSetting {
   nightlyAttempts           Int       @default(0)
   nightlyError              String?
   updatedAt                 DateTime  @updatedAt
+}
+
+model SyncModeTransition {
+  id             String   @id @default(cuid())
+  fromMode       String
+  toMode         String
+  transitionedAt DateTime @default(now())
+
+  @@index([transitionedAt])
 }
 
 model DatabaseRecoveryState {

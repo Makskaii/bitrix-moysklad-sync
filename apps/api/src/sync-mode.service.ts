@@ -81,46 +81,40 @@ export class SyncModeService {
     if (mode === 'on' && this.databaseRecovery && !await this.databaseRecovery.assertReady()) {
       throw new ConflictException('Database loss recovery must be explicitly confirmed before Apply can be enabled');
     }
-    const current = await this.ensureGlobalSetting();
-    if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
-    const enteringOff = mode === 'off' && current.serviceMode !== 'off';
-    const leavingOffInterval = mode === 'on' && current.offSince !== null;
-    const now = new Date();
-    const offSince = enteringOff ? new Date() : current.offSince;
-    const setting = await this.database.syncSetting.update({
-      where: { id: 'global' },
-      data: {
-        serviceMode: mode,
-        offSince,
-        ...((mode === 'pause' || mode === 'off') ? { lastInactiveAt: now } : {}),
-        ...(mode === 'on' && current.serviceMode !== 'on' ? { lastActiveAt: now } : {}),
-        ...(enteringOff ? {
-          resumeStatus: 'skipped',
-          resumeFrom: null,
-          resumeThrough: null,
-          resumeProvider: 'BITRIX24',
-          resumeBitrixStart: 0,
-          resumeMoyskladOffset: 0,
-          resumeError: 'Events missed during OFF are intentionally not replayed.',
-          resumeRetryAfter: null,
-          resumeAttempts: 0,
-        } : {}),
-        ...(leavingOffInterval ? {
-          resumeStatus: 'skipped',
-          resumeFrom: null,
-          resumeThrough: null,
-          resumeProvider: 'BITRIX24',
-          resumeBitrixStart: 0,
-          resumeMoyskladOffset: 0,
-          resumeError: 'Events missed during OFF are intentionally not replayed.',
-          resumeRetryAfter: null,
-          resumeAttempts: 0,
-          offSince: null,
-        } : {}),
-      },
-      select: { serviceMode: true },
+    await this.ensureGlobalSetting();
+    return this.database.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "SyncSetting" WHERE "id" = 'global' FOR UPDATE`;
+      const current = await tx.syncSetting.findUniqueOrThrow({ where: { id: 'global' } });
+      if (mode === current.serviceMode) return { mode: current.serviceMode as ServiceMode };
+      const enteringOff = mode === 'off' && current.serviceMode !== 'off';
+      const leavingOffInterval = mode === 'on' && current.offSince !== null;
+      const now = new Date();
+      const offSince = enteringOff ? now : current.offSince;
+      const setting = await tx.syncSetting.update({
+        where: { id: 'global' },
+        data: {
+          serviceMode: mode,
+          offSince,
+          ...((mode === 'pause' || mode === 'off') ? { lastInactiveAt: now } : {}),
+          ...(mode === 'on' && current.serviceMode !== 'on' ? { lastActiveAt: now } : {}),
+          ...(enteringOff ? {
+            resumeStatus: 'skipped', resumeFrom: null, resumeThrough: null,
+            resumeProvider: 'BITRIX24', resumeBitrixStart: 0, resumeMoyskladOffset: 0,
+            resumeError: 'Events missed during OFF are intentionally not replayed.',
+            resumeRetryAfter: null, resumeAttempts: 0,
+          } : {}),
+          ...(leavingOffInterval ? {
+            resumeStatus: 'skipped', resumeFrom: null, resumeThrough: null,
+            resumeProvider: 'BITRIX24', resumeBitrixStart: 0, resumeMoyskladOffset: 0,
+            resumeError: 'Events missed during OFF are intentionally not replayed.',
+            resumeRetryAfter: null, resumeAttempts: 0, offSince: null,
+          } : {}),
+        },
+        select: { serviceMode: true },
+      });
+      await tx.syncModeTransition.create({ data: { fromMode: current.serviceMode, toMode: mode, transitionedAt: now } });
+      return { mode: setting.serviceMode as ServiceMode };
     });
-    return { mode: setting.serviceMode as ServiceMode };
   }
 
   async readEntitySettings() {
