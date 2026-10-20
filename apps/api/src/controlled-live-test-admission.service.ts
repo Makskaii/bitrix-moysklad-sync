@@ -18,7 +18,7 @@ interface ControlledLiveManifestIngressRecord {
   syntheticOnly: true;
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'BOTH';
   sourceSystem: 'BITRIX24' | 'MOYSKLAD';
-  sourceNativeId: string | null;
+  sourceNativeId: string;
   targetSystem: 'BITRIX24' | 'MOYSKLAD';
   targetNativeId: string | null;
   allowedActions?: ControlledLiveIngressAction[];
@@ -49,10 +49,10 @@ export class ControlledLiveTestAdmissionService {
           !source.currentName.includes('тест') || !source.currentName.includes(this.manifest.runId) ||
           source.sourceCreatedAt.getTime() < new Date(candidate.createdAfterUtc).getTime() || source.sourceCreatedAt.getTime() > Date.now()) return null;
       if (candidate.sourceSystem === source.sourceSystem &&
-          (candidate.sourceNativeId === null || candidate.sourceNativeId === source.sourceNativeId)) return { record: candidate, reversed: false, prior: null };
+          candidate.sourceNativeId === source.sourceNativeId) return { record: candidate, reversed: false, prior: null };
       if (candidate.direction === 'BOTH' && candidate.targetSystem === source.sourceSystem) {
         const prior = priorAdmissions.find((row: any) => row.sourceSystem === candidate.sourceSystem &&
-          (candidate.sourceNativeId === null || row.sourceNativeId === candidate.sourceNativeId) &&
+          row.sourceNativeId === candidate.sourceNativeId &&
           row.targetSystem === source.sourceSystem && row.targetNativeId === source.sourceNativeId);
         if (prior) return { record: candidate, reversed: true, prior };
       }
@@ -160,7 +160,7 @@ export class ControlledLiveTestAdmissionService {
     const admission = await this.database.controlledTestAdmission.findUnique({ where: { eventId } });
     if (admission) this.assertAdmissionNamespace(admission);
     const record = admission && this.manifest.records.find((candidate: any) => candidate.entity === entity && candidate.name === admission.sourceName &&
-      candidate.sourceSystem === admission.sourceSystem && (candidate.sourceNativeId === null || candidate.sourceNativeId === admission.sourceNativeId) &&
+      candidate.sourceSystem === admission.sourceSystem && candidate.sourceNativeId === admission.sourceNativeId &&
       candidate.targetSystem === targetSystem && candidate.targetNativeId === null);
     if (!admission || !record || admission.targetNativeId !== null || admission.targetSystem !== targetSystem || admission.entity !== entity) {
       throw new Error('CONTROLLED_LIVE_TEST_CREATE_NOT_RESERVED');
@@ -200,11 +200,11 @@ export class ControlledLiveTestAdmissionService {
     for (const record of this.manifest.records) {
       if (record.entity !== entity || record.syntheticOnly !== true || !admissions.some((row: any) => row.sourceName === record.name)) continue;
       const forward = record.sourceSystem === input.sourceSystem && record.targetSystem === input.targetSystem &&
-        (record.sourceNativeId === null || record.sourceNativeId === input.sourceNativeId) &&
+        record.sourceNativeId === input.sourceNativeId &&
         (record.targetNativeId === null || record.targetNativeId === input.targetNativeId);
       const reverse = record.direction === 'BOTH' && record.targetSystem === input.sourceSystem && record.sourceSystem === input.targetSystem &&
         (record.targetNativeId === null || record.targetNativeId === input.sourceNativeId) &&
-        (record.sourceNativeId === null || record.sourceNativeId === input.targetNativeId);
+        record.sourceNativeId === input.targetNativeId;
       if (!forward && !reverse) continue;
       const prior = admissions.find((row: any) => row.sourceName === record.name && row.runId === this.manifest.runId && row.entity === entity &&
         Number.isFinite(row.sourceCreatedAt?.getTime?.()) && row.sourceCreatedAt.getTime() >= new Date(record.createdAfterUtc).getTime() &&
@@ -225,7 +225,7 @@ export class ControlledLiveTestAdmissionService {
     const candidates = this.manifest.records.filter((record: any) => {
       if (entityHint && record.entity !== entityHint) return false;
       return record.syntheticOnly === true && (
-        record.direction !== 'MOYSKLAD_TO_BITRIX24' && record.sourceSystem === sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === sourceNativeId) ||
+        record.direction !== 'MOYSKLAD_TO_BITRIX24' && record.sourceSystem === sourceSystem && record.sourceNativeId === sourceNativeId ||
         record.direction === 'BOTH' && record.targetSystem === sourceSystem && (record.targetNativeId === null || record.targetNativeId === sourceNativeId));
     });
     if (candidates.length !== 1) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_READ_NOT_UNIQUELY_MANIFESTED');
@@ -334,9 +334,9 @@ function controlledManifestEntity(value: string): string {
 }
 
 function manifestMatchesAdmission(record: any, admission: any): boolean {
-  const forward = record.sourceSystem === admission.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === admission.sourceNativeId) &&
+  const forward = record.sourceSystem === admission.sourceSystem && record.sourceNativeId === admission.sourceNativeId &&
     record.targetSystem === admission.targetSystem && (record.targetNativeId === null || record.targetNativeId === admission.targetNativeId);
   const reverse = record.direction === 'BOTH' && record.targetSystem === admission.sourceSystem && (record.targetNativeId === null || record.targetNativeId === admission.sourceNativeId) &&
-    record.sourceSystem === admission.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === admission.targetNativeId);
+    record.sourceSystem === admission.targetSystem && record.sourceNativeId === admission.targetNativeId;
   return forward || reverse;
 }

@@ -48,6 +48,9 @@ test('malformed manifests, duplicate targets and omitted policy data fail closed
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], syntheticOnly: false }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], direction: 'ANY' }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], direction: 'MOYSKLAD_TO_BITRIX24' }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], sourceNativeId: null }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
+  const { sourceNativeId: _omittedSourceNativeId, ...recordWithoutSourceId } = manifest.records[0];
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [recordWithoutSourceId] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], allowedActions: ['DELETE'] }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], allowedActions: [] }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
 });
@@ -277,6 +280,52 @@ test('client source admission, target readback binding and restart scope are dur
     await restartedAdmission.runForEvent('evt-2', async () => assert.doesNotThrow(() => assertApplyExternalWrite('BITRIX24', 'CLIENT_UPDATE', 'b24-17', 'client:COMPANY')));
     await assert.rejects(restartedAdmission.admit('evt-wrong-readback', { ...source, currentNativeId: 'different', currentName: source.currentName }), /SOURCE_ID_MISMATCH/);
     await assert.rejects(restartedAdmission.admit('evt-3', { ...source, sourceNativeId: 'shared-real-company', currentNativeId: 'shared-real-company', currentName: source.currentName }), /SOURCE_NOT_ADMITTED/);
+  } finally {
+    setControlledLiveTestWriteCheck(null);
+    for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.path], ['DATABASE_URL', previous.database]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('deal-order admission requires an exact source ID while target-null creation remains reserved', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'issue60-exact-source-'));
+  const manifestPath = join(directory, 'manifest.json');
+  const runId = 'LIVE-TEST-20261020T1438Z-block2';
+  const sourceName = `тест ${runId} D01`;
+  const record = {
+    entity: 'deal-order', direction: 'BITRIX24_TO_MOYSKLAD', name: sourceName, syntheticOnly: true,
+    sourceSystem: 'BITRIX24', sourceNativeId: 'b24-test-100', targetSystem: 'MOYSKLAD', targetNativeId: null,
+    createdAfterUtc: '2026-10-20T00:00:00Z', allowedActions: ['UPDATE'],
+  };
+  const dynamicManifest = { ...manifest, runId, records: [record] };
+  const rows = new Map<string, any>();
+  const fakeDatabase = { controlledTestAdmission: {
+    findMany: async () => [...rows.values()],
+    findUnique: async ({ where }: any) => rows.get(where.eventId) ?? null,
+    upsert: async ({ where, create }: any) => { if (!rows.has(where.eventId)) rows.set(where.eventId, { ...create }); return rows.get(where.eventId); },
+  } };
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE, path: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL };
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
+  process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
+  try {
+    await writeFile(manifestPath, JSON.stringify(dynamicManifest), 'utf8');
+    const admission = new ControlledLiveTestAdmissionService(fakeDatabase as any);
+    const source = { entity: 'deal-order', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-test-100', currentNativeId: 'b24-test-100', currentName: sourceName, sourceCreatedAt: new Date() };
+    await admission.admit('evt-exact-source', source);
+    await assert.rejects(admission.admit('evt-foreign-source', { ...source, sourceNativeId: 'b24-foreign-900', currentNativeId: 'b24-foreign-900' }), /SOURCE_NOT_ADMITTED/);
+
+    const assertWrite = createControlledLiveTestPolicy(dynamicManifest, testDatabaseUrl);
+    const scope = {
+      eventId: 'evt-exact-source', runId, entity: 'deal-order', sourceSystem: 'BITRIX24' as const, sourceNativeId: source.sourceNativeId,
+      targetSystem: 'MOYSKLAD' as const, targetNativeId: null, admittedSourceName: sourceName, admittedSourceCreatedAt: source.sourceCreatedAt.toISOString(),
+    };
+    withControlledLiveEventScope(scope, () => assert.doesNotThrow(() => assertWrite('MOYSKLAD', 'CUSTOMER_ORDER_CREATE', null, 'deal-order')));
+    withControlledLiveEventScope({ ...scope, sourceNativeId: 'b24-foreign-900' }, () =>
+      assert.throws(() => assertWrite('MOYSKLAD', 'CUSTOMER_ORDER_CREATE', null, 'deal-order'), /TARGET_NOT_IN_MANIFEST/));
   } finally {
     setControlledLiveTestWriteCheck(null);
     for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.path], ['DATABASE_URL', previous.database]] as const) {

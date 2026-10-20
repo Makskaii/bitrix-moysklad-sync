@@ -10,7 +10,7 @@ export interface ControlledLiveManifestRecord {
   name: string;
   syntheticOnly: true;
   sourceSystem: ControlledProvider;
-  sourceNativeId: string | null;
+  sourceNativeId: string;
   targetSystem: ControlledProvider;
   targetNativeId: string | null;
   createdAfterUtc: string;
@@ -80,7 +80,7 @@ export function createControlledLiveTestPolicy(
         providerValue === scope.targetSystem && nativeId === scope.targetNativeId ||
         providerValue === scope.pendingTargetSystem && nativeId === scope.pendingTargetNativeId;
       const sourceAllowed = manifest.records.some((record) => record.entity === scope.entity &&
-        ((record.sourceSystem === providerValue && (record.sourceNativeId === null || record.sourceNativeId === nativeId)) ||
+        ((record.sourceSystem === providerValue && record.sourceNativeId === nativeId) ||
          (record.targetSystem === providerValue && (record.targetNativeId === null || record.targetNativeId === nativeId))));
       const dependencyAllowed = manifest.records.some((record) => record.entity === scope.entity && scopeMatchesManifestPair(record, scope) &&
         record.readOnlyDependencies?.some((dependency) => dependency.provider === providerValue && dependency.nativeId === nativeId && entityMatchesScope(requestEntity, dependency.entity)));
@@ -93,10 +93,10 @@ export function createControlledLiveTestPolicy(
     if (!entityMatchesScope(requestEntity, scope.entity)) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
     const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation) && !/CHILD/i.test(operation);
     const allowed = manifest.records.some((record) => record.entity === scope.entity &&
-      ((record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
+      ((record.sourceSystem === scope.sourceSystem && record.sourceNativeId === scope.sourceNativeId &&
         record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId)) ||
-       (record.direction === 'BOTH' && record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
-        record.sourceSystem === scope.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.targetNativeId))) &&
+        (record.direction === 'BOTH' && record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
+        record.sourceSystem === scope.targetSystem && record.sourceNativeId === scope.targetNativeId)) &&
       ((scope.targetSystem === providerValue && scope.admittedSourceName === record.name &&
         (isCreate ? record.sourceSystem === scope.sourceSystem && record.targetNativeId === null && scope.targetNativeId === null && nativeId === null :
           scope.targetNativeId !== null && nativeId === scope.targetNativeId)) ||
@@ -181,7 +181,7 @@ function parseManifest(value: unknown): ControlledLiveManifest {
         !Number.isFinite(new Date(item.createdAfterUtc).getTime()) ||
         (item.allowedActions !== undefined && (!Array.isArray(item.allowedActions) || item.allowedActions.length === 0 ||
           item.allowedActions.some((action) => action !== 'CREATE' && action !== 'UPDATE') || new Set(item.allowedActions).size !== item.allowedActions.length)) ||
-        !(item.sourceNativeId === null || (typeof item.sourceNativeId === 'string' && item.sourceNativeId)) ||
+        !(typeof item.sourceNativeId === 'string' && item.sourceNativeId) ||
         !(item.targetNativeId === null || (typeof item.targetNativeId === 'string' && item.targetNativeId)) || item.sourceSystem === item.targetSystem ||
         (item.readOnlyDependencies !== undefined && (!Array.isArray(item.readOnlyDependencies) || item.readOnlyDependencies.some((dependency) =>
           !isRecord(dependency) || !isProvider(dependency.provider) || typeof dependency.entity !== 'string' || !dependency.entity || typeof dependency.nativeId !== 'string' || !dependency.nativeId))) ||
@@ -194,7 +194,7 @@ function parseManifest(value: unknown): ControlledLiveManifest {
   const uniqueness = new Set<string>();
   for (const record of records) {
     const identities = [
-      record.sourceNativeId === null ? null : `${record.entity}:${record.sourceSystem}:${record.sourceNativeId}`,
+      `${record.entity}:${record.sourceSystem}:${record.sourceNativeId}`,
       record.targetNativeId === null ? `${record.entity}:${record.targetSystem}:name:${record.name}` : `${record.entity}:${record.targetSystem}:${record.targetNativeId}`,
     ].filter((value): value is string => value !== null);
     for (const identity of identities) {
@@ -219,10 +219,10 @@ function entityMatchesScope(requestEntity: string | undefined, scopeEntity: stri
   return requestEntity === scopeEntity || (requestEntity === 'client:COUNTERPARTY' && ['client:COMPANY', 'client:CONTACT'].includes(scopeEntity));
 }
 function scopeMatchesManifestPair(record: ControlledLiveManifestRecord, scope: ControlledLiveEventScope): boolean {
-  const forward = record.sourceSystem === scope.sourceSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.sourceNativeId) &&
+  const forward = record.sourceSystem === scope.sourceSystem && record.sourceNativeId === scope.sourceNativeId &&
     record.targetSystem === scope.targetSystem && (record.targetNativeId === null || record.targetNativeId === scope.targetNativeId);
   const reverse = record.direction === 'BOTH' && record.targetSystem === scope.sourceSystem && (record.targetNativeId === null || record.targetNativeId === scope.sourceNativeId) &&
-    record.sourceSystem === scope.targetSystem && (record.sourceNativeId === null || record.sourceNativeId === scope.targetNativeId);
+    record.sourceSystem === scope.targetSystem && record.sourceNativeId === scope.targetNativeId;
   return forward || reverse;
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
