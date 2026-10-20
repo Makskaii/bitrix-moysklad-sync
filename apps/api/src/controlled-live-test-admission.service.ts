@@ -437,7 +437,8 @@ function bindingMatchesExpected(binding: any, runId: string, record: any,
     (targetExpected === null || binding[targetField] === targetExpected) &&
     binding.bitrix24PortalOrigin === namespace.bitrix24PortalOrigin &&
     binding.bitrix24UserId === namespace.bitrix24UserId && binding.moyskladAccountId === namespace.moyskladAccountId &&
-    binding.sourceName === source.currentName && binding.sourceCreatedAt.getTime() === source.sourceCreatedAt.getTime();
+    binding.sourceName === source.currentName &&
+    (reversed || binding.sourceCreatedAt.getTime() === source.sourceCreatedAt.getTime());
 }
 
 function isUniqueConstraintError(error: unknown): error is { code: string } {

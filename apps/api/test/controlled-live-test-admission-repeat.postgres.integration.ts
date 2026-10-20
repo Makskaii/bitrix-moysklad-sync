@@ -103,7 +103,7 @@ test('a manifested company may be admitted for repeated update events without we
     moyskladAccountId: 'b0b309ee-13e3-11e9-9109-f8fc0001f188',
   };
   const records = [
-    { entity: 'client:COMPANY', direction: 'BITRIX24_TO_MOYSKLAD', name: sourceName, syntheticOnly: true,
+    { entity: 'client:COMPANY', direction: 'BOTH', name: sourceName, syntheticOnly: true,
       sourceSystem: 'BITRIX24', sourceNativeId: sourceId, targetSystem: 'MOYSKLAD', targetNativeId: targetId,
       allowedActions: ['UPDATE'], createdAfterUtc: new Date(now.getTime() - 1_000).toISOString() },
   ];
@@ -111,7 +111,7 @@ test('a manifested company may be admitted for repeated update events without we
   const manifestPath = join(directory, 'manifest.json');
   const previous = Object.fromEntries(['CONTROLLED_LIVE_TEST_MODE', 'CONTROLLED_LIVE_TEST_INSTANCE', 'CONTROLLED_LIVE_TEST_MANIFEST', 'DATABASE_URL', 'SYNC_MODE']
     .map((key) => [key, process.env[key]]));
-  const eventIds = Array.from({ length: 4 }, () => `repeat-${randomUUID()}`);
+  const eventIds = Array.from({ length: 5 }, () => `repeat-${randomUUID()}`);
   let database: DatabaseService | undefined;
   try {
     process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
@@ -125,8 +125,10 @@ test('a manifested company may be admitted for repeated update events without we
     await database.$connect();
     setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ runId, testDatabaseName: databaseName, testSchemaName: schemaName, providerNamespace, records }, databaseUrl));
     const events = await Promise.all(eventIds.map((id, index) => database!.inboundEvent.create({ data: {
-      id, source: 'BITRIX24', deliveryKey: `delivery-${id}`, eventType: 'ONCRMCOMPANYUPDATE',
-      externalEntityType: 'company', externalEntityId: index === 3 ? secondSourceId : sourceId, payload: {},
+      id, source: index === 3 ? 'MOYSKLAD' : 'BITRIX24', deliveryKey: `delivery-${id}`,
+      eventType: index === 3 ? 'UPDATE' : 'ONCRMCOMPANYUPDATE',
+      externalEntityType: index === 3 ? 'counterparty' : 'company',
+      externalEntityId: index === 3 ? targetId : index === 4 ? secondSourceId : sourceId, payload: {},
     } })));
     const admission = new ControlledLiveTestAdmissionService(database);
     const source: VerifiedControlledSource = {
@@ -148,6 +150,18 @@ test('a manifested company may be admitted for repeated update events without we
     await admission.admit(events[0]!.id, source);
     assert.equal(await database.controlledTestAdmission.count({ where: { runId, entity: 'client:COMPANY', sourceNativeId: sourceId } }), 3,
       're-admitting the same event remains idempotent');
+
+    const reverseSource: VerifiedControlledSource = {
+      entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: targetId,
+      currentNativeId: targetId, currentName: sourceName, sourceCreatedAt: new Date(now.getTime() - 500),
+    };
+    await admission.admit(events[3]!.id, reverseSource);
+    const reverseAdmission = await database.controlledTestAdmission.findUniqueOrThrow({ where: { eventId: events[3]!.id } });
+    assert.equal(reverseAdmission.sourceSystem, 'MOYSKLAD');
+    assert.equal(reverseAdmission.targetSystem, 'BITRIX24');
+    assert.equal(reverseAdmission.targetNativeId, sourceId);
+    assert.equal(reverseAdmission.bindingId, (await database.controlledTestAdmission.findUniqueOrThrow({ where: { eventId: events[0]!.id } })).bindingId,
+      'opposite provider timestamps may differ while both independently satisfy the manifest window');
 
     const conflictingSource: VerifiedControlledSource = {
       ...source, sourceNativeId: secondSourceId, currentNativeId: secondSourceId, currentName: `тест ${runId} unmanifested company`,

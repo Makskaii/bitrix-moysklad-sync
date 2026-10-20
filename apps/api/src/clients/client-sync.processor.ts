@@ -476,9 +476,13 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         if (type === 'counterparty' && stringValue(moyskladSourceRecord.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
         await this.admitControlledSource(event.id, event, entity, sourceSystem, moyskladSourceRecord);
       }
+      const sourceNativeId = event.externalEntityId;
+      const gateway = this.gateway;
+      if (!sourceNativeId || !gateway) return await this.hold(event, 'CLIENT_RUNTIME_GATEWAY_UNAVAILABLE', { source: event.source, entity }, fence);
+      const continueAfterAdmission = async () => {
       if (entity === 'CONTACT' && sourceSystem === 'BITRIX24') {
         const contextPairs = await this.database.entityPair.findMany({
-          where: { entityType: 'CONTACT', active: true, bitrix24Id: event.externalEntityId },
+          where: { entityType: 'CONTACT', active: true, bitrix24Id: sourceNativeId },
           orderBy: [{ moyskladParentId: 'asc' }, { id: 'asc' }],
         });
         if (contextPairs.length) return await this.processContactPairFanout(event, eventConfig, bitrixSourceRecord!, contextPairs, fence);
@@ -507,7 +511,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           : parentIdFromEvent(event)
         : undefined;
       let pair = await this.database.entityPair.findFirst({
-        where: { entityType: entity, active: true, ...(event.source === 'BITRIX24' ? { bitrix24Id: event.externalEntityId } : { moyskladId: event.externalEntityId }),
+        where: { entityType: entity, active: true, ...(event.source === 'BITRIX24' ? { bitrix24Id: sourceNativeId } : { moyskladId: sourceNativeId }),
           ...(entity === 'CONTACT' ? { moyskladParentId: contactPairParentId ?? null } : {}) },
       });
       if (!pair && sourceSystem === 'MOYSKLAD' && event.externalEntityType === 'counterparty') {
@@ -530,13 +534,13 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const bitrixEntity = entity === 'COMPANY' ? 'COMPANY' : 'CONTACT';
       const msType = pair.moyskladType === 'contactperson' ? 'contactperson' : 'counterparty';
       let [bitrix, moysklad] = await Promise.all([
-        this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
-        this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
+        gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+        gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
       ]);
       if (entity === 'COMPANY') {
         try {
           const [bitrixInn, moyskladInn] = await Promise.all([
-            this.candidateGateway.readCompanyInn('BITRIX24', pair.bitrix24Id),
+            this.candidateGateway!.readCompanyInn('BITRIX24', pair.bitrix24Id!),
             Promise.resolve(stringValue(moysklad.inn)),
           ]);
           if (bitrixInn && moyskladInn && bitrixInn !== moyskladInn) {
@@ -571,8 +575,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         prior = revision.state;
         if (revision.rebased) {
           [bitrix, moysklad] = await Promise.all([
-            this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
-            this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
+            gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+            gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
           ]);
         }
       }
@@ -623,11 +627,11 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         });
       }
       if (writes.ambiguous) return this.hold(event, writes.ambiguous, { pairId: pair.id });
-      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await this.gateway.updateMoysklad(msType, pair.moyskladId, pair.moyskladParentId, writes.moysklad, event.id); }
-      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await this.gateway.updateBitrix(bitrixEntity, pair.bitrix24Id, writes.bitrix24, event.id); }
+      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await gateway.updateMoysklad(msType, pair.moyskladId!, pair.moyskladParentId, writes.moysklad, event.id); }
+      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await gateway.updateBitrix(bitrixEntity, pair.bitrix24Id!, writes.bitrix24, event.id); }
       const [afterBitrix, afterMoysklad] = await Promise.all([
-        this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
-        this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
+        gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+        gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
       ]);
       const confirmed = { bitrix24Values: selectFields(afterBitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(afterMoysklad, applicable, groups, 'MOYSKLAD') };
       if (!matchesWrittenFields(writes.bitrix24, confirmed.bitrix24Values) || !matchesWrittenFields(writes.moysklad, confirmed.moyskladValues)) {
@@ -644,6 +648,10 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: updatedFields.length ? `Configured fields synchronized (MoySklad wins conflicts): ${updatedFields.join(', ')} (pair ${pair.id}).` : `No configured field changes to synchronize (pair ${pair.id}).`, referenceId: event.id } });
       });
       return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length || childResourceChanged ? 'SYNCED' : 'UNCHANGED';
+      };
+      return this.controlledAdmission
+        ? await this.controlledAdmission.runForEvent(event.id, continueAfterAdmission)
+        : await continueAfterAdmission();
     } catch (error) {
       if (error instanceof ServiceModeNotOnError) return 'IGNORED';
       const retryable = isRetryableFailure(error);

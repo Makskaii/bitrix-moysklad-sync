@@ -51,6 +51,7 @@ let externalRequests: string[] = [];
 let controlledGuardFailures: string[] = [];
 let providerOutcomes: string[] = [];
 let clientBoundaries: string[] = [];
+let fetchBoundaries: string[] = [];
 let previousEnvironment: Record<string, string | undefined> = {};
 let originalFetch: typeof fetch;
 let manifestDirectory: string;
@@ -171,9 +172,29 @@ before(async () => {
 
   mode = new SyncModeService(database);
   admission = new ControlledLiveTestAdmissionService(database);
+  const guardedFetch = globalThis.fetch;
+  const tracedFetch: typeof fetch = async (input, init) => {
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+    let provider = 'unknown';
+    try {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.startsWith('/rest/')) provider = 'BITRIX24';
+      else if (url.pathname.startsWith('/api/remap/1.2/')) provider = 'MOYSKLAD';
+    } catch { /* safe class-only trace below */ }
+    try {
+      const response = await guardedFetch(input, init);
+      fetchBoundaries.push(`${provider}:${method.toUpperCase()}:HTTP_${response.status}`);
+      return response;
+    } catch (error) {
+      const code = error instanceof Error && /^CONTROLLED_LIVE_TEST_[A-Z0-9_]+$/.test(error.message)
+        ? error.message : error instanceof TypeError ? 'TYPE_ERROR' : 'FETCH_ERROR';
+      fetchBoundaries.push(`${provider}:${method.toUpperCase()}:THREW_${error instanceof Error ? error.constructor.name : 'NON_ERROR'}:${code}`);
+      throw error;
+    }
+  };
   clientProcessor = new ClientSyncProcessor(database, settings, mode,
-    traceClientGateway(new HttpClientSyncGateway(globalThis.fetch)),
-    traceClientGateway(new HttpClientCandidateGateway(database, globalThis.fetch)),
+    traceClientGateway(new HttpClientSyncGateway(tracedFetch)),
+    traceClientGateway(new HttpClientCandidateGateway(database, tracedFetch)),
     undefined, undefined, admission);
   dispatcher = new EventDispatcherService(database,
     { enqueue: () => undefined } as any,
@@ -206,7 +227,7 @@ after(async () => {
   if (manifestDirectory) await rm(manifestDirectory, { recursive: true, force: true });
 });
 
-test('public company UPDATE deliveries persist distinct admissions for one exclusive pair (admission-only)', async (t) => {
+test('public repeated company UPDATEs stay in event scope and reuse one exclusive pair', async (t) => {
   assert.equal(await database.entityPair.count({ where: { bitrix24Id: sourceId, moyskladId: targetId, active: true } }), 1);
   const postUpdate = async (label: string) => {
     const response = await originalFetch(`${apiUrl}/webhooks/bitrix24`, {
@@ -229,16 +250,14 @@ test('public company UPDATE deliveries persist distinct admissions for one exclu
   const first = await postUpdate('one');
   const second = await postUpdate('two');
   assert.notEqual(first.eventId, second.eventId, 'independent Bitrix deliveries retain separate durable event IDs');
-  assert.ok(['UNCHANGED', 'RETRYABLE_FAILURE'].includes(first.terminal.status), JSON.stringify({ status: first.terminal.status, lastErrorCategory: first.terminal.lastErrorCategory, logs: first.logs, admissions: first.admissions, pairs: first.pairs, externalRequests, controlledGuardFailures, providerOutcomes, clientBoundaries }));
-  assert.ok(['UNCHANGED', 'RETRYABLE_FAILURE'].includes(second.terminal.status), JSON.stringify({ status: second.terminal.status, lastErrorCategory: second.terminal.lastErrorCategory, logs: second.logs, admissions: second.admissions, pairs: second.pairs, externalRequests, controlledGuardFailures, providerOutcomes, clientBoundaries }));
+  assert.ok(['SUCCEEDED', 'UNCHANGED'].includes(first.terminal.status), JSON.stringify({ status: first.terminal.status, lastErrorCategory: first.terminal.lastErrorCategory, logs: first.logs, admissions: first.admissions, pairs: first.pairs, externalRequests, controlledGuardFailures, providerOutcomes, clientBoundaries, fetchBoundaries }));
+  assert.ok(['SUCCEEDED', 'UNCHANGED'].includes(second.terminal.status), JSON.stringify({ status: second.terminal.status, lastErrorCategory: second.terminal.lastErrorCategory, logs: second.logs, admissions: second.admissions, pairs: second.pairs, externalRequests, controlledGuardFailures, providerOutcomes, clientBoundaries, fetchBoundaries }));
   assert.equal(first.admissions, 1, 'first public delivery persisted its event admission before any downstream sync outcome');
   assert.equal(second.admissions, 1, 'repeated public delivery persisted a distinct event admission');
-  if (first.terminal.status === 'RETRYABLE_FAILURE') assert.equal(first.terminal.lastErrorCategory, 'CLIENT_SYNC_FAILURE');
-  if (second.terminal.status === 'RETRYABLE_FAILURE') assert.equal(second.terminal.lastErrorCategory, 'CLIENT_SYNC_FAILURE');
   t.diagnostic(JSON.stringify({
-    scope: 'admission-only; downstream synchronization is not asserted',
+    scope: 'public intake, real dispatcher and processor, isolated PostgreSQL; no field writes configured',
     outcomes: [first, second].map(({ terminal, admissions: eventAdmissions }) => ({ status: terminal.status, lastErrorCategory: terminal.lastErrorCategory, eventAdmissions })),
-    clientBoundaries, providerOutcomes,
+    clientBoundaries, fetchBoundaries, providerOutcomes,
   }));
   assert.equal(first.terminal.attempts, 1);
   assert.equal(second.terminal.attempts, 1);
