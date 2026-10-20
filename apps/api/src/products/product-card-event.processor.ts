@@ -15,6 +15,7 @@ import { ProductDuplicateAliasService } from './product-duplicate-alias.service'
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { chooseProductCatalogCandidate, comparableCatalogPrice, ProductCatalogCandidate } from './product-catalog-match-policy';
 import { writeOperationalLog } from '../monitoring-log';
+import { withServiceModeOn } from '../service-mode-transaction';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -75,12 +76,19 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       .finally(() => { this.recoveryScan = null; });
   }
 
+  private async readUnderMode<T>(operation: () => Promise<T>): Promise<T> {
+    const result = await withServiceModeOn(this.database, operation);
+    if (!result.enabled) throw new Error('PRODUCT_EVENT_SERVICE_MODE_NOT_ON');
+    return result.value;
+  }
+
   private async resumeProductEvents() {
     if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return;
     try {
-      const now = new Date();
-      const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
-      const pending = await this.database.inboundEvent.findMany({
+      const pending = await withServiceModeOn(this.database, async (transaction) => {
+        const now = new Date();
+        const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
+        return transaction.inboundEvent.findMany({
         where: {
           AND: [
             { OR: [
@@ -98,7 +106,9 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         select: { id: true },
         take: 100,
       });
-      for (const event of pending) this.enqueue(event.id);
+      });
+      if (!pending.enabled) return;
+      for (const event of pending.value ?? []) this.enqueue(event.id);
     } catch {
       // A later timer tick retries database discovery without blocking startup.
     }
@@ -117,7 +127,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     if (!event || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
     if (!isProductEvent(event.source, event.eventType, event.externalEntityType)) return null;
 
-    const claimed = await this.database.$transaction(async (transaction) => {
+    const claim = await withServiceModeOn(this.database, async (transaction) => {
       await assertWorkerLeaseInTransaction(workerLease, transaction);
       return transaction.inboundEvent.updateMany({
       where: {
@@ -132,7 +142,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       data: { status: 'PROCESSING', attempts: { increment: 1 }, processingStartedAt: new Date(), lastErrorCategory: null, retryAfter: null },
       });
     });
-    if (claimed.count !== 1) return null;
+    if (!claim.enabled || claim.value?.count !== 1) return null;
 
     const attempt = event.attempts + 1;
     const supported = await this.resolveProductId(event, attempt);
@@ -221,8 +231,8 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         const sourceSystem = 'MOYSKLAD';
         const sourceNativeId = authoritativeRestore ? matches[0]!.moyskladId : supported.productId;
         const sourceRecord = authoritativeRestore
-          ? await this.controlledAdmission.withProductRestoreSourceRead({ eventId: event.id, sourceNativeId, targetNativeId: matches[0]!.bitrix24Id, entity }, () => this.bitrixApi.readMoysklad(sourceNativeId, kind))
-          : await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, sourceNativeId, entity, () => this.bitrixApi.readMoysklad(sourceNativeId, kind));
+          ? await this.controlledAdmission.withProductRestoreSourceRead({ eventId: event.id, sourceNativeId, targetNativeId: matches[0]!.bitrix24Id, entity }, () => this.readUnderMode(() => this.bitrixApi.readMoysklad(sourceNativeId, kind)))
+          : await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, sourceNativeId, entity, () => this.readUnderMode(() => this.bitrixApi.readMoysklad(sourceNativeId, kind)));
         const sourceCreatedAt = sourceRecord.createdAt ? new Date(sourceRecord.createdAt) : null;
         if (!sourceRecord.name || !sourceCreatedAt || !Number.isFinite(sourceCreatedAt.getTime())) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
         await this.controlledAdmission.admit(event.id, { entity, sourceSystem, sourceNativeId, currentNativeId: sourceNativeId,
@@ -252,8 +262,8 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       }
       const entity = input.kind === 'service' ? 'catalog-service' : 'catalog-product';
       const record = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
-        ? await this.controlledAdmission.withCurrentSourceRead(input.eventId, 'MOYSKLAD', input.productId, entity, () => this.bitrixApi.readMoyskladRecord(input.productId, input.kind))
-        : await this.bitrixApi.readMoyskladRecord(input.productId, input.kind);
+        ? await this.controlledAdmission.withCurrentSourceRead(input.eventId, 'MOYSKLAD', input.productId, entity, () => this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind)))
+        : await this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind));
       const createdAt = typeof record.created === 'string' ? new Date(record.created) : null;
       const boundary = await this.databaseRecovery?.launchBoundary().catch(() => null);
       if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime())) {
@@ -271,7 +281,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       }
       const pinned = await this.fieldSettings.eventConfig(input.eventId);
       const settings = pinned.config as unknown as ProductCardSettings;
-      const snapshot = await this.bitrixApi.readMoysklad(input.productId, input.kind);
+      const snapshot = await this.readUnderMode(() => this.bitrixApi.readMoysklad(input.productId, input.kind));
       const unitId = mappedUnitId(snapshot.unitId, settings);
       const prices = initialMappedPrices(snapshot.prices, settings);
       const creator = this.catalogCreate;
@@ -317,7 +327,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const fields = asRecord(data.FIELDS);
       const priceId = readScalar(fields.ID) ?? event.externalEntityId;
       if (!priceId || !/^\d{1,20}$/.test(priceId)) return { status: 'retryable' };
-      try { return { status: 'resolved', productId: await this.bitrixApi.readBitrix24PriceProductId(priceId) }; }
+      try { return { status: 'resolved', productId: await this.readUnderMode(() => this.bitrixApi.readBitrix24PriceProductId(priceId)) }; }
       catch (error) {
         return isRetryableFailure(error)
           ? { status: 'retryable', retryAfter: retryAtForFailure(error, attempt) }
@@ -345,21 +355,22 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     const fields = asRecord(asRecord(payload.data).FIELDS);
     if (Number(fields.TYPE) === 7) kind = 'service';
     let source;
-    try { source = await this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true }); }
+    try { source = await this.readUnderMode(() => this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true })); }
     catch (error) {
       if (kind === 'product') {
-        try { kind = 'service'; source = await this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true }); }
+        try { kind = 'service'; source = await this.readUnderMode(() => this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true })); }
         catch { return null; }
       } else return null;
     }
     if (!source.name || !source.taxSemantics) return null;
+    const sourceName = source.name;
     const mapping = mappings[0]!;
     const sourcePrice = source.prices.filter((price) => price.typeId === String(mapping.bitrix24Id));
     if (sourcePrice.length !== 1) return null;
-    const candidates = await this.bitrixApi.findMoyskladProductsByExactName(source.name, kind);
+    const candidates = await this.readUnderMode(() => this.bitrixApi.findMoyskladProductsByExactName(sourceName, kind));
     const available: ProductCatalogCandidate[] = [];
     for (const candidate of candidates) {
-      const target = await this.bitrixApi.readMoysklad(candidate.id, kind).catch(() => null);
+      const target = await this.readUnderMode(() => this.bitrixApi.readMoysklad(candidate.id, kind)).catch(() => null);
       if (!target || !target.taxSemantics) continue;
       const targetPrices = target.prices.filter((price) => price.typeId === mapping.moyskladId);
       if (targetPrices.length !== 1) continue;
@@ -381,13 +392,17 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
           nameExact: true, configuredPriceType: String(mapping.bitrix24Id), priceEqual: true, currencyVerified: true, taxComparable: true,
           selectionReason: selection.selectionReason,
           duplicateCreatedAt: source.createdAt ?? null,
-          canonicalCreatedAt: (await this.bitrixApi.readBitrix24(pair.bitrix24Id, kind).catch(() => null))?.createdAt ?? null,
+          canonicalCreatedAt: (await this.readUnderMode(() => this.bitrixApi.readBitrix24(pair.bitrix24Id, kind)).catch(() => null))?.createdAt ?? null,
           selectionCandidateCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
           selectionCandidateCreatedAtSource: targetCandidate.createdAt ? 'MOYSKLAD.created' : 'unavailable',
         } });
       return pair.id;
     }
     const created = await this.database.$transaction(async (transaction) => {
+      const mode = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
+        SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+      `;
+      if (mode[0]?.serviceMode !== 'on') return null;
       await assertWorkerLeaseInTransaction(workerLease, transaction);
       await lockEntityPairState(transaction);
       const conflict = await transaction.entityPair.findFirst({ where: { entityType: 'PRODUCT', active: true, OR: [{ bitrix24Id: productId }, { moyskladId: targetCandidate.id }] }, select: { id: true } });
@@ -405,7 +420,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   private async applyResult(eventId: string, event: { source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; attempts: number }, result: ProductCardSyncResult, workerLease?: EventWorkerLeaseContext) {
-    await this.database.$transaction(async (transaction) => {
+    await withServiceModeOn(this.database, async (transaction) => {
     await assertWorkerLeaseInTransaction(workerLease, transaction);
     const finish = async (status: string, reason: string, retryAfter: Date | null = null) => transaction.inboundEvent.updateMany({
       where: { id: eventId, OR: [{ status: 'PROCESSING' }, { status: 'RECEIVED' }, { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' }] },
@@ -452,7 +467,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   private async finish(eventId: string, status: string, reason: string, retryAfter: Date | null = null, workerLease?: EventWorkerLeaseContext) {
-    await this.database.$transaction(async (transaction) => {
+    await withServiceModeOn(this.database, async (transaction) => {
       await assertWorkerLeaseInTransaction(workerLease, transaction);
       await transaction.inboundEvent.updateMany({
       where: { id: eventId, OR: [

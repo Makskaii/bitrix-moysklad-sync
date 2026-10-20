@@ -59,6 +59,7 @@ before(async () => {
   assert.notEqual(parentUrl.searchParams.get('schema'), dryUrl.searchParams.get('schema'));
   process.env.SYNC_MODE = 'dry';
   database = new DatabaseService();
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { serviceMode: 'on' }, update: { serviceMode: 'on' } });
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
