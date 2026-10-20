@@ -11,18 +11,31 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
     offSince: null,
     resumeStatus: 'idle',
   };
+  const transitions: Array<Record<string, unknown>> = [];
+  const transaction = {
+    $queryRaw: async () => [],
+    syncModeTransition: {
+      findFirst: async () => transitions.length ? { transitionedAt: transitions[transitions.length - 1].transitionedAt } : null,
+      create: async ({ data }: { data: Record<string, unknown> }) => { transitions.push(data); return data; },
+    },
+    syncSetting: {
+      findUniqueOrThrow: async () => ({ ...state }),
+      update: async ({ data, select }: { data: Record<string, unknown>; select?: Record<string, boolean> }) => {
+        Object.assign(state, data);
+        return select ? Object.fromEntries(Object.keys(select).map((key) => [key, state[key]])) : { ...state };
+      },
+    },
+  };
   const database = {
     syncSetting: {
       upsert: async () => ({ ...state }),
-      update: async ({ data, select }: { data: Record<string, unknown>; select: Record<string, boolean> }) => {
-        Object.assign(state, data);
-        return Object.fromEntries(Object.keys(select).map((key) => [key, state[key]]));
-      },
     },
+    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>) => work(transaction),
   };
   const service = new SyncModeService(database as never);
 
   await service.setMode('off');
+  assert.deepEqual(transitions.map(({ fromMode, toMode }) => [fromMode, toMode]), [['unknown', 'on'], ['on', 'off']]);
   assert.equal(state.serviceMode, 'off');
   assert.equal(state.resumeStatus, 'skipped');
   assert.match(String(state.resumeError), /not replayed/i);
@@ -46,16 +59,28 @@ test('test ON, pause, and resume never establish or move the separately confirme
     acknowledgement: 'Independent operations record confirmed for this launch.',
   };
   const modeState: Record<string, unknown> = { serviceMode: 'off', offSince: null, resumeStatus: 'idle' };
+  const modeTransitions: Array<Record<string, unknown>> = [];
+  const transaction = {
+    $queryRaw: async () => [],
+    syncModeTransition: {
+      findFirst: async () => modeTransitions.length ? { transitionedAt: modeTransitions[modeTransitions.length - 1].transitionedAt } : null,
+      create: async ({ data }: { data: Record<string, unknown> }) => { modeTransitions.push(data); return data; },
+    },
+    syncSetting: {
+      findUniqueOrThrow: async () => ({ ...modeState }),
+      update: async ({ data, select }: { data: Record<string, unknown>; select?: Record<string, boolean> }) => {
+        Object.assign(modeState, data);
+        return select ? Object.fromEntries(Object.keys(select).map((key) => [key, modeState[key]])) : { ...modeState };
+      },
+    },
+  };
   const database = {
     databaseRecoveryState: { findUnique: async () => recoveryState },
     databaseRecoveryAudit: { findFirst: async () => ({ actorId: 'BITRIX24_USER:123' }) },
     syncSetting: {
       upsert: async () => ({ ...modeState }),
-      update: async ({ data, select }: { data: Record<string, unknown>; select: Record<string, boolean> }) => {
-        Object.assign(modeState, data);
-        return Object.fromEntries(Object.keys(select).map((key) => [key, modeState[key]]));
-      },
     },
+    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>) => work(transaction),
   };
   const recovery = new DatabaseRecoveryService(database as never);
   const syncMode = new SyncModeService(database as never, recovery);
@@ -313,20 +338,33 @@ test('disabling and leaving directions unchanged bypass enable preflight when se
 
 test('PAUSE timestamps the recovery window without scheduling an OFF replay', async () => {
   const state: Record<string, unknown> = {
-    serviceMode: 'on', offSince: null, resumeStatus: 'idle',
+    serviceMode: 'on', offSince: null, resumeStatus: 'idle', modeHistoryTrackedFrom: new Date('2026-10-01T00:00:00Z'),
+  };
+  const transitions: Array<Record<string, unknown>> = [];
+  const transaction = {
+    $queryRaw: async () => [],
+    syncModeTransition: {
+      findFirst: async () => transitions.length ? { transitionedAt: transitions[transitions.length - 1].transitionedAt } : null,
+      create: async ({ data }: { data: Record<string, unknown> }) => { transitions.push(data); return data; },
+    },
+    syncSetting: {
+      findUniqueOrThrow: async () => ({ ...state }),
+      update: async ({ data, select }: { data: Record<string, unknown>; select?: Record<string, boolean> }) => {
+        Object.assign(state, data);
+        return select ? Object.fromEntries(Object.keys(select).map((key) => [key, state[key]])) : { ...state };
+      },
+    },
   };
   const database = {
     syncSetting: {
       upsert: async () => ({ ...state }),
-      update: async ({ data, select }: { data: Record<string, unknown>; select: Record<string, boolean> }) => {
-        Object.assign(state, data);
-        return Object.fromEntries(Object.keys(select).map((key) => [key, state[key]]));
-      },
     },
+    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>) => work(transaction),
   };
   const service = new SyncModeService(database as never);
 
   await service.setMode('pause');
+  assert.deepEqual(transitions.map(({ fromMode, toMode }) => [fromMode, toMode]), [['on', 'pause']]);
   assert.equal(state.serviceMode, 'pause');
   assert.ok(state.lastInactiveAt instanceof Date);
   assert.equal(state.resumeStatus, 'idle');
@@ -337,7 +375,7 @@ test('PAUSE timestamps the recovery window without scheduling an OFF replay', as
   assert.equal(state.lastInactiveAt, lastInactiveAt);
 });
 
-test('nightly execution skips if an inactive interval touched the window after scheduling', async () => {
+test('nightly interval checks do not discard active slices because downtime touched the window', async () => {
   const now = new Date();
   const state = {
     lastInactiveAt: new Date(now.getTime() - 60_000),
@@ -351,7 +389,7 @@ test('nightly execution skips if an inactive interval touched the window after s
     const mustSkip = await (recovery as unknown as {
       nightlyMustSkip: (setting: typeof state, at: Date) => Promise<boolean>;
     }).nightlyMustSkip(state, now);
-    assert.equal(mustSkip, true);
+    assert.equal(mustSkip, false);
   } finally {
     if (oldMode === undefined) delete process.env.SYNC_MODE;
     else process.env.SYNC_MODE = oldMode;

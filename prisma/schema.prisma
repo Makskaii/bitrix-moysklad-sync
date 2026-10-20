@@ -20,6 +20,7 @@ model SyncSetting {
   offSince                  DateTime?
   lastInactiveAt            DateTime?
   lastActiveAt              DateTime?
+  modeHistoryTrackedFrom    DateTime?
   resumeStatus              String    @default("idle")
   resumeFrom                DateTime?
   resumeThrough             DateTime?
@@ -38,6 +39,10 @@ model SyncSetting {
   nightlyBitrixEntityTypeId Int       @default(3)
   nightlyBitrixLastId       String?
   nightlyMoyskladOffset     Int       @default(0)
+  nightlyMoyskladEntity     String    @default("counterparty")
+  nightlyActiveSegments     Json      @default("[]")
+  nightlySegmentIndex       Int       @default(0)
+  nightlyCoverage           Json      @default("{}")
   nightlyBitrixStatus       String    @default("pending")
   nightlyMoyskladStatus     String    @default("pending")
   nightlyLeaseToken         String?
@@ -46,6 +51,15 @@ model SyncSetting {
   nightlyAttempts           Int       @default(0)
   nightlyError              String?
   updatedAt                 DateTime  @updatedAt
+}
+
+model SyncModeTransition {
+  id             String   @id @default(cuid())
+  fromMode       String
+  toMode         String
+  transitionedAt DateTime @default(now())
+
+  @@index([transitionedAt])
 }
 
 model DatabaseRecoveryState {
@@ -291,6 +305,7 @@ model EntityPair {
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
   duplicateProductAliases ProductDuplicateAlias[] @relation("CanonicalProductPair")
+  settingsRevisions EntityPairSettingsRevision[]
   dealOrderPositions DealOrderPositionPair[]
   dealOrderPositionAdds DealOrderPositionAddOperation[]
 
@@ -401,6 +416,24 @@ model EntityPairSyncState {
   childResourceState Json?
   updatedAt       DateTime   @updatedAt
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+}
+
+model EntityPairSettingsRevision {
+  id                   String     @id @default(cuid())
+  pairId               String
+  fromSettingsVersion  Int?
+  toSettingsVersion    Int
+  status               String     @default("PREPARED")
+  semanticFingerprint  String
+  previousBaseline     Json
+  currentBaseline      Json?
+  errorCategory        String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  pair                 EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, toSettingsVersion])
+  @@index([status, updatedAt])
 }
 
 model DealOrderCreateOperation {

@@ -108,13 +108,42 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     return this.candidates(rows.filter((row) => exactName(row.TITLE, name) && hasExactPhone(row.PHONE, phone)), 'COMPANY', targetSystem);
   }
 
+  async companyByEmail(email: string, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
+    if (targetSystem === 'MOYSKLAD') {
+      const rows = await this.moyskladList('entity/counterparty', { filter: `email=${email}` });
+      return this.candidates(rows.filter((row) => row.companyType !== 'individual' && row.archived !== true && exactEmail(row.email, email)), 'COMPANY', targetSystem);
+    }
+    const rows = await this.bitrixList('crm.company.list', {
+      filter: { EMAIL: email }, select: ['ID', 'TITLE', 'PHONE', 'EMAIL', 'DATE_CREATE', 'UF_CRM_1789126724375'],
+    });
+    const exact = rows.filter((row) => hasExactEmail(row.EMAIL, email));
+    const inss = await this.bitrixCompanyInns(exact.map((row) => id(row.ID)).filter((value): value is string => Boolean(value)));
+    return this.candidates(exact.map((row) => ({ ...row, inn: inss.get(String(row.ID)) ?? null })), 'COMPANY', targetSystem);
+  }
+
+  async contactByEmail(email: string, companyId: string | null = null, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
+    if (targetSystem === 'MOYSKLAD') {
+      const path = companyId
+        ? `entity/counterparty/${encodeURIComponent(companyId)}/contactpersons`
+        : 'entity/counterparty';
+      const rows = await this.moyskladList(path, { filter: `email=${email}` });
+      return this.candidates(rows.filter((row) => row.archived !== true && exactEmail(row.email, email) &&
+        (companyId ? true : row.companyType === 'individual')), 'CONTACT', targetSystem,
+      (row) => ({ ...row, ...(companyId ? { parentId: companyId } : {}) }));
+    }
+    const rows = await this.bitrixContacts({ EMAIL: email, ...(companyId ? { COMPANY_ID: companyId } : {}) },
+      ['ID', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'COMPANY_ID', 'PHONE', 'EMAIL', 'DATE_CREATE']);
+    return this.candidates(rows.filter((row) => hasExactEmail(row.EMAIL, email) &&
+      (companyId ? String(row.COMPANY_ID ?? '') === companyId : isStandaloneB24Contact(row.COMPANY_ID))), 'CONTACT', targetSystem);
+  }
+
   async contactByCompanyAndNamePhone(companyId: string, normalizedName: string, normalizedPhone: string, email?: string, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
     if (targetSystem === 'MOYSKLAD') {
       const rows = await this.moyskladList(`entity/counterparty/${encodeURIComponent(companyId)}/contactpersons`, { search: normalizedName });
-      return this.candidates(rows.filter((row) => exactPersonName(row.name, normalizedName) && exactPhone(row.phone, normalizedPhone) && (!email || !row.email || exactEmail(row.email, email))), 'CONTACT', targetSystem, (row) => ({ ...row, parentId: companyId }));
+      return this.candidates(rows.filter((row) => exactPersonName(row.name, normalizedName) && exactPhone(row.phone, normalizedPhone)), 'CONTACT', targetSystem, (row) => ({ ...row, parentId: companyId }));
     }
     const rows = await this.bitrixContacts({ COMPANY_ID: companyId, PHONE: normalizedPhone }, ['ID', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'PHONE', 'EMAIL', 'DATE_CREATE']);
-    return this.candidates(rows.filter((row) => exactB24PersonName(row, normalizedName) && hasExactPhone(row.PHONE, normalizedPhone) && (!email || !hasString(row.EMAIL) || hasExactEmail(row.EMAIL, email))), 'CONTACT', targetSystem);
+    return this.candidates(rows.filter((row) => exactB24PersonName(row, normalizedName) && hasExactPhone(row.PHONE, normalizedPhone)), 'CONTACT', targetSystem);
   }
 
   async contactByCompanyAndNameEmail(companyId: string, normalizedName: string, normalizedEmail: string, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
@@ -129,10 +158,10 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
   async contactByStandaloneNamePhone(normalizedName: string, normalizedPhone: string, email?: string, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
     if (targetSystem === 'MOYSKLAD') {
       const rows = await this.moyskladList('entity/counterparty', { search: normalizedName });
-      return this.candidates(rows.filter((row) => row.companyType === 'individual' && exactPersonName(row.name, normalizedName) && exactPhone(row.phone, normalizedPhone) && (!email || !row.email || exactEmail(row.email, email))), 'CONTACT', targetSystem);
+      return this.candidates(rows.filter((row) => row.companyType === 'individual' && exactPersonName(row.name, normalizedName) && exactPhone(row.phone, normalizedPhone)), 'CONTACT', targetSystem);
     }
     const rows = await this.bitrixContacts({ PHONE: normalizedPhone }, ['ID', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'PHONE', 'EMAIL', 'DATE_CREATE']);
-    return this.candidates(rows.filter((row) => exactB24PersonName(row, normalizedName) && hasExactPhone(row.PHONE, normalizedPhone) && (!email || !hasString(row.EMAIL) || hasExactEmail(row.EMAIL, email))), 'CONTACT', targetSystem);
+    return this.candidates(rows.filter((row) => exactB24PersonName(row, normalizedName) && hasExactPhone(row.PHONE, normalizedPhone)), 'CONTACT', targetSystem);
   }
 
   async contactByStandaloneNameEmail(normalizedName: string, normalizedEmail: string, targetSystem: ClientSystem = 'MOYSKLAD'): Promise<ClientCandidate[]> {
@@ -228,9 +257,11 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       filledFields: countFilled(row), occupiedByPair: false,
     }));
     if (!candidates.length) return [];
+    // A tombstoned/inactive link is still occupied. Reusing either endpoint
+    // would silently revive a relationship the lifecycle workflow suspended.
     const occupied = system === 'MOYSKLAD'
-      ? await this.database.entityPair.findMany({ where: { entityType: entity, active: true, moyskladId: { in: candidates.map((x) => x.id) } }, select: { moyskladId: true } })
-      : await this.database.entityPair.findMany({ where: { entityType: entity, active: true, bitrix24Id: { in: candidates.map((x) => x.id) } }, select: { bitrix24Id: true } });
+      ? await this.database.entityPair.findMany({ where: { entityType: entity, moyskladId: { in: candidates.map((x) => x.id) } }, select: { moyskladId: true } })
+      : await this.database.entityPair.findMany({ where: { entityType: entity, bitrix24Id: { in: candidates.map((x) => x.id) } }, select: { bitrix24Id: true } });
     const ids = new Set(occupied.map((row) => 'moyskladId' in row ? row.moyskladId : row.bitrix24Id));
     const withOccupancy = candidates.map((candidate) => ({ ...candidate, occupiedByPair: ids.has(candidate.id) }));
     const metricResults = await Promise.all(withOccupancy.map(async (candidate) => {
@@ -288,6 +319,26 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       rows.push(...await this.bitrixList('crm.company.list', { filter: { '@ID': ids.slice(start, start + 50) }, select: ['ID', 'TITLE', 'PHONE', 'DATE_CREATE', 'UF_CRM_1789126724375'] }));
     }
     return rows;
+  }
+
+  private async bitrixCompanyInns(ids: string[]): Promise<Map<string, string>> {
+    const values = new Map<string, Set<string>>();
+    for (let start = 0; start < ids.length; start += 50) {
+      const pageIds = ids.slice(start, start + 50);
+      const rows = await this.bitrixList('crm.requisite.list', {
+        filter: { ENTITY_TYPE_ID: 4, '@ENTITY_ID': pageIds }, select: ['ENTITY_ID', 'RQ_INN'],
+      });
+      for (const row of rows) {
+        const entityId = id(row.ENTITY_ID);
+        const inn = stringValue(row.RQ_INN);
+        if (!entityId || !inn) continue;
+        const current = values.get(entityId) ?? new Set<string>();
+        current.add(inn);
+        values.set(entityId, current);
+      }
+    }
+    for (const [entityId, inss] of values) if (inss.size > 1) throw new Error('CLIENT_COMPANY_INN_AMBIGUOUS');
+    return new Map([...values].map(([entityId, inss]) => [entityId, [...inss][0]!]));
   }
 
   private async bitrixContacts(filter: Record<string, unknown>, select: string[]) {
@@ -386,7 +437,8 @@ function duplicateMarker(row: Record<string, unknown>): boolean | null {
 }
 function exactPersonName(actual: unknown, expected: string) { return typeof actual === 'string' && normName(actual) === normName(expected); }
 function exactPhone(actual: unknown, expected: string) { return phone(actual) === phone(expected); }
-function exactEmail(actual: unknown, expected: string) { return typeof actual === 'string' && actual.trim().toLowerCase() === expected.trim().toLowerCase(); }
+function exactEmail(actual: unknown, expected: string) { return typeof actual === 'string' && actual.normalize('NFKC').trim().toLowerCase() === expected.normalize('NFKC').trim().toLowerCase(); }
+function isStandaloneB24Contact(value: unknown) { return value === null || value === undefined || value === '' || value === 0 || value === '0'; }
 function hasExactPhone(actual: unknown, expected: string) { return Array.isArray(actual) ? actual.some((item) => isRecord(item) && exactPhone(item.VALUE, expected)) : exactPhone(actual, expected); }
 function hasExactEmail(actual: unknown, expected: string) { return Array.isArray(actual) ? actual.some((item) => isRecord(item) && exactEmail(item.VALUE, expected)) : exactEmail(actual, expected); }
 function hasString(value: unknown) { return Array.isArray(value) ? value.some((item) => isRecord(item) && typeof item.VALUE === 'string' && Boolean(item.VALUE.trim())) : typeof value === 'string' && value.trim().length > 0; }

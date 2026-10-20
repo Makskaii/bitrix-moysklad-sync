@@ -8,6 +8,7 @@ import { writeOperationalLog } from './monitoring-log';
 import { ClientSyncProcessor } from './clients/client-sync.processor';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { EventDispatcherService } from './event-dispatcher.service';
+import { buildActiveWindowSegments, ActiveWindowSegment } from './service-mode-intervals';
 
 const MOYSKLAD_PAGE_SIZE = 1_000;
 const MOYSKLAD_CONTACTPERSON_MAX_PAGES = 20;
@@ -59,11 +60,20 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         resumeProvider: true, resumeBitrixStart: true, resumeMoyskladOffset: true, resumeError: true,
         resumeRetryAfter: true, resumeAttempts: true,
         nightlyScheduledDate: true, nightlyStatus: true, nightlyFrom: true, nightlyThrough: true,
-        nightlyProvider: true, nightlyBitrixStart: true, nightlyMoyskladOffset: true,
+        nightlyProvider: true, nightlyBitrixStart: true, nightlyMoyskladOffset: true, nightlyMoyskladEntity: true,
         nightlyBitrixEntityTypeId: true, nightlyBitrixLastId: true, nightlyBitrixStatus: true, nightlyMoyskladStatus: true,
         nightlyRetryAfter: true, nightlyAttempts: true, nightlyError: true,
+        nightlyActiveSegments: true, nightlySegmentIndex: true, nightlyCoverage: true,
+        modeHistoryTrackedFrom: true,
       },
     });
+    const modeTransitions = await this.database.syncModeTransition.findMany({
+      where: { transitionedAt: { lte: new Date() } }, orderBy: [{ transitionedAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, fromMode: true, toMode: true, transitionedAt: true },
+    });
+    const previewThrough = new Date();
+    const previewFrom = new Date(previewThrough.getTime() - NIGHTLY_WINDOW_MS);
+    const preview = buildActiveWindowSegments(previewFrom, previewThrough, setting.modeHistoryTrackedFrom, modeTransitions);
     return {
       status: setting.resumeStatus,
       from: setting.resumeFrom,
@@ -74,6 +84,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       error: setting.resumeError,
       retryAfter: setting.resumeRetryAfter,
       attempts: setting.resumeAttempts,
+      modeHistory: { trackedFrom: setting.modeHistoryTrackedFrom, transitions: modeTransitions },
       nightly: {
         scheduledDate: setting.nightlyScheduledDate,
         status: setting.nightlyStatus,
@@ -84,11 +95,24 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         bitrixEntityTypeId: setting.nightlyBitrixEntityTypeId,
         bitrixLastId: setting.nightlyBitrixLastId,
         moyskladOffset: setting.nightlyMoyskladOffset,
+        moyskladEntity: setting.nightlyMoyskladEntity,
         bitrixStatus: setting.nightlyBitrixStatus,
         moyskladStatus: setting.nightlyMoyskladStatus,
         retryAfter: setting.nightlyRetryAfter,
         attempts: setting.nightlyAttempts,
         error: setting.nightlyError,
+        activeSegments: setting.nightlyActiveSegments,
+        segmentIndex: setting.nightlySegmentIndex,
+        coverage: {
+          status: setting.nightlyStatus,
+          activeSegmentCount: readNightlySegments(setting.nightlyActiveSegments).length,
+          currentSegmentIndex: setting.nightlySegmentIndex,
+          scheduled: setting.nightlyCoverage,
+          preview: {
+            requestedFrom: previewFrom, requestedThrough: previewThrough, coveredFrom: preview.coveredFrom,
+            active: preview.segments, skipped: preview.skipped,
+          },
+        },
       },
     };
   }
@@ -130,15 +154,19 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (local.hour !== 1 || local.minute !== 0 || setting.nightlyScheduledDate === local.date) return;
 
     const mode = await this.syncMode.read();
-    const clientScope = (await this.syncMode.readEntitySettings()).find((entity) => entity.key === 'contacts-companies');
-    const downtimeCutoff = new Date(now.getTime() - NIGHTLY_WINDOW_MS);
-    const downtimeTouchedWindow =
-      (setting.lastInactiveAt !== null && setting.lastInactiveAt >= downtimeCutoff) ||
-      (setting.lastActiveAt !== null && setting.lastActiveAt >= downtimeCutoff);
+    const recoveryScopes = (await this.syncMode.readEntitySettings()).filter((entity) =>
+      ['contacts-companies', 'deals-orders', 'invoices', 'products-variations'].includes(entity.key));
+    const requestedFrom = this.nightlyWindowStart(now);
+    const transitions = await this.database.syncModeTransition.findMany({
+      where: { transitionedAt: { lte: now } }, orderBy: [{ transitionedAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, fromMode: true, toMode: true, transitionedAt: true },
+    });
+    const coverage = buildActiveWindowSegments(requestedFrom, now, setting.modeHistoryTrackedFrom, transitions);
+    const segments = coverage.segments;
     const configuredMode = process.env.SYNC_MODE === 'apply' || process.env.SYNC_MODE === 'dry';
-    const enabled = mode.mode === 'on' && configuredMode && !downtimeTouchedWindow &&
-      clientScope?.ready === true && (clientScope.bitrix24ToMoysklad || clientScope.moyskladToBitrix24);
-    const windowFrom = enabled ? this.nightlyWindowStart(now) : null;
+    const enabled = mode.mode === 'on' && configuredMode && segments.length > 0 &&
+      recoveryScopes.some((scope) => scope.ready && (scope.bitrix24ToMoysklad || scope.moyskladToBitrix24));
+    const firstSegment = segments[0];
     const claim = await this.database.syncSetting.updateMany({
       where: {
         id: 'global',
@@ -147,22 +175,31 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       data: {
         nightlyScheduledDate: local.date,
         nightlyStatus: enabled ? 'pending' : 'skipped',
-        nightlyFrom: windowFrom,
-        nightlyThrough: enabled ? now : null,
+        nightlyFrom: enabled ? firstSegment.from : null,
+        nightlyThrough: enabled ? firstSegment.through : null,
+        nightlyActiveSegments: segments.map(({ from, through }) => ({ from: from.toISOString(), through: through.toISOString() })),
+        nightlySegmentIndex: 0,
+        nightlyCoverage: {
+          requestedFrom: requestedFrom.toISOString(), requestedThrough: now.toISOString(),
+          coveredFrom: coverage.coveredFrom?.toISOString() ?? null,
+          active: segments.map(({ from, through }) => ({ from: from.toISOString(), through: through.toISOString() })),
+          skipped: coverage.skipped.map(({ from, through, mode, reason }) => ({ from: from.toISOString(), through: through.toISOString(), mode, reason })),
+        },
         nightlyProvider: 'BITRIX24',
         nightlyBitrixStart: 0,
-        nightlyBitrixEntityTypeId: 3,
+        nightlyBitrixEntityTypeId: 2,
         nightlyBitrixLastId: null,
         nightlyMoyskladOffset: 0,
+        nightlyMoyskladEntity: 'counterparty',
         nightlyBitrixStatus: enabled ? 'pending' : 'skipped',
         nightlyMoyskladStatus: enabled ? 'pending' : 'skipped',
         nightlyRetryAfter: null,
         nightlyAttempts: 0,
-        nightlyError: enabled ? null : downtimeTouchedWindow
-          ? 'Skipped because the previous 24-hour window included OFF or PAUSE downtime.'
-          : mode.mode !== 'on' || !configuredMode
+        nightlyError: enabled ? null : mode.mode !== 'on' || !configuredMode
             ? 'Skipped because synchronization was not On and configured for dry or apply at the scheduled time.'
-            : 'Skipped because the contacts-companies entity or both directions are disabled.',
+            : segments.length === 0
+              ? 'Skipped because no covered On interval exists in the requested window.'
+            : 'Skipped because no recovery entity has a ready enabled direction.',
       },
     });
     if (claim.count === 1 && enabled) await this.runNightlyJob();
@@ -201,12 +238,36 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         });
         return;
       }
+      if (await this.nightlyIsPaused()) return;
       await this.runBitrixFeed(setting, leaseToken);
+      if (await this.nightlyIsPaused()) return;
+      setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+      if (setting.nightlyStatus === 'skipped') return;
       await this.runMoyskladFeed(setting, leaseToken);
-      await this.runAcceptedEventRecheck(setting.nightlyFrom, setting.nightlyThrough, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+      if (await this.nightlyIsPaused()) return;
+      setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+      if (setting.nightlyStatus === 'skipped') return;
+      await this.runAcceptedEventRecheck(setting.nightlyFrom, setting.nightlyThrough, nightlyJobKey(setting), leaseToken);
+      if (await this.nightlyIsPaused()) return;
       const final = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       const failed = final?.nightlyBitrixStatus === 'failed' || final?.nightlyMoyskladStatus === 'failed';
       const complete = final?.nightlyBitrixStatus === 'complete' && final?.nightlyMoyskladStatus === 'complete';
+      const segments = readNightlySegments(final?.nightlyActiveSegments);
+      const nextIndex = (final?.nightlySegmentIndex ?? 0) + 1;
+      if (complete && nextIndex < segments.length) {
+        const next = segments[nextIndex];
+        await this.database.syncSetting.updateMany({
+          where: { id: 'global', nightlyLeaseToken: leaseToken },
+          data: {
+            nightlySegmentIndex: nextIndex, nightlyFrom: next.from, nightlyThrough: next.through,
+            nightlyBitrixStart: 0, nightlyBitrixEntityTypeId: 2, nightlyBitrixLastId: null,
+            nightlyMoyskladOffset: 0, nightlyMoyskladEntity: 'counterparty',
+            nightlyBitrixStatus: 'pending', nightlyMoyskladStatus: 'pending',
+            nightlyStatus: 'running', nightlyProvider: 'BITRIX24', nightlyRetryAfter: null,
+          },
+        });
+        return;
+      }
       const retryAfter = final?.nightlyRetryAfter && final.nightlyRetryAfter > new Date()
         ? final.nightlyRetryAfter
         : new Date(Date.now() + retryDelayMs(final?.nightlyAttempts ?? 1));
@@ -216,7 +277,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           nightlyStatus: final?.nightlyStatus === 'skipped' ? 'skipped' : complete ? 'awaiting_processing' : failed ? 'failed' : 'running',
           nightlyProvider: complete ? 'COMPLETE' : 'BITRIX24',
           nightlyRetryAfter: failed ? retryAfter : null,
-          ...(complete ? { nightlyError: 'Provider feeds are queued for active pairs; waiting for event processing. Delete and archival changes remain outside this slice.' } : {}),
+          ...(complete ? { nightlyError: 'Active interval feeds are queued for processing. Skipped intervals are shown in coverage; delete and archival changes remain outside this slice.' } : {}),
         },
       });
     } catch {
@@ -245,22 +306,39 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (setting.nightlyBitrixStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
-      while (setting.nightlyBitrixEntityTypeId <= 4) {
+      while (setting.nightlyBitrixEntityTypeId !== 5) {
         const queriedEntityTypeId = setting.nightlyBitrixEntityTypeId;
+        if (![2, 3, 4, 31, 32].includes(queriedEntityTypeId)) throw new Error('Unsupported Bitrix24 nightly entity cursor');
         const queriedLastId = setting.nightlyBitrixLastId;
         await this.renewNightlyLease(leaseToken);
-        const page = await this.readBitrixPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedEntityTypeId, queriedLastId);
+        const page = queriedEntityTypeId === 32
+          ? await this.readBitrixProductPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedLastId)
+          : await this.readBitrixPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedEntityTypeId, queriedLastId);
         await this.renewNightlyLease(leaseToken);
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
-        await this.saveChangedEvents('BITRIX24', queriedEntityTypeId === 3 ? 'CONTACT' : 'COMPANY', page.ids, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+        const jobKey = nightlyJobKey(setting);
+        if (queriedEntityTypeId === 3 || queriedEntityTypeId === 4) {
+          await this.saveChangedEvents('BITRIX24', queriedEntityTypeId === 3 ? 'CONTACT' : 'COMPANY', page.ids, jobKey, leaseToken);
+        } else if (queriedEntityTypeId === 32) {
+          await this.saveBitrixProductEvents(page.ids, jobKey, leaseToken);
+        } else {
+          await this.saveBitrixDocumentEvents(queriedEntityTypeId as 2 | 31, page.ids, jobKey, leaseToken);
+        }
         const result = await this.database.syncSetting.updateMany({
           where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyBitrixEntityTypeId: queriedEntityTypeId, nightlyBitrixLastId: queriedLastId },
           data: page.nextId !== null
             ? { nightlyBitrixLastId: page.nextId }
-            : queriedEntityTypeId === 3
+            : queriedEntityTypeId === 2
+              ? { nightlyBitrixEntityTypeId: 3, nightlyBitrixStart: 0, nightlyBitrixLastId: null }
+              : queriedEntityTypeId === 3
               ? { nightlyBitrixEntityTypeId: 4, nightlyBitrixStart: 0, nightlyBitrixLastId: null }
-              : { nightlyBitrixStatus: 'complete', nightlyBitrixEntityTypeId: 5, nightlyBitrixStart: 0, nightlyBitrixLastId: null },
+              : queriedEntityTypeId === 4
+                ? { nightlyBitrixEntityTypeId: 31, nightlyBitrixStart: 0, nightlyBitrixLastId: null }
+                : queriedEntityTypeId === 31
+                  ? { nightlyBitrixEntityTypeId: 32, nightlyBitrixStart: 0, nightlyBitrixLastId: null }
+                  : { nightlyBitrixStatus: 'complete', nightlyBitrixEntityTypeId: 5, nightlyBitrixStart: 0, nightlyBitrixLastId: null },
         });
         if (result.count !== 1) throw new Error('Nightly lease or Bitrix cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
@@ -275,25 +353,35 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (setting.nightlyMoyskladStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
-      while (true) {
+      const feeds = ['counterparty', 'customerorder', 'invoiceout', 'product', 'service'] as const;
+      while (setting.nightlyMoyskladEntity !== 'complete') {
+        const queriedEntity = setting.nightlyMoyskladEntity as typeof feeds[number];
+        if (!feeds.includes(queriedEntity)) throw new Error('Unsupported MoySklad nightly entity cursor');
         const queriedOffset = setting.nightlyMoyskladOffset;
         await this.renewNightlyLease(leaseToken);
-        const page = await this.readMoyskladPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
+        const page = await this.readMoyskladUpdatedPage(queriedEntity, setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
         await this.renewNightlyLease(leaseToken);
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
-        await this.saveChangedEvents('MOYSKLAD', 'COMPANY', page.ids, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+        const jobKey = nightlyJobKey(setting);
+        if (queriedEntity === 'counterparty') {
+          await this.saveChangedEvents('MOYSKLAD', 'COMPANY', page.ids, jobKey, leaseToken);
+        } else {
+          await this.saveMoyskladUpdatedEvents(queriedEntity, page.ids, jobKey, leaseToken);
+        }
+        const nextEntity = page.hasNext ? queriedEntity : feeds[feeds.indexOf(queriedEntity) + 1] ?? 'complete';
         const result = await this.database.syncSetting.updateMany({
-          where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() }, nightlyMoyskladOffset: queriedOffset },
+          where: { id: 'global', nightlyLeaseToken: leaseToken, nightlyLeaseExpiresAt: { gt: new Date() }, nightlyMoyskladOffset: queriedOffset, nightlyMoyskladEntity: queriedEntity },
           data: page.hasNext
             ? { nightlyMoyskladOffset: setting.nightlyMoyskladOffset + page.count }
-            : { nightlyMoyskladOffset: 0 },
+            : { nightlyMoyskladOffset: 0, nightlyMoyskladEntity: nextEntity },
         });
         if (result.count !== 1) throw new Error('Nightly lease or MoySklad cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
-        if (!page.hasNext) break;
       }
-      await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, `nightly:${setting.nightlyScheduledDate}`, leaseToken);
+      await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, nightlyJobKey(setting), leaseToken);
+      if (await this.nightlyIsPaused()) return;
       const latest = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (latest?.nightlyStatus === 'skipped') return;
       const completed = await this.database.syncSetting.updateMany({
@@ -325,6 +413,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         const page = await this.readMoyskladContactpersonPage(parentId, offset);
         await this.renewNightlyLease(leaseToken);
         const current = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+        if (await this.nightlyIsPaused()) return;
         if (!current || await this.nightlyMustSkip(current, new Date())) { await this.markNightlySkipped(leaseToken); return; }
         if (expectedSize === null) expectedSize = page.size;
         if (page.size !== expectedSize) {
@@ -358,6 +447,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     while (true) {
       await this.renewNightlyLease(leaseToken);
       const setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+      if (await this.nightlyIsPaused()) return;
       if (!setting || await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
       const scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
       const events = await this.database.inboundEvent.findMany({
@@ -398,6 +488,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     // page. Recheck controls and the service mode after the complete scan.
     await this.renewNightlyLease(leaseToken);
     const latestSetting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+    if (await this.nightlyIsPaused()) return;
     if (!latestSetting || await this.nightlyMustSkip(latestSetting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
     let scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
     let processed = 0;
@@ -405,6 +496,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       if (processed > 0 && processed % take === 0) {
         await this.renewNightlyLease(leaseToken);
         const currentSetting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
+        if (await this.nightlyIsPaused()) return;
         if (!currentSetting || await this.nightlyMustSkip(currentSetting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
         scopes = new Map((await this.syncMode.readEntitySettings()).map((item) => [item.key, item]));
       }
@@ -601,13 +693,13 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (renewed !== 1) throw new Error('Nightly run lease was lost');
   }
 
-  private async nightlyMustSkip(setting: { lastInactiveAt: Date | null; lastActiveAt: Date | null }, now: Date) {
+  private async nightlyMustSkip(_setting: { lastInactiveAt: Date | null; lastActiveAt: Date | null }, _now: Date) {
     const mode = await this.syncMode.read();
-    const cutoff = new Date(now.getTime() - NIGHTLY_WINDOW_MS);
-    const downtimeTouchedWindow =
-      (setting.lastInactiveAt !== null && setting.lastInactiveAt >= cutoff) ||
-      (setting.lastActiveAt !== null && setting.lastActiveAt >= cutoff);
-    return mode.mode !== 'on' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') || downtimeTouchedWindow;
+    return mode.mode === 'off' || (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry');
+  }
+
+  private async nightlyIsPaused() {
+    return (await this.syncMode.read()).mode === 'pause';
   }
 
   private async cancelLegacyOffResumeJob() {
@@ -662,13 +754,59 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     return { ids: itemIds, nextId: itemIds.length === 50 ? itemIds[itemIds.length - 1] : null };
   }
 
-  private async readMoyskladPage(from: Date, through: Date, offset: number): Promise<{ ids: string[]; count: number; hasNext: boolean }> {
-    if (offset !== 0) throw new UnsupportedPaginationError('MoySklad saved offset pagination is unsupported in this safe nightly slice; feed stopped without enqueue or cursor advancement.');
+  private async readBitrixProductPage(from: Date, through: Date, lastId: string | null): Promise<{ ids: string[]; nextId: string | null }> {
+    if (!this.fieldSettings || typeof (this.fieldSettings as any).active !== 'function') return { ids: [], nextId: null };
+    const settings = await this.fieldSettings.active();
+    const rawCatalogId = settings.config.productCatalogRuntime?.bitrix24CatalogId;
+    if (!rawCatalogId) return { ids: [], nextId: null };
+    const catalogId = Number(rawCatalogId);
+    if (!Number.isSafeInteger(catalogId) || catalogId < 1) throw new Error('Configured Bitrix24 product catalog ID is invalid');
+    const base = process.env.BITRIX24_REST_BASE_URL;
+    if (!base) throw new Error('Bitrix24 API is not configured');
+    const url = new URL('catalog.product.list.json', base.endsWith('/') ? base : `${base}/`);
+    const filter: Record<string, unknown> = {
+      iblockId: catalogId,
+      '>=timestampX': from.toISOString(), '<=timestampX': through.toISOString(),
+      ...(lastId === null ? {} : { '>id': Number(lastId) }),
+    };
+    const body = { filter, order: { id: 'ASC' }, select: ['id', 'timestampX'], start: 0 };
+    let response: Response;
+    try {
+      await this.waitForNightlyRequestSlot();
+      response = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      await this.recordApiAttempt('BITRIX24', 'catalog.product.list', 'POST', null, false);
+      throw error;
+    }
+    await this.recordApiAttempt('BITRIX24', 'catalog.product.list', 'POST', response.status, response.ok);
+    if (!response.ok) throw providerFeedError(response);
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || payload.error || !isRecord(payload.result) || !Array.isArray(payload.result.products)) {
+      throw new Error('Bitrix24 changed-product query failed');
+    }
+    const ids = payload.result.products.map((row) => isRecord(row) ? readId(row.id) : null);
+    if (ids.some((id) => id === null)) throw new Error('Invalid Bitrix24 changed-product row');
+    const productIds = ids as string[];
+    return { ids: productIds, nextId: productIds.length === 50 ? productIds[productIds.length - 1] : null };
+  }
+
+  private async readMoyskladUpdatedPage(entity: 'counterparty' | 'customerorder' | 'invoiceout' | 'product' | 'service', from: Date, through: Date, offset: number): Promise<{ ids: string[]; count: number; hasNext: boolean }> {
+    if (!Number.isInteger(offset) || offset < 0 || offset % MOYSKLAD_PAGE_SIZE !== 0) {
+      throw new UnsupportedPaginationError('MoySklad cursor is not aligned to a supported collection page; feed stopped without enqueue or cursor advancement.');
+    }
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new Error('MoySklad API is not configured');
-    const url = new URL('entity/counterparty', base.endsWith('/') ? base : `${base}/`);
-    url.searchParams.set('filter', `updated>=${moyskladDate(from)};updated<=${moyskladDate(through)}`);
+    // The provider filter is second-granular. Round inward so a fractional
+    // boundary never admits a record from the adjacent OFF/PAUSE interval.
+    const safeFrom = new Date(Math.ceil(from.getTime() / 1_000) * 1_000);
+    const safeThrough = new Date(Math.floor(through.getTime() / 1_000) * 1_000);
+    if (safeThrough < safeFrom) return { ids: [], count: 0, hasNext: false };
+    const url = new URL(`entity/${entity}`, base.endsWith('/') ? base : `${base}/`);
+    url.searchParams.set('filter', `updated>=${moyskladDate(safeFrom)};updated<=${moyskladDate(safeThrough)}`);
     url.searchParams.set('order', 'updated,asc');
     url.searchParams.set('limit', String(MOYSKLAD_PAGE_SIZE));
     url.searchParams.set('offset', String(offset));
@@ -680,28 +818,77 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
-      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', null, false);
+      await this.recordApiAttempt('MOYSKLAD', `entity/${entity}`, 'GET', null, false);
       throw error;
     }
-    await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty', 'GET', response.status, response.ok);
+    await this.recordApiAttempt('MOYSKLAD', `entity/${entity}`, 'GET', response.status, response.ok);
     if (!response.ok) throw providerFeedError(response);
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) || typeof payload.meta.size !== 'number' ||
         typeof payload.meta.limit !== 'number' || typeof payload.meta.offset !== 'number') {
-      throw new Error('Invalid MoySklad changed-record page');
+      throw new Error(`Invalid MoySklad ${entity} changed-record page`);
     }
-    const ids = payload.rows.map((row) => isRecord(row) ? readId(row.id) : null);
-    if (ids.some((id) => id === null)) throw new Error('Invalid MoySklad changed-record row');
-    if (payload.meta.limit !== MOYSKLAD_PAGE_SIZE || payload.meta.offset !== 0) {
+    const ids = payload.rows.map((row) => {
+      if (!isRecord(row) || typeof row.updated !== 'string' || moyskladMoment(row.updated) === null) return null;
+      return readId(row.id);
+    });
+    if (ids.some((id) => id === null)) throw new Error(`Invalid MoySklad ${entity} changed-record row`);
+    if (payload.meta.limit !== MOYSKLAD_PAGE_SIZE || payload.meta.offset !== offset) {
       throw new UnsupportedPaginationError('MoySklad returned unexpected limit/offset metadata; feed stopped without enqueue or cursor advancement.');
     }
-    if (payload.meta.size > MOYSKLAD_PAGE_SIZE || typeof payload.meta.nextHref === 'string') {
-      throw new UnsupportedPaginationError('MoySklad returned more than 1,000 changed counterparties; stable keyset pagination is not verified, so this feed is stopped without enqueue or cursor advancement.');
-    }
-    if (!Number.isInteger(payload.meta.size) || payload.meta.size < 0 || payload.meta.size !== payload.rows.length) {
+    if (!Number.isInteger(payload.meta.size) || payload.meta.size < 0 || payload.rows.length > MOYSKLAD_PAGE_SIZE ||
+        (payload.rows.length === 0 && offset < payload.meta.size)) {
       throw new UnsupportedPaginationError('MoySklad changed-record total is inconsistent with the returned page; feed stopped without enqueue or cursor advancement.');
     }
-    return { ids: ids as string[], count: payload.rows.length, hasNext: false };
+    const hasNext = offset + payload.rows.length < payload.meta.size;
+    if (hasNext && payload.rows.length !== MOYSKLAD_PAGE_SIZE) {
+      throw new UnsupportedPaginationError('MoySklad returned a short page before the advertised total; feed stopped without enqueue or cursor advancement.');
+    }
+    return { ids: ids as string[], count: payload.rows.length, hasNext };
+  }
+
+  /** Queue document signals for the standard pair-first processors. No pair is
+   * required here: a newly eligible deal may create its order, while invoices
+   * remain held until their exact order pair exists. */
+  private async saveBitrixDocumentEvents(entityTypeId: 2 | 31, ids: string[], jobKey: string, leaseToken: string) {
+    if (!ids.length || !this.fieldSettings || !this.dispatcher) return;
+    const uniqueIds = [...new Set(ids)];
+    const entityKey = entityTypeId === 2 ? 'deals-orders' : 'invoices';
+    const eventType = entityTypeId === 2 ? 'ONCRMDEALUPDATE' : 'ONCRMDYNAMICITEMUPDATE';
+    const externalEntityType = entityTypeId === 2 ? 'deal' : 'invoice';
+    const [toMoysklad, toBitrix24] = await Promise.all([
+      this.syncMode.isDirectionEnabled(entityKey, 'bitrix24ToMoysklad'),
+      this.syncMode.isDirectionEnabled(entityKey, 'moyskladToBitrix24'),
+    ]);
+    const enabled = toMoysklad || toBitrix24;
+    for (const id of uniqueIds) {
+      const deliveryKey = `${jobKey}:${entityKey}:${id}`;
+      const eventId = await this.fieldSettings.saveAcceptedEvent({
+        source: 'BITRIX24', deliveryKey, eventType, externalEntityType, externalEntityId: id,
+        payload: {
+          event: eventType,
+          data: { FIELDS: { ID: id }, ...(entityTypeId === 31 ? { ENTITY_TYPE_ID: 31 } : {}) },
+          recovery: 'nightly',
+        } as Prisma.InputJsonValue,
+        directionDisabled: !enabled, requireServiceNotOff: true, nightlyLeaseToken: leaseToken,
+      });
+      if (enabled) await this.dispatcher.dispatch(eventId.id);
+    }
+  }
+
+  private async saveBitrixProductEvents(ids: string[], jobKey: string, leaseToken: string) {
+    if (!ids.length || !this.fieldSettings || !this.dispatcher) return;
+    const enabled = await this.syncMode.isDirectionEnabled('products-variations', 'moyskladToBitrix24');
+    for (const id of new Set(ids)) {
+      const eventType = 'CATALOG.PRODUCT.ON.UPDATE';
+      const eventId = await this.fieldSettings.saveAcceptedEvent({
+        source: 'BITRIX24', deliveryKey: `${jobKey}:product:${id}`, eventType,
+        externalEntityType: 'product', externalEntityId: id,
+        payload: { event: eventType, data: { FIELDS: { ID: id } }, recovery: 'nightly' } as Prisma.InputJsonValue,
+        directionDisabled: !enabled, requireServiceNotOff: true, nightlyLeaseToken: leaseToken,
+      });
+      if (enabled) await this.dispatcher.dispatch(eventId.id);
+    }
   }
 
   private async saveChangedEvents(
@@ -765,6 +952,45 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       } catch (error) { failures.push(error); }
     }
     if (failures.length) throw new Error(`Could not durably queue ${failures.length} changed client pair event(s)`);
+  }
+
+  /**
+   * Queue timestamp-discovered MySklad changes through the ordinary accepted
+   * event pipeline. No historical imports are performed here: event processors
+   * apply their normal pair/create eligibility gates and exact entity types.
+   */
+  private async saveMoyskladUpdatedEvents(
+    entity: 'counterparty' | 'customerorder' | 'invoiceout' | 'product' | 'service',
+    ids: string[],
+    jobKey: string,
+    leaseToken: string,
+  ) {
+    if (!ids.length || !this.fieldSettings || !this.dispatcher) return;
+    const scope: NightlyScope = entity === 'counterparty' ? 'contacts-companies'
+      : entity === 'customerorder' ? 'deals-orders'
+        : entity === 'invoiceout' ? 'invoices' : 'products-variations';
+    const directionEnabled = await this.syncMode.isDirectionEnabled(scope, 'moyskladToBitrix24');
+    const base = process.env.MOYSKLAD_API_BASE_URL;
+    if (!base) throw new Error('MoySklad API is not configured');
+    const root = base.endsWith('/') ? base : `${base}/`;
+    const uniqueIds = [...new Set(ids)];
+    for (const id of uniqueIds) {
+      const event = await this.fieldSettings.saveAcceptedEvent({
+        source: 'MOYSKLAD',
+        deliveryKey: `${jobKey}:moysklad:${entity}:${id}`,
+        eventType: 'UPDATE',
+        externalEntityType: entity,
+        externalEntityId: id,
+        payload: {
+          recovery: 'nightly', entity,
+          meta: { href: new URL(`entity/${entity}/${encodeURIComponent(id)}`, root).href },
+        } as Prisma.InputJsonValue,
+        directionDisabled: !directionEnabled,
+        requireServiceNotOff: true,
+        nightlyLeaseToken: leaseToken,
+      });
+      if (directionEnabled) await this.dispatcher.dispatch(event.id);
+    }
   }
 
   private async recordApiAttempt(provider: string, operation: string, method: string, statusCode: number | null, succeeded: boolean) {
@@ -883,6 +1109,20 @@ function localScheduleParts(date: Date) {
     hour: Number(values.hour),
     minute: Number(values.minute),
   };
+}
+
+function readNightlySegments(value: unknown): ActiveWindowSegment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const from = item.from instanceof Date ? item.from : typeof item.from === 'string' ? new Date(item.from) : null;
+    const through = item.through instanceof Date ? item.through : typeof item.through === 'string' ? new Date(item.through) : null;
+    return from && through && Number.isFinite(from.getTime()) && through > from ? [{ from, through }] : [];
+  });
+}
+
+function nightlyJobKey(setting: { nightlyScheduledDate: string | null; nightlySegmentIndex: number }): string {
+  return `nightly:${setting.nightlyScheduledDate}:segment:${setting.nightlySegmentIndex}`;
 }
 
 function moyskladDate(date: Date): string {

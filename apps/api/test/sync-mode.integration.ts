@@ -157,6 +157,7 @@ before(async () => {
   }) as typeof fetch;
   app = await NestFactory.create(SyncModeTestModule, { logger: false });
   await app.get(DatabaseService).syncSetting.deleteMany();
+  await app.get(DatabaseService).syncModeTransition.deleteMany();
   await app.get(DatabaseService).syncDirectionSetting.deleteMany();
   await app.get(DatabaseService).fieldSettingsState.deleteMany();
   await app.get(DatabaseService).fieldSettingsVersion.deleteMany();
@@ -216,6 +217,37 @@ test('administrator can persist Pause through the settings API', async () => {
     headers: { authorization: 'Bearer admin-test-token' },
   });
   assert.deepEqual(await afterRestart.json(), { mode: 'pause' });
+});
+
+test('public mode transitions produce a read-only nightly coverage preview with OFF and PAUSE slices excluded', async () => {
+  const token = { authorization: 'Bearer admin-test-token', 'content-type': 'application/json' };
+  const changeMode = async (mode: 'on' | 'pause' | 'off') => {
+    const response = await nativeFetch(`${apiUrl}/api/admin/sync-mode`, {
+      method: 'PATCH', headers: token, body: JSON.stringify({ mode, confirmed: true }),
+    });
+    assert.equal(response.status, 200);
+  };
+  await changeMode('on');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await changeMode('off');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await changeMode('on');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await changeMode('pause');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await changeMode('on');
+
+  const status = await nativeFetch(`${apiUrl}/api/admin/sync-mode/recovery`, { headers: { authorization: 'Bearer admin-test-token' } })
+    .then((response) => response.json()) as {
+      modeHistory: { transitions: Array<{ fromMode: string; toMode: string }> };
+      nightly: { coverage: { preview: { active: Array<unknown>; skipped: Array<{ mode: string }> } } };
+    };
+  assert.ok(status.modeHistory.transitions.some((transition) => transition.fromMode === 'on' && transition.toMode === 'off'));
+  assert.ok(status.modeHistory.transitions.some((transition) => transition.fromMode === 'off' && transition.toMode === 'on'));
+  assert.ok(status.modeHistory.transitions.some((transition) => transition.fromMode === 'on' && transition.toMode === 'pause'));
+  assert.ok(status.nightly.coverage.preview.active.length >= 2);
+  assert.ok(status.nightly.coverage.preview.skipped.some(({ mode }) => mode === 'off'));
+  assert.ok(status.nightly.coverage.preview.skipped.some(({ mode }) => mode === 'pause'));
 });
 
 test('administrator must explicitly confirm risky global mode transitions', async () => {
