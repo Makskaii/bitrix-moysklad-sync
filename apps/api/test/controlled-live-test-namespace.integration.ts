@@ -11,6 +11,7 @@ let origin = '';
 let currentBitrixUserId = '42';
 let currentMoyskladAccountId = accountId;
 let observed: string[] = [];
+let observedMoyskladHeaders: Record<string, string | string[] | undefined> | undefined;
 
 before(async () => {
   server = createServer(async (request, response) => {
@@ -21,6 +22,12 @@ before(async () => {
       return;
     }
     if (request.url === '/api/remap/1.2/context/employee' && request.method === 'GET') {
+      observedMoyskladHeaders = request.headers;
+      if (request.headers.accept !== 'application/json;charset=utf-8' || request.headers['accept-encoding'] !== 'gzip') {
+        response.statusCode = 406;
+        response.end('{}');
+        return;
+      }
       response.end(JSON.stringify({ id: 'employee-id', accountId: currentMoyskladAccountId }));
       return;
     }
@@ -53,6 +60,22 @@ test('provider namespace verification matches portal origin and read-only curren
   const verified = await verifyControlledLiveProviderNamespace(manifest(), options());
   assert.deepEqual(verified, { ...manifest() });
   assert.deepEqual(observed, ['POST /rest/user.current.json', 'GET /api/remap/1.2/context/employee']);
+  assert.equal(observedMoyskladHeaders?.accept, 'application/json;charset=utf-8');
+  assert.equal(observedMoyskladHeaders?.['accept-encoding'], 'gzip');
+});
+
+test('provider identity verification fails closed when required content-negotiation headers are rejected', async () => {
+  const wrongHeadersFetcher: typeof fetch = (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/api/remap/1.2/context/employee') {
+      return fetch(input, { ...init, headers: { ...(init?.headers as Record<string, string>), 'accept-encoding': 'identity' } });
+    }
+    return fetch(input, init);
+  };
+  await assert.rejects(
+    verifyControlledLiveProviderNamespace(manifest(), options(), wrongHeadersFetcher),
+    /MOYSKLAD_IDENTITY_READ_FAILED/,
+  );
 });
 
 test('provider account IDs accept UUID-shaped MoySklad values without RFC variant assumptions', async () => {

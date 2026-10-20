@@ -50,7 +50,11 @@ export async function verifyControlledLiveProviderNamespace(
   if (bitrixUserId !== expected.bitrix24UserId) throw new Error('CONTROLLED_LIVE_TEST_BITRIX24_CREDENTIAL_IDENTITY_MISMATCH');
 
   const moyskladResponse = await fetcher(new URL('context/employee', ensureTrailingSlash(moyskladBase.base)), {
-    method: 'GET', headers: { authorization: `Bearer ${options.moyskladApiToken}`, accept: 'application/json' }, redirect: 'error',
+    method: 'GET', headers: {
+      authorization: `Bearer ${options.moyskladApiToken}`,
+      accept: 'application/json;charset=utf-8',
+      'accept-encoding': 'gzip',
+    }, redirect: 'error',
   });
   if (!moyskladResponse.ok) throw new Error('CONTROLLED_LIVE_TEST_MOYSKLAD_IDENTITY_READ_FAILED');
   const moyskladPayload: unknown = await moyskladResponse.json();
