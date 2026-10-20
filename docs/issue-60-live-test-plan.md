@@ -1,5 +1,7 @@
 # Issue #60 controlled live-test plan (prepared, not authorized)
 
+Historical planning snapshot. Its environment/access blockers and runtime implementation state are not current #79 status. For current planned live scenarios, see [Issue #79 scoped live scenarios (2026-10-20)](issue-79-scoped-live-scenarios-2026-10-20.md) and the dated [Issue #79 live preflight](issue-79-live-preflight-2026-10-20.md). This file is retained as historical evidence; it is not proof that any live scenario ran.
+
 Status: planning artifact only. No test records, provider writes, webhooks, service settings, or production traffic have been changed. This document is not permission to enable the general sync flow or perform production cutover.
 
 ## Go/no-go gates
