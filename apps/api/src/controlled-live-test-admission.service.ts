@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
-import { bindControlledLiveTarget, ControlledLiveEventScope, createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from './controlled-live-test-policy';
+import { bindControlledLiveTarget, ControlledLiveEventScope, ControlledLiveIngressAction, createControlledLiveTestPolicy, enterControlledLiveEventScope, registerControlledTargetReadback, withControlledLiveEventScope } from './controlled-live-test-policy';
 import { setControlledLiveTestWriteCheck } from './external-write-guard';
 import { ControlledLiveProviderNamespace, getVerifiedControlledLiveProviderNamespace } from './controlled-live-test-namespace';
 
@@ -11,6 +11,17 @@ export interface VerifiedControlledSource {
   currentNativeId: string;
   currentName: string;
   sourceCreatedAt: Date;
+}
+
+interface ControlledLiveManifestIngressRecord {
+  entity: string;
+  syntheticOnly: true;
+  direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'BOTH';
+  sourceSystem: 'BITRIX24' | 'MOYSKLAD';
+  sourceNativeId: string | null;
+  targetSystem: 'BITRIX24' | 'MOYSKLAD';
+  targetNativeId: string | null;
+  allowedActions?: ControlledLiveIngressAction[];
 }
 
 /** Durable admission is written only after a caller has freshly read and verified the provider source. */
@@ -71,6 +82,44 @@ export class ControlledLiveTestAdmissionService {
       throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_CONFLICT');
     }
     this.enterScope(existing);
+  }
+
+  /**
+   * Checks an authenticated webhook envelope against the exact run manifest
+   * before it is persisted or dispatched. The later provider read, admission,
+   * marker, boundary, and transport checks remain authoritative as well.
+   */
+  allowsIncomingEvent(input: {
+    sourceSystem: 'BITRIX24' | 'MOYSKLAD';
+    eventType: string | null;
+    externalEntityType: string | null;
+    sourceNativeId: string | null;
+  }): boolean {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
+    const action = controlledIngressAction(input.sourceSystem, input.eventType);
+    const entities = controlledIngressEntities(input.sourceSystem, input.externalEntityType);
+    const records = (this.manifest as { records?: ControlledLiveManifestIngressRecord[] } | undefined)?.records;
+    if (!action || !entities || !input.sourceNativeId || !Array.isArray(records)) return false;
+
+    const matchingRecords = records.filter((record) => {
+      if (!entities.includes(record.entity) || record.syntheticOnly !== true ||
+          !Array.isArray(record.allowedActions) || record.allowedActions.length === 0 ||
+          record.allowedActions.some((candidate) => candidate !== 'CREATE' && candidate !== 'UPDATE') ||
+          new Set(record.allowedActions).size !== record.allowedActions.length || !record.allowedActions.includes(action) ||
+          typeof record.sourceNativeId !== 'string' || !record.sourceNativeId ||
+          record.targetSystem === record.sourceSystem) return false;
+
+      const sourceSide = record.sourceSystem === input.sourceSystem && record.sourceNativeId === input.sourceNativeId &&
+        (record.direction === 'BITRIX24_TO_MOYSKLAD' && record.sourceSystem === 'BITRIX24' && record.targetSystem === 'MOYSKLAD' ||
+         record.direction === 'MOYSKLAD_TO_BITRIX24' && record.sourceSystem === 'MOYSKLAD' && record.targetSystem === 'BITRIX24' ||
+         record.direction === 'BOTH' && typeof record.targetNativeId === 'string' && record.targetNativeId.length > 0 && record.sourceSystem !== record.targetSystem);
+      if (sourceSide) return true;
+
+      return record.direction === 'BOTH' && typeof record.targetNativeId === 'string' && record.targetNativeId.length > 0 &&
+        record.targetSystem === input.sourceSystem && record.targetNativeId === input.sourceNativeId &&
+        record.sourceSystem !== record.targetSystem;
+    });
+    return matchingRecords.length === 1;
   }
 
   async bindCreatedTarget(eventId: string, targetNativeId: string, verifiedTargetNativeId: string, verifiedTargetName: string, targetCreatedAt: Date, verifiedTargetRunMarker?: string): Promise<void> {
@@ -246,6 +295,35 @@ export class ControlledLiveTestAdmissionService {
         admission.bitrix24UserId !== this.providerNamespace.bitrix24UserId || admission.moyskladAccountId !== this.providerNamespace.moyskladAccountId) {
       throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_PROVIDER_NAMESPACE_MISMATCH');
     }
+  }
+}
+
+function controlledIngressAction(sourceSystem: 'BITRIX24' | 'MOYSKLAD', eventType: string | null): ControlledLiveIngressAction | null {
+  if (!eventType) return null;
+  if (sourceSystem === 'MOYSKLAD') return eventType === 'CREATE' || eventType === 'UPDATE' ? eventType : null;
+  if (/^(?:ONCRM(?:DEAL|CONTACT|COMPANY|DYNAMICITEM|PRODUCT)ADD|CATALOG\.PRODUCT\.ON\.ADD)$/.test(eventType)) return 'CREATE';
+  if (/^(?:ONCRM(?:DEAL|CONTACT|COMPANY|DYNAMICITEM|PRODUCT)UPDATE|CATALOG\.PRODUCT\.ON\.UPDATE)$/.test(eventType)) return 'UPDATE';
+  return null;
+}
+
+function controlledIngressEntities(sourceSystem: 'BITRIX24' | 'MOYSKLAD', externalEntityType: string | null): string[] | null {
+  if (sourceSystem === 'BITRIX24') {
+    switch (externalEntityType) {
+      case 'company': return ['client:COMPANY'];
+      case 'contact': return ['client:CONTACT'];
+      case 'deal': return ['deal-order'];
+      case 'invoice': return ['invoice'];
+      case 'product': return ['catalog-product'];
+      default: return null;
+    }
+  }
+  switch (externalEntityType) {
+    case 'counterparty': return ['client:COMPANY', 'client:CONTACT'];
+    case 'customerorder': return ['deal-order'];
+    case 'invoiceout': return ['invoice'];
+    case 'product': return ['catalog-product'];
+    case 'service': return ['catalog-service'];
+    default: return null;
   }
 }
 

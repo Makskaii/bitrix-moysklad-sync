@@ -26,9 +26,20 @@ import { EventIntakeDisabledError, FieldSettingsService } from './field-settings
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { EventDispatcherService } from './event-dispatcher.service';
 import { DatabaseRecoveryService } from './database-recovery.service';
+import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
+type Bitrix24IntakeAcknowledgement = { accepted: boolean; eventId?: string; reason?: string };
+type MoySkladIntakeAcknowledgement = {
+  accepted: boolean;
+  eventId?: string;
+  eventIds: string[];
+  contactEventIds: string[];
+  pairEventIds: string[];
+  rejectedCount?: number;
+  reason?: string;
+};
 const webhookLogger = new Logger('WebhookIntake');
 
 @Injectable()
@@ -39,9 +50,10 @@ export class EventIntakeService {
     @Optional() @Inject(WebhookDiagnosticLog) private readonly diagnostics?: WebhookDiagnosticLog,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
     @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
+    @Optional() @Inject(ControlledLiveTestAdmissionService) private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
-  async receiveBitrix24(payload: EventPayload) {
+  async receiveBitrix24(payload: EventPayload): Promise<Bitrix24IntakeAcknowledgement> {
     const expectedToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
     if (!expectedToken) {
       throw new ServiceUnavailableException('Bitrix24 event authentication is not configured');
@@ -71,6 +83,15 @@ export class EventIntakeService {
     const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
     const eventType = typeof safePayload.event === 'string' ? safePayload.event : null;
     const externalEntityType = bitrixEntityType(eventType, safePayload);
+    const event = {
+      eventType,
+      externalEntityId: readString(fields.ID) ?? readString(data.ID),
+      externalEntityType,
+      payload: safePayload,
+    };
+    if (!this.isControlledIngressAllowed('BITRIX24', event)) {
+      return { accepted: false, reason: 'controlled_scope_rejected' };
+    }
     const direction = getEventDirection('BITRIX24', eventType, externalEntityType);
     const productSignal = externalEntityType === 'product' && isProductCatalogSignal(eventType);
     const directionDisabled = (!productSignal && direction === 'products-variations:bitrix24ToMoysklad') ||
@@ -78,12 +99,6 @@ export class EventIntakeService {
         direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
       ));
 
-    const event = {
-      eventType,
-      externalEntityId: readString(fields.ID) ?? readString(data.ID),
-      externalEntityType,
-      payload: safePayload,
-    };
     // Bitrix's webhook body has no documented stable delivery ID. A payload hash
     // would collapse two legitimate identical updates, so preserve each arrival.
     return this.save('BITRIX24', `delivery:${randomUUID()}`, event, directionDisabled);
@@ -94,7 +109,7 @@ export class EventIntakeService {
     requestId: unknown,
     payload: EventPayload | undefined,
     query: Record<string, unknown>,
-  ) {
+  ): Promise<MoySkladIntakeAcknowledgement> {
     const expectedSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
     if (!expectedSecret) {
       throw new ServiceUnavailableException('MoySklad webhook authentication is not configured');
@@ -124,15 +139,32 @@ export class EventIntakeService {
     }
 
     const safePayload = payload ?? {};
-    if (Array.isArray(safePayload.events) &&
+    const controlled = process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled';
+    if (!controlled && Array.isArray(safePayload.events) &&
       (safePayload.events.length === 0 || safePayload.events.some((event) => !isRecord(event)))) {
       throw new BadRequestException('MoySklad events must be a non-empty array of event objects');
     }
-    const events = readMoySkladEvents(safePayload, query);
+    const indexedEvents = controlled && Array.isArray(safePayload.events)
+      ? safePayload.events.map((item, index) => {
+        const parsed = isRecord(item) ? readMoySkladEvents({ events: [item] }, query)[0] : undefined;
+        return {
+          index,
+          event: parsed ?? { eventType: null, externalEntityId: null, externalEntityType: null, payload: {} },
+        };
+      })
+      : readMoySkladEvents(safePayload, query).map((event, index) => ({ event, index }));
+    const emptyBatchRejection = controlled && Array.isArray(safePayload.events) && safePayload.events.length === 0 ? 1 : 0;
+    const selectedEvents = controlled
+      ? indexedEvents.filter(({ event }) => this.isControlledIngressAllowed('MOYSKLAD', event))
+      : indexedEvents;
+    const rejectedCount = indexedEvents.length - selectedEvents.length + emptyBatchRejection;
+    if (controlled && selectedEvents.length === 0) {
+      return { accepted: false, eventIds: [], contactEventIds: [], pairEventIds: [], rejectedCount, reason: 'controlled_scope_rejected' };
+    }
     const eventIds: string[] = [];
     const contactEventIds: string[] = [];
     const pairEventIds: string[] = [];
-    for (const [index, event] of events.entries()) {
+    for (const { index, event } of selectedEvents) {
       const payload = { ...safePayload, ...(Array.isArray(safePayload.events) ? { events: [event.payload] } : {}) };
       const queueEvent = {
         eventType: event.eventType,
@@ -159,7 +191,9 @@ export class EventIntakeService {
         pairEventIds.push(acknowledgement.eventId);
       }
     }
-    return { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds };
+    return controlled
+      ? { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds, rejectedCount }
+      : { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds };
   }
 
   private async ensureIntakeEnabled() {
@@ -173,6 +207,21 @@ export class EventIntakeService {
     if ((await this.syncMode.read()).mode === 'off') {
       throw new GoneException('Event intake is disabled');
     }
+  }
+
+  private isControlledIngressAllowed(sourceSystem: InboundSource, event: {
+    eventType: string | null;
+    externalEntityId: string | null;
+    externalEntityType: string | null;
+  }): boolean {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
+    if (!this.controlledAdmission) throw new ServiceUnavailableException('Controlled live ingress policy is not configured');
+    return this.controlledAdmission.allowsIncomingEvent({
+      sourceSystem,
+      eventType: event.eventType,
+      externalEntityType: event.externalEntityType,
+      sourceNativeId: event.externalEntityId,
+    });
   }
 
   private async save(
@@ -264,13 +313,14 @@ export class EventsController {
   ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
     const acknowledgement = await this.intake.receiveBitrix24(payload);
-    if (this.dispatcher) {
-      response.once('finish', () => { void this.dispatcher!.dispatch(acknowledgement.eventId).catch(() => undefined); });
-    } else if (isContactBitrixEvent(readString(payload.event))) {
-      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    const eventId = acknowledgement.eventId;
+    if (acknowledgement.accepted && eventId && this.dispatcher) {
+      response.once('finish', () => { void this.dispatcher!.dispatch(eventId).catch(() => undefined); });
+    } else if (acknowledgement.accepted && eventId && isContactBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.contactSync?.enqueue(eventId));
     }
-    if (!this.dispatcher && isDealBitrixEvent(readString(payload.event))) {
-      response.once('finish', () => this.pairFirstEvent?.enqueue(acknowledgement.eventId));
+    if (acknowledgement.accepted && eventId && !this.dispatcher && isDealBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.pairFirstEvent?.enqueue(eventId));
     }
     return acknowledgement;
   }
@@ -284,16 +334,16 @@ export class EventsController {
     @Body() payload: EventPayload | undefined,
     @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
   ) {
-    if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
+    if (payload !== undefined && !isRecord(payload) && process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') throw new UnauthorizedException();
     return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
-      if (this.dispatcher) {
+      if (acknowledgement.accepted && this.dispatcher) {
         response.once('finish', () => acknowledgement.eventIds.forEach((eventId) => {
           void this.dispatcher!.dispatch(eventId).catch(() => undefined);
         }));
-      } else if (acknowledgement.contactEventIds.length > 0) {
+      } else if (acknowledgement.accepted && acknowledgement.contactEventIds.length > 0) {
         response.once('finish', () => acknowledgement.contactEventIds.forEach((eventId) => this.contactSync?.enqueue(eventId)));
       }
-      if (!this.dispatcher && acknowledgement.pairEventIds.length > 0) {
+      if (acknowledgement.accepted && !this.dispatcher && acknowledgement.pairEventIds.length > 0) {
         response.once('finish', () => acknowledgement.pairEventIds.forEach((eventId) => this.pairFirstEvent?.enqueue(eventId)));
       }
       const { contactEventIds, pairEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
