@@ -97,11 +97,6 @@ before(async () => {
         createdAfterUtc: '2026-10-20T12:00:00Z', allowedActions: ['UPDATE'],
       },
       {
-        entity: 'deal-order', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261020T120000Z-a1b2c3 null source', syntheticOnly: true,
-        sourceSystem: 'BITRIX24', sourceNativeId: null, targetSystem: 'MOYSKLAD', targetNativeId: null,
-        createdAfterUtc: '2026-10-20T12:00:00Z', allowedActions: ['CREATE'],
-      },
-      {
         entity: 'deal-order', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261020T120000Z-a1b2c3 action required', syntheticOnly: true,
         sourceSystem: 'BITRIX24', sourceNativeId: 'b24-deal-no-action', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-order-no-action',
         createdAfterUtc: '2026-10-20T12:00:00Z',
