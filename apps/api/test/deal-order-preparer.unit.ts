@@ -24,7 +24,7 @@ const clientResolver = {
   async scheduleOptionalContactRetry() {},
   async verifyServiceCounterparty() { return true; },
 };
-const preparer = new DealOrderCreationPreparer({ entityPair: { findMany }, operationalLog: { create: async () => ({}) } } as unknown as DatabaseService, clientResolver as never);
+const preparer = new DealOrderCreationPreparer(createPreparerDatabase(), clientResolver as never);
 let productPairExists = true;
 let rows: Record<string, unknown>[] = [];
 let deal: Record<string, unknown>;
@@ -120,7 +120,7 @@ test('a later unsupported row is omitted without suppressing the other valid row
     async resolveForDocument() { dependencyCalls++; return { status: 'RESOLVED', pair: { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '200', moyskladId: uuids.company }, companyPair: null, selectedSourceId: '200', reason: 'TEST' }; },
     async scheduleOptionalContactRetry() {}, async verifyServiceCounterparty() { return true; },
   };
-  const withResolver = new DealOrderCreationPreparer({ entityPair: { findMany }, operationalLog: { create: async () => ({}) } } as unknown as DatabaseService, resolver as never);
+  const withResolver = new DealOrderCreationPreparer(createPreparerDatabase(), resolver as never);
   const result = await withResolver.prepare({ bitrix24DealId: '100', eventId: 'event-preflight-before-deps', eventConfig: eventConfig() });
   assert.equal(result.status, 'READY');
   if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 1);
@@ -135,6 +135,17 @@ test('native MySklad numbering must be explicitly verified before an order can b
   const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-5', eventConfig: settings });
   assert.deepEqual(result, { status: 'WAITING', reason: 'NATIVE_ORDER_NUMBERING_UNVERIFIED' });
 });
+
+function createPreparerDatabase(): DatabaseService {
+  const database: any = {
+    entityPair: { findMany },
+    operationalLog: { create: async () => ({}) },
+    $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+      $queryRaw: async () => [{ serviceMode: 'on' }],
+    }),
+  };
+  return database as DatabaseService;
+}
 
 function eventConfig(): any {
   return {

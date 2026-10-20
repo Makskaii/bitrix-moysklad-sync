@@ -24,7 +24,6 @@ let msRows: Record<string, unknown>[] = [];
 let calls: Array<{ method: string; path: string }> = [];
 let positionAdds = 0;
 let failPositionReadId: string | null = null;
-let pauseAfterNextMsPositionUpdate = false;
 let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MALFORMED_JSON' | 'INVALID_SHAPE' | 'INVALID_UOM' | 'UNAUTHORIZED' = 'NORMAL';
 let productReadCalls = 0;
 
@@ -45,6 +44,18 @@ before(async () => {
   process.env.MOYSKLAD_API_BASE_URL = `${base}api/remap/1.2/`;
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-only';
   runtime = new DealOrderPositionRuntimeService(database, new SyncModeService(database));
+});
+
+test('durable OFF blocks deal-position provider reads before any request is sent', async () => {
+  const one = await seed('98119');
+  await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+  calls = [];
+  try {
+    await assert.rejects(runtime.process({ pair: confirmed(one.pair), eventId: 'event-position-off-gate', eventConfig: config() }), /SERVICE_MODE_NOT_ON/);
+    assert.deepEqual(calls, [], 'neither provider is contacted while durable service mode is OFF');
+  } finally {
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  }
 });
 
 after(async () => {
@@ -112,24 +123,16 @@ test('unsupported linked row is durably skipped while other valid rows update wi
   assert.equal(calls.some((call) => call.method === 'DELETE' || /productrow\.delete/.test(call.path)), false);
 });
 
-test('persisted pause between addressed row writes blocks the next mutation and never reports success', async () => {
+test('durable PAUSE blocks deal-position provider reads before any request is sent', async () => {
   const one = await seed('98108');
-  const secondId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
-  const secondSource = { id: '398', productId: 904, measureCode: 796, quantity: 2, price: 5, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null };
-  const secondTarget = msPosition(secondId, 2, 500);
-  b24Rows = [{ ...b24Rows[0]!, quantity: 3 }, { ...secondSource, quantity: 3 }];
-  msRows = [{ ...msRows[0]! }, secondTarget];
-  await db.dealOrderPositionPair.create({ data: { pairId: one.pair.id, bitrix24ProductRowId: '398', moyskladPositionId: secondId,
-    bitrix24Values: sourceValues(secondSource), moyskladValues: targetValues(secondTarget) } });
-  pauseAfterNextMsPositionUpdate = true;
+  await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } });
   calls = [];
-  const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-pause-between-row-writes', eventConfig: config() });
-  assert.deepEqual(result, { status: 'RETRY', reason: 'DEAL_ORDER_WRITE_BLOCKED_PAUSE' });
-  assert.equal((await db.syncSetting.findUniqueOrThrow({ where: { id: 'global' } })).serviceMode, 'pause');
-  assert.equal(calls.filter((call) => call.method === 'PUT' && call.path.includes('/positions/')).length, 1, 'second provider mutation was blocked by a fresh DB mode read');
-  assert.equal(msRows[0]!.quantity, 3, 'the first accepted write remains for idempotent resume');
-  assert.equal(msRows[1]!.quantity, 2, 'the next row was not changed');
-  await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  try {
+    await assert.rejects(runtime.process({ pair: confirmed(one.pair), eventId: 'event-position-pause-gate', eventConfig: config() }), /SERVICE_MODE_NOT_ON/);
+    assert.deepEqual(calls, [], 'neither provider is contacted while durable service mode is PAUSE');
+  } finally {
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+  }
 });
 
 test('deletions remove only the linked address on either provider, never replace a full row list', async () => {
@@ -330,7 +333,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);
     if (request.method === 'GET' && failPositionReadId === id) { failPositionReadId = null; response.writeHead(500); response.end('{}'); return; }
-    if (request.method === 'PUT' && row) { const update = JSON.parse(text); Object.assign(row, update); if (pauseAfterNextMsPositionUpdate) { pauseAfterNextMsPositionUpdate = false; await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } }); } }
+    if (request.method === 'PUT' && row) { const update = JSON.parse(text); Object.assign(row, update); }
     if (request.method === 'DELETE') { msRows = msRows.filter((entry) => entry.id !== id); return send(response, {}); }
     const current = msRows.find((entry) => entry.id === id);
     return current ? send(response, current) : send(response, {}, 404);

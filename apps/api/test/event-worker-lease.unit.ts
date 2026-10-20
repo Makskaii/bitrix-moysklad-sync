@@ -3,6 +3,58 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { EventWorkerLeaseService } from '../src/event-worker-lease.service';
 
+function modeOnDatabase(database: Record<string, any>): Record<string, any> {
+  return { ...database, $transaction: (work: (transaction: any) => Promise<unknown>) => work({ ...database, $queryRaw: async () => [{ serviceMode: 'on' }] }) };
+}
+
+test('durable OFF does not initialize or claim a worker-lease slot', async () => {
+  let callbackCalls = 0;
+  let leaseDbWrites = 0;
+  const database = {
+    $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+      $queryRaw: async () => [{ serviceMode: 'off' }],
+      $executeRaw: async () => { leaseDbWrites += 1; },
+      eventWorkerLease: { updateMany: async () => { leaseDbWrites += 1; return { count: 1 }; } },
+    }),
+  };
+  const service = new EventWorkerLeaseService(database as never);
+  const result = await service.run('off-event', async () => { callbackCalls += 1; return 'processed'; });
+  assert.equal(result, null);
+  assert.equal(callbackCalls, 0);
+  assert.equal(leaseDbWrites, 0);
+});
+
+test('durable PAUSE or a missing mode row does not initialize or claim a worker-lease slot', async () => {
+  for (const modeRows of [[{ serviceMode: 'paused' }], []]) {
+    let leaseDbWrites = 0;
+    const database = {
+      $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+        $queryRaw: async () => modeRows,
+        $executeRaw: async () => { leaseDbWrites += 1; },
+        eventWorkerLease: { updateMany: async () => { leaseDbWrites += 1; return { count: 1 }; } },
+      }),
+    };
+    const service = new EventWorkerLeaseService(database as never);
+    const result = await service.run('disabled-event', async () => 'processed');
+    assert.equal(result, null);
+    assert.equal(leaseDbWrites, 0);
+  }
+});
+
+test('mode-row read failure prevents worker-lease writes and propagates', async () => {
+  let leaseDbWrites = 0;
+  const database = {
+    $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+      $queryRaw: async () => { throw new Error('mode database unavailable'); },
+      $executeRaw: async () => { leaseDbWrites += 1; },
+      eventWorkerLease: { updateMany: async () => { leaseDbWrites += 1; return { count: 1 }; } },
+    }),
+  };
+  const service = new EventWorkerLeaseService(database as never);
+  await assert.rejects(service.run('unavailable-event', async () => 'processed'), /mode database unavailable/);
+  assert.equal(leaseDbWrites, 0);
+});
+
 test('worker leases enforce four shared slots across service instances', async () => {
   const slots = new Map<number, { ownerToken: string; eventId: string; leaseExpiresAt: Date }>();
   const database = {
@@ -27,8 +79,8 @@ test('worker leases enforce four shared slots across service instances', async (
       return 1;
     },
   };
-  const firstService = new EventWorkerLeaseService(database as never);
-  const secondService = new EventWorkerLeaseService(database as never);
+  const firstService = new EventWorkerLeaseService(modeOnDatabase(database) as never);
+  const secondService = new EventWorkerLeaseService(modeOnDatabase(database) as never);
   let active = 0;
   let maximum = 0;
   let release!: () => void;
@@ -70,7 +122,7 @@ test('worker callback can detect a stolen lease before an external side-effect b
       return 1;
     },
   };
-  const service = new EventWorkerLeaseService(database as never);
+  const service = new EventWorkerLeaseService(modeOnDatabase(database) as never);
   let externalWriteReached = false;
   await assert.rejects(service.run('event-fenced', async (lease) => {
     const slot = slots.get(0)!;
@@ -107,8 +159,8 @@ test('two service instances racing on the first empty slot return normally inste
       return 1;
     },
   };
-  const firstService = new EventWorkerLeaseService(database as never);
-  const secondService = new EventWorkerLeaseService(database as never);
+  const firstService = new EventWorkerLeaseService(modeOnDatabase(database) as never);
+  const secondService = new EventWorkerLeaseService(modeOnDatabase(database) as never);
   const outcomes = await Promise.allSettled([
     firstService.run('first', async () => 'first'),
     secondService.run('second', async () => 'second'),
@@ -139,7 +191,7 @@ test('an expired owner cannot renew its lease and cross a side-effect boundary',
       return 1;
     },
   };
-  const service = new EventWorkerLeaseService(database as never);
+  const service = new EventWorkerLeaseService(modeOnDatabase(database) as never);
   let externalWriteReached = false;
   await assert.rejects(service.run('expired-owner', async (lease) => {
     slots.get(0)!.leaseExpiresAt = new Date(0);

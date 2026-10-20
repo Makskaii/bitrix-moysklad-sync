@@ -48,6 +48,8 @@ test('malformed manifests, duplicate targets and omitted policy data fail closed
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], syntheticOnly: false }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], direction: 'ANY' }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], direction: 'MOYSKLAD_TO_BITRIX24' }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], allowedActions: ['DELETE'] }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
+  assert.throws(() => createControlledLiveTestPolicy({ ...manifest, records: [{ ...manifest.records[0], allowedActions: [] }] }, testDatabaseUrl), /MANIFEST_RECORD_INVALID/);
 });
 
 test('a mutation is allowed only for the exact current run, source, entity, provider and target ID', () => {
