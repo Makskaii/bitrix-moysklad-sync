@@ -98,7 +98,19 @@ before(async () => {
       const barrier = nextReadBarrier;
       nextReadBarrier = undefined;
       barrier.started();
-      await new Promise<void>((resolve) => { barrier.release = resolve; });
+      const signal = init?.signal;
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(signal?.reason ?? new Error('provider request aborted'));
+        };
+        if (signal?.aborted) { onAbort(); return; }
+        signal?.addEventListener('abort', onAbort, { once: true });
+        barrier.release = () => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        };
+      });
     }
     return new Response(JSON.stringify({ error: 'NOT_FOUND' }), { status: 404, headers: { 'content-type': 'application/json' } });
   };
@@ -290,7 +302,7 @@ test('an OFF flip between a bounded source read and tombstone prevents the next 
   }
 });
 
-test('a late provider callback cannot continue lifecycle work after the durable transaction timeout', async () => {
+test('an aborted bounded provider read leaves work recoverable and does not start another request before retry', async () => {
   await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
   const timeoutPairId = `${pairId}-timeout`;
   const timeoutEvent = await database.inboundEvent.create({ data: {
@@ -309,21 +321,20 @@ test('a late provider callback cannot continue lifecycle work after the durable 
   const { app } = await createApp();
   try {
     await providerStarted;
-    const deadline = Date.now() + 18_000;
+    const deadline = Date.now() + 12_000;
     let event = await database.inboundEvent.findUniqueOrThrow({ where: { id: timeoutEvent.id } });
     while (event.status !== 'RETRYABLE_FAILURE' && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       event = await database.inboundEvent.findUniqueOrThrow({ where: { id: timeoutEvent.id } });
     }
-    assert.equal(event.status, 'RETRYABLE_FAILURE', 'the 15-second transaction timeout must return control to the worker');
-    assert.equal(providerReads, readsBefore + 1, 'only the one bounded current-state operation may have started');
-    const pairBeforeLateCompletion = await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } });
-    assert.equal(pairBeforeLateCompletion.lifecycleStatus, 'ACTIVE');
-    barrier.release(); // the simulated provider ignores abort and resolves after the DB transaction timed out
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const pairAfterLateCompletion = await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } });
-    assert.equal(pairAfterLateCompletion.lifecycleStatus, 'ACTIVE', 'late callback result must not resume into tombstone or another provider operation');
-    assert.equal(providerReads, readsBefore + 1);
+    assert.equal(event.status, 'RETRYABLE_FAILURE', 'the 10-second transport AbortSignal must return the single provider callback before the 15-second transaction deadline');
+    assert.equal(providerReads, readsBefore + 1, 'only one provider operation may start before the failure is durably recorded');
+    assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } })).lifecycleStatus, 'ACTIVE');
+    await database.inboundEvent.update({ where: { id: timeoutEvent.id }, data: { status: 'PROCESSING', retryAfter: null, processingStartedAt: new Date(Date.now() - 120_000) } });
+    const recovered = await waitFor(() => database.inboundEvent.findUniqueOrThrow({ where: { id: timeoutEvent.id } }), (row) => row.status === 'SUCCEEDED');
+    assert.equal(recovered.status, 'SUCCEEDED');
+    assert.equal((await database.entityPair.findUniqueOrThrow({ where: { id: timeoutPairId } })).lifecycleStatus, 'TOMBSTONED');
+    assert.equal(providerReads, readsBefore + 2, 'only ON recovery may perform the second source read');
   } finally {
     barrier.release();
     await app.close();
