@@ -9,6 +9,7 @@ import { assertApplyExternalWrite, assertControlledExternalRead, installControll
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
 import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
+import { parseClientMoyskladTimestamp } from '../src/clients/client-moysklad-date';
 import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
 const testDatabaseUrl = 'postgres://localhost/sync_issue60_test?schema=issue60_harness_test';
@@ -363,11 +364,15 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
     const url = String(input); const method = init?.method ?? 'GET';
     const body = init?.body instanceof URLSearchParams ? init.body.toString() : String(init?.body ?? '');
     calls.push({ url, method, body });
-    if (method === 'POST' && url.endsWith('/entity/counterparty')) return new Response(JSON.stringify({ id: 'ms-29', name: dynamicManifest.records[0].name, created: '2026-10-19T02:00:00Z' }), { status: 200 });
-    if (method === 'GET' && url.endsWith('/entity/counterparty/ms-29')) return new Response(JSON.stringify({ id: 'ms-29', name: dynamicManifest.records[0].name, created: '2026-10-19T02:00:00Z' }), { status: 200 });
+    if (method === 'POST' && url.endsWith('/entity/counterparty')) return new Response(JSON.stringify({ id: 'ms-29', name: dynamicManifest.records[0].name, created: '2026-10-20 20:35:52.853' }), { status: 200 });
+    if (method === 'GET' && url.endsWith('/entity/counterparty/ms-29')) return new Response(JSON.stringify({ id: 'ms-29', name: dynamicManifest.records[0].name, created: '2026-10-20 20:35:52.853' }), { status: 200 });
     if (method === 'POST' && url.endsWith('/crm.company.update.json')) return new Response(JSON.stringify({ result: true }), { status: 200 });
     return new Response('{}', { status: 404 });
   };
+  const previousTimezone = process.env.TZ;
+  const previousDateNow = Date.now;
+  process.env.TZ = 'America/New_York';
+  Date.now = () => Date.parse('2026-10-20T17:36:00.000Z');
   try {
     const admission = new ControlledLiveTestAdmissionService(database as any);
     const source = { entity: 'client:COMPANY', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-17', currentNativeId: 'b24-17', currentName: dynamicManifest.records[0].name, sourceCreatedAt: new Date('2026-10-19T01:00:00Z') };
@@ -378,7 +383,13 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
       const targetId = await candidate.createTarget({ entity: 'COMPANY', targetSystem: 'MOYSKLAD', targetType: 'counterparty', parentId: null, source: { TITLE: source.currentName }, configuredFields: { name: 'forged config override' }, eventId: 'client-create' });
       assert.equal(targetId, 'ms-29');
       const readback = await candidate.readRecord('MOYSKLAD', 'COMPANY', targetId);
-      await admission.bindCreatedTarget('client-create', targetId, String(readback.id), String(readback.name), new Date(String(readback.created)));
+      const parsedCreatedAt = parseClientMoyskladTimestamp(readback.created) ?? new Date(Number.NaN);
+      assert.equal(parsedCreatedAt.toISOString(), '2026-10-20T17:35:52.853Z');
+      await assert.rejects(admission.bindCreatedTarget('client-create', targetId, String(readback.id), String(readback.name), new Date('2026-10-20T17:37:00.000Z')), /CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID/);
+      await assert.rejects(admission.bindCreatedTarget('client-create', targetId, String(readback.id), String(readback.name), new Date('2026-10-18T17:35:52.853Z')), /CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID/);
+      await assert.rejects(admission.bindCreatedTarget('client-create', targetId, String(readback.id), 'wrong name', parsedCreatedAt), /CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID/);
+      await assert.rejects(admission.bindCreatedTarget('client-create', targetId, 'wrong-id', String(readback.name), parsedCreatedAt), /CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID/);
+      await admission.bindCreatedTarget('client-create', targetId, String(readback.id), String(readback.name), parsedCreatedAt);
     });
     await admission.admit('client-echo', { entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: 'ms-29', currentNativeId: 'ms-29', currentName: source.currentName, sourceCreatedAt: new Date('2026-10-19T02:00:00Z') });
     await admission.runForEvent('client-echo', async () => new HttpClientSyncGateway(fetcher).updateBitrix('COMPANY', 'b24-17', { PHONE: '555-0100' }));
@@ -387,6 +398,8 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
     assert.doesNotMatch(calls[0].body, /forged/);
     assert.equal(calls[2].method, 'POST');
   } finally {
+    Date.now = previousDateNow;
+    if (previousTimezone === undefined) delete process.env.TZ; else process.env.TZ = previousTimezone;
     setControlledLiveTestWriteCheck(null);
     for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.path], ['DATABASE_URL', previous.database], ['SYNC_MODE', previous.sync], ['MOYSKLAD_API_BASE_URL', previous.msBase], ['BITRIX24_REST_BASE_URL', previous.b24Base], ['MOYSKLAD_API_TOKEN', previous.msToken]] as const) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;

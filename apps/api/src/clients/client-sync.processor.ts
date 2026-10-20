@@ -16,6 +16,7 @@ import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from '../admin
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { enterControlledLiveEventScope } from '../controlled-live-test-policy';
 import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
+import { parseClientMoyskladTimestamp } from './client-moysklad-date';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -1084,7 +1085,11 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         this.controlledAdmission.allowTargetReadback(resolution.targetSystem, targetId);
         const readback = await candidateGateway.readRecord(resolution.targetSystem, entity, targetId, contactPairParentId);
         const targetCreatedValue = resolution.targetSystem === 'BITRIX24' ? readback.DATE_CREATE : readback.created;
-        const targetCreatedAt = targetCreatedValue instanceof Date ? targetCreatedValue : new Date(String(targetCreatedValue ?? ''));
+        const targetCreatedAt = targetCreatedValue instanceof Date
+          ? targetCreatedValue
+          : resolution.targetSystem === 'MOYSKLAD'
+            ? parseClientMoyskladTimestamp(targetCreatedValue) ?? new Date(Number.NaN)
+            : new Date(String(targetCreatedValue ?? ''));
         await this.controlledAdmission.bindCreatedTarget(event.id, targetId, String(readback.ID ?? readback.id ?? ''), controlledClientName(entity, readback), targetCreatedAt);
       }
       targetType = resolution.targetType;
