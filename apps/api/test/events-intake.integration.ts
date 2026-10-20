@@ -631,10 +631,27 @@ test('intake routes invoice events and terminally skips disabled entity directio
   const { eventId: unsupportedProductEventId } = await unsupportedBitrixProduct.json() as { eventId: string };
   const skippedProduct = [...rows.values()].find((row) => row.id === unsupportedProductEventId)!;
   assert.equal(skippedProduct.externalEntityType, 'product');
-  assert.equal(skippedProduct.status, 'SKIPPED_DIRECTION_DISABLED');
-  assert.equal(skippedProduct.lastErrorCategory, 'DIRECTION_DISABLED');
+  assert.equal(skippedProduct.status, 'RECEIVED');
+  assert.equal(skippedProduct.lastErrorCategory, null);
 
   disabledDirections.clear();
+});
+
+test('legacy product webhook is retained as a safe catalog signal and auth is not persisted', async () => {
+  rows.clear();
+  disabledDirections.add('products-variations:bitrix24ToMoysklad');
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'event=ONCRMPRODUCTUPDATE&auth%5Bapplication_token%5D=bitrix-test-application-token&data%5BFIELDS%5D%5BID%5D=9102',
+  });
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  const event = [...rows.values()].find((row) => row.id === eventId)!;
+  assert.equal(event.eventType, 'ONCRMPRODUCTUPDATE');
+  assert.equal(event.externalEntityType, 'product');
+  assert.equal(event.externalEntityId, '9102');
+  assert.equal(event.status, 'RECEIVED');
+  assert.equal((event.payload as Record<string, unknown>).auth, undefined);
 });
 
 test('MoySklad service events obey the products direction gate', async () => {

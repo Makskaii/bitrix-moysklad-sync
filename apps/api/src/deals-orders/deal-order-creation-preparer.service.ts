@@ -6,6 +6,7 @@ import { isPlannedDeliveryDateMapping, normalizePlannedDeliveryDate, toMoySkladP
 import { writeOperationalLog } from '../monitoring-log';
 import { DealOrderPreparedInput } from './deal-order-create-operation.service';
 import { bitrixMoneyToMoySklad } from './deal-order-money';
+import { assertApplyExternalWrite } from '../external-write-guard';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -201,11 +202,22 @@ export class DealOrderCreationPreparer {
         select: { moyskladId: true },
         take: 2,
       });
-      if (productPairs.length !== 1 || !isUuid(productPairs[0]?.moyskladId)) {
-        await skipRow(productPairs.length > 1 ? 'PRODUCT_PAIR_AMBIGUOUS' : 'PRODUCT_PAIR_MISSING');
-        continue;
-      }
-      targetProductId = productPairs[0].moyskladId;
+      if (productPairs.length === 1 && isUuid(productPairs[0]?.moyskladId)) targetProductId = productPairs[0].moyskladId;
+      else if (productPairs.length === 0) {
+        const alias = await this.database.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId }, select: { id: true, canonicalPairId: true } });
+        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true } }) : null;
+        if (!canonical || !isUuid(canonical.moyskladId)) { await skipRow('PRODUCT_PAIR_MISSING'); continue; }
+        targetProductId = canonical.moyskladId;
+        try {
+          await ensureDuplicateAliasDealComment(input.bitrix24DealId, alias!.id, productId, input.eventId);
+        } catch {
+          await writeOperationalLog(this.database, 'ADMIN', JSON.stringify({
+            type: 'PRODUCT_DUPLICATE_ALIAS_TIMELINE_COMMENT_UNAVAILABLE', aliasId: alias!.id,
+            dealId: input.bitrix24DealId, duplicateBitrix24Id: productId, eventId: input.eventId,
+          }), input.eventId);
+        }
+        await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_DUPLICATE_ALIAS_USED_FOR_DOCUMENT_ROW', eventId: input.eventId, dealId: input.bitrix24DealId, sourceProductId: productId }), input.eventId);
+      } else { await skipRow('PRODUCT_PAIR_AMBIGUOUS'); continue; }
       const assortment = await readMoySkladAssortment(targetProductId);
       if (!assortment || assortment.uomId !== unit.moyskladId) { await skipRow('PRODUCT_UNIT_MISMATCH'); continue; }
 
@@ -380,6 +392,36 @@ async function readBitrixDeal(id: string): Promise<Record<string, unknown>> {
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok || !isRecord(body) || body.error || !isRecord(body.result)) throw new Error('B24 deal read failed');
   return body.result;
+}
+
+async function ensureDuplicateAliasDealComment(dealId: string, aliasId: string, duplicateProductId: string, eventId: string): Promise<void> {
+  const marker = `[product-duplicate-alias:${aliasId}]`;
+  const base = bitrixBase();
+  let complete = false;
+  for (let start = 0; start < 1000;) {
+    const read = await fetch(new URL('crm.timeline.comment.list.json', withSlash(base)), {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ 'filter[ENTITY_ID]': dealId, 'filter[ENTITY_TYPE]': 'deal', select: 'ID,COMMENT', start: String(start) }),
+      redirect: 'error', signal: AbortSignal.timeout(10_000),
+    });
+    const body: unknown = await read.json().catch(() => null);
+    if (!read.ok || !isRecord(body) || body.error || !Array.isArray(body.result)) throw new Error('B24 deal timeline read failed');
+    if (body.result.some((row) => isRecord(row) && typeof row.COMMENT === 'string' && row.COMMENT.includes(marker))) return;
+    const next = typeof body.next === 'number' ? body.next : null;
+    if (next === null) { complete = true; break; }
+    if (!Number.isInteger(next) || next <= start) throw new Error('B24 deal timeline pagination invalid');
+    start = next;
+  }
+  if (!complete) throw new Error('B24 deal timeline pagination incomplete');
+  assertApplyExternalWrite('BITRIX24', 'PRODUCT_DUPLICATE_ALIAS_TIMELINE_COMMENT');
+  const comment = `${marker} Product row ${duplicateProductId} resolves to the existing canonical product. No duplicate MySklad product was created. Reference event ${eventId}.`;
+  const added = await fetch(new URL('crm.timeline.comment.add.json', withSlash(base)), {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ 'fields[ENTITY_ID]': dealId, 'fields[ENTITY_TYPE]': 'deal', 'fields[COMMENT]': comment }),
+    redirect: 'error', signal: AbortSignal.timeout(10_000),
+  });
+  const addedBody: unknown = await added.json().catch(() => null);
+  if (!added.ok || !isRecord(addedBody) || addedBody.error || (typeof addedBody.result !== 'number' && typeof addedBody.result !== 'string')) throw new Error('B24 deal timeline comment write failed');
 }
 
 async function readAllBitrixRows(id: string): Promise<Record<string, unknown>[]> {

@@ -289,6 +289,7 @@ model EntityPair {
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
+  duplicateProductAliases ProductDuplicateAlias[] @relation("CanonicalProductPair")
   dealOrderPositions DealOrderPositionPair[]
   dealOrderPositionAdds DealOrderPositionAddOperation[]
 
@@ -296,6 +297,23 @@ model EntityPair {
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
   @@index([lifecycleStatus, tombstonedAt])
+}
+
+model ProductDuplicateAlias {
+  id                  String     @id @default(cuid())
+  duplicateBitrix24Id String     @unique
+  canonicalBitrix24Id String
+  canonicalMoyskladId String
+  canonicalPairId     String
+  moyskladType        String     @default("product")
+  reason              String
+  evidence            Json
+  createdAt           DateTime   @default(now())
+  canonicalPair       EntityPair @relation("CanonicalProductPair", fields: [canonicalPairId], references: [id], onDelete: Restrict)
+
+  @@index([canonicalPairId, createdAt])
+  @@index([canonicalBitrix24Id])
+  @@index([canonicalMoyskladId])
 }
 
 model ClientDependencyRetry {

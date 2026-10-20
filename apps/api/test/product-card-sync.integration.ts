@@ -99,6 +99,43 @@ test('a Bitrix24-only field change is repaired from MySklad during a MySklad eve
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
 });
 
+test('a Bitrix24 catalog signal uses the explicit MySklad-authoritative restore path only', async () => {
+  const api = new FakeApi();
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  api.bitrix24.name = 'Edited in Bitrix24';
+  api.moysklad.name = 'Canonical MySklad name';
+
+  const result = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.name, 'Canonical MySklad name');
+  assert.ok(api.writes.length > 0);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('authoritative product restore applies saved scalar transforms and fails closed on invalid values', async () => {
+  const api = new FakeApi();
+  const mapped = { ...settings, rules: [...settings.rules,
+    { id: 'product-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal', precision: 3 } } },
+  ] };
+  api.bitrix24.fields = { weight: 3 };
+  api.moysklad.fields = { weight: '2.125' };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+
+  const result = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings: mapped });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.fields!.weight, 2.125);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+  api.moysklad.fields!.weight = '02.125';
+  const invalid = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings: mapped });
+  assert.equal(invalid.status, 'MANUAL_REVIEW');
+  assert.equal(api.bitrix24.fields!.weight, 2.125, 'invalid conversion does not write a fallback or null');
+});
+
 test('mapped catalog prices flow from MySklad to Bitrix24 while unmapped prices stay untouched', async () => {
   const api = new FakeApi();
   api.moysklad.prices.push({ priceId: 'unmapped-ms-price', typeId: 'unmapped-type', value: 77, currency: 'RUB', currencyRef: currencyRef() });

@@ -190,6 +190,24 @@ export class ControlledLiveTestAdmissionService {
     return withControlledLiveEventScope(scope, action);
   }
 
+  /** Read the exact MySklad side of a manifested product/service pair when a
+   * Bitrix24 event is only a reassertion signal. It grants no write authority. */
+  async withProductRestoreSourceRead<T>(input: { eventId: string; sourceNativeId: string; targetNativeId: string; entity: 'catalog-product' | 'catalog-service' }, action: () => Promise<T>): Promise<T> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return action();
+    const record = this.manifest.records.find((candidate: any) => candidate.entity === input.entity &&
+      candidate.direction === 'MOYSKLAD_TO_BITRIX24' && candidate.sourceSystem === 'MOYSKLAD' &&
+      candidate.sourceNativeId === input.sourceNativeId && candidate.targetSystem === 'BITRIX24' && candidate.targetNativeId === input.targetNativeId &&
+      candidate.syntheticOnly === true);
+    if (!record) throw new Error('CONTROLLED_LIVE_TEST_PRODUCT_RESTORE_PAIR_NOT_MANIFESTED');
+    const scope: ControlledLiveEventScope = {
+      eventId: input.eventId, runId: this.manifest.runId, entity: input.entity,
+      sourceSystem: 'MOYSKLAD', sourceNativeId: input.sourceNativeId,
+      targetSystem: 'BITRIX24', targetNativeId: input.targetNativeId,
+      admittedSourceName: record.name, admittedSourceCreatedAt: record.createdAfterUtc, phase: 'SOURCE_READ',
+    };
+    return withControlledLiveEventScope(scope, action);
+  }
+
   private enterScope(admission: any): void {
     enterControlledLiveEventScope(this.scope(admission.eventId, admission));
   }

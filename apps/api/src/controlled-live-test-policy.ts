@@ -86,6 +86,7 @@ export function createControlledLiveTestPolicy(
       if (!sourceAllowed && !dependencyAllowed) throw new Error('CONTROLLED_LIVE_TEST_READ_NOT_IN_MANIFEST');
       return;
     }
+    if (scope.phase === 'SOURCE_READ') throw new Error('CONTROLLED_LIVE_TEST_WRITE_DURING_SOURCE_READ_FORBIDDEN');
     if (!entityMatchesScope(requestEntity, scope.entity)) throw new Error('CONTROLLED_LIVE_TEST_ENTITY_MISMATCH');
     const isCreate = /(?:^|_)CREATE(?:_|$)/i.test(operation) && !/CHILD/i.test(operation);
     const allowed = manifest.records.some((record) => record.entity === scope.entity &&
