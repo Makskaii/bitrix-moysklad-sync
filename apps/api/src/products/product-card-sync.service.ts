@@ -1,4 +1,5 @@
 import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { applyFieldTransform, type FieldTransform } from '../field-settings/field-transform';
 
 export type ProductCardPair = {
   id: string;
@@ -19,6 +20,8 @@ export type ProductCardSnapshot = {
   detailText: string | null;
   unitId: string | null;
   prices: ProductCardPrice[];
+  /** Normalized VAT rate/enabled/included semantics when the provider data proves them. */
+  taxSemantics?: string | null;
   /** Primitive values only; complex references, files and collections stay on dedicated paths. */
   fields?: Record<string, string | number | boolean | null>;
   updatedAt: string | null;
@@ -27,7 +30,7 @@ export type ProductCardSnapshot = {
 };
 
 export type ProductCardApi = {
-  readBitrix24(id: string, kind?: 'product' | 'service'): Promise<ProductCardSnapshot>;
+  readBitrix24(id: string, kind?: 'product' | 'service', options?: { includeTaxSemantics?: boolean }): Promise<ProductCardSnapshot>;
   readMoysklad(id: string, kind?: 'product' | 'service'): Promise<ProductCardSnapshot>;
   updateBitrix24(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service'): Promise<void>;
   updateBitrix24Price(priceId: string, value: number, currency: string): Promise<void>;
@@ -47,7 +50,7 @@ export type ProductCardSyncResult =
   | { status: 'RETRYABLE_FAILURE'; reason: string; changedFields: string[]; retryAfter?: Date };
 
 type Side = 'BITRIX24' | 'MOYSKLAD';
-type FieldRule = { source: string; target: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean };
+type FieldRule = { source: string; target: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean; transform: FieldTransform };
 type Direction = {
   target: Side;
   value: unknown;
@@ -78,9 +81,10 @@ export class ProductCardSyncService {
     settingsVersion: number;
     settings: ProductCardSettings;
     attempt?: number;
+    authoritativeRestore?: boolean;
   }): Promise<ProductCardSyncResult> {
     const { pair, settings, settingsVersion } = input;
-    if (input.source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [] };
+    if (input.source === 'BITRIX24' && !input.authoritativeRestore) return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED', changedFields: [] };
     if (pair.entityType !== 'PRODUCT' || pair.active !== true) return review('PRODUCT_PAIR_NOT_ACTIVE');
     if (!Number.isInteger(settingsVersion) || settingsVersion < 1) return review('FIELD_SETTINGS_VERSION_INVALID');
     const rules = productRules(settings);
@@ -103,7 +107,7 @@ export class ProductCardSyncService {
     if (!nonEmpty(bitrix24.name) || !nonEmpty(moysklad.name)) return review('PRODUCT_NAME_VALUE_MISSING');
 
     const current = snapshotValues(bitrix24, moysklad, settings);
-    if (!previous) {
+    if (!previous && !input.authoritativeRestore) {
       try {
         await this.state.write(pair.id, settingsVersion, current);
         return { status: 'BASELINED', changedFields: [] };
@@ -113,39 +117,46 @@ export class ProductCardSyncService {
       }
     }
 
-    const next = cloneState(previous);
+    const next = cloneState(previous ?? current);
     const changedFields: string[] = [];
     const criticalReasons: string[] = [];
     const optionalReasons: string[] = [];
     let directions: Direction[];
     let priceDirections: Direction[] = [];
     try {
+      if (input.authoritativeRestore) {
+        directions = authoritativeRestoreDirections(bitrix24, moysklad, rules, settings);
+      } else {
       const name = chooseField('name', bitrix24.name, moysklad.name,
-        previous.bitrix24Values.name, previous.moyskladValues.name, rules.name, true);
+        previous!.bitrix24Values.name, previous!.moyskladValues.name, rules.name, true);
       const description = rules.description ? chooseField('description', bitrix24.detailText, moysklad.detailText,
-        previous.bitrix24Values.description, previous.moyskladValues.description, rules.description, false) : null;
+        previous!.bitrix24Values.description, previous!.moyskladValues.description, rules.description, false) : null;
       const code = rules.code ? chooseField('code', bitrix24.code, moysklad.code,
-        previous.bitrix24Values.code, previous.moyskladValues.code, rules.code, false) : null;
+        previous!.bitrix24Values.code, previous!.moyskladValues.code, rules.code, false) : null;
       const unit = chooseUnit(bitrix24.unitId, moysklad.unitId,
-        previous.bitrix24Values.unitId, previous.moyskladValues.unitId, settings.references.units);
+        previous!.bitrix24Values.unitId, previous!.moyskladValues.unitId, settings.references.units);
       const generic = rules.fields.flatMap((rule) => {
         if (!rule.moyskladToBitrix24 || isDedicatedFieldRule(rule)) return [];
         const mapped = chooseMappedScalar(
           rule,
           bitrix24.fields?.[rule.source],
           moysklad.fields?.[rule.target],
-          record(previous.bitrix24Values.fields) ? previous.bitrix24Values.fields[rule.source] : undefined,
-          record(previous.moyskladValues.fields) ? previous.moyskladValues.fields[rule.target] : undefined,
+          record(previous!.bitrix24Values.fields) ? previous!.bitrix24Values.fields[rule.source] : undefined,
+          record(previous!.moyskladValues.fields) ? previous!.moyskladValues.fields[rule.target] : undefined,
+          rule.transform,
         );
         return mapped ? [mapped] : [];
       });
       directions = [name, description, code, unit, ...generic].filter((value): value is Direction => value !== null);
+      }
     } catch (error) {
       return review(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_CARD_FIELD_UNAVAILABLE');
     }
     try {
-      priceDirections = choosePrices(bitrix24.prices, moysklad.prices,
-        previous.bitrix24Values.prices, previous.moyskladValues.prices, settings.references.priceTypes);
+      priceDirections = input.authoritativeRestore
+        ? authoritativeRestorePrices(bitrix24.prices, moysklad.prices, settings.references.priceTypes)
+        : choosePrices(bitrix24.prices, moysklad.prices,
+          previous!.bitrix24Values.prices, previous!.moyskladValues.prices, settings.references.priceTypes);
     } catch (error) {
       optionalReasons.push(error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_PRICE_FIELD_UNAVAILABLE');
     }
@@ -308,15 +319,14 @@ function productRules(settings: ProductCardSettings): ProductRules {
   for (const candidate of settings.rules) {
     if (!record(candidate) || candidate.entity !== 'catalog' || typeof candidate.sourceField !== 'string' || typeof candidate.targetField !== 'string') continue;
     if (candidate.sourceField === 'xmlId') continue; // reserved as ProductCatalogCreateService's recovery identity
-    const forward = record(candidate.bitrix24ToMoysklad) ? candidate.bitrix24ToMoysklad : null;
     const reverse = record(candidate.moyskladToBitrix24) ? candidate.moyskladToBitrix24 : null;
-    if ((forward?.enabled === true && record(forward.transform) && forward.transform.kind !== 'copy') ||
-      (reverse?.enabled === true && record(reverse.transform) && reverse.transform.kind !== 'copy')) continue;
+    const transform = reverse?.enabled === true && record(reverse.transform) ? reverse.transform as FieldTransform : { kind: 'copy' as const };
     const rule: FieldRule = {
       source: candidate.sourceField,
       target: candidate.targetField,
       bitrix24ToMoysklad: false,
       moyskladToBitrix24: reverse?.enabled === true,
+      transform,
     };
     if (candidate.sourceField === 'name' && candidate.targetField === 'name') result.name = rule;
     else if (candidate.sourceField === 'detailText' && candidate.targetField === 'description') result.description = rule;
@@ -333,16 +343,20 @@ function isDedicatedFieldRule(rule: FieldRule) {
     (rule.source === 'measure' && rule.target === 'uom');
 }
 
-function chooseMappedScalar(rule: FieldRule, b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown): Direction | null {
+function chooseMappedScalar(rule: FieldRule, b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, transform: FieldTransform): Direction | null {
   if (b24 === undefined || ms === undefined || oldB24 === undefined || oldMs === undefined) return null;
   if (b24 === null || ms === null) return null;
-  if (!isScalarValue(b24) || !isScalarValue(ms) || !sameScalarType(b24, ms)) return null;
-  if (!isScalarValue(oldB24) || !isScalarValue(oldMs) || !sameScalarType(oldB24, oldMs)) return null;
-  if (same(b24, ms) || same(b24, oldB24) && same(ms, oldMs)) return null;
+  const transformed = applyFieldTransform(transform, ms);
+  if (transformed.status === 'error') throw new ProductCardManualReviewError('PRODUCT_FIELD_TRANSFORM_INVALID');
+  if (transformed.status === 'skip' || !isScalarValue(transformed.value) || transformed.value === null || !isScalarValue(b24) || !sameScalarType(b24, transformed.value)) return null;
+  const oldTransformed = applyFieldTransform(transform, oldMs);
+  if (oldTransformed.status !== 'mapped' || !isScalarValue(oldTransformed.value) || oldTransformed.value === null ||
+    !isScalarValue(oldB24) || !sameScalarType(oldB24, oldTransformed.value)) return null;
+  if (same(b24, transformed.value) || same(b24, oldB24) && same(transformed.value, oldTransformed.value)) return null;
   return {
     field: `field:${rule.source}:${rule.target}`,
     target: 'BITRIX24',
-    value: ms,
+    value: transformed.value,
     bitrix24Field: rule.source,
     moyskladField: rule.target,
   };
@@ -443,6 +457,48 @@ function choosePrices(b24: ProductCardPrice[], ms: ProductCardPrice[], oldB24: u
     if (!same(b24Price.value, previousB24) || !same(msPrice.value, previousMs)) {
       result.push({ field: `price:${msKey}`, target: 'BITRIX24', value: msPrice.value, bitrix24Key: b24Key, moyskladKey: msKey });
     }
+  }
+  return result;
+}
+
+function authoritativeRestoreDirections(b24: ProductCardSnapshot, ms: ProductCardSnapshot, rules: ProductRules, settings: ProductCardSettings): Direction[] {
+  const result: Direction[] = [];
+  const add = (field: string, value: unknown, bitrix24Key?: string, moyskladKey?: string, bitrix24Field?: string, moyskladField?: string) => {
+    if (value === undefined || value === null) return;
+    result.push({ field, target: 'BITRIX24', value, ...(bitrix24Key ? { bitrix24Key } : {}), ...(moyskladKey ? { moyskladKey } : {}), ...(bitrix24Field ? { bitrix24Field } : {}), ...(moyskladField ? { moyskladField } : {}) });
+  };
+  if (!rules.name?.moyskladToBitrix24 || !nonEmpty(ms.name)) throw new ProductCardManualReviewError('PRODUCT_NAME_MAPPING_MISSING');
+  if (!same(b24.name, ms.name)) add('name', ms.name);
+  if (rules.description?.moyskladToBitrix24 && !same(b24.detailText, ms.detailText)) add('description', ms.detailText);
+  if (rules.code?.moyskladToBitrix24 && !same(b24.code, ms.code)) add('code', ms.code);
+  for (const rule of rules.fields) {
+    if (!rule.moyskladToBitrix24 || !isWritableScalarField(rule.source)) continue;
+    const transformed = applyFieldTransform(rule.transform, ms.fields?.[rule.target]);
+    if (transformed.status === 'error') throw new ProductCardManualReviewError('PRODUCT_FIELD_TRANSFORM_INVALID');
+    if (transformed.status === 'mapped' && isScalarValue(transformed.value) && !same(b24.fields?.[rule.source], transformed.value)) {
+      add(`field:${rule.source}:${rule.target}`, transformed.value, undefined, undefined, rule.source, rule.target);
+    }
+  }
+  if (ms.unitId) {
+    const matches = settings.references.units.filter((candidate) => record(candidate) && candidate.status === 'configured' && String(candidate.moyskladId) === ms.unitId && Number.isInteger(candidate.bitrix24Id));
+    if (matches.length !== 1 || !record(matches[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
+    const bitrix24Id = Number(matches[0].bitrix24Id);
+    if (!sameIdentifier(b24.unitId, bitrix24Id)) add('unit', bitrix24Id, String(bitrix24Id), ms.unitId);
+  }
+  return result;
+}
+
+function authoritativeRestorePrices(b24: ProductCardPrice[], ms: ProductCardPrice[], mappings: unknown[]): Direction[] {
+  const result: Direction[] = [];
+  for (const candidate of mappings) {
+    if (!record(candidate) || candidate.status !== 'configured' || !Number.isInteger(candidate.bitrix24Id) || typeof candidate.moyskladId !== 'string') continue;
+    const b24Price = b24.find((price) => price.typeId === String(candidate.bitrix24Id));
+    const msPrice = ms.find((price) => price.typeId === candidate.moyskladId);
+    if (!b24Price || !msPrice) continue;
+    if (!sameCurrency(b24Price.currency, msPrice.currency) || !msPrice.currencyRef || !Number.isFinite(msPrice.value)) {
+      throw new ProductCardManualReviewError('PRODUCT_PRICE_CURRENCY_UNVERIFIED_OR_MISMATCHED');
+    }
+    if (!same(b24Price.value, msPrice.value)) result.push({ field: `price:${candidate.moyskladId}`, target: 'BITRIX24', value: msPrice.value, bitrix24Key: String(candidate.bitrix24Id), moyskladKey: candidate.moyskladId });
   }
   return result;
 }

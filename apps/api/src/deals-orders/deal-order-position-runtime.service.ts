@@ -98,6 +98,11 @@ export class DealOrderPositionRuntimeService {
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },
     });
+    const aliases = await this.database.productDuplicateAlias.findMany({ where: { duplicateBitrix24Id: { in: productIds } }, select: { duplicateBitrix24Id: true, canonicalPairId: true } });
+    const canonicalIds = aliases.map((alias) => alias.canonicalPairId);
+    const canonicalPairs = canonicalIds.length ? await this.database.entityPair.findMany({ where: { id: { in: canonicalIds }, entityType: 'PRODUCT', active: true }, select: { id: true, moyskladId: true } }) : [];
+    const canonicalById = new Map(canonicalPairs.map((pair) => [pair.id, pair.moyskladId]));
+    productPairs.push(...aliases.flatMap((alias) => canonicalById.has(alias.canonicalPairId) ? [{ bitrix24Id: alias.duplicateBitrix24Id, moyskladId: canonicalById.get(alias.canonicalPairId)! }] : []));
     const sourceById = new Map(b24Rows.map((row) => [String(row.id), row]));
     const targetById = new Map(msRows.map((row) => [row.id, row]));
     const plans: Array<{ linkId: string; source: Row; target: Position; quantity: number; price: number; discount: number; vat: number; vatEnabled: boolean; bitrixPrice: number; bitrixDiscountRate: number; bitrixTaxRate: number | null; bitrixTaxIncluded: 'Y' | 'N'; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'ECHO' }> = [];
@@ -294,6 +299,11 @@ export class DealOrderPositionRuntimeService {
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },
     });
+    const aliases = await this.database.productDuplicateAlias.findMany({ where: { duplicateBitrix24Id: { in: productIds } }, select: { duplicateBitrix24Id: true, canonicalPairId: true } });
+    const canonicalIds = aliases.map((alias) => alias.canonicalPairId);
+    const canonicalPairs = canonicalIds.length ? await this.database.entityPair.findMany({ where: { id: { in: canonicalIds }, entityType: 'PRODUCT', active: true }, select: { id: true, moyskladId: true } }) : [];
+    const canonicalById = new Map(canonicalPairs.map((pair) => [pair.id, pair.moyskladId]));
+    productPairs.push(...aliases.flatMap((alias) => canonicalById.has(alias.canonicalPairId) ? [{ bitrix24Id: alias.duplicateBitrix24Id, moyskladId: canonicalById.get(alias.canonicalPairId)! }] : []));
     const productBySource = new Map<string, string>();
     for (const id of productIds) {
       const candidates = productPairs.filter((candidate) => candidate.bitrix24Id === id);
@@ -358,7 +368,12 @@ export class DealOrderPositionRuntimeService {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
         continue;
       }
-      const candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      let candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      if (!candidates.length) {
+        const alias = await this.database.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId }, select: { canonicalPairId: true } });
+        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true } }) : null;
+        if (canonical) candidates = [canonical];
+      }
       if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) { await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED'); continue; }
       let product: unknown;
       try {

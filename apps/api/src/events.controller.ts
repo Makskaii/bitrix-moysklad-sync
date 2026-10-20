@@ -72,8 +72,9 @@ export class EventIntakeService {
     const eventType = typeof safePayload.event === 'string' ? safePayload.event : null;
     const externalEntityType = bitrixEntityType(eventType, safePayload);
     const direction = getEventDirection('BITRIX24', eventType, externalEntityType);
-    const directionDisabled = direction === 'products-variations:bitrix24ToMoysklad' ||
-      (direction !== null && !await this.syncMode.isDirectionEnabled(
+    const productSignal = externalEntityType === 'product' && isProductCatalogSignal(eventType);
+    const directionDisabled = (!productSignal && direction === 'products-variations:bitrix24ToMoysklad') ||
+      (direction !== null && !productSignal && !await this.syncMode.isDirectionEnabled(
         direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
       ));
 
@@ -394,11 +395,17 @@ function safeDealEventType(value: string | null): string | null {
 function bitrixEntityType(value: string | null, payload: EventPayload): string | null {
   if (value?.startsWith('CATALOG.PRODUCT.')) return 'product';
   if (value?.startsWith('CATALOG.PRICE.')) return 'catalogprice';
+  if (/^ONCRMPRODUCT(?:ADD|UPDATE|DELETE)$/.test(value ?? '')) return 'product';
   if (/^ONCRMDYNAMICITEM(?:ADD|UPDATE|DELETE)$/.test(value ?? '') && bitrixEntityTypeId(payload) === 31) return 'invoice';
   if (value?.startsWith('ONCRMDEAL')) return 'deal';
   if (value?.startsWith('ONCRMCONTACT')) return 'contact';
   if (value?.startsWith('ONCRMCOMPANY')) return 'company';
   return null;
+}
+
+function isProductCatalogSignal(value: string | null): boolean {
+  return /^CATALOG\.PRODUCT\.ON\.(?:ADD|UPDATE|DELETE)$/.test(value ?? '') ||
+    /^ONCRMPRODUCT(?:ADD|UPDATE|DELETE)$/.test(value ?? '');
 }
 
 function bitrixEntityTypeId(payload: EventPayload): number | null {

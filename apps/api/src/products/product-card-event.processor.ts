@@ -11,15 +11,18 @@ import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { ProductCatalogCreateService, ProductCatalogManualReviewError } from './product-catalog-create.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { ProductDuplicateAliasService } from './product-duplicate-alias.service';
+import { lockEntityPairState } from '../pairs/pair-db-lock';
+import { chooseProductCatalogCandidate, comparableCatalogPrice, ProductCatalogCandidate } from './product-catalog-match-policy';
+import { writeOperationalLog } from '../monitoring-log';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
 const EVENT_BATCH_DELAY_MS = 250;
 
 /**
- * Dispatches supported update events only to already-persisted PRODUCT hardpairs.
- * The event intake owns authentication and event persistence; this processor
- * never searches, creates, or guesses a product pair.
+ * Dispatches catalog signal events through the dedicated MySklad-authoritative
+ * restore path. Adds may establish only a fully comparable exact catalog pair.
  */
 @Injectable()
 export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
@@ -36,6 +39,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     @Optional() private readonly catalogCreate?: ProductCatalogCreateService,
     @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
+    @Optional() private readonly duplicateAliases?: ProductDuplicateAliasService,
   ) {}
 
   supports(event: InboundEventMetadata): boolean {
@@ -80,7 +84,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         where: {
           AND: [
             { OR: [
-              { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.ADD', 'CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRICE.ON.ADD', 'CATALOG.PRICE.ON.UPDATE', 'CATALOG.PRICE.ON.DELETE'] } },
+              { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.ADD', 'CATALOG.PRODUCT.ON.UPDATE', 'ONCRMPRODUCTADD', 'ONCRMPRODUCTUPDATE', 'ONCRMPRODUCTDELETE', 'CATALOG.PRICE.ON.ADD', 'CATALOG.PRICE.ON.UPDATE', 'CATALOG.PRICE.ON.DELETE'] } },
               { source: 'MOYSKLAD', eventType: { in: ['CREATE', 'UPDATE'] }, externalEntityType: { in: ['product', 'service'] } },
             ] },
             { OR: [
@@ -130,20 +134,12 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     });
     if (claimed.count !== 1) return null;
 
-    // Ignore every Bitrix24 catalog change before resolving its product or pair.
-    // This also keeps legacy direction settings from reopening reverse writes.
-    if (event.source === 'BITRIX24') {
-      const gate = await this.runtime.preflight('BITRIX24');
-      if (gate.status !== 'READY') {
-        const result = { ...gate, changedFields: [] as [] };
-        await this.applyResult(event.id, event, result, workerLease);
-        return result;
-      }
-    }
-
     const attempt = event.attempts + 1;
     const supported = await this.resolveProductId(event, attempt);
-    if (supported.status === 'not-product-event') return null;
+    if (supported.status === 'not-product-event') {
+      await this.finish(event.id, 'SKIPPED_UNSUPPORTED_ENTITY', 'PRODUCT_EVENT_ID_RESOLUTION_UNSUPPORTED', null, workerLease);
+      return null;
+    }
     if (supported.status === 'unsupported-product-kind') {
       await this.finish(event.id, 'SKIPPED_UNSUPPORTED_ENTITY', 'PRODUCT_CARD_ENTITY_KIND_UNSUPPORTED', null, workerLease);
       return null;
@@ -160,14 +156,30 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     }
 
     const sideField = event.source === 'BITRIX24' ? 'bitrix24Id' : 'moyskladId';
+    const eventFields = asRecord(asRecord(asRecord(event.payload).data).FIELDS);
     const nativeKindFilter = event.source === 'MOYSKLAD'
       ? (event.externalEntityType === 'service' ? { moyskladType: 'service' } : { OR: [{ moyskladType: 'product' }, { moyskladType: null }] })
-      : {};
+      : Number(eventFields.TYPE) === 7 ? { moyskladType: 'service' }
+        : Number(eventFields.TYPE) === 1 ? { OR: [{ moyskladType: 'product' }, { moyskladType: null }] } : {};
     let matches = await this.database.entityPair.findMany({
       where: { entityType: 'PRODUCT', active: true, [sideField]: supported.productId, ...nativeKindFilter },
       select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true },
       take: 2,
     });
+    if (!matches.length && event.source === 'BITRIX24' && this.duplicateAliases) {
+      const resolution = await this.duplicateAliases.resolveBitrix24Product(supported.productId);
+      if (resolution.status === 'PAIR') matches = await this.database.entityPair.findMany({ where: { id: resolution.pair.id, entityType: 'PRODUCT', active: true },
+        select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true }, take: 2 });
+      if (resolution.status === 'ALIAS') {
+        matches = await this.database.entityPair.findMany({ where: { id: resolution.alias.canonicalPairId, entityType: 'PRODUCT', active: true },
+          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true }, take: 2 });
+      }
+    }
+    if (!matches.length && event.source === 'BITRIX24' && ['CATALOG.PRODUCT.ON.ADD', 'ONCRMPRODUCTADD'].includes(event.eventType ?? '')) {
+      const createdPairId = await this.matchOrPairBitrixProduct(supported.productId, event.id, attempt, workerLease);
+      if (createdPairId) matches = await this.database.entityPair.findMany({ where: { id: createdPairId, entityType: 'PRODUCT', active: true },
+        select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true }, take: 2 });
+    }
     if (!matches.length && event.source === 'MOYSKLAD' && event.eventType === 'CREATE' && ['product', 'service'].includes(event.externalEntityType ?? '')) {
       const created = await this.createPostBoundaryProduct({ productId: supported.productId, kind: event.externalEntityType as 'product' | 'service', eventId: event.id, attempt, workerLease });
       if (created) {
@@ -187,7 +199,13 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
     try {
       await workerLease?.assertOwned();
       const pinned = await this.fieldSettings.eventConfig(event.id);
-      const run = () => this.runtime.process({
+      const run = () => event.source === 'BITRIX24' ? this.runtime.processAuthoritativeRestore({
+          pairId: matches[0]!.id,
+          settingsVersion: pinned.version,
+          eventId: event.id,
+          attempt,
+          ...(workerLease ? { assertWorkerLease: workerLease.assertOwned } : {}),
+        }) : this.runtime.process({
           pairId: matches[0]!.id,
           source: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
           settingsVersion: pinned.version,
@@ -197,14 +215,17 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         });
       let result: ProductCardSyncResult;
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
-        const entity = event.externalEntityType === 'service' ? 'catalog-service' : 'catalog-product';
+        const entity = matches[0]!.moyskladType === 'service' ? 'catalog-service' : 'catalog-product';
         const kind = entity === 'catalog-service' ? 'service' : 'product';
-        const sourceSystem = event.source as 'BITRIX24' | 'MOYSKLAD';
-        const sourceRecord = await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, supported.productId, entity, async () =>
-          sourceSystem === 'BITRIX24' ? this.bitrixApi.readBitrix24(supported.productId, kind) : this.bitrixApi.readMoysklad(supported.productId, kind));
+        const authoritativeRestore = event.source === 'BITRIX24';
+        const sourceSystem = 'MOYSKLAD';
+        const sourceNativeId = authoritativeRestore ? matches[0]!.moyskladId : supported.productId;
+        const sourceRecord = authoritativeRestore
+          ? await this.controlledAdmission.withProductRestoreSourceRead({ eventId: event.id, sourceNativeId, targetNativeId: matches[0]!.bitrix24Id, entity }, () => this.bitrixApi.readMoysklad(sourceNativeId, kind))
+          : await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, sourceNativeId, entity, () => this.bitrixApi.readMoysklad(sourceNativeId, kind));
         const sourceCreatedAt = sourceRecord.createdAt ? new Date(sourceRecord.createdAt) : null;
         if (!sourceRecord.name || !sourceCreatedAt || !Number.isFinite(sourceCreatedAt.getTime())) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
-        await this.controlledAdmission.admit(event.id, { entity, sourceSystem, sourceNativeId: supported.productId, currentNativeId: supported.productId,
+        await this.controlledAdmission.admit(event.id, { entity, sourceSystem, sourceNativeId, currentNativeId: sourceNativeId,
           currentName: sourceRecord.name, sourceCreatedAt });
         result = await this.controlledAdmission.runForEvent(event.id, run);
       } else {
@@ -280,12 +301,13 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   private async resolveProductId(event: {
     source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; payload: Prisma.JsonValue;
   }, attempt: number): Promise<{ status: 'not-product-event' } | { status: 'unsupported-product-kind' } | { status: 'retryable'; retryAfter?: Date; permanent?: boolean } | { status: 'resolved'; productId: string }> {
-    if (event.source === 'BITRIX24' && event.eventType === 'CATALOG.PRODUCT.ON.UPDATE') {
+    if (event.source === 'BITRIX24' && ['CATALOG.PRODUCT.ON.UPDATE', 'CATALOG.PRODUCT.ON.ADD', 'ONCRMPRODUCTUPDATE', 'ONCRMPRODUCTADD'].includes(event.eventType ?? '')) {
       const root = asRecord(event.payload);
       const data = asRecord(root.data);
       const fields = asRecord(data.FIELDS);
       const type = Number(fields.TYPE);
-      if (type !== 1) return { status: 'unsupported-product-kind' };
+      const legacyProductEvent = /^ONCRMPRODUCT(?:ADD|UPDATE)$/.test(event.eventType ?? '');
+      if (type !== 1 && type !== 7 && !(legacyProductEvent && (!Number.isFinite(type) || type === 0))) return { status: 'unsupported-product-kind' };
       const id = readScalar(fields.ID) ?? event.externalEntityId;
       return id && /^\d{1,20}$/.test(id) ? { status: 'resolved', productId: id } : { status: 'retryable' };
     }
@@ -307,6 +329,79 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       return id && isUuid(id) ? { status: 'resolved', productId: id } : { status: 'retryable' };
     }
     return { status: 'not-product-event' };
+  }
+
+  private async matchOrPairBitrixProduct(productId: string, eventId: string, attempt: number, workerLease?: EventWorkerLeaseContext): Promise<string | null> {
+    if (!this.duplicateAliases || !/^\d{1,20}$/.test(productId)) return null;
+    const existing = await this.duplicateAliases.resolveBitrix24Product(productId);
+    if (existing.status === 'PAIR') return existing.pair.id;
+    if (existing.status === 'ALIAS') return existing.alias.canonicalPairId;
+    const pinned = await this.fieldSettings.eventConfig(eventId);
+    const mappings = pinned.config.references.priceTypes.filter((row) => row.status === 'configured' && typeof row.moyskladId === 'string' && Number.isInteger(row.bitrix24Id));
+    if (mappings.length !== 1) return null;
+    let kind: 'product' | 'service' = 'product';
+    const root = await this.database.inboundEvent.findUnique({ where: { id: eventId }, select: { payload: true } });
+    const payload = asRecord(root?.payload);
+    const fields = asRecord(asRecord(payload.data).FIELDS);
+    if (Number(fields.TYPE) === 7) kind = 'service';
+    let source;
+    try { source = await this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true }); }
+    catch (error) {
+      if (kind === 'product') {
+        try { kind = 'service'; source = await this.bitrixApi.readBitrix24(productId, kind, { includeTaxSemantics: true }); }
+        catch { return null; }
+      } else return null;
+    }
+    if (!source.name || !source.taxSemantics) return null;
+    const mapping = mappings[0]!;
+    const sourcePrice = source.prices.filter((price) => price.typeId === String(mapping.bitrix24Id));
+    if (sourcePrice.length !== 1) return null;
+    const candidates = await this.bitrixApi.findMoyskladProductsByExactName(source.name, kind);
+    const available: ProductCatalogCandidate[] = [];
+    for (const candidate of candidates) {
+      const target = await this.bitrixApi.readMoysklad(candidate.id, kind).catch(() => null);
+      if (!target || !target.taxSemantics) continue;
+      const targetPrices = target.prices.filter((price) => price.typeId === mapping.moyskladId);
+      if (targetPrices.length !== 1) continue;
+      available.push({ id: candidate.id, name: candidate.name, kind, priceTypeKey: String(mapping.bitrix24Id), price: targetPrices[0]!.value,
+        currency: targetPrices[0]!.currency, taxSemantics: target.taxSemantics, createdAt: candidate.createdAt, usage: null });
+    }
+    const incoming: ProductCatalogCandidate = { id: `b24:${productId}`, name: source.name, kind, priceTypeKey: String(mapping.bitrix24Id),
+      price: sourcePrice[0]!.value, currency: sourcePrice[0]!.currency, taxSemantics: source.taxSemantics, createdAt: source.createdAt ?? null, usage: null };
+    const eligible = available.filter((candidate) => comparableCatalogPrice(incoming, candidate));
+    const selection = chooseProductCatalogCandidate(eligible);
+    if (selection.status !== 'selected') return null;
+    const targetCandidate = eligible.find((candidate) => candidate.id === selection.candidateId);
+    if (!targetCandidate) return null;
+    const pair = await this.database.entityPair.findFirst({ where: { entityType: 'PRODUCT', active: true, moyskladId: targetCandidate.id, moyskladType: kind },
+      select: { id: true, bitrix24Id: true, moyskladId: true } });
+    if (pair) {
+      await this.duplicateAliases.record({ duplicateBitrix24Id: productId, canonicalPairId: pair.id, moyskladType: kind,
+        reason: 'EXACT_NAME_CONFIGURED_PRICE_CURRENCY_AND_TAX_MATCH', evidence: {
+          nameExact: true, configuredPriceType: String(mapping.bitrix24Id), priceEqual: true, currencyVerified: true, taxComparable: true,
+          usageSource: selection.usageSource, usageCoverage: selection.usageCoverage, tieBreak: selection.tieBreak,
+          duplicateCreatedAt: source.createdAt ?? null,
+          canonicalCreatedAt: (await this.bitrixApi.readBitrix24(pair.bitrix24Id, kind).catch(() => null))?.createdAt ?? null,
+          selectionCandidateCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
+          selectionCandidateCreatedAtSource: targetCandidate.createdAt ? 'MOYSKLAD.created' : 'unavailable',
+        } });
+      return pair.id;
+    }
+    const created = await this.database.$transaction(async (transaction) => {
+      await assertWorkerLeaseInTransaction(workerLease, transaction);
+      await lockEntityPairState(transaction);
+      const conflict = await transaction.entityPair.findFirst({ where: { entityType: 'PRODUCT', active: true, OR: [{ bitrix24Id: productId }, { moyskladId: targetCandidate.id }] }, select: { id: true } });
+      if (conflict) return null;
+      const created = await transaction.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: targetCandidate.id,
+        moyskladType: kind, active: true, source: 'AUTO', reason: 'EXACT_CATALOG_NAME_PRICE_CURRENCY_TAX_MATCH' }, select: { id: true } });
+      return created.id;
+    });
+    if (created) await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_EXACT_CATALOG_PAIR_CREATED', pairId: created,
+      bitrix24Id: productId, moyskladId: targetCandidate.id, kind, nameExact: true, configuredPriceType: String(mapping.bitrix24Id),
+      priceEqual: true, currencyVerified: true, taxComparable: true, usageSource: selection.usageSource, usageCoverage: selection.usageCoverage,
+      tieBreak: selection.tieBreak, moyskladCreatedAt: targetCandidate.createdAt instanceof Date ? targetCandidate.createdAt.toISOString() : targetCandidate.createdAt,
+    }), eventId);
+    return created;
   }
 
   private async applyResult(eventId: string, event: { source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; attempts: number }, result: ProductCardSyncResult, workerLease?: EventWorkerLeaseContext) {
@@ -381,7 +476,7 @@ async function assertWorkerLeaseInTransaction(
 function retryDelayMs(attempt: number): number { return Math.min(60_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 6), 3_600_000); }
 function isProductEvent(source: string, eventType: string | null, externalEntityType: string | null): boolean {
   return source === 'BITRIX24'
-    ? eventType === 'CATALOG.PRODUCT.ON.ADD' || eventType === 'CATALOG.PRODUCT.ON.UPDATE' || /^CATALOG\.PRICE\.ON\.(ADD|UPDATE|DELETE)$/.test(eventType ?? '')
+    ? eventType === 'CATALOG.PRODUCT.ON.ADD' || eventType === 'CATALOG.PRODUCT.ON.UPDATE' || /^ONCRMPRODUCT(?:ADD|UPDATE)$/.test(eventType ?? '') || /^CATALOG\.PRICE\.ON\.(ADD|UPDATE|DELETE)$/.test(eventType ?? '')
     : source === 'MOYSKLAD' && ['CREATE', 'UPDATE'].includes(eventType ?? '') && ['product', 'service'].includes(externalEntityType ?? '');
 }
 function isDue(status: string, retryAfter: Date | null, processingStartedAt: Date | null): boolean {
