@@ -22,6 +22,7 @@ import { invoiceGoodsValue, InvoiceGoodsReview, InvoiceGoodsRow, InvoiceGoodsSta
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
 const RECOVERY_INTERVAL_MS = 1_000;
+const ORDER_WAIT_RETRY_MS = 30_000;
 const MAX_ATTEMPTS = 8;
 type Source = 'BITRIX24' | 'MOYSKLAD';
 type InvoiceDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
@@ -94,7 +95,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
             ] },
             { OR: [
               { status: 'RECEIVED' },
-              { status: 'WAITING_FOR_ORDER' },
+              { status: 'WAITING_FOR_ORDER', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: staleBefore } }] },
@@ -135,7 +136,8 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
     const claim = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
       where: { id: event.id, OR: [
-        { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' },
+        { status: 'RECEIVED' },
+        { status: 'WAITING_FOR_ORDER', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: new Date(Date.now() - PROCESSING_LEASE_MS) } }] },
@@ -177,7 +179,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const resolveOrder = () => this.resolveOrderPair(source, link.orderId, boundary);
       const order = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? await this.controlledAdmission.runForEvent(event.id, resolveOrder) : await resolveOrder();
-      if (order.status === 'WAITING_FOR_ORDER') return this.finish(event, 'WAITING_FOR_ORDER', order.reason, null, lease);
+      if (order.status === 'WAITING_FOR_ORDER') return this.finish(event, 'WAITING_FOR_ORDER', order.reason, new Date(Date.now() + ORDER_WAIT_RETRY_MS), lease);
       if (order.status === 'SKIPPED_OUT_OF_SCOPE') return this.finish(event, 'SKIPPED_PRE_LAUNCH', order.reason, null, lease);
       if (order.status === 'MANUAL_REVIEW') return this.finish(event, 'MANUAL_REVIEW', order.reason, null, lease);
 
@@ -812,8 +814,15 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       }
       if (status === 'SUCCEEDED') await transaction.manualReviewCase.updateMany({ where: { eventId: event.id, status: 'OPEN' }, data: { status: 'RESOLVED', resolvedAt: new Date() } });
       await transaction.inboundEvent.updateMany({
-        where: { id: event.id, OR: [{ status: 'PROCESSING' }, { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' }, { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' }] },
-        data: { status, lastErrorCategory: reason || null, processingStartedAt: null, retryAfter, ...(status === 'SUCCEEDED' ? { lastSuccessfulAt: new Date() } : {}) },
+        where: status === 'WAITING_FOR_ORDER'
+          ? { id: event.id, status: 'PROCESSING', attempts: event.attempts + 1 }
+          : { id: event.id, OR: [{ status: 'PROCESSING' }, { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' }, { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' }] },
+        // A successful dependency check is not a failed processing attempt.
+        // Restore only this owned claim, atomically with its persisted next poll;
+        // preserve any real failures that preceded the wait and never reset them.
+        data: { status, lastErrorCategory: reason || null, processingStartedAt: null, retryAfter,
+          ...(status === 'WAITING_FOR_ORDER' ? { attempts: event.attempts } : {}),
+          ...(status === 'SUCCEEDED' ? { lastSuccessfulAt: new Date() } : {}) },
       });
     });
     return { status, reason };
@@ -957,7 +966,7 @@ function record(value: unknown): InvoiceRecord { return isRecord(value) ? value 
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isDue(status: string, retryAfter: Date | null, processingStartedAt: Date | null): boolean {
   const now = Date.now();
-  return status === 'RECEIVED' || status === 'WAITING_FOR_ORDER' ||
-    (['RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(status) && (!retryAfter || retryAfter.getTime() <= now)) ||
+  return status === 'RECEIVED' ||
+    (['WAITING_FOR_ORDER', 'RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(status) && (!retryAfter || retryAfter.getTime() <= now)) ||
     (status === 'PROCESSING' && (!processingStartedAt || processingStartedAt.getTime() < now - PROCESSING_LEASE_MS));
 }
