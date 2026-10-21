@@ -154,6 +154,9 @@ export class ProductCardHttpApi implements ProductCardApi {
     if (product.id !== id || !isRecord(product.meta)) throw new Error('PRODUCT_CARD_READ_INVALID');
     if (product.meta.type !== kind) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
     const uom = isRecord(product.uom) && isRecord(product.uom.meta) ? idFromHref(product.uom.meta.href) : null;
+    // Coalesce repeated currency relations only within this snapshot. Twelve
+    // price types commonly refer to the same currency; no cross-event cache.
+    const currencies = new Map<string, Promise<string | null>>();
     const prices = Array.isArray(product.salePrices) ? await Promise.all(product.salePrices.filter(isRecord).map(async (price) => {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
       const typeId = idFromHref(typeMeta.href);
@@ -165,8 +168,8 @@ export class ProductCardHttpApi implements ProductCardApi {
       const currencyId = isRecord(rawCurrency?.meta) ? idFromHref(rawCurrency.meta.href) : null;
       let currencyCode = explicitIsoCode(rawCurrency);
       if (!currencyCode && currencyId) {
-        const currency = asRecord(await this.moyskladRequest(`entity/currency/${encodeURIComponent(currencyId)}`, 'GET'));
-        currencyCode = explicitIsoCode(currency);
+        if (!currencies.has(currencyId)) currencies.set(currencyId, this.moyskladRequest(`entity/currency/${encodeURIComponent(currencyId)}`, 'GET').then(currency => explicitIsoCode(asRecord(currency))));
+        currencyCode = await currencies.get(currencyId)!;
       }
       const currencyRef = currencyId ? { meta: {
         href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}`,

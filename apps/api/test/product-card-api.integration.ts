@@ -34,7 +34,8 @@ before(async () => {
         uom: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/uom/abcdefab-cdef-abcd-efab-cdefabcdefab' } },
         salePrices: [{ value: 1250,
           currency: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' } },
-          priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
+          priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } },
+          { value: 0, currency: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' } }, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/bbcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/service/' + serviceId && request.method === 'GET') return response.end(JSON.stringify({
         id: serviceId, meta: { type: 'service' }, name: 'Setup', description: 'Install', updated: '2026-10-07 10:00:00.000',
@@ -90,6 +91,8 @@ test('product API adapter reads only addressed cards and issues partial field an
   assert.equal(ms.prices[0].typeId, 'abcdefab-cdef-abcd-efab-cdefabcdefac');
   assert.equal(ms.prices[0].currency, 'RUB');
   assert.equal(ms.prices[0].value, 12.5, '1250 Remap minor units are the same 12.50 RUB as Bitrix catalog.price');
+  assert.equal(ms.prices[1].value, 0);
+  assert.equal(requests.filter(request=>request.path.endsWith('/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad')).length,1,'one snapshot reads each selected currency only once despite multiple price types');
   assert.equal((ms.prices[0].currencyRef?.meta as { type: string }).type, 'currency');
 
   await api.updateBitrix24('101', { name: 'Renamed' });
