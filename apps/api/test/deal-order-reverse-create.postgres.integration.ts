@@ -122,7 +122,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(items[0].title, 'Заказ покупателя SO-54');
   assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
   assert.equal(items[0].originId, ids.order);
-  assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 133.33, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
+  assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 111.11, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
   assert.deepEqual([rows[0].discountRate, rows[0].taxRate, rows[0].taxIncluded], [10, 20, 'Y']);
   assert.deepEqual(rows.map((row) => row.measureCode), [796, 796, 796], 'product-row MEASURE_CODE uses the saved catalog code, not its catalog ID');
   assert.equal(rows.some((row) => Number(row.productId) !== 903), false);

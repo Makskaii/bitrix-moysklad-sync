@@ -89,7 +89,7 @@ test('quantity, discount, and price updates use exact row/position IDs in both d
 test('addressed row updates preserve explicitly excluded VAT and only use the current MS order VAT mode', async () => {
   const one = await seed('98106');
   vatIncluded = false;
-  b24Rows[0] = { ...b24Rows[0], quantity: 2, price: 10, priceNetto: 10, taxRate: 20, taxIncluded: 'N' };
+  b24Rows[0] = { ...b24Rows[0], quantity: 2, price: 12, priceNetto: 10, taxRate: 20, taxIncluded: 'N' };
   calls = [];
   const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-row-update-vat-excluded', eventConfig: config() });
   assert.deepEqual(result, { status: 'SYNCED', rowValuesChanged: true });

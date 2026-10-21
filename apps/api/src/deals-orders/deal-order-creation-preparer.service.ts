@@ -260,7 +260,7 @@ export class DealOrderCreationPreparer {
       });
       sourceRowIds.push(rowId);
       sourceRowValues.push({
-        productId, measureCode, quantity, price: row.price, priceNetto: row.priceNetto,
+        productId, measureCode, quantity, price: row.price, priceNetto: row.priceNetto, priceBrutto: row.priceBrutto,
         discountTypeId, discountRate, discountSum, taxRate, taxIncluded: row.taxIncluded,
       });
       sourceProductIds.push(productId);
