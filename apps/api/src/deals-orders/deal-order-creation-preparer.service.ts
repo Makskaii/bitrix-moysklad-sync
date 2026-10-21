@@ -9,6 +9,7 @@ import { bitrixMoneyToMoySklad } from './deal-order-money';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
+import { moyskladUomReferenceId } from './moysklad-uom-reference';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -488,9 +489,10 @@ async function readMoySkladAssortment(id: string, gate: ProviderModeGate): Promi
   if (!response.ok || !isRecord(body) || !Array.isArray(body.rows) || body.rows.length !== 1 || !isRecord(body.rows[0])) throw new Error('MySklad assortment read failed');
   const row = body.rows[0];
   const type = isRecord(row.meta) ? row.meta.type : null;
-  if (row.id !== id || type !== 'product' || !isRecord(row.uom) || !isUuid(row.uom.id)) return null;
+  const uomId = moyskladUomReferenceId(row.uom, base);
+  if (row.id !== id || type !== 'product' || !uomId) return null;
   const href = isRecord(row.meta) && typeof row.meta.href === 'string' ? row.meta.href : '';
-  return { type, uomId: row.uom.id, href };
+  return { type, uomId, href };
 }
 
 async function verifyMySkladReference(type: 'organization' | 'store' | 'employee' | 'currency' | 'state', id: string, gate: ProviderModeGate): Promise<boolean> {

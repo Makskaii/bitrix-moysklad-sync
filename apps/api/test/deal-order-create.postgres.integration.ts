@@ -266,7 +266,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (url.pathname === '/api/remap/1.2/entity/assortment' && headerContractDealId) {
     captureHeaderContractRequest(request, url.pathname);
     if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
-    return send(response, { rows: [{ id: ids.product, meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` }, uom: { id: ids.unit } }] });
+    return send(response, { rows: [{ id: ids.product, meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } }] });
   }
   const entity = url.pathname.match(/\/entity\/(counterparty|organization|store|employee|currency)\/([0-9a-f-]{36})$/);
   if (entity) {
@@ -285,7 +285,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { id: state[1], meta: { type: 'state' } });
   }
   const product = url.pathname.match(/\/entity\/product\/([0-9a-f-]{36})$/);
-  if (product) return send(response, { id: product[1], meta: { type: 'product' }, uom: { id: ids.unit } });
+  if (product) return send(response, { id: product[1], meta: { type: 'product' }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
   if (url.pathname === '/rest/crm.deal.get.json') {
     if (body.get('id') === headerContractDealId) return send(response, { result: {
       ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,

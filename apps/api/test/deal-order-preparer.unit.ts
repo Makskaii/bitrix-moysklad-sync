@@ -217,7 +217,7 @@ async function fakeFetch(input: string | URL | Request, init?: RequestInit): Pro
     return json({ result: { productRows: rows }, total: rows.length });
   }
   if (url.hostname === 'moysklad.test' && url.pathname.endsWith('/entity/assortment')) {
-    return json({ rows: [{ id: uuids.product, meta: { type: 'product', href: msRef('product', uuids.product) }, uom: { id: uuids.unit } }] });
+    return json({ rows: [{ id: uuids.product, meta: { type: 'product', href: msRef('product', uuids.product) }, uom: { meta: {type:'uom',href:msRef('uom',uuids.unit)} } }] });
   }
   if (url.hostname === 'moysklad.test') {
     const headers = new Headers(input instanceof Request ? input.headers : undefined);

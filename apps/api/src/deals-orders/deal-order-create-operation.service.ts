@@ -6,6 +6,7 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { moyskladUomReferenceId } from './moysklad-uom-reference';
 
 type CustomerOrderPosition = {
   assortment: { meta: { type: string; href: string } };
@@ -182,7 +183,7 @@ export class DealOrderCreateOperationService {
       let orderId = operation.moyskladOrderId;
       if (!orderId) {
         const created = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('entity/customerorder', withSlash(base)), {
-          method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' },
+          method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', 'content-type': 'application/json' },
           body: JSON.stringify({ ...payload, syncId: operation.syncId }),
         }));
         if (!isRecord(created) || !isUuid(created.id) || !isRecord(created.meta) || created.meta.type !== 'customerorder') {
@@ -198,7 +199,7 @@ export class DealOrderCreateOperationService {
 
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('MOYSKLAD', orderId);
       const order = await this.providerRead(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
       });
       const expectedNativeFields = {
         ...('shipmentAddress' in payload ? { shipmentAddress: payload.shipmentAddress } : {}),
@@ -268,7 +269,7 @@ export class DealOrderCreateOperationService {
       [input.payload.state, 'state'],
     ] as Array<[Reference, string]>) {
       const result = await this.providerRead(new URL(reference.meta.href), {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
       });
       const expectedId = referenceId(reference.meta.href);
       if (!isRecord(result) || result.id !== expectedId || !isRecord(result.meta) || result.meta.type !== type) {
@@ -305,13 +306,13 @@ export class DealOrderCreateOperationService {
       }
       const pathType = positions[index].assortment.meta.type;
       const product = await this.providerRead(new URL(`entity/${pathType}/${encodeURIComponent(targetId)}`, withSlash(moyskladBase())), {
-        method: 'GET', headers: { authorization: `Bearer ${process.env.MOYSKLAD_API_TOKEN ?? ''}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${process.env.MOYSKLAD_API_TOKEN ?? ''}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
       });
       if (!isRecord(product) || product.id !== targetId || !isRecord(product.meta) || product.meta.type !== pathType ||
-          !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
+          moyskladUomReferenceId(product.uom, moyskladBase()) !== mappedUnit.moyskladId) {
         throw new Error(`Customer-order product ${sourceProductId} unit does not match its configured row unit`);
       }
-      targetProducts.set(targetId, { id: targetId, uomId: product.uom.id });
+      targetProducts.set(targetId, { id: targetId, uomId: mappedUnit.moyskladId });
     }
   }
 

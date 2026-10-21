@@ -10,6 +10,7 @@ import { writeOperationalLog } from '../monitoring-log';
 import { resolveDictionaryValue } from './deal-order-field-runtime.service';
 import { moySkladMoneyToBitrix } from './deal-order-money';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
+import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
@@ -256,7 +257,7 @@ export class DealOrderReverseCreateService {
         if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== 'product') {
           throw new DealOrderReverseManualReviewError(`MySklad assortment ${assortmentId} is not a readable product`);
         }
-        const uomId = isRecord(product.uom) ? readId(product.uom.id) : null;
+        const uomId = moyskladUomReferenceId(product.uom, configuredBase('MOYSKLAD_API_BASE_URL'));
         const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === uomId);
         if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1 || !numericBitrixMeasureCode(unit[0]?.bitrix24Code)) {
           await skip(id, 'UNIT_UNMAPPED');
@@ -474,7 +475,7 @@ async function msGet(path: string, gate: ProviderGate = requestJson): Promise<un
   const base = configuredBase('MOYSKLAD_API_BASE_URL');
   const token = process.env.MOYSKLAD_API_TOKEN;
   if (!token) throw new Error('MySklad API read is not configured');
-  return gate(new URL(path, ensureSlash(base)), { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+  return gate(new URL(path, ensureSlash(base)), { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' } });
 }
 async function msGetAllPositions(orderId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const all: Row[] = [];
@@ -484,7 +485,7 @@ async function msGetAllPositions(orderId: string, gate: ProviderGate = requestJs
   for (let offset = 0; offset < 10_000;) {
     const url = new URL(`entity/customerorder/${orderId}/positions`, ensureSlash(base));
     url.searchParams.set('limit', '100'); url.searchParams.set('offset', String(offset));
-    const body = await gate(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+    const body = await gate(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' } });
     const rows = isRecord(body) && Array.isArray(body.rows) ? body.rows.filter(isRecord) : null;
     if (!rows) throw new Error('MySklad positions response is invalid');
     all.push(...rows); if (rows.length < 100) return all;

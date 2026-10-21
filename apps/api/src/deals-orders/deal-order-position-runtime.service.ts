@@ -10,6 +10,7 @@ import { bitrixMoneyToMoySklad, moySkladMoneyToBitrix } from './deal-order-money
 import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } from '../sync-mode.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from './deal-order-reverse-create.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
@@ -170,7 +171,7 @@ export class DealOrderPositionRuntimeService {
       }
       try {
         const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || moyskladUomReferenceId(product.uom, moyskladBase()) !== mappedUnit.moyskladId) {
           await skipRow('BITRIX24', link.bitrix24ProductRowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
           continue;
         }
@@ -365,7 +366,7 @@ export class DealOrderPositionRuntimeService {
       }
       try {
         const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || moyskladUomReferenceId(product.uom, moyskladBase()) !== mappedUnit.moyskladId) {
           return hold('DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_MISMATCH');
         }
       } catch (error) { if (error instanceof ServiceModeNotOnError) throw error; return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_READ_FAILED' }; }
@@ -416,10 +417,10 @@ export class DealOrderPositionRuntimeService {
         if (isTransientProductLookupFailure(error)) return { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_RETRYABLE' };
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_REJECTED' };
       }
-      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || typeof product.uom.id !== 'string') {
+      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !moyskladUomReferenceId(product.uom, moyskladBase())) {
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_INVALID' };
       }
-      if (product.uom.id !== unit.moyskladId) {
+      if (moyskladUomReferenceId(product.uom, moyskladBase()) !== unit.moyskladId) {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_UNIT_MISMATCH');
         continue;
       }
@@ -668,6 +669,6 @@ function configuredBase(name: string): URL {
   return url;
 }
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
-function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error(); return { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' }; }
+function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error(); return { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', 'content-type': 'application/json' }; }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
