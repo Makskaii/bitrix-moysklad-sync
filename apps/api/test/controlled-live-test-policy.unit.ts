@@ -588,7 +588,9 @@ test('deal product-row list accepts only exact manifested owner equality filters
   process.env.BITRIX24_REST_BASE_URL = 'https://guarded-bitrix.invalid/rest/';
   process.env.MOYSKLAD_API_BASE_URL = 'https://guarded-ms.invalid/api/';
   globalThis.fetch = (async () => { calls++; return new Response('{}'); }) as typeof fetch;
-  const record = { ...manifest.records[0], entity: 'deal-order', sourceNativeId: '138060', targetNativeId: null };
+  const productId = '11111111-2222-3333-4444-555555555555';
+  const record = { ...manifest.records[0], entity: 'deal-order', sourceNativeId: '138060', targetNativeId: null,
+    readOnlyDependencies: [{provider:'MOYSKLAD',entity:'catalog-product',nativeId:productId}] };
   setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ ...manifest, records: [record] }, testDatabaseUrl));
   const request = (body: URLSearchParams) => fetch('https://guarded-bitrix.invalid/rest/crm.item.productrow.list', {method:'POST', body});
   const valid = () => new URLSearchParams({'filter[=ownerId]':'138060','filter[=ownerType]':'D',start:'0'});
@@ -605,8 +607,15 @@ test('deal product-row list accepts only exact manifested owner equality filters
       const broad = valid(); broad.set('filter[LOGIC]', 'OR');
       await assert.rejects(request(broad), /READ_SCOPE_INVALID/);
       await assert.rejects(request(new URLSearchParams({start:'0'})), /READ_SCOPE_INVALID/);
+      const assortment = (query: string) => fetch('https://guarded-ms.invalid/api/entity/assortment?' + query);
+      await assortment(`filter=id%3D${productId}&limit=2`);
+      await assert.rejects(assortment('limit=2'), /READ_SCOPE_INVALID/);
+      await assert.rejects(assortment(`filter=id%3D${productId}&limit=100`), /READ_SCOPE_INVALID/);
+      await assert.rejects(assortment(`filter=id%3D${productId}&filter=name%3Dforeign&limit=2`), /READ_SCOPE_INVALID/);
+      await assert.rejects(assortment('filter=id%3D11111111-2222-3333-4444-555555555556&limit=2'), /READ_ID_NOT_APPROVED|READ_SCOPE_INVALID/);
+      await assert.rejects(assortment(`filter=id%3D${productId}&limit=2&offset=1`), /READ_SCOPE_INVALID/);
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = originalFetch;
     setControlledLiveTestWriteCheck(null);
