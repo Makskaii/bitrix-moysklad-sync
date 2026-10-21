@@ -243,6 +243,46 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
   }
 });
 
+test('reverse product preflight permits unused live UOMs when every configured target is unique and present', async () => {
+  const configuredUnits = Array.from({ length: 9 }, (_, index) => ({
+    bitrix24Id: index + 1,
+    bitrix24Code: String(index + 1),
+    moyskladId: `ms-unit-${index + 1}`,
+    moyskladCode: String(index + 1),
+    status: 'configured',
+  }));
+  const units = [
+    ...configuredUnits,
+    ...Array.from({ length: 3 }, (_, index) => ({
+      bitrix24Id: index + 10,
+      bitrix24Code: String(index + 10),
+      moyskladId: null,
+      moyskladCode: null,
+      status: 'unmapped',
+    })),
+  ];
+  const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  try {
+    const service = new SyncModeService({} as never, undefined, undefined,
+      { active: async () => ({ version: 2, config: {
+        rules: [], references: { units, namedPairs: [] }, productCatalogRuntime: { bitrix24CatalogId: '14' },
+      } }) } as never,
+      { productCatalogReadiness: async () => ({
+        units: [...configuredUnits.map((unit) => unit.moyskladId), ...Array.from({ length: 55 }, (_, index) => `unused-ms-unit-${index + 1}`)],
+        productCatalogs: ['14'],
+      }) } as never);
+
+    const report = await service.preflightEntityDirection('products-variations', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(report.canEnable, true);
+    assert.deepEqual(report.blockers, []);
+    assert.deepEqual(report.warnings.map((warning) => warning.code), ['UNUSED_PROVIDER_UNIT_UNMAPPED']);
+  } finally {
+    if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
+    else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
+  }
+});
+
 test('reverse deal preflight ignores unavailable MySklad order-creation fallbacks', async () => {
   let referenceReads = 0;
   const configuration = {

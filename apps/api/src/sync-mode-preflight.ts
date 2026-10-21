@@ -165,14 +165,36 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
         blockers.push(finding('PRODUCT_CATALOG_UNAVAILABLE', 'Выбранный каталог Bitrix24 больше недоступен.', selectedCatalog));
       }
       const units = array(references?.units);
-      for (const unitId of input.applicableUnits ?? []) {
-        const row = units.map(object).find((candidate) => {
-          const sourceValue = input.direction === 'bitrix24ToMoysklad' ? candidate?.bitrix24Id : candidate?.moyskladId;
-          return String(sourceValue) === unitId;
-        });
-        if (!row || row.status !== 'configured' || !nonEmpty(row.moyskladId)) {
-          blockers.push(finding('UNIT_MAPPING_UNCONFIRMED', 'Для единицы измерения нет подтверждённой пары.', String(unitId)));
+      const availableUnitIds = input.applicableUnits ?? [];
+      const configuredMappings = units.map(object).filter((candidate): candidate is Record<string, unknown> => candidate?.status === 'configured');
+      if (!configuredMappings.length) {
+        blockers.push(finding('UNIT_MAPPING_UNCONFIRMED', 'Для направления из МойСклад в Bitrix24 нужна хотя бы одна настроенная пара единиц измерения.'));
+      }
+
+      const configuredTargets = new Set<string>();
+      const duplicateConfiguredTargets = new Set<string>();
+      for (const mapping of configuredMappings) {
+        const targetUnitId = nonEmpty(mapping?.moyskladId) ? String(mapping.moyskladId) : '';
+        if (!targetUnitId) {
+          blockers.push(finding('UNIT_MAPPING_UNCONFIRMED', 'У настроенной пары единиц измерения отсутствует единица МойСклад.'));
+          continue;
         }
+        if (configuredTargets.has(targetUnitId)) duplicateConfiguredTargets.add(targetUnitId);
+        configuredTargets.add(targetUnitId);
+        const liveMatches = availableUnitIds.filter((unitId) => unitId === targetUnitId).length;
+        if (liveMatches === 0) {
+          blockers.push(finding('UNIT_MAPPING_UNCONFIRMED', 'Настроенная единица измерения МойСклад отсутствует в текущем каталоге.', targetUnitId));
+        } else if (liveMatches > 1) {
+          blockers.push(finding('UNIT_MAPPING_AMBIGUOUS', 'Настроенная единица измерения повторяется в текущем каталоге МойСклад.', targetUnitId));
+        }
+      }
+      for (const targetUnitId of duplicateConfiguredTargets) {
+        blockers.push(finding('UNIT_MAPPING_AMBIGUOUS', 'Единица МойСклад назначена более чем одной настроенной паре.', targetUnitId));
+      }
+
+      const unusedProviderUnits = new Set(availableUnitIds.filter((unitId) => !configuredTargets.has(unitId)));
+      if (unusedProviderUnits.size) {
+        warnings.push(finding('UNUSED_PROVIDER_UNIT_UNMAPPED', 'В каталоге МойСклад есть единицы без настроенной пары; готовность их не требует, а запись товара с такой единицей останется заблокированной runtime-проверкой.'));
       }
     }
 

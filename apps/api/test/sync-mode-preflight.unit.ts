@@ -112,3 +112,82 @@ test('product preflight rejects the unsupported reverse direction and requires a
   assert.ok(unavailable.blockers.some((item) => item.code === 'API_ACCESS_UNAVAILABLE'));
   assert.ok(unavailable.blockers.some((item) => item.code === 'WEBHOOK_AUTH_NOT_CONFIGURED'));
 });
+
+test('reverse product preflight requires only configured live UOM mappings and warns about unused catalog units', () => {
+  const configured = Array.from({ length: 9 }, (_, index) => ({
+    bitrix24Id: index + 1,
+    bitrix24Code: String(index + 1),
+    moyskladId: `ms-unit-${index + 1}`,
+    moyskladCode: String(index + 1),
+    status: 'configured',
+  }));
+  const explicitUnmapped = Array.from({ length: 3 }, (_, index) => ({
+    bitrix24Id: index + 10,
+    bitrix24Code: String(index + 10),
+    moyskladId: null,
+    moyskladCode: null,
+    status: 'unmapped',
+  }));
+  const availableUnits = [...configured.map((unit) => unit.moyskladId!), ...Array.from({ length: 55 }, (_, index) => `unused-ms-unit-${index + 1}`)];
+  const report = evaluateEnablePreflight({
+    entityKey: 'products-variations',
+    direction: 'moyskladToBitrix24',
+    settings: { version: 2, config: {
+      rules: [], references: { units: [...configured, ...explicitUnmapped], namedPairs: [] },
+      productCatalogRuntime: { bitrix24CatalogId: '14' },
+    } },
+    apiAccess: true,
+    webhookAuthConfigured: true,
+    applicableUnits: availableUnits,
+    availableProductCatalogIds: ['14'],
+  });
+
+  assert.equal(report.canEnable, true);
+  assert.deepEqual(report.blockers, []);
+  assert.deepEqual(report.warnings.map((warning) => warning.code), ['UNUSED_PROVIDER_UNIT_UNMAPPED']);
+  assert.match(report.warnings[0]!.message, /runtime-проверкой/i);
+});
+
+test('reverse product preflight blocks if there are no configured UOM mappings', () => {
+  const report = evaluateEnablePreflight({
+    entityKey: 'products-variations',
+    direction: 'moyskladToBitrix24',
+    settings: { version: 2, config: {
+      rules: [], references: { units: [{ bitrix24Id: 1, moyskladId: null, status: 'unmapped' }], namedPairs: [] },
+      productCatalogRuntime: { bitrix24CatalogId: '14' },
+    } },
+    apiAccess: true,
+    webhookAuthConfigured: true,
+    applicableUnits: ['ms-unit-1'],
+    availableProductCatalogIds: ['14'],
+  });
+  assert.equal(report.canEnable, false);
+  assert.ok(report.blockers.some((item) => item.code === 'UNIT_MAPPING_UNCONFIRMED'));
+});
+
+test('reverse product preflight blocks missing, duplicate-live, and duplicate-configured UOM targets', () => {
+  const makeInput = (units: unknown[], applicableUnits: string[]) => ({
+    entityKey: 'products-variations',
+    direction: 'moyskladToBitrix24' as const,
+    settings: { version: 2, config: {
+      rules: [], references: { units, namedPairs: [] }, productCatalogRuntime: { bitrix24CatalogId: '14' },
+    } },
+    apiAccess: true,
+    webhookAuthConfigured: true,
+    applicableUnits,
+    availableProductCatalogIds: ['14'],
+  });
+  const mapping = { bitrix24Id: 1, bitrix24Code: '796', moyskladId: 'ms-unit-1', moyskladCode: '796', status: 'configured' };
+
+  const missing = evaluateEnablePreflight(makeInput([mapping], ['other-ms-unit']));
+  assert.ok(missing.blockers.some((item) => item.code === 'UNIT_MAPPING_UNCONFIRMED' && item.referenceId === 'ms-unit-1'));
+
+  const duplicateLive = evaluateEnablePreflight(makeInput([mapping], ['ms-unit-1', 'ms-unit-1']));
+  assert.ok(duplicateLive.blockers.some((item) => item.code === 'UNIT_MAPPING_AMBIGUOUS' && item.referenceId === 'ms-unit-1'));
+
+  const duplicateConfigured = evaluateEnablePreflight(makeInput([
+    mapping,
+    { ...mapping, bitrix24Id: 2, bitrix24Code: '797', moyskladCode: '797' },
+  ], ['ms-unit-1']));
+  assert.ok(duplicateConfigured.blockers.some((item) => item.code === 'UNIT_MAPPING_AMBIGUOUS' && item.referenceId === 'ms-unit-1'));
+});
