@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { assertApplyExternalWrite } from '../external-write-guard';
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const logger = new Logger('InvoiceHttpApi');
 export type InvoiceRecord = Record<string, unknown>;
 
 @Injectable()
@@ -124,7 +125,13 @@ export class InvoiceHttpApi {
     const token = requiredEnv('MOYSKLAD_API_TOKEN');
     const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
-    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    if (!response.ok) {
+      const rejected: unknown = await response.clone().json().catch(() => null);
+      const codes = isRecord(rejected) && Array.isArray(rejected.errors)
+        ? rejected.errors.filter(isRecord).map((error) => error.code).filter((code): code is number => typeof code === 'number' && Number.isSafeInteger(code)) : [];
+      logger.warn(JSON.stringify({ provider: 'MOYSKLAD', operation: method, resource: url.pathname.includes('/invoiceout') ? 'invoiceout' : 'customerorder', status: response.status, codes }));
+      throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    }
     if (response.status === 204) return {};
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!isRecord(payload)) throw new ProviderFailure('MOYSKLAD', 400);

@@ -304,7 +304,7 @@ export class DealOrderHeaderSyncProcessor {
     assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_CLIENT_UPDATE');
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('write token unavailable');
-    const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(base)), { method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(base)), { method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
       body: JSON.stringify({ agent }), redirect: 'error', signal: AbortSignal.timeout(10_000) }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
   }
@@ -320,7 +320,7 @@ export class DealOrderHeaderSyncProcessor {
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('write token unavailable');
     const response = await fetch(new URL(`entity/customerorder/${encodeURIComponent(id)}`, withSlash(base)), {
-      method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
       body: JSON.stringify({ description: value }), redirect: 'error', signal: AbortSignal.timeout(10_000),
     }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
