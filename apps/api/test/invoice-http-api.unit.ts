@@ -21,6 +21,8 @@ test('invoice HTTP adapter creates invoiceout linked to the exact customer order
   try {
     assert.equal(await new InvoiceHttpApi().createMoysklad('b24-91', orderId, { name: 'Invoice A', payedSum: 90, 'attributes.aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa': 'mapped' }), invoiceId);
     assert.equal(requests[0]?.url, 'https://ms-fixture.invalid/api/remap/1.2/entity/invoiceout');
+    assert.equal(new Headers(requests[0].init.headers).get('accept'),'application/json;charset=utf-8');
+    assert.equal(new Headers(requests[0].init.headers).get('accept-encoding'),'gzip');
     const body = JSON.parse(String(requests[0]?.init.body)) as Record<string, any>;
     assert.equal(body.externalCode, 'b24-91');
     assert.equal(body.customerOrder.meta.href, `https://ms-fixture.invalid/api/remap/1.2/entity/customerorder/${orderId}`);

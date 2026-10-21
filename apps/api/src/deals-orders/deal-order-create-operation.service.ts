@@ -180,6 +180,11 @@ export class DealOrderCreateOperationService {
     const token = process.env.MOYSKLAD_API_TOKEN;
     try {
       if (!token) throw new Error('Customer-order create is not configured');
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
+        if (scope.targetNativeId === null) await this.controlledAdmission.assertCreateReserved(input.eventId, 'deal-order', 'MOYSKLAD');
+        else if (scope.targetNativeId !== operation.moyskladOrderId) throw new Error('CONTROLLED_LIVE_TEST_TARGET_BIND_CONFLICT');
+      }
       let orderId = operation.moyskladOrderId;
       if (!orderId) {
         const created = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('entity/customerorder', withSlash(base)), {

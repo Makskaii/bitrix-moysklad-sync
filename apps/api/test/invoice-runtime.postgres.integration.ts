@@ -255,14 +255,21 @@ test('controlled invoice processor admits a synthetic source, creates and binds 
     assert.equal((await db.controlledTestAdmission.findUnique({ where: { eventId: created.id } }))?.targetNativeId, pair.moyskladId);
 
     target.description = 'synthetic echo value';
+    // A real reverse callback is enabled only after the newly verified target is
+    // explicitly pinned in the immutable manifest used by the resumed instance.
+    (runManifest.records[0] as { targetNativeId: string | null }).targetNativeId = pair.moyskladId;
+    await writeFile(manifestPath, JSON.stringify(runManifest), 'utf8');
+    const echoAdmission = new ControlledLiveTestAdmissionService(db);
+    const echoProcessor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db),
+      { launchBoundary: async () => launchBoundary, assertReady: async () => true } as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db), echoAdmission);
     const echoed = await createEvent(`controlled-echo-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
     echoEventId = echoed.id;
-    await admission.withCurrentSourceRead(echoed.id, 'MOYSKLAD', pair.moyskladId, 'invoice', async () => {
+    await echoAdmission.withCurrentSourceRead(echoed.id, 'MOYSKLAD', pair.moyskladId, 'invoice', async () => {
       const current = await new InvoiceHttpApi().readMoysklad(pair.moyskladId);
-      await admission.admit(echoed.id, { entity: 'invoice', sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId,
+      await echoAdmission.admit(echoed.id, { entity: 'invoice', sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId,
         currentNativeId: String(current.id), currentName: String(current.name), sourceCreatedAt: new Date(String(current.created)) });
     });
-    await controlledProcessor.process(echoed.id);
+    await echoProcessor.process(echoed.id);
     const echoState = await db.inboundEvent.findUniqueOrThrow({ where: { id: echoed.id } });
     assert.equal(echoState.status, 'SUCCEEDED', JSON.stringify(echoState));
     assert.equal(bitrixInvoices.get(sourceId)?.description, 'synthetic echo value');

@@ -268,6 +268,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const syntheticName = controlledInvoiceName(input.sourceRecord);
       if (!syntheticName) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
       fields[input.source === 'BITRIX24' ? 'name' : 'title'] = syntheticName;
+      const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
+      if (scope.targetNativeId === null) {
+        await this.controlledAdmission.assertCreateReserved(input.eventId, 'invoice', input.source === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24');
+      }
     }
     if (input.source === 'BITRIX24') {
       const existing = await this.api.findMoyskladByExternalCode(input.sourceId);

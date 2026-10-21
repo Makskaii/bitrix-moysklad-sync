@@ -234,6 +234,27 @@ test('MySklad order ID persists after remote create and retry reuses it rather t
   assert.equal(b24OrderNumber, 'SO-54');
 });
 
+test('controlled create and persisted-ID recovery reserve their owning event before any target create or binding',async()=>{
+  const previous=process.env.CONTROLLED_LIVE_TEST_MODE;
+  const input=preparedInput('905');let reservations=0;posts=0;
+  const admission={async scopeForEvent(){return {targetNativeId:null};},async assertCreateReserved(eventId:string,entity:string,provider:string){
+    reservations++;assert.equal(eventId,input.eventId);assert.equal(entity,'deal-order');assert.equal(provider,'MOYSKLAD');throw new Error('RESERVATION_BUSY');
+  }};
+  process.env.CONTROLLED_LIVE_TEST_MODE='enabled';
+  try{
+    const controlled=new DealOrderCreateOperationService(database,new SyncModeService(database),admission as never);
+    await assert.rejects(controlled.createAndPair(input),/RESERVATION_BUSY/);
+    assert.equal(posts,0);assert.equal(reservations,1);
+    await db.dealOrderCreateOperation.update({where:{bitrix24DealId:'905'},data:{moyskladOrderId:ids.order}});
+    await assert.rejects(controlled.createAndPair(input),/RESERVATION_BUSY/);
+    assert.equal(posts,0);assert.equal(reservations,2);
+    assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({where:{bitrix24DealId:'905'}})).moyskladOrderId,ids.order);
+  }finally{
+    if(previous===undefined)delete process.env.CONTROLLED_LIVE_TEST_MODE;else process.env.CONTROLLED_LIVE_TEST_MODE=previous;
+    await db.dealOrderCreateOperation.deleteMany({where:{bitrix24DealId:'905'}});
+  }
+});
+
 function preparedInput(bitrix24DealId = '901'): any {
   return {
     bitrix24DealId, bitrix24CompanyId: '902', bitrix24ContactId: null, confirmedCustomerPairIds: [companyPairId],

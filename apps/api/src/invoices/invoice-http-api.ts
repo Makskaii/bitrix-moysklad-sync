@@ -52,7 +52,7 @@ export class InvoiceHttpApi {
     const base = ensureSlash(requiredEnv('MOYSKLAD_API_BASE_URL'));
     const body = { ...moyskladFields(fields, base), externalCode: sourceId, customerOrder: { meta: meta(base, 'customerorder', orderId) } };
     if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'invoiceout', entityId: `externalCode:${sourceId}`, operation: 'CREATE', fields: body })) return `dry:${sourceId}`;
-    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_CREATE');
+    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_CREATE', null, 'invoice');
     const created = record(await this.moyskladRequest('entity/invoiceout', 'POST', body));
     const id = typeof created.id === 'string' && isUuid(created.id) ? created.id : '';
     if (!id) throw new Error('INVOICE_CREATE_RESPONSE_INVALID');
@@ -63,14 +63,14 @@ export class InvoiceHttpApi {
     const body = moyskladFields(fields, ensureSlash(requiredEnv('MOYSKLAD_API_BASE_URL')));
     if (Object.keys(body).length === 0) return;
     if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'invoiceout', entityId: id, operation: 'UPDATE', fields: body })) return;
-    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_UPDATE');
+    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_UPDATE', id, 'invoice');
     await this.moyskladRequest(`entity/invoiceout/${encodeURIComponent(id)}`, 'PUT', body);
   }
 
   async createBitrix24(sourceId: string, dealId: string, fields: InvoiceRecord): Promise<string> {
     const body = { ...fields, parentId2: Number(dealId), originatorId: 'MOYSKLAD', originId: sourceId };
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'crm_dynamic_31', entityId: `origin:${sourceId}`, operation: 'CREATE', fields: body })) return `dry:${sourceId}`;
-    assertApplyExternalWrite('BITRIX24', 'INVOICE_CREATE');
+    assertApplyExternalWrite('BITRIX24', 'INVOICE_CREATE', null, 'invoice');
     const created = record(await this.bitrixCall('crm.item.add', { entityTypeId: 31, fields: body }));
     const item = record(created.item ?? created);
     const id = scalarId(item.id);
@@ -82,7 +82,7 @@ export class InvoiceHttpApi {
     if (!/^\d{1,20}$/.test(id)) throw new Error('INVOICE_ID_INVALID');
     if (Object.keys(fields).length === 0) return;
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'crm_dynamic_31', entityId: id, operation: 'UPDATE', fields })) return;
-    assertApplyExternalWrite('BITRIX24', 'INVOICE_UPDATE');
+    assertApplyExternalWrite('BITRIX24', 'INVOICE_UPDATE', id, 'invoice');
     await this.bitrixCall('crm.item.update', { entityTypeId: 31, id, fields });
   }
 
@@ -102,7 +102,7 @@ export class InvoiceHttpApi {
   }
 
   private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
-    if (/\.(?:add|update)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'INVOICE_REQUEST');
+    if (/\.(?:add|update)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', /\.add$/i.test(method) ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', /\.add$/i.test(method) ? null : scalarId(params.id), 'invoice');
     const base = requiredEnv('BITRIX24_REST_BASE_URL');
     const url = new URL(`${method}.json`, ensureSlash(base));
     const form = new URLSearchParams();
@@ -120,9 +120,9 @@ export class InvoiceHttpApi {
   }
 
   private async moyskladRequestUrl(url: URL, method: 'GET' | 'POST' | 'PUT', body?: InvoiceRecord): Promise<unknown> {
-    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'INVOICE_REQUEST');
+    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', method === 'POST' ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', method === 'POST' ? null : url.pathname.split('/').at(-1), 'invoice');
     const token = requiredEnv('MOYSKLAD_API_TOKEN');
-    const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
     if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
     if (response.status === 204) return {};
