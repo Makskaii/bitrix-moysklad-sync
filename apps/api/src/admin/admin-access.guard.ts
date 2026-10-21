@@ -35,12 +35,15 @@ export async function readBitrixAdministratorIdentity(accessToken: string, fetch
   const timeout = setTimeout(() => controller.abort(), checkTimeoutMs);
   try {
     const body = new URLSearchParams({ auth: accessToken });
-    const response = await fetcher(bitrixAdminMethod.replace('user.admin.json', 'user.current.json'), {
+    // profile is a base-scope method; user.current requires the separate user scope,
+    // which a valid local-app admin token need not have. Never substitute a server identity.
+    const response = await fetcher(bitrixAdminMethod.replace('user.admin.json', 'profile.json'), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body, signal: controller.signal,
     });
     if (!response.ok) return null;
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !isRecord(payload.result)) return null;
+    if (payload.result.ADMIN === false) return null;
     const id = payload.result.ID ?? payload.result.id;
     return (typeof id === 'string' && /^\d{1,20}$/.test(id)) || (typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
       ? `BITRIX24_USER:${String(id)}`

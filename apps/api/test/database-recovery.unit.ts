@@ -125,6 +125,18 @@ test('dry mode still blocks writes even after database recovery is acknowledged'
   assert.throws(() => assertApplyExternalWrite('BITRIX24', 'TEST_WRITE'), /WRITE_REQUIRES_APPLY_MODE/);
 });
 
+test('admin audit identity uses base-scope profile without widening application permissions', async () => {
+  const calls: string[] = [];
+  const identity = await readBitrixAdministratorIdentity('test-admin-token', async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ result: { ID: '3664', ADMIN: true } }), { status: 200 });
+  });
+  assert.equal(identity, 'BITRIX24_USER:3664');
+  assert.deepEqual(calls, ['https://aerosystems.bitrix24.ru/rest/profile.json']);
+  assert.equal(await readBitrixAdministratorIdentity('nonadmin', async () => new Response(JSON.stringify({ result: { ID: '7', ADMIN: false } }), { status: 200 })), null);
+  assert.equal(await readBitrixAdministratorIdentity('inactive', async () => new Response(JSON.stringify({ result: [] }), { status: 200 })), null);
+});
+
 test('clean first launch uses server time without false recovery declarations and survives restart', async () => {
   const store = fakeDatabase();
   const service = new DatabaseRecoveryService(store.database as never);
