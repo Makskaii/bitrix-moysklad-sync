@@ -110,6 +110,8 @@ test('company lookup prefers INN and never fills an empty target INN from the Bi
     findPair: async () => null,
     companyByInn: async () => { calls.push('inn'); return [candidate('by-inn', { inn: '123' })]; },
     companyByExactNameAndPhone: async () => { calls.push('name-phone'); return []; },
+    companyByEmail: async () => { calls.push('email'); return []; },
+    contactByEmail: async () => [],
     contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
     contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
   });
@@ -127,6 +129,7 @@ test('company lookup prefers eligible unmarked Bitrix24 matches and falls back t
     findPair: async () => null,
     companyByInn: async () => matches,
     companyByExactNameAndPhone: async () => [],
+    companyByEmail: async () => [], contactByEmail: async () => [],
     contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
     contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
   });
@@ -151,6 +154,7 @@ test('contact lookup normalizes FIO and phone, uses email only when phone is abs
   const resolver = new ClientRuntimeResolver({
     findPair: async () => null,
     companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+    companyByEmail: async () => [], contactByEmail: async () => [],
     contactByCompanyAndNamePhone: async (_company, name, phone, email) => { calls.push(`${name}|${phone}|${email}`); return []; },
     contactByCompanyAndNameEmail: async (_company, name, email) => { calls.push(`${name}|${email}`); return []; },
     contactByStandaloneNamePhone: async (name, phone, email) => { calls.push(`${name}|${phone}|${email}`); return []; },
@@ -171,10 +175,96 @@ test('contact with an unresolved primary company is not attached to a random com
   const resolver = new ClientRuntimeResolver({
     findPair: async () => null,
     companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+    companyByEmail: async () => [], contactByEmail: async () => [],
     contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
     contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
   });
   assert.deepEqual(await resolver.resolve({ id: 'p1', entity: 'CONTACT', name: 'Ivanov', phone: '123', companyId: 'c1' }), {
     action: 'MANUAL_REVIEW', reason: 'PRIMARY_COMPANY_UNRESOLVED', candidates: [],
   });
+});
+
+test('unique normalized company email matches despite a name change and no phone', async () => {
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+    companyByEmail: async (email) => email === 'billing@example.com' ? [candidate('company-email', { type: 'company', email })] : [],
+    contactByEmail: async () => [], contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  assert.deepEqual(await resolver.resolve({ id: 'source-company', entity: 'COMPANY', name: 'Renamed Company', email: ' BILLING@EXAMPLE.COM ' }), {
+    action: 'USE_CANDIDATE', targetId: 'company-email', targetType: 'company', targetSystem: 'MOYSKLAD',
+    reason: 'Matched by unique normalized exact email; no name or phone match was required.',
+    evidence: { usageCount: 0, filledFields: 1, createdAt: '2025-01-01T00:00:00.000Z', usageMetricDegraded: false, criteria: ['normalized_email'] },
+  });
+});
+
+test('unique normalized email pairs a nameless existing company and contact', async () => {
+  const companyResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+    companyByEmail: async (email) => email === 'billing@example.com' ? [candidate('company-email', { type: 'company', email })] : [],
+    contactByEmail: async () => [], contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const company = await companyResolver.resolve({ id: 'nameless-company', entity: 'COMPANY', email: ' BILLING@EXAMPLE.COM ' });
+  assert.equal(company.action, 'USE_CANDIDATE');
+  assert.equal(company.action === 'USE_CANDIDATE' && company.targetId, 'company-email');
+
+  const contactResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
+    contactByEmail: async (email) => email === 'person@example.com' ? [candidate('person-email', { type: 'contactperson', email })] : [],
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const contact = await contactResolver.resolve({ id: 'nameless-contact', entity: 'CONTACT', email: ' Person@Example.com ' });
+  assert.equal(contact.action, 'USE_CANDIDATE');
+  assert.equal(contact.action === 'USE_CANDIDATE' && contact.targetId, 'person-email');
+});
+
+test('unique contact email matches within its native parent scope despite a different name', async () => {
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
+    contactByEmail: async (email, companyId) => email === 'person@example.com' && companyId === 'ms-company'
+      ? [candidate('person-email', { type: 'contactperson', parentId: companyId, email })] : [],
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const result = await resolver.resolve({ id: 'b24-contact', entity: 'CONTACT', name: 'Different Full Name', email: 'Person@Example.com', companyId: 'b24-company' }, 'ms-company');
+  assert.equal(result.action, 'USE_CANDIDATE');
+  assert.equal(result.action === 'USE_CANDIDATE' && result.targetType, 'contactperson');
+  assert.equal(result.action === 'USE_CANDIDATE' && result.reason.startsWith('Matched by unique normalized exact email'), true);
+});
+
+test('a shared or already occupied email is a manual conflict, never a tie-break or new pair', async () => {
+  let matches = [candidate('person-a'), candidate('person-b')];
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
+    contactByEmail: async () => matches,
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  assert.deepEqual(await resolver.resolve({ id: 'b24-contact', entity: 'CONTACT', name: 'A Different Name', email: 'shared@example.com' }), {
+    action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: ['person-a', 'person-b'],
+  });
+  matches = [candidate('already-linked', { occupiedByPair: true })];
+  assert.equal((await resolver.resolve({ id: 'b24-contact-2', entity: 'CONTACT', name: 'Someone Else', email: 'shared@example.com' })).action, 'MANUAL_REVIEW');
+});
+
+test('email cannot override a conflicting phone/name or company INN match', async () => {
+  const contactResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [], companyByExactNameAndPhone: async () => [], companyByEmail: async () => [],
+    contactByEmail: async () => [candidate('email-person', { type: 'contact' })],
+    contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [candidate('phone-person', { type: 'contact' })], contactByStandaloneNameEmail: async () => [],
+  });
+  const contact = await contactResolver.resolve({ id: 'contact', entity: 'CONTACT', name: 'Иван Иванов', phone: '+7 999 111-22-33', email: 'p@example.com' });
+  assert.deepEqual(contact, { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: ['phone-person', 'email-person'] });
+
+  const companyResolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByInn: async () => [candidate('inn-company', { type: 'company', inn: '123' })],
+    companyByExactNameAndPhone: async () => [], companyByEmail: async () => [candidate('email-company', { type: 'company', inn: '123' })],
+    contactByEmail: async () => [], contactByCompanyAndNamePhone: async () => [], contactByCompanyAndNameEmail: async () => [],
+    contactByStandaloneNamePhone: async () => [], contactByStandaloneNameEmail: async () => [],
+  });
+  const company = await companyResolver.resolve({ id: 'company', entity: 'COMPANY', name: 'Example', inn: '123', email: 'p@example.com' });
+  assert.deepEqual(company, { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: ['inn-company', 'email-company'] });
 });

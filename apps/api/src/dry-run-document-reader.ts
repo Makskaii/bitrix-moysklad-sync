@@ -1,12 +1,14 @@
-import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { ProviderFailure, providerResponseFailure } from './provider-failure';
+import { DatabaseService } from './database.service';
+import { ServiceModeNotOnError, withServiceModeOn } from './service-mode-transaction';
 
 const READ_TIMEOUT_MS = 10_000;
 
 @Injectable()
 export class DryRunDocumentReader {
-  constructor(private readonly dryWrites?: DryRunWriteJournal) {}
+  constructor(private readonly dryWrites?: DryRunWriteJournal, @Optional() private readonly database?: DatabaseService) {}
 
   async readBitrix24Deal(id: string): Promise<Record<string, unknown>> {
     assertDryServerMode();
@@ -19,19 +21,21 @@ export class DryRunDocumentReader {
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new ServiceUnavailableException('Bitrix24 read endpoint is not configured');
     const url = new URL('crm.deal.get.json', withTrailingSlash(base));
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id }),
-      redirect: 'error',
-      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
-    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
-    const body: unknown = await response.json().catch(() => null);
-    if (!isRecord(body) || body.error || !isRecord(body.result) || String(body.result.ID ?? '') !== id) {
-      throw new ProviderFailure('BITRIX24', 400);
-    }
-    return { ...body.result, ...(await this.dryWrites?.readback('BITRIX24', 'deal', id)) };
+    return this.withMode(async () => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id }),
+        redirect: 'error',
+        signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
+      if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+      const body: unknown = await response.json().catch(() => null);
+      if (!isRecord(body) || body.error || !isRecord(body.result) || String(body.result.ID ?? '') !== id) {
+        throw new ProviderFailure('BITRIX24', 400);
+      }
+      return { ...body.result, ...(await this.dryWrites?.readback('BITRIX24', 'deal', id)) };
+    });
   }
 
   async readDealOrderCreationTimestamp(system: 'BITRIX24' | 'MOYSKLAD', id: string): Promise<Date | null> {
@@ -40,6 +44,19 @@ export class DryRunDocumentReader {
       : await this.readMoySkladCustomerOrderForBaseline(id);
     const raw = system === 'BITRIX24' ? record.DATE_CREATE : record.created;
     return system === 'BITRIX24' ? parseTimestamp(raw) : parseMoySkladTimestamp(raw);
+  }
+
+  async readDealOrderForControlledAdmission(system: 'BITRIX24' | 'MOYSKLAD', id: string): Promise<{ nativeId: string; name: string; createdAt: Date } | null> {
+    const record = system === 'BITRIX24'
+      ? await this.readBitrix24DealForBaseline(id)
+      : await this.readMoySkladCustomerOrderForBaseline(id);
+    const nativeId = system === 'BITRIX24' ? String(record.ID ?? record.id ?? '') : String(record.id ?? '');
+    const nameValue = system === 'BITRIX24' ? record.TITLE ?? record.title ?? record.name : record.name;
+    const name = typeof nameValue === 'string' ? nameValue : '';
+    const rawCreated = system === 'BITRIX24' ? record.DATE_CREATE : record.created;
+    const createdAt = system === 'BITRIX24' ? parseTimestamp(rawCreated) : parseMoySkladTimestamp(rawCreated);
+    if (nativeId !== id || !name.trim() || !createdAt) return null;
+    return { nativeId, name, createdAt };
   }
 
   async readMoySkladCustomerOrder(id: string): Promise<Record<string, unknown>> {
@@ -54,18 +71,27 @@ export class DryRunDocumentReader {
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!base || !token) throw new ServiceUnavailableException('MoySklad read endpoint is not configured');
     const url = new URL(`entity/customerorder/${encodeURIComponent(id)}`, withTrailingSlash(base));
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
-      redirect: 'error',
-      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
-    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
-    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
-    const body: unknown = await response.json().catch(() => null);
-    if (!isRecord(body) || body.id !== id || !isRecord(body.meta) || body.meta.type !== 'customerorder') {
-      throw new ProviderFailure('MOYSKLAD', 400);
-    }
-    return { ...body, ...(await this.dryWrites?.readback('MOYSKLAD', 'customerorder', id)) };
+    return this.withMode(async () => {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+      if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+      const body: unknown = await response.json().catch(() => null);
+      if (!isRecord(body) || body.id !== id || !isRecord(body.meta) || body.meta.type !== 'customerorder') {
+        throw new ProviderFailure('MOYSKLAD', 400);
+      }
+      return { ...body, ...(await this.dryWrites?.readback('MOYSKLAD', 'customerorder', id)) };
+    });
+  }
+
+  private async withMode<T>(work: () => Promise<T>): Promise<T> {
+    if (!this.database) return work();
+    const result = await withServiceModeOn(this.database, async () => work());
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
   }
 }
 

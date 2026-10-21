@@ -24,12 +24,14 @@ const clientResolver = {
   async scheduleOptionalContactRetry() {},
   async verifyServiceCounterparty() { return true; },
 };
-const preparer = new DealOrderCreationPreparer({ entityPair: { findMany }, operationalLog: { create: async () => ({}) } } as unknown as DatabaseService, clientResolver as never);
+const preparer = new DealOrderCreationPreparer(createPreparerDatabase(), clientResolver as never);
 let productPairExists = true;
 let rows: Record<string, unknown>[] = [];
 let deal: Record<string, unknown>;
 let requestCount = 0;
 let nextRowId = 1;
+let requireExactMoyskladReadHeaders = false;
+let observedMoyskladReferenceHeaders: Array<{ accept: string | null; acceptEncoding: string | null }> = [];
 
 before(() => {
   for (const key of ['BITRIX24_REST_BASE_URL', 'MOYSKLAD_API_BASE_URL', 'MOYSKLAD_API_TOKEN']) originalEnv.set(key, process.env[key]);
@@ -59,6 +61,24 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.sourceRowValues.length, 2);
   assert.equal(result.input.payload.organization.meta.href, msRef('organization', uuids.organization));
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
+});
+
+test('deal-order reference probes use the required MySklad JSON charset and gzip headers', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  requireExactMoyskladReadHeaders = true;
+  observedMoyskladReferenceHeaders = [];
+  try {
+    const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-ms-reference-headers', eventConfig: eventConfig() });
+    assert.equal(result.status, 'READY');
+    assert.equal(observedMoyskladReferenceHeaders.length, 5);
+    assert.deepEqual(observedMoyskladReferenceHeaders, Array.from({ length: 5 }, () => ({
+      accept: 'application/json;charset=utf-8',
+      acceptEncoding: 'gzip',
+    })));
+  } finally {
+    requireExactMoyskladReadHeaders = false;
+  }
 });
 
 test('creation includes supported scalar custom attributes and holds unsupported configured mappings before order creation', async () => {
@@ -120,7 +140,7 @@ test('a later unsupported row is omitted without suppressing the other valid row
     async resolveForDocument() { dependencyCalls++; return { status: 'RESOLVED', pair: { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '200', moyskladId: uuids.company }, companyPair: null, selectedSourceId: '200', reason: 'TEST' }; },
     async scheduleOptionalContactRetry() {}, async verifyServiceCounterparty() { return true; },
   };
-  const withResolver = new DealOrderCreationPreparer({ entityPair: { findMany }, operationalLog: { create: async () => ({}) } } as unknown as DatabaseService, resolver as never);
+  const withResolver = new DealOrderCreationPreparer(createPreparerDatabase(), resolver as never);
   const result = await withResolver.prepare({ bitrix24DealId: '100', eventId: 'event-preflight-before-deps', eventConfig: eventConfig() });
   assert.equal(result.status, 'READY');
   if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 1);
@@ -135,6 +155,17 @@ test('native MySklad numbering must be explicitly verified before an order can b
   const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-5', eventConfig: settings });
   assert.deepEqual(result, { status: 'WAITING', reason: 'NATIVE_ORDER_NUMBERING_UNVERIFIED' });
 });
+
+function createPreparerDatabase(): DatabaseService {
+  const database: any = {
+    entityPair: { findMany },
+    operationalLog: { create: async () => ({}) },
+    $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
+      $queryRaw: async () => [{ serviceMode: 'on' }],
+    }),
+  };
+  return database as DatabaseService;
+}
 
 function eventConfig(): any {
   return {
@@ -175,7 +206,7 @@ function reset() {
 
 async function findMany(args: { where: { entityType: string; bitrix24Id: string }; take: number }) {
   const id = args.where.entityType === 'COMPANY' ? uuids.company : productPairExists ? uuids.product : null;
-  return id ? [{ moyskladId: id }] : [];
+  return id ? [{ moyskladId: id, bitrix24Id: args.where.bitrix24Id, active: true, lifecycleStatus: 'ACTIVE', moyskladType: 'product' }] : [];
 }
 
 async function fakeFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -189,6 +220,16 @@ async function fakeFetch(input: string | URL | Request, init?: RequestInit): Pro
     return json({ rows: [{ id: uuids.product, meta: { type: 'product', href: msRef('product', uuids.product) }, uom: { id: uuids.unit } }] });
   }
   if (url.hostname === 'moysklad.test') {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers || undefined).forEach((value, name) => headers.set(name, value));
+    const isReferenceProbe = /\/entity\/(organization|store|employee|currency)\//.test(url.pathname) || /\/entity\/customerorder\/metadata\/states\//.test(url.pathname);
+    if (isReferenceProbe) {
+      observedMoyskladReferenceHeaders.push({ accept: headers.get('accept'), acceptEncoding: headers.get('accept-encoding') });
+      if (requireExactMoyskladReadHeaders &&
+          (headers.get('accept') !== 'application/json;charset=utf-8' || headers.get('accept-encoding') !== 'gzip')) {
+        return json({ errors: [{ code: 1062 }] }, 400);
+      }
+    }
     const state = url.pathname.match(/\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/);
     if (state) return json({ id: state[1], meta: { type: 'state' } });
     const entity = url.pathname.match(/\/entity\/(organization|store|employee|currency)\/([0-9a-f-]{36})$/);

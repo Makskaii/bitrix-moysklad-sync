@@ -17,7 +17,7 @@ const settings: ProductCardSettings = {
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
   ],
   references: {
-    units: [{ bitrix24Id: 3, moyskladId: 'unit-uuid-3', status: 'configured' }],
+    units: [{ bitrix24Id: 3, moyskladId: 'unit-uuid-3', status: 'configured' }, { bitrix24Id: 4, moyskladId: 'unit-uuid-4', status: 'configured' }],
     priceTypes: [{ bitrix24Id: 2, moyskladId: 'price-type-2', status: 'configured' }],
   },
 };
@@ -29,17 +29,20 @@ class MemoryState implements ProductCardStateStore {
 }
 
 class FakeApi implements ProductCardApi {
-  bitrix24 = card('Initial', 'B24 detail', '3', [{ priceId: 'b24-price-2', typeId: '2', value: 10, currency: 'RUB' }]);
-  moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }]);
+  bitrix24 = card('Initial', 'B24 detail', '3', [{ priceId: 'b24-price-2', typeId: '2', value: 10, currency: 'RUB' }], { weight: 1.5, xmlId: 'initial-external' });
+  moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }], { weight: 1.5, externalCode: 'initial-external' });
   writes: Array<{ side: string; fields: string }> = [];
   ambiguousBitrixUpdate = false;
+  ambiguousBitrixPriceUpdate = false;
   async readBitrix24() { return structuredClone(this.bitrix24); }
   async readMoysklad() { return structuredClone(this.moysklad); }
   async updateBitrix24(_id: string, fields: Record<string, unknown>) {
     this.writes.push({ side: 'BITRIX24', fields: Object.keys(fields).join(',') });
     if ('name' in fields) this.bitrix24.name = String(fields.name);
     if ('detailText' in fields) this.bitrix24.detailText = String(fields.detailText);
+    if ('code' in fields) this.bitrix24.code = String(fields.code);
     if ('measure' in fields) this.bitrix24.unitId = String(fields.measure);
+    Object.assign(this.bitrix24.fields ?? {}, fields);
     if (this.ambiguousBitrixUpdate) {
       this.ambiguousBitrixUpdate = false;
       throw new ProviderFailure('BITRIX24', null);
@@ -49,6 +52,10 @@ class FakeApi implements ProductCardApi {
     this.writes.push({ side: 'BITRIX24', fields: `price:${priceId}` });
     const price = this.bitrix24.prices.find((item) => item.priceId === priceId)!;
     price.value = value;
+    if (this.ambiguousBitrixPriceUpdate) {
+      this.ambiguousBitrixPriceUpdate = false;
+      throw new ProviderFailure('BITRIX24', null);
+    }
   }
   async updateMoysklad(_id: string, fields: Record<string, unknown>) {
     this.writes.push({ side: 'MOYSKLAD', fields: Object.keys(fields).join(',') });
@@ -58,8 +65,8 @@ class FakeApi implements ProductCardApi {
   }
 }
 
-function card(name: string, detailText: string, unitId: string, prices: ProductCardPrice[]): ProductCardSnapshot {
-  return { name, detailText, unitId, prices, updatedAt: '2026-10-07T10:00:00Z' };
+function card(name: string, detailText: string, unitId: string, prices: ProductCardPrice[], fields: Record<string, string | number | boolean | null> = {}): ProductCardSnapshot {
+  return { name, detailText, unitId, prices, fields, updatedAt: '2026-10-07T10:00:00Z' };
 }
 function currencyRef() { return { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/currency-id', type: 'currency', mediaType: 'application/json' } }; }
 
@@ -92,6 +99,43 @@ test('a Bitrix24-only field change is repaired from MySklad during a MySklad eve
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
 });
 
+test('a Bitrix24 catalog signal uses the explicit MySklad-authoritative restore path only', async () => {
+  const api = new FakeApi();
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  api.bitrix24.name = 'Edited in Bitrix24';
+  api.moysklad.name = 'Canonical MySklad name';
+
+  const result = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.name, 'Canonical MySklad name');
+  assert.ok(api.writes.length > 0);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('authoritative product restore applies saved scalar transforms and fails closed on invalid values', async () => {
+  const api = new FakeApi();
+  const mapped = { ...settings, rules: [...settings.rules,
+    { id: 'product-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'string-to-number', numberType: 'decimal', precision: 3 } } },
+  ] };
+  api.bitrix24.fields = { weight: 3 };
+  api.moysklad.fields = { weight: '2.125' };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+
+  const result = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings: mapped });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.fields!.weight, 2.125);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+  api.moysklad.fields!.weight = '02.125';
+  const invalid = await sync.sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings: mapped });
+  assert.equal(invalid.status, 'MANUAL_REVIEW');
+  assert.equal(api.bitrix24.fields!.weight, 2.125, 'invalid conversion does not write a fallback or null');
+});
+
 test('mapped catalog prices flow from MySklad to Bitrix24 while unmapped prices stay untouched', async () => {
   const api = new FakeApi();
   api.moysklad.prices.push({ priceId: 'unmapped-ms-price', typeId: 'unmapped-type', value: 77, currency: 'RUB', currencyRef: currencyRef() });
@@ -105,6 +149,42 @@ test('mapped catalog prices flow from MySklad to Bitrix24 while unmapped prices 
   assert.equal(api.bitrix24.prices[0]!.value, 12);
   assert.equal(api.moysklad.prices[1]!.value, 77);
   assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('configured UOM ID compares numeric settings with string Bitrix24 readback and allows later price writes', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  const configured = { ...settings, references: {
+    ...settings.references,
+    units: [{ bitrix24Id: 4, moyskladId: 'unit-uuid-4', status: 'configured' }],
+  } };
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured })).status, 'BASELINED');
+  api.moysklad.unitId = 'unit-uuid-4';
+  api.moysklad.prices[0]!.value = 11;
+
+  const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.unitId, '4', 'adapter readback exposes the applied numeric measure ID as a string');
+  assert.equal(api.bitrix24.prices[0]!.value, 11, 'confirmed price mapping continues after unit readback');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['measure', 'price:b24-price-2']);
+  assert.equal(api.writes.filter((write) => write.fields === 'measure').length, 1, 'numeric/string unit ID equivalence prevents a second unit write');
+});
+
+test('optional UOM absent on both providers stays unchanged without a unit write', async () => {
+  for (const absent of [null, undefined]) {
+    const api = new FakeApi();
+    api.bitrix24.unitId = absent as null;
+    api.moysklad.unitId = absent as null;
+    const sync = new ProductCardSyncService(api, new MemoryState());
+    assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings })).status, 'BASELINED');
+
+    const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+
+    assert.equal(result.status, 'UNCHANGED');
+    assert.equal(api.writes.some((write) => write.fields === 'measure'), false);
+  }
 });
 
 test('product provider retries use the durable attempt number for bounded fallback backoff', async () => {
@@ -135,4 +215,83 @@ test('applied product write with a lost response is read back instead of repeate
   assert.equal(result.status, 'SYNCED');
   assert.equal(api.bitrix24.name, 'Applied once');
   assert.deepEqual(api.writes, [{ side: 'BITRIX24', fields: 'name' }], 'target readback confirms the applied value before a retry can issue another write');
+});
+
+test('configured writable catalog code updates Bitrix24 from MySklad without enabling reverse writes', async () => {
+  const api = new FakeApi();
+  api.bitrix24.code = 'OLD';
+  api.moysklad.code = 'OLD';
+  const configured = { ...settings, rules: [...settings.rules, {
+    id: 'product-code', entity: 'catalog', sourceField: 'code', targetField: 'code',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+  }] };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured });
+  api.moysklad.code = 'NEW';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: configured })).status, 'SYNCED');
+  assert.equal(api.bitrix24.code, 'NEW');
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('configured service price changes update Bitrix24 and an applied write with lost response is read back, not repeated', async () => {
+  const api = new FakeApi();
+  const servicePair = { ...pair, moyskladType: 'service' };
+  const sync = new ProductCardSyncService(api, new MemoryState());
+  await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  api.moysklad.prices[0]!.value = 11;
+  api.ambiguousBitrixPriceUpdate = true;
+  const result = await sync.sync({ pair: servicePair, source: 'MOYSKLAD', settingsVersion: 1, settings });
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.prices[0]!.value, 11);
+  assert.equal(api.writes.filter((write) => write.fields.startsWith('price:')).length, 1);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
+test('explicit scalar mappings preserve zero and empty string without overwriting Bitrix24 recovery identity', async () => {
+  const api = new FakeApi();
+  const mapped = { ...settings, rules: [...settings.rules,
+    { id: 'product-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+    { id: 'product-external-code', entity: 'catalog', sourceField: 'xmlId', targetField: 'externalCode',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
+  ] };
+  const state = new MemoryState();
+  const sync = new ProductCardSyncService(api, state);
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'BASELINED');
+  api.moysklad.fields!.weight = 0;
+  api.moysklad.fields!.externalCode = '';
+
+  const result = await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped });
+
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.fields!.weight, 0);
+  assert.equal(api.bitrix24.fields!.xmlId, 'initial-external', 'the XML ID remains the durable catalog-create recovery key');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['weight']);
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'UNCHANGED');
+  api.moysklad.fields!.externalCode = 'different-identity';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: mapped })).status, 'UNCHANGED');
+  assert.equal(api.bitrix24.fields!.xmlId, 'initial-external');
+  assert.deepEqual(api.writes.map((write) => write.fields), ['weight'], 'empty and changed MySklad external codes cannot replace the recovery XML ID');
+});
+
+test('unconfigured and disabled catalog scalar candidates are never written', async () => {
+  const api = new FakeApi();
+  const state = new MemoryState();
+  const disabled = { ...settings, rules: [...settings.rules,
+    { id: 'disabled-weight', entity: 'catalog', sourceField: 'weight', targetField: 'weight',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
+  ] };
+  const sync = new ProductCardSyncService(api, state);
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: disabled })).status, 'BASELINED');
+  api.moysklad.fields!.weight = 9;
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings: disabled })).status, 'UNCHANGED');
+  assert.deepEqual(api.writes, []);
+  api.moysklad.fields!.externalCode = 'unconfigured';
+  assert.equal((await sync.sync({ pair, source: 'MOYSKLAD', settingsVersion: 1, settings })).status, 'UNCHANGED');
+  assert.deepEqual(api.writes, []);
 });

@@ -38,10 +38,10 @@ export class ProductCardRuntimeService {
     private readonly lifecycle?: ClientLifecycleService,
   ) {}
 
-  async preflight(source: 'BITRIX24' | 'MOYSKLAD'): Promise<ProductCardRuntimeGate> {
+  async preflight(source: 'BITRIX24' | 'MOYSKLAD', authoritativeRestore = false): Promise<ProductCardRuntimeGate> {
     // Product cards are deliberately one-way. Persisted legacy direction flags
     // must not reopen the Bitrix24 → MySklad write path.
-    if (source === 'BITRIX24') return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' };
+    if (source === 'BITRIX24' && !authoritativeRestore) return { status: 'SKIPPED_DIRECTION_DISABLED', reason: 'PRODUCT_DIRECTION_DISABLED' };
     if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return { status: 'SKIPPED_DISABLED', reason: 'SYNC_MODE_REQUIRED' };
     let mode: 'on' | 'pause' | 'off';
     try { mode = (await this.syncMode.read()).mode; }
@@ -59,8 +59,12 @@ export class ProductCardRuntimeService {
     return { status: 'READY' };
   }
 
-  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string; attempt?: number; assertWorkerLease?: () => Promise<void> }) {
-    const gate = await this.preflight(input.source);
+  processAuthoritativeRestore(input: { pairId: string; settingsVersion: number; eventId: string; attempt: number; assertWorkerLease?: () => Promise<void> }) {
+    return this.process({ ...input, source: 'BITRIX24', authoritativeRestore: true });
+  }
+
+  async process(input: { pairId: string; source: 'BITRIX24' | 'MOYSKLAD'; settingsVersion: number; eventId?: string; attempt?: number; assertWorkerLease?: () => Promise<void>; authoritativeRestore?: boolean }) {
+    const gate = await this.preflight(input.source, input.authoritativeRestore === true);
     if (gate.status !== 'READY') return { ...gate, changedFields: [] as [] };
     let pair;
     let versioned;
@@ -68,7 +72,7 @@ export class ProductCardRuntimeService {
       [pair, versioned] = await Promise.all([
         this.database.entityPair.findFirst({
           where: { id: input.pairId, entityType: 'PRODUCT', active: true },
-          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, active: true, source: true, reason: true, createdAt: true },
+          select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true },
         }),
         this.fieldSettings.version(input.settingsVersion),
       ]);
@@ -114,7 +118,7 @@ export class ProductCardRuntimeService {
     const stateStore = new DatabaseProductCardStateStore(this.database, withBothLeases);
     const reconciler = new ProductCardSyncService(guardedApi, stateStore);
     try {
-      const reconcile = () => reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings, attempt: input.attempt });
+      const reconcile = () => reconciler.sync({ pair, source: input.source, settingsVersion: versioned.version, settings, attempt: input.attempt, authoritativeRestore: input.authoritativeRestore });
       return this.lifecycle ? await this.lifecycle.withPairActiveLock(pair.id, 'PRODUCT', reconcile) : await reconcile();
     } catch (error) {
       if (error instanceof ProductCardWriteGateError) {
@@ -243,11 +247,11 @@ class LeaseBoundProductCardApi implements ProductCardApi {
     private readonly withLease: <T>(operation: () => Promise<T>) => Promise<T>,
   ) {}
 
-  readBitrix24(id: string) { return this.withLease(() => this.api.readBitrix24(id)); }
-  readMoysklad(id: string) { return this.withLease(() => this.api.readMoysklad(id)); }
-  updateBitrix24(id: string, fields: Record<string, unknown>) { return this.withLease(() => this.api.updateBitrix24(id, fields)); }
+  readBitrix24(id: string, kind?: 'product' | 'service') { return this.withLease(() => this.api.readBitrix24(id, kind)); }
+  readMoysklad(id: string, kind?: 'product' | 'service') { return this.withLease(() => this.api.readMoysklad(id, kind)); }
+  updateBitrix24(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service') { return this.withLease(() => this.api.updateBitrix24(id, fields, kind)); }
   updateBitrix24Price(priceId: string, value: number, currency: string) { return this.withLease(() => this.api.updateBitrix24Price(priceId, value, currency)); }
-  updateMoysklad(id: string, fields: Record<string, unknown>) { return this.withLease(() => this.api.updateMoysklad(id, fields)); }
+  updateMoysklad(id: string, fields: Record<string, unknown>, kind?: 'product' | 'service') { return this.withLease(() => this.api.updateMoysklad(id, fields, kind)); }
 }
 
 function isUniqueConstraintError(error: unknown): boolean {

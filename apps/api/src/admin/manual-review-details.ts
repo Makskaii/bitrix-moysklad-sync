@@ -1,5 +1,12 @@
 import { Prisma } from '@prisma/client';
 
+const SAFE_EMAIL_DIAGNOSTIC_KEYS = new Set([
+  'bitrixEmailPresent',
+  'moyskladEmailPresent',
+  'bitrixEmailFieldCount',
+  'moyskladEmailFieldCount',
+]);
+
 export type ManualReviewDetails = {
   entityLabel?: string;
   fieldTitle?: string;
@@ -34,7 +41,9 @@ export function sanitizeReviewDiagnostic(value: unknown): Record<string, unknown
 function sanitizeRecord(source: Record<string, unknown>, depth: number): Record<string, unknown> | null {
   if (depth >= 3) return null;
   return Object.fromEntries(Object.entries(source).slice(0, 30)
-    .filter(([key]) => !/(token|secret|password|email|phone|address|birthday|comment|description|raw|payload|auth|credential)/i.test(key))
+    .filter(([key, value]) => SAFE_EMAIL_DIAGNOSTIC_KEYS.has(key)
+      ? isSafeEmailDiagnosticValue(key, value)
+      : !/(token|secret|password|email|phone|address|birthday|comment|description|raw|payload|auth|credential)/i.test(key))
     .map(([key, child]) => [key.slice(0, 100), sanitizeValue(child, depth + 1)]));
 }
 
@@ -42,11 +51,19 @@ function sanitizeForStorage(source: Record<string, unknown>, depth: number): Rec
   if (depth >= 5) return { truncated: true };
   const sensitiveField = typeof source.fieldTitle === 'string' && /(token|secret|password|credential|auth|email|phone|address|birthday|bank|inn|passport)/i.test(source.fieldTitle);
   return Object.fromEntries(Object.entries(source).slice(0, 50).map(([key, child]) => {
-    if (/(token|secret|password|email|phone|address|birthday|comment|description|raw|payload|auth|credential)/i.test(key) || sensitiveField && /^(previousValue|oldValue|proposedValue|newValue|sourceProposedValue|restoreValue)$/i.test(key)) {
+    if (SAFE_EMAIL_DIAGNOSTIC_KEYS.has(key) && !isSafeEmailDiagnosticValue(key, child) ||
+        !SAFE_EMAIL_DIAGNOSTIC_KEYS.has(key) && /(token|secret|password|email|phone|address|birthday|comment|description|raw|payload|auth|credential)/i.test(key) ||
+        sensitiveField && /^(previousValue|oldValue|proposedValue|newValue|sourceProposedValue|restoreValue)$/i.test(key)) {
       return [key, '[redacted]'];
     }
     return [key.slice(0, 100), safeStoredValue(child, depth + 1)];
   }));
+}
+
+function isSafeEmailDiagnosticValue(key: string, value: unknown): boolean {
+  return key.endsWith('Present')
+    ? typeof value === 'boolean'
+    : Number.isInteger(value) && typeof value === 'number' && value >= 0;
 }
 
 function safeStoredValue(value: unknown, depth: number): unknown {

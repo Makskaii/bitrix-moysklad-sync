@@ -23,6 +23,8 @@ import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-
 import { withDealOrderPairLock } from '../deals-orders/deal-order-pair-lock';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -36,13 +38,13 @@ type DocumentDependencyResult =
 
 /**
  * Resolves persisted deal/order webhook events before any sync work can be
- * considered. This temporary intake gate deliberately has no writer: it
- * resolves pair identity only, while downstream baseline readiness belongs to
- * the baseline processor. Unresolved identities are durably held for review.
+ * considered. Eligible unpaired Bitrix deal ADD/UPDATE events may create one
+ * durable customer order; other unresolved identities are held for review.
  */
 @Injectable()
 export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly active = new Set<string>();
+  private readonly documentReader?: DryRunDocumentReader;
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
 
@@ -55,7 +57,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
     @Optional() private readonly syncMode?: SyncModeService,
     @Optional() @Inject(CLIENT_DEPENDENCY_RESOLVER) private readonly clientDependencies?: ClientDependencyResolver,
-    @Optional() private readonly documentReader?: DryRunDocumentReader,
+    @Optional() documentReader?: DryRunDocumentReader,
     @Optional() private readonly databaseRecovery?: DatabaseRecoveryService,
     @Optional() private readonly creationPreparer?: DealOrderCreationPreparer,
     @Optional() private readonly createOperation?: DealOrderCreateOperationService,
@@ -64,7 +66,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly reverseCreate?: DealOrderReverseCreateService,
     @Optional() private readonly totalRuntime?: DealOrderTotalReconciliationHandler,
     @Optional() private readonly dryWrites?: DryRunWriteJournal,
-  ) {}
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
+  ) {
+    this.documentReader = documentReader ? serviceModeBoundProvider(database, documentReader) : undefined;
+  }
 
   onApplicationBootstrap() {
     this.requestRecoveryScan();
@@ -92,9 +97,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
 
   private async resumePendingEvents() {
     try {
-      const now = new Date();
-      const staleBefore = new Date(now.getTime() - EVENT_LEASE_MS);
-      const pending = await this.database.inboundEvent.findMany({
+      const scan = await withServiceModeOn(this.database, async (transaction) => {
+        const now = new Date();
+        const staleBefore = new Date(now.getTime() - EVENT_LEASE_MS);
+        return transaction.inboundEvent.findMany({
         where: {
           AND: [
             { OR: [
@@ -110,16 +116,51 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         },
         select: { id: true },
         take: 100,
+        });
       });
-      for (const event of pending) this.enqueue(event.id);
+      if (!scan.enabled) return;
+      for (const event of scan.value) this.enqueue(event.id);
     } catch {
       // Pending rows remain durable; the next scan retries discovery.
     }
   }
 
   async process(eventId: string): Promise<PairFirstResult | null> {
-    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
-    return this.processWithLease(eventId);
+    const execute = async (workerLease?: EventWorkerLeaseContext) => {
+      if (!this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return this.processWithLease(eventId, workerLease);
+      const event = await this.database.inboundEvent.findUnique({ where: { id: eventId }, select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true } });
+      if (!event || !event.externalEntityId || !isDealOrderEvent(event)) return this.processWithLease(eventId, workerLease);
+      if (process.env.SYNC_MODE !== 'apply') {
+        await this.finishBeforeClaim(event, 'MANUAL_REVIEW', 'CONTROLLED_LIVE_TEST_APPLY_MODE_REQUIRED');
+        return null;
+      }
+      const mode = await withServiceModeOn(this.database, async () => true);
+      if (!mode.enabled || (this.syncMode && (await this.syncMode.read()).mode !== 'on')) return null;
+      try {
+        await this.prepareControlledAdmission(event);
+      } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
+        const retryable = error instanceof ProviderFailure && isRetryableFailure(error);
+        await this.finishBeforeClaim(event, retryable ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW', retryable ? 'CONTROLLED_LIVE_TEST_SOURCE_READ_RETRYABLE' : 'CONTROLLED_LIVE_TEST_ADMISSION_REQUIRED',
+          retryable ? retryAtForFailure(error, 1) : null);
+        return null;
+      }
+      return this.controlledAdmission.runForEvent(eventId, () => this.processWithLease(eventId, workerLease));
+    };
+    if (this.workerLease) return this.workerLease.run(eventId, execute);
+    return execute();
+  }
+
+  private async prepareControlledAdmission(event: { id: string; source: string; externalEntityId: string | null }) {
+    if (!this.controlledAdmission || !this.documentReader) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_SERVICE_UNAVAILABLE');
+    if (!event.externalEntityId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_ID_REQUIRED');
+    const sourceId = event.externalEntityId;
+    const sourceSystem = event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD';
+    const source = await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, sourceId, 'deal-order',
+      () => this.documentReader!.readDealOrderForControlledAdmission(sourceSystem, sourceId));
+    if (!source || source.nativeId !== sourceId) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
+    await this.controlledAdmission.admit(event.id, { entity: 'deal-order', sourceSystem, sourceNativeId: sourceId,
+      currentNativeId: source.nativeId, currentName: source.name, sourceCreatedAt: source.createdAt });
   }
 
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairFirstResult | null> {
@@ -128,11 +169,8 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true },
     });
     if (!event || !event.externalEntityId || !isDealOrderEvent(event) || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
-    if (this.syncMode) {
-      const currentMode = (await this.syncMode.read()).mode;
-      if (currentMode === 'pause') return null;
-      if (currentMode === 'off') { await this.finishBeforeClaim(event, 'SKIPPED_DISABLED', 'SERVICE_MODE_OFF'); return null; }
-    }
+    const mode = await withServiceModeOn(this.database, async () => true);
+    if (!mode.enabled || (this.syncMode && (await this.syncMode.read()).mode !== 'on')) return null;
 
     if (this.databaseRecovery) {
       const boundary = await this.databaseRecovery.launchBoundary().catch(() => null);
@@ -146,6 +184,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD', event.externalEntityId,
         );
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
         if (error instanceof ProviderFailure && isRetryableFailure(error)) {
           await this.finishBeforeClaim(event, 'RETRYABLE_FAILURE', 'CREATION_TIMESTAMP_READ_RETRYABLE', retryAtForFailure(error, event.attempts + 1));
         } else {
@@ -165,7 +204,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
 
     const staleBefore = new Date(Date.now() - EVENT_LEASE_MS);
     await workerLease?.assertOwned();
-    const claim = await this.database.$transaction(async (transaction) => {
+    const claim = await withServiceModeOn(this.database, async (transaction) => {
       await assertWorkerFenceInTransaction(workerLease, transaction);
       return transaction.inboundEvent.updateMany({
         where: {
@@ -179,13 +218,14 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         data: { status: 'PROCESSING', processingStartedAt: new Date(), attempts: { increment: 1 }, retryAfter: null, lastErrorCategory: null },
       });
     });
-    if (claim.count !== 1) return null;
+    if (!claim.enabled || claim.value.count !== 1) return null;
 
     const input: PairResolutionInput = {
       entityType: 'DEAL',
       sourceSystem: event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD',
       externalId: event.externalEntityId,
       eventId: event.id,
+      eventType: event.eventType,
     };
 
     let result: PairResolutionResult;
@@ -216,11 +256,16 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             inactiveStage || unconfiguredStage ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
           return null;
         }
+        if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+          const scope = await this.controlledAdmission.scopeForEvent(event.id);
+          prepared.input.payload.description = scope.admittedSourceName;
+        }
         await workerLease?.assertOwned();
         const creation = await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
         partialDealOrderCreation = creation.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
         if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
         const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
         await this.finish(event.id, 'RETRYABLE_FAILURE', 'CUSTOMER_ORDER_CREATE_RETRY', workerLease,
@@ -236,10 +281,13 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        const reverseResult = await this.reverseCreate.createAndPair({ moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined });
+        const reverseInput = { moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined,
+          ...(this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? { controlledSyntheticName: (await this.controlledAdmission.scopeForEvent(event.id)).admittedSourceName } : {}) };
+        const reverseResult = await this.reverseCreate.createAndPair(reverseInput);
         partialDealOrderCreation = reverseResult.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
         if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
         const reason = error instanceof Error ? error.message : 'REVERSE_DEAL_CREATE_FAILED';
         if (error instanceof DealOrderReverseManualReviewError) {
@@ -309,6 +357,13 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         }
         documentClient = dependencyResult?.client;
         const baseline = await this.baseline.ensureForConfirmedPair({ pair: result.pair, eventId: event.id, eventConfig, attempt });
+        if (baseline.status === 'STALE_PINNED_EVENT') {
+          // Preserve the event's immutable historical pin, but never let an
+          // older retry overwrite a newer pair baseline or compare snapshots
+          // from incompatible semantic projections.
+          await this.finish(event.id, 'UNCHANGED', 'SETTINGS_PIN_SUPERSEDED', workerLease);
+          return result;
+        }
         if (baseline.status !== 'READY') {
           if (baseline.status === 'DATABASE_FAILURE') {
             // Leave the claimed PROCESSING row untouched. The lease-expiry
@@ -358,6 +413,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           await this.finish(event.id, 'SUCCEEDED', null, workerLease);
         }
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return result;
         if (await this.finishForWriteGateError(event.id, error, workerLease)) return result;
         await this.database.$transaction(async (transaction) => {
           await assertWorkerFenceInTransaction(workerLease, transaction);
@@ -533,6 +589,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         },
       };
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
         return { status: 'REVIEW' as const, reason: 'CLIENT_DEPENDENCY_READ_REJECTED' };
       }
@@ -575,7 +632,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     const mode = reason.match(/^DEAL_ORDER_WRITE_BLOCKED_(PAUSE|OFF|RECOVERY|DIRECTION|LEASE|NOT_APPLY)$/)?.[1];
     if (!mode) return false;
     if (mode === 'PAUSE') await this.deferWhileInactive(eventId, workerLease);
-    else if (mode === 'OFF') await this.finish(eventId, 'SKIPPED_DISABLED', reason, workerLease);
+    else if (mode === 'OFF') return true;
     else if (mode === 'DIRECTION') await this.finish(eventId, 'MANUAL_REVIEW', reason, workerLease);
     else await this.finish(eventId, 'RETRYABLE_FAILURE', reason, workerLease, retryAtForFailure(new Error(reason), 1));
     return true;

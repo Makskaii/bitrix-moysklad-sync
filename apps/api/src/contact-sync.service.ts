@@ -6,9 +6,11 @@ import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from './admin/
 import { assertApplyExternalWrite } from './external-write-guard';
 import { ProviderFailure, isRetryableFailure, providerResponseFailure, retryAtForFailure } from './provider-failure';
 import { SyncModeService } from './sync-mode.service';
+import { ServiceModeNotOnError, withServiceModeOn } from './service-mode-transaction';
 import { FieldSettingsService } from './field-settings/field-settings.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from './event-worker-lease.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
+import { clientOwnsContactEvent } from './contact-event-owner';
 
 type JsonRecord = Record<string, unknown>;
 type EntityLeaseIdentity = { entityKey: string; ownerToken: string };
@@ -27,7 +29,7 @@ class EntityMappingChangedError extends Error {
 const PROCESSING_LEASE_MS = 60_000;
 const ENTITY_LOCK_LEASE_MS = 60_000;
 const ENTITY_LOCK_RENEW_INTERVAL_MS = 15_000;
-const EXTERNAL_REQUEST_TIMEOUT_MS = 15_000;
+const EXTERNAL_REQUEST_TIMEOUT_MS = 10_000;
 const EVENT_BATCH_DELAY_MS = 250;
 
 @Injectable()
@@ -69,11 +71,11 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async resumeReceivedContactEvents() {
-    if (!await this.isApplyEnabled()) return;
+    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return;
     try {
       const now = new Date();
       const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
-      const pending = await this.database.inboundEvent.findMany({
+      const scan = await withServiceModeOn(this.database, async (tx) => tx.inboundEvent.findMany({
         where: {
           AND: [
             { OR: [
@@ -93,15 +95,23 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
             ] },
           ],
         },
-        select: { id: true },
-      });
-      for (const event of pending) this.enqueue(event.id);
+        select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
+      }));
+      if (!scan.enabled) return;
+      for (const event of scan.value) {
+        if (await clientOwnsContactEvent(this.database, event)) continue;
+        this.enqueue(event.id);
+      }
     } catch {
       // A later event delivery can enqueue pending work again; do not block app startup.
     }
   }
 
   async process(eventId: string) {
+    // The optional global semaphore is transient coordination only; this precheck
+    // avoids acquiring it during stable OFF, while durable event/entity claims are
+    // independently serialized with OFF inside withServiceModeOn below.
+    if (!await this.isApplyEnabled()) return;
     if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
     return this.processWithLease(eventId);
   }
@@ -110,7 +120,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     if (this.active.has(eventId)) return;
     if (!await this.isApplyEnabled()) return;
     const candidate = await this.database.inboundEvent.findUnique({ where: { id: eventId } });
-    if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType)) return;
+    if (!candidate || !isContactEmailEvent(candidate.source, candidate.eventType, candidate.externalEntityType) ||
+        await clientOwnsContactEvent(this.database, candidate)) return;
     const entityKey = await this.entityLeaseKey(candidate);
     if (entityKey && this.activeEntities.has(entityKey)) return;
     this.active.add(eventId);
@@ -159,6 +170,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
         const pinnedSettings = await this.fieldSettings?.eventConfig(event.id);
         await this.syncContactEmail(event, attempt, entityKey && lockOwner ? { entityKey, ownerToken: lockOwner } : null, pinnedSettings?.config, workerLease);
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return;
         if (error instanceof Error && error.message === 'EVENT_WORKER_LEASE_LOST') return;
         if (error instanceof EntityLockLostError) return;
         if (error instanceof EntityMappingChangedError) {
@@ -245,18 +257,21 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private async acquireEntityLock(entityKey: string, ownerToken: string, eventId: string): Promise<boolean> {
     const now = new Date();
     const leaseExpiresAt = new Date(now.getTime() + ENTITY_LOCK_LEASE_MS);
-    const reclaimed = await this.database.inboundEntityLock.updateMany({
-      where: { entityKey, leaseExpiresAt: { lte: now } },
-      data: { ownerToken, eventId, leaseExpiresAt },
+    const gated = await withServiceModeOn(this.database, async (tx) => {
+      const reclaimed = await tx.inboundEntityLock.updateMany({
+        where: { entityKey, leaseExpiresAt: { lte: now } },
+        data: { ownerToken, eventId, leaseExpiresAt },
+      });
+      if (reclaimed.count === 1) return true;
+      try {
+        await tx.inboundEntityLock.create({ data: { entityKey, ownerToken, eventId, leaseExpiresAt } });
+        return true;
+      } catch (error) {
+        if (isUniqueConstraintError(error)) return false;
+        throw error;
+      }
     });
-    if (reclaimed.count === 1) return true;
-    try {
-      await this.database.inboundEntityLock.create({ data: { entityKey, ownerToken, eventId, leaseExpiresAt } });
-      return true;
-    } catch (error) {
-      if (isUniqueConstraintError(error)) return false;
-      throw error;
-    }
+    return gated.enabled && gated.value;
   }
 
   private renewEntityLockWhileProcessing(entityKey: string, ownerToken: string): NodeJS.Timeout {
@@ -264,10 +279,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     const timer = setInterval(() => {
       if (renewing) return;
       renewing = true;
-      void this.database.inboundEntityLock.updateMany({
+      void withServiceModeOn(this.database, (tx) => tx.inboundEntityLock.updateMany({
         where: { entityKey, ownerToken },
         data: { leaseExpiresAt: new Date(Date.now() + ENTITY_LOCK_LEASE_MS) },
-      }).then(() => { renewing = false; }, () => { renewing = false; });
+      })).then(() => { renewing = false; }, () => { renewing = false; });
     }, ENTITY_LOCK_RENEW_INTERVAL_MS);
     timer.unref();
     return timer;
@@ -292,8 +307,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     commit: (transaction: Prisma.TransactionClient) => Promise<T>,
     workerLease?: EventWorkerLeaseContext,
   ): Promise<T> {
-    if (!lease && !workerLease) return commit(this.database as unknown as Prisma.TransactionClient);
-    return this.database.$transaction(async (transaction) => {
+    const gated = await withServiceModeOn(this.database, async (transaction) => {
       if (workerLease?.assertOwnedIn) await workerLease.assertOwnedIn(transaction);
       else await workerLease?.assertOwned();
       if (!lease) return commit(transaction);
@@ -309,6 +323,8 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       }
       return commit(transaction);
     });
+    if (!gated.enabled) throw new ServiceModeNotOnError();
+    return gated.value;
   }
 
   private async coalescePendingEvents(
@@ -345,16 +361,13 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async isApplyEnabled(): Promise<boolean> {
-    return (process.env.SYNC_MODE === 'apply' || process.env.SYNC_MODE === 'dry') && (await this.syncMode.read()).mode === 'on';
-  }
-
-  private async deferIfModeIsNoLongerOn(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<boolean> {
-    if (await this.isApplyEnabled()) return false;
-    await this.commitWithEntityLease(null, (tx) => tx.inboundEvent.updateMany({
-      where: { id: eventId, status: 'PROCESSING' },
-      data: { status: 'RECEIVED', processingStartedAt: null, lastErrorCategory: null },
-    }), workerLease);
-    return true;
+    if (process.env.SYNC_MODE !== 'apply' && process.env.SYNC_MODE !== 'dry') return false;
+    try {
+      const gated = await withServiceModeOn(this.database, async () => true);
+      return gated.enabled && gated.value;
+    } catch {
+      return false;
+    }
   }
 
   private async skipIfDirectionDisabled(event: {
@@ -457,7 +470,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     }
 
     let value = direction === 'BITRIX24_TO_MOYSKLAD' ? bitrixEmail : moyskladEmail;
-    const configuredTransform = this.fieldSettings?.transformField(
+    const configuredTransform = this.fieldSettings?.transformFieldResult(
       pinnedConfig,
       'contacts',
       direction,
@@ -465,10 +478,15 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       direction === 'BITRIX24_TO_MOYSKLAD' ? { EMAIL: bitrixContact.EMAIL, email: bitrixEmail } : { email: moyskladEmail },
     );
     if (configuredTransform) {
-      if (configuredTransform.error || typeof configuredTransform.value !== 'string' || !configuredTransform.value.trim()) {
-        throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, snapshotRevision: snapshot.revision });
+      if (configuredTransform.status === 'error') {
+        throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, reason: configuredTransform.reason, snapshotRevision: snapshot.revision });
       }
-      value = configuredTransform.value;
+      if (configuredTransform.status === 'mapped') {
+        if (typeof configuredTransform.value !== 'string' || !configuredTransform.value.trim()) {
+          throw new ReviewRequiredError('FIELD_TRANSFORM_FAILED', { transform: configuredTransform.transform, snapshotRevision: snapshot.revision });
+        }
+        value = configuredTransform.value;
+      }
     }
     const configuredDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!await this.syncMode.isDirectionEnabled('contacts-companies', configuredDirection)) {
@@ -479,7 +497,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       }), workerLease);
       return;
     }
-    if (await this.deferIfModeIsNoLongerOn(event.id, workerLease)) return;
+    if (!await this.isApplyEnabled()) return;
     await workerLease?.assertOwned();
     await this.assertEntityLockOwner(lease);
     if (direction === 'BITRIX24_TO_MOYSKLAD') {
@@ -556,6 +574,12 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async bitrixRequest(eventId: string, method: string, fields: Record<string, string>): Promise<unknown> {
+    const gated = await withServiceModeOn(this.database, () => this.bitrixRequestUnderMode(eventId, method, fields));
+    if (!gated.enabled) throw new ServiceModeNotOnError();
+    return gated.value;
+  }
+
+  private async bitrixRequestUnderMode(eventId: string, method: string, fields: Record<string, string>): Promise<unknown> {
     if (/\.update(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'CONTACT_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('EXTERNAL_API_FAILURE');
@@ -607,6 +631,12 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async moyskladRequest(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord, accepts: (payload: unknown) => boolean = isRecord): Promise<unknown> {
+    const gated = await withServiceModeOn(this.database, () => this.moyskladRequestUnderMode(eventId, counterpartyId, method, body, accepts));
+    if (!gated.enabled) throw new ServiceModeNotOnError();
+    return gated.value;
+  }
+
+  private async moyskladRequestUnderMode(eventId: string, counterpartyId: string, method: 'GET' | 'PUT', body?: JsonRecord, accepts: (payload: unknown) => boolean = isRecord): Promise<unknown> {
     if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'CONTACT_REQUEST');
     const base = process.env.MOYSKLAD_API_BASE_URL;
     const token = process.env.MOYSKLAD_API_TOKEN;

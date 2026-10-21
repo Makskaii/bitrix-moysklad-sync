@@ -6,12 +6,26 @@ import { DatabaseProductCardStateStore, ProductCardRuntimeService } from '../src
 
 const databaseUrl = process.env.PRODUCT_TEST_DATABASE_URL;
 
+function assertProductTestDatabaseTarget(databaseUrl: string, isolatedFlag: string | undefined) {
+  assert.equal(isolatedFlag, '1', 'set PRODUCT_TEST_ISOLATED=1 only for a fresh disposable product test database');
+  const parsedUrl = new URL(databaseUrl);
+  assert.ok(['localhost', '127.0.0.1', '::1'].includes(parsedUrl.hostname), 'refusing a non-local product-card test database');
+  assert.match(parsedUrl.pathname, /^\/(?:(?:aerosystems_product|issue61)_[a-z0-9_]+_test|sync_issue79_integration_products_test)$/i, 'requires a dedicated product test database name');
+  assert.equal(parsedUrl.searchParams.get('schema'), 'issue15_product_test', 'refusing to run product-card tests outside issue15_product_test schema');
+}
+
+test('product PostgreSQL test harness only permits an explicitly isolated loopback database and dedicated schema', () => {
+  const safe = 'postgresql://local-test@127.0.0.1:5432/sync_issue79_integration_products_test?schema=issue15_product_test';
+  assert.doesNotThrow(() => assertProductTestDatabaseTarget(safe, '1'));
+  assert.throws(() => assertProductTestDatabaseTarget(safe, undefined), /PRODUCT_TEST_ISOLATED/);
+  assert.throws(() => assertProductTestDatabaseTarget('postgresql://local-test@example.invalid:5432/aerosystems_product_issue61_test?schema=issue15_product_test', '1'), /non-local/);
+  assert.throws(() => assertProductTestDatabaseTarget('postgresql://local-test@127.0.0.1:5432/sync?schema=issue15_product_test', '1'), /dedicated product test database/);
+  assert.throws(() => assertProductTestDatabaseTarget('postgresql://local-test@127.0.0.1:5432/aerosystems_product_issue61_test?schema=public', '1'), /outside issue15_product_test/);
+});
+
 test('product last-success state persists by active pair in isolated PostgreSQL', { skip: !databaseUrl }, async () => {
   assert.ok(databaseUrl, 'PRODUCT_TEST_DATABASE_URL must point to the dedicated #15 test database');
-  const parsedUrl = new URL(databaseUrl);
-  assert.ok(['localhost', '127.0.0.1', '::1'].includes(parsedUrl.hostname), 'refusing to run product-card persistence test against a non-local database');
-  assert.equal(parsedUrl.pathname, '/sync', 'product-card persistence test requires its dedicated test database');
-  assert.equal(parsedUrl.searchParams.get('schema'), 'issue15_product_test', 'refusing to run product-card persistence outside issue15_product_test schema');
+  assertProductTestDatabaseTarget(databaseUrl, process.env.PRODUCT_TEST_ISOLATED);
   const previousMode = process.env.SYNC_MODE;
   const previousUrl = process.env.DATABASE_URL;
   process.env.SYNC_MODE = 'apply';
@@ -45,10 +59,7 @@ test('product last-success state persists by active pair in isolated PostgreSQL'
 
 test('concurrent runtime instances retry by PRODUCT pair and retain both verified field updates', { skip: !databaseUrl }, async () => {
   assert.ok(databaseUrl, 'PRODUCT_TEST_DATABASE_URL must point to the dedicated #15 test database');
-  const parsedUrl = new URL(databaseUrl);
-  assert.ok(['localhost', '127.0.0.1', '::1'].includes(parsedUrl.hostname), 'refusing to run product-card concurrency test against a non-local database');
-  assert.equal(parsedUrl.pathname, '/sync', 'product-card concurrency test requires its dedicated test database');
-  assert.equal(parsedUrl.searchParams.get('schema'), 'issue15_product_test', 'refusing to run product-card concurrency test outside issue15_product_test schema');
+  assertProductTestDatabaseTarget(databaseUrl, process.env.PRODUCT_TEST_ISOLATED);
   const previousMode = process.env.SYNC_MODE;
   const previousUrl = process.env.DATABASE_URL;
   process.env.SYNC_MODE = 'apply';

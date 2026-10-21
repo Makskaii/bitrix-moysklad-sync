@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
+import { ProductCatalogManualReviewError } from '../src/products/product-catalog-create.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../src/deals-orders/deal-order-reverse-create.service';
 
 process.env.SYNC_MODE ??= 'apply';
@@ -36,6 +37,7 @@ let sourceProductName = 'MS product name';
 let productAdds = 0;
 let msProductWrites = 0;
 let pauseAfterFirstRowAdd = false;
+let pauseModeAck: Promise<void> | null = null;
 const suffix = randomUUID();
 let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
@@ -87,7 +89,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   const input = { moyskladOrderId: ids.order, eventId: `event-${suffix}`, eventConfig };
   const firstAttempt = await service.createAndPair(input).then(() => null, (error: unknown) => error);
   assert.ok(firstAttempt instanceof Error, `expected injected response loss; productAdds=${productAdds}, rowAdds=${rowAdds}`);
-  assert.match(firstAttempt.message, /Provider request failed \(500\)/);
+  assert.match(firstAttempt.message, /BITRIX24_PRODUCT_API_500/);
   const pendingProduct = await db.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: ids.product } });
   assert.equal(pendingProduct.bitrix24ProductId, null, 'uncertain product response stays journaled without guessing the ID');
   assert.equal(products.length, 1, 'fake provider applied the product add before losing its response');
@@ -110,8 +112,9 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(products[0].name, 'MS product name');
   assert.equal(products[0].code, 'MS-SKU-54');
   assert.equal(products[0].detailText, 'MS product description');
-  assert.equal(products[0].measure, 796);
+  assert.equal(products[0].measure, 9, 'Bitrix catalog product measure uses the catalog measure ID');
   assert.equal(products[0].xmlId, `MOYSKLAD_PRODUCT_${ids.product}`);
+  assert.equal((products[0].property108 as { value: string }).value, ids.product);
   assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '903');
   assert.equal(dealAdds, 1, 'deal is never duplicated');
   assert.equal(rowAdds, 3, 'ambiguous row response recovered by durable sort slots, no duplicate row is added');
@@ -121,6 +124,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(items[0].originId, ids.order);
   assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 133.33, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
   assert.deepEqual([rows[0].discountRate, rows[0].taxRate, rows[0].taxIncluded], [10, 20, 'Y']);
+  assert.deepEqual(rows.map((row) => row.measureCode), [796, 796, 796], 'product-row MEASURE_CODE uses the saved catalog code, not its catalog ID');
   assert.equal(rows.some((row) => Number(row.productId) !== 903), false);
   const savedPair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', moyskladId: ids.order, active: true } });
   assert.equal(savedPair.bitrix24Id, '801');
@@ -203,7 +207,7 @@ test('existing paired order resumes a lost product-prerequisite response before 
   pairIds.push(dealPair.id);
   const input = { pairId: dealPair.id, bitrix24DealId: '881', moyskladOrderId: orderId, eventId: `event-${suffix}-product-recovery`, eventConfig: config(), positionIds: ['new-product-position'], assertPairLease: async () => true };
   try {
-    await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    await assert.rejects(service.addPositionsToExistingPair(input), /BITRIX24_PRODUCT_API_500/);
     assert.equal(productAdds, 1, 'uncertain B24 product create is durably fenced');
     assert.equal(rows.length, 0);
     assert.equal(dealAdds, 0, 'prerequisite recovery never creates a replacement deal');
@@ -240,6 +244,7 @@ test('persisted pause between existing-order row adds preserves the first ID and
     await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
     pauseAfterFirstRowAdd = true;
     await assert.rejects(service.addPositionsToExistingPair(input), /DEAL_ORDER_WRITE_BLOCKED_PAUSE/);
+    await pauseModeAck;
     assert.equal(rows.length, 1);
     const partial = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: orderId }, include: { positions: true } });
     assert.equal(partial.status, 'PENDING');
@@ -253,6 +258,8 @@ test('persisted pause between existing-order row adds preserves the first ID and
     assert.deepEqual(rows.map((row) => row.sort), [1, 2], 'the resumed row-add reuses its journaled sort slot');
   } finally {
     pauseAfterFirstRowAdd = false;
+    await pauseModeAck;
+    pauseModeAck = null;
     await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
     await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
     await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
@@ -269,7 +276,7 @@ test('an existing product pair is preserved when the MySklad product name change
   await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
   const productPair = await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: '904', moyskladId: ids.product, source: 'MANUAL' } });
   pairIds.push(productPair.id);
-  items = []; rows = []; products = [{ id: 904, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'Existing Bitrix product name', measure: 796 }];
+  items = []; rows = []; products = [{ id: 904, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'Existing Bitrix product name', measure: 9 }];
   nextDealId = 802;
   productAdds = 0; dealAdds = 0; rowAdds = 0; msProductWrites = 0; loseProductCreateResponse = false; loseSecondRowResponse = false;
   orderPositions = [position('rename-1', 1)];
@@ -326,10 +333,10 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
   await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
   await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
   dealAdds = 0; rowAdds = 0; productAdds = 0; items = []; rows = [];
-  const candidate = { id: 905, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 796 };
+  const candidate = { id: 905, iblockId: 42, type: 1, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, property108: { value: ids.product }, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 9 };
   products = [candidate, { ...candidate, id: 906 }];
   orderPositions = [position('ambiguous-1', 1)];
-  await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof ProductCatalogManualReviewError);
   assert.equal(productAdds, 0);
   assert.equal(dealAdds, 0);
 });
@@ -337,7 +344,7 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
 function config(): any {
   return { version: 4, createdAt: new Date(0).toISOString(), config: {
     schemaVersion: 1, rules: [], groups: [], serviceCounterpartyId: null,
-    references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] },
+    references: { units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] },
     dealOrderRuntime: {
       nativeOrderNumberingVerified: true,
       bitrix24ProductCatalogId: '42',
@@ -383,7 +390,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     rows.push(added);
     if (pauseAfterFirstRowAdd) {
       pauseAfterFirstRowAdd = false;
-      await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } });
+      // Let the bounded provider operation return before the mode update needs
+      // its conflicting database lock; the next request must observe PAUSE.
+      pauseModeAck = db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'pause' } }).then(() => undefined);
     }
     if (rowAdds === 2 && loseSecondRowResponse) {
       loseSecondRowResponse = false;
@@ -395,9 +404,20 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const found = products.filter((product) => product.xmlId === body.filter?.xmlId && String(product.iblockId) === String(body.filter?.iblockId));
     return send(response, { result: { products: found }, total: found.length });
   }
+  if (pathname === '/rest/catalog.product.getFieldsByFilter') {
+    // ProductCatalogCreateService checks writable fields before catalog.product.add.
+    // Mirror the Bitrix response envelope consumed by that production caller.
+    return send(response, { result: { product: {
+      name: { type: 'string', isReadOnly: false },
+      code: { type: 'string', isReadOnly: false },
+      detailText: { type: 'string', isReadOnly: false },
+      measure: { type: 'integer', isReadOnly: false },
+      property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false },
+    } } });
+  }
   if (pathname === '/rest/catalog.product.add') {
     productAdds++;
-    const created = { ...body.fields, id: String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
+    const created = { ...body.fields, type: 1, id: String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
     products.push(created);
     if (loseProductCreateResponse) { loseProductCreateResponse = false; response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic product create response loss' })); return; }
     return send(response, { result: { element: created } });

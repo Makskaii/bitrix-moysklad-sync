@@ -45,7 +45,7 @@ export type AssignEntityPairInput = {
   entityType: EntityType;
   bitrix24Id: string;
   moyskladId: string;
-  moyskladType?: 'counterparty' | 'contactperson' | 'customerorder' | 'product';
+  moyskladType?: 'counterparty' | 'contactperson' | 'customerorder' | 'invoiceout' | 'product';
   moyskladParentId?: string;
   replaceExisting?: boolean;
 };
@@ -201,7 +201,7 @@ function validate(input: AssignEntityPairInput): void {
   if (!isEntityType(input.entityType)) throw new BadRequestException('entityType is unsupported');
   if (!isId(input.bitrix24Id)) throw new BadRequestException('bitrix24Id is required');
   if (!isId(input.moyskladId)) throw new BadRequestException('moyskladId is required');
-  if (input.moyskladType !== undefined && !['counterparty', 'contactperson', 'customerorder', 'product'].includes(input.moyskladType)) {
+  if (input.moyskladType !== undefined && !['counterparty', 'contactperson', 'customerorder', 'invoiceout', 'product'].includes(input.moyskladType)) {
     throw new BadRequestException('moyskladType is unsupported');
   }
   if (input.moyskladType === 'contactperson' && (input.entityType !== 'CONTACT' || !input.moyskladParentId)) {

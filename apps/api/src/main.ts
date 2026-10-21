@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { Controller, Get, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { AdminController } from './admin/admin.controller';
 import { AdminAuditController } from './admin/admin-audit.controller';
 import { AdminAuditService } from './admin/admin-audit.service';
@@ -55,10 +55,22 @@ import { EventWorkerLeaseService } from './event-worker-lease.service';
 import { ProductCardEventProcessor } from './products/product-card-event.processor';
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
+import { ProductCatalogCreateService } from './products/product-catalog-create.service';
 import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from './clients/client-lifecycle.service';
 import { DryRunWriteJournal } from './dry-run-write-journal';
 import { DatabaseRecoveryService } from './database-recovery.service';
 import { setDatabaseRecoveryReady } from './external-write-guard';
+import { readFileSync } from 'node:fs';
+import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from './external-write-guard';
+import { verifyControlledLiveProviderNamespace } from './controlled-live-test-namespace';
+import { createControlledLiveTestPolicy } from './controlled-live-test-policy';
+import { resolveApiBindHost } from './api-bind-host';
+import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
+import { InvoiceHttpApi } from './invoices/invoice-http-api';
+import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
+import { ProductDuplicatesController } from './admin/product-duplicates.controller';
+import { ProductDuplicateAliasService } from './products/product-duplicate-alias.service';
+import { ApplicationLaunchController } from './application-launch.controller';
 
 @Controller()
 class AppController {
@@ -73,30 +85,51 @@ class AppController {
 }
 
 @Module({
-  controllers: [AppController, AdminController, AdminAuditController, ClientLifecycleController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
+  controllers: [AppController, ApplicationLaunchController, AdminController, AdminAuditController, ClientLifecycleController, ProductDuplicatesController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
-    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
+    { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
     EventWorkerLeaseService, DatabaseRecoveryService,
     WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
     DryRunWriteJournal,
-    { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCardRuntimeService, ProductCardEventProcessor,
+    { provide: InvoiceHttpApi, useFactory: (dry: DryRunWriteJournal) => new InvoiceHttpApi(dry), inject: [DryRunWriteJournal] }, InvoiceEventProcessor,
+    { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCatalogCreateService, ProductCardRuntimeService, ProductDuplicateAliasService, ProductCardEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
     { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
-    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, ClientLifecycleService,
+    { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ControlledLiveTestAdmissionService, ClientSyncProcessor, ClientLifecycleService,
     { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
     { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor }, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor],
 })
-class AppModule {}
+export class AppModule {}
 
 async function bootstrap() {
+  const apiBindHost = resolveApiBindHost(process.env.API_BIND_HOST);
+  if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+    if (process.env.CONTROLLED_LIVE_TEST_INSTANCE !== 'isolated') {
+      throw new Error('CONTROLLED_LIVE_TEST_REQUIRES_ISOLATED_INSTANCE');
+    }
+    if (process.env.SYNC_MODE !== 'apply') throw new Error('CONTROLLED_LIVE_TEST_REQUIRES_APPLY_MODE');
+    const manifestPath = process.env.CONTROLLED_LIVE_TEST_MANIFEST;
+    if (!manifestPath || !isAbsolute(manifestPath)) {
+      throw new Error('CONTROLLED_LIVE_TEST_MANIFEST_PATH_INVALID');
+    }
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { providerNamespace?: unknown };
+    setControlledLiveTestWriteCheck(createControlledLiveTestPolicy(manifest, process.env.DATABASE_URL));
+    installControlledLiveFetchGuard(manifest.providerNamespace);
+    await verifyControlledLiveProviderNamespace(manifest.providerNamespace, {
+      bitrix24RestBaseUrl: process.env.BITRIX24_REST_BASE_URL,
+      moyskladApiBaseUrl: process.env.MOYSKLAD_API_BASE_URL,
+      moyskladApiToken: process.env.MOYSKLAD_API_TOKEN,
+      allowLoopbackHttp: process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled',
+    });
+  }
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
   await app.get(DatabaseRecoveryService).initialize();
   app.useStaticAssets(resolve(__dirname, '../../../../apps/web/dist'));
-  await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
+  await app.listen(process.env.PORT ?? 3000, apiBindHost);
 }
 
-void bootstrap();
+if (require.main === module) void bootstrap();

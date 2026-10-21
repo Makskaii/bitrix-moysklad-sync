@@ -49,16 +49,21 @@ import { ClientChildResourceSync } from '../clients/client-child-resource-sync';
 import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from '../event-dispatcher.service';
 import { EventWorkerLeaseService } from '../event-worker-lease.service';
 import { ProductCardEventProcessor } from '../products/product-card-event.processor';
+import { ProductDuplicateAliasService } from '../products/product-duplicate-alias.service';
+import { ProductDuplicatesController } from './product-duplicates.controller';
 import { ProductCardHttpApi } from '../products/product-card-api';
 import { ProductCardRuntimeService } from '../products/product-card-runtime.service';
+import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
 import { CLIENT_LIFECYCLE_GATEWAY, ClientLifecycleService } from '../clients/client-lifecycle.service';
+import { InvoiceEventProcessor } from '../invoices/invoice-event.processor';
+import { InvoiceHttpApi } from '../invoices/invoice-http-api';
 
 @Module({})
 export class LocalAdminPreviewModule {
   static register(databaseProvider: Provider = DatabaseService, fieldDataProvider: Type<ReadOnlyFieldDataProvider> = ReadOnlyFieldDataProvider, localPreviewAccess = true): DynamicModule {
     return {
       module: LocalAdminPreviewModule,
-      controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController, ClientLifecycleController] : [])],
+      controllers: [PreviewHealthController, AdminController, AdminAuditController, AdminPreviewController, FieldSettingsController, SyncModeController, ContactSyncStatusController, MonitoringController, EventsController, WebhookDiagnosticsController, ...(databaseProvider === DatabaseService ? [PairResolutionController, HistoricalInventoryController, ClientMappingController, ClientLifecycleController, ProductDuplicatesController] : [])],
       providers: [
         databaseProvider,
         AdminAuditService,
@@ -79,9 +84,10 @@ export class LocalAdminPreviewModule {
           { provide: HttpClientSyncGateway, useFactory: (dry: DryRunWriteJournal) => new HttpClientSyncGateway(fetch, dry), inject: [DryRunWriteJournal] }, { provide: CLIENT_SYNC_GATEWAY, useExisting: HttpClientSyncGateway },
           { provide: HttpClientCandidateGateway, useFactory: (database: DatabaseService, dry: DryRunWriteJournal) => new HttpClientCandidateGateway(database, fetch, dry), inject: [DatabaseService, DryRunWriteJournal] }, { provide: CLIENT_CANDIDATE_GATEWAY, useExisting: HttpClientCandidateGateway },
           { provide: ClientChildResourceSync, useFactory: (dry: DryRunWriteJournal) => new ClientChildResourceSync(fetch, dry), inject: [DryRunWriteJournal] }, ClientSyncProcessor, { provide: CLIENT_DEPENDENCY_RESOLVER, useExisting: ClientSyncProcessor },
-          ProductCardHttpApi, ProductCardRuntimeService, ProductCardEventProcessor, ClientLifecycleService,
+          ProductCardHttpApi, ProductCatalogCreateService, ProductCardRuntimeService, ProductDuplicateAliasService, ProductCardEventProcessor, ClientLifecycleService,
+          InvoiceHttpApi, InvoiceEventProcessor,
           { provide: CLIENT_LIFECYCLE_GATEWAY, useExisting: HttpClientSyncGateway },
-          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService) => [products, clients, lifecycle], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService] },
+          { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
           EntityPairService, PairResolutionProvider,
           { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider },
           PairFirstEventProcessor,

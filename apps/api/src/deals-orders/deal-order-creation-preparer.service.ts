@@ -6,6 +6,9 @@ import { isPlannedDeliveryDateMapping, normalizePlannedDeliveryDate, toMoySkladP
 import { writeOperationalLog } from '../monitoring-log';
 import { DealOrderPreparedInput } from './deal-order-create-operation.service';
 import { bitrixMoneyToMoySklad } from './deal-order-money';
+import { assertApplyExternalWrite } from '../external-write-guard';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -39,6 +42,12 @@ export class DealOrderCreationPreparer {
     @Optional() @Inject(CLIENT_DEPENDENCY_RESOLVER) private readonly dependencies?: ClientDependencyResolver,
   ) {}
 
+  private async providerModeGate<T>(work: () => Promise<T>): Promise<T> {
+    const result = await withServiceModeOn(this.database, async () => work());
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
   async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<DealOrderPreparationResult> {
     const references = readRuntimeReferences(input.eventConfig.config.dealOrderRuntime);
     if (!references) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
@@ -47,9 +56,12 @@ export class DealOrderCreationPreparer {
     let deal: Record<string, unknown>;
     let rows: Record<string, unknown>[];
     try {
-      deal = await readBitrixDeal(input.bitrix24DealId);
-      rows = await readAllBitrixRows(input.bitrix24DealId);
-    } catch { return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' }; }
+      deal = await readBitrixDeal(input.bitrix24DealId, (work) => this.providerModeGate(work));
+      rows = await readAllBitrixRows(input.bitrix24DealId, (work) => this.providerModeGate(work));
+    } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
+      return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
+    }
 
     if (String(deal.ID ?? '') !== input.bitrix24DealId) return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
     const stageId = readString(deal.STAGE_ID);
@@ -84,11 +96,11 @@ export class DealOrderCreationPreparer {
     const employeeFallbackUsed = !!assignedBy && !references.employees.some((candidate) => candidate.bitrix24Id === assignedBy);
 
     const referencesVerified = await Promise.all([
-      verifyMySkladReference('organization', targetOrganizationId),
-      verifyMySkladReference('store', targetStoreId),
-      verifyMySkladReference('employee', targetEmployeeId),
-      verifyMySkladReference('currency', currency.moyskladId),
-      verifyMySkladReference('state', stage.moyskladId),
+      verifyMySkladReference('organization', targetOrganizationId, (work) => this.providerModeGate(work)),
+      verifyMySkladReference('store', targetStoreId, (work) => this.providerModeGate(work)),
+      verifyMySkladReference('employee', targetEmployeeId, (work) => this.providerModeGate(work)),
+      verifyMySkladReference('currency', currency.moyskladId, (work) => this.providerModeGate(work)),
+      verifyMySkladReference('state', stage.moyskladId, (work) => this.providerModeGate(work)),
     ]).catch(() => []);
     if (referencesVerified.length !== 5 || referencesVerified.some((isValid) => !isValid)) {
       return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
@@ -170,7 +182,13 @@ export class DealOrderCreationPreparer {
       const rowId = sourceRowId;
       const productId = readNumericId(row.productId);
       const measureCode = readNumber(row.measureCode);
-      const unit = measureCode === null ? null : units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
+      // Bitrix product rows expose MEASURE_CODE (catalog.measure.code), not
+      // catalog.measure.id. Resolve only a unique saved catalog-code mapping;
+      // duplicate codes or an ID-only match must remain unmapped.
+      const unitCandidates = measureCode === null ? [] : units.filter((candidate) => candidate.bitrix24Code === String(measureCode));
+      const unit = unitCandidates.length === 1 && unitCandidates[0]?.status === 'configured' && unitCandidates[0].moyskladId
+        ? unitCandidates[0]
+        : null;
       const quantity = readNumber(row.quantity);
       const priceCents = toMinorUnits(row.price);
       const discountTypeId = readNumber(row.discountTypeId);
@@ -196,17 +214,37 @@ export class DealOrderCreationPreparer {
       }
 
       let targetProductId: string | null = null;
+      try {
+        await ensureDocumentProductIdentity(this.database, {
+          bitrix24ProductId: productId, eventId: input.eventId,
+          bitrix24CatalogId: input.eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? input.eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
+        });
+      } catch (error) {
+        if (error instanceof DocumentProductIdentityError) return { status: 'WAITING', reason: error.reason };
+        throw error;
+      }
       const productPairs = await this.database.entityPair.findMany({
         where: { entityType: 'PRODUCT', bitrix24Id: productId, active: true },
         select: { moyskladId: true },
         take: 2,
       });
-      if (productPairs.length !== 1 || !isUuid(productPairs[0]?.moyskladId)) {
-        await skipRow(productPairs.length > 1 ? 'PRODUCT_PAIR_AMBIGUOUS' : 'PRODUCT_PAIR_MISSING');
-        continue;
-      }
-      targetProductId = productPairs[0].moyskladId;
-      const assortment = await readMoySkladAssortment(targetProductId);
+      if (productPairs.length === 1 && isUuid(productPairs[0]?.moyskladId)) targetProductId = productPairs[0].moyskladId;
+      else if (productPairs.length === 0) {
+        const alias = await this.database.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId }, select: { id: true, canonicalPairId: true } });
+        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true } }) : null;
+        if (!canonical || !isUuid(canonical.moyskladId)) { await skipRow('PRODUCT_PAIR_MISSING'); continue; }
+        targetProductId = canonical.moyskladId;
+        try {
+          await ensureDuplicateAliasDealComment(input.bitrix24DealId, alias!.id, productId, input.eventId, (work) => this.providerModeGate(work));
+        } catch {
+          await writeOperationalLog(this.database, 'ADMIN', JSON.stringify({
+            type: 'PRODUCT_DUPLICATE_ALIAS_TIMELINE_COMMENT_UNAVAILABLE', aliasId: alias!.id,
+            dealId: input.bitrix24DealId, duplicateBitrix24Id: productId, eventId: input.eventId,
+          }), input.eventId);
+        }
+        await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_DUPLICATE_ALIAS_USED_FOR_DOCUMENT_ROW', eventId: input.eventId, dealId: input.bitrix24DealId, sourceProductId: productId }), input.eventId);
+      } else { await skipRow('PRODUCT_PAIR_AMBIGUOUS'); continue; }
+      const assortment = await readMoySkladAssortment(targetProductId, (work) => this.providerModeGate(work));
       if (!assortment || assortment.uomId !== unit.moyskladId) { await skipRow('PRODUCT_UNIT_MISMATCH'); continue; }
 
       rowsPrepared.push({
@@ -240,7 +278,7 @@ export class DealOrderCreationPreparer {
       sourceRowValues,
       sourceMeasureCodes,
       skippedRows,
-      unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, moyskladId: unit.moyskladId, status: unit.status })),
+      unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, bitrix24Code: unit.bitrix24Code, moyskladId: unit.moyskladId, status: unit.status })),
       payload: {
         agent: { meta: { type: 'counterparty', href: msHref(msBase, `entity/counterparty/${agentCounterpartyId}`) } },
         organization: { meta: { type: 'organization', href: msHref(msBase, `entity/organization/${targetOrganizationId}`) } },
@@ -371,28 +409,60 @@ function isReadOnlyQ26PaidSumRule(rule: VersionedFieldSettingsDto['config']['rul
     !rule.bitrix24ToMoysklad.enabled && rule.moyskladToBitrix24.enabled && rule.moyskladToBitrix24.transform.kind === 'copy';
 }
 
-async function readBitrixDeal(id: string): Promise<Record<string, unknown>> {
+type ProviderModeGate = <T>(work: () => Promise<T>) => Promise<T>;
+
+async function readBitrixDeal(id: string, gate: ProviderModeGate): Promise<Record<string, unknown>> {
   const base = bitrixBase();
-  const response = await fetch(new URL('crm.deal.get.json', withSlash(base)), {
+  const response = await gate(() => fetch(new URL('crm.deal.get.json', withSlash(base)), {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ id }),
     redirect: 'error', signal: AbortSignal.timeout(10_000),
-  });
+  }));
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok || !isRecord(body) || body.error || !isRecord(body.result)) throw new Error('B24 deal read failed');
   return body.result;
 }
 
-async function readAllBitrixRows(id: string): Promise<Record<string, unknown>[]> {
+async function ensureDuplicateAliasDealComment(dealId: string, aliasId: string, duplicateProductId: string, eventId: string, gate: ProviderModeGate): Promise<void> {
+  const marker = `[product-duplicate-alias:${aliasId}]`;
+  const base = bitrixBase();
+  let complete = false;
+  for (let start = 0; start < 1000;) {
+    const read = await gate(() => fetch(new URL('crm.timeline.comment.list.json', withSlash(base)), {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ 'filter[ENTITY_ID]': dealId, 'filter[ENTITY_TYPE]': 'deal', select: 'ID,COMMENT', start: String(start) }),
+      redirect: 'error', signal: AbortSignal.timeout(10_000),
+    }));
+    const body: unknown = await read.json().catch(() => null);
+    if (!read.ok || !isRecord(body) || body.error || !Array.isArray(body.result)) throw new Error('B24 deal timeline read failed');
+    if (body.result.some((row) => isRecord(row) && typeof row.COMMENT === 'string' && row.COMMENT.includes(marker))) return;
+    const next = typeof body.next === 'number' ? body.next : null;
+    if (next === null) { complete = true; break; }
+    if (!Number.isInteger(next) || next <= start) throw new Error('B24 deal timeline pagination invalid');
+    start = next;
+  }
+  if (!complete) throw new Error('B24 deal timeline pagination incomplete');
+  assertApplyExternalWrite('BITRIX24', 'PRODUCT_DUPLICATE_ALIAS_TIMELINE_COMMENT');
+  const comment = `${marker} Product row ${duplicateProductId} resolves to the existing canonical product. No duplicate MySklad product was created. Reference event ${eventId}.`;
+  const added = await gate(() => fetch(new URL('crm.timeline.comment.add.json', withSlash(base)), {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ 'fields[ENTITY_ID]': dealId, 'fields[ENTITY_TYPE]': 'deal', 'fields[COMMENT]': comment }),
+    redirect: 'error', signal: AbortSignal.timeout(10_000),
+  }));
+  const addedBody: unknown = await added.json().catch(() => null);
+  if (!added.ok || !isRecord(addedBody) || addedBody.error || (typeof addedBody.result !== 'number' && typeof addedBody.result !== 'string')) throw new Error('B24 deal timeline comment write failed');
+}
+
+async function readAllBitrixRows(id: string, gate: ProviderModeGate): Promise<Record<string, unknown>[]> {
   const base = bitrixBase();
   const all: Record<string, unknown>[] = [];
   let start = 0;
   let total: number | null = null;
   while (total === null || start < total) {
     const params = new URLSearchParams({ 'filter[=ownerType]': 'D', 'filter[=ownerId]': id, start: String(start) });
-    const response = await fetch(new URL('crm.item.productrow.list', withSlash(base)), {
+    const response = await gate(() => fetch(new URL('crm.item.productrow.list', withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: params,
       redirect: 'error', signal: AbortSignal.timeout(10_000),
-    });
+    }));
     const body: unknown = await response.json().catch(() => null);
     if (!response.ok || !isRecord(body) || body.error || !isRecord(body.result) || !Array.isArray(body.result.productRows) || typeof body.total !== 'number') {
       throw new Error('B24 product rows read failed');
@@ -408,12 +478,12 @@ async function readAllBitrixRows(id: string): Promise<Record<string, unknown>[]>
   return all;
 }
 
-async function readMoySkladAssortment(id: string): Promise<{ type: 'product'; uomId: string; href: string } | null> {
+async function readMoySkladAssortment(id: string, gate: ProviderModeGate): Promise<{ type: 'product'; uomId: string; href: string } | null> {
   const base = moyskladBase();
   const url = new URL('entity/assortment', withSlash(base));
   url.searchParams.set('filter', `id=${id}`);
   url.searchParams.set('limit', '2');
-  const response = await fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) });
+  const response = await gate(() => fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) }));
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok || !isRecord(body) || !Array.isArray(body.rows) || body.rows.length !== 1 || !isRecord(body.rows[0])) throw new Error('MySklad assortment read failed');
   const row = body.rows[0];
@@ -423,15 +493,15 @@ async function readMoySkladAssortment(id: string): Promise<{ type: 'product'; uo
   return { type, uomId: row.uom.id, href };
 }
 
-async function verifyMySkladReference(type: 'organization' | 'store' | 'employee' | 'currency' | 'state', id: string): Promise<boolean> {
+async function verifyMySkladReference(type: 'organization' | 'store' | 'employee' | 'currency' | 'state', id: string, gate: ProviderModeGate): Promise<boolean> {
   if (!isUuid(id)) return false;
   const base = moyskladBase();
   const path = type === 'state'
     ? `entity/customerorder/metadata/states/${id}`
     : `entity/${type}/${id}`;
-  const response = await fetch(new URL(path, withSlash(base)), {
+  const response = await gate(() => fetch(new URL(path, withSlash(base)), {
     method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000),
-  });
+  }));
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok || !isRecord(body) || body.id !== id || !isRecord(body.meta)) return false;
   return type === 'state' ? body.meta.type === 'state' : body.meta.type === type;
@@ -484,4 +554,4 @@ function configuredBase(name: string, localHttpAllowed: boolean): URL {
 }
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
 function msHref(base: URL, path: string): string { return new URL(path, withSlash(base)).href; }
-function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error('MySklad read token unavailable'); return { authorization: `Bearer ${token}`, accept: 'application/json' }; }
+function msHeaders(): HeadersInit { const token = process.env.MOYSKLAD_API_TOKEN; if (!token) throw new Error('MySklad read token unavailable'); return { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' }; }

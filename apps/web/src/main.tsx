@@ -8,7 +8,10 @@ import { ClientMappingPage } from './client-mapping';
 
 type TrialAction = { id: string; message: string; createdAt: string };
 type ServiceMode = 'on' | 'pause' | 'off';
-type EntityControl = { key: string; label: string; ready: boolean; availability: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean };
+type EntityControl = { key: string; label: string; ready: boolean; implementation?: string; supportedDirections?: string[]; availability: string; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean };
+type PreflightFinding = { code: string; message: string; referenceId?: string };
+type EnablePreflightReport = { entityKey: string; direction: 'bitrix24ToMoysklad' | 'moyskladToBitrix24'; settingsVersion: number | null; canEnable: boolean; blockers: PreflightFinding[]; warnings: PreflightFinding[] };
+type DirectionConfirmation = { entity: EntityControl; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean; preflight?: EnablePreflightReport | null; preflightLoading?: boolean };
 type RecoveryStatus = { status: string; provider: string; bitrixStart: number; moyskladOffset: number; error: string | null };
 type DatabaseRecoveryStatus = { status: string; previousLaunchBoundary: string | null; pairsRestored: boolean; lostEventsAcknowledged: boolean; acknowledgedAt?: string | null; acknowledgement?: string | null; audit?: Array<{ action: string; actorId: string; oldBoundaryAt: string | null; boundaryAt: string; occurredAt: string; acknowledgement: string }> };
 type BitrixAuth = { access_token: string };
@@ -65,7 +68,7 @@ function App() {
   const [mode, setMode] = useState<ServiceMode>('off');
   const [entities, setEntities] = useState<EntityControl[]>([]);
   const [confirmMode, setConfirmMode] = useState<ServiceMode | null>(null);
-  const [confirmDirections, setConfirmDirections] = useState<{ entity: EntityControl; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } | null>(null);
+  const [confirmDirections, setConfirmDirections] = useState<DirectionConfirmation | null>(null);
   const [recovery, setRecovery] = useState<RecoveryStatus>({ status: 'idle', provider: 'BITRIX24', bitrixStart: 0, moyskladOffset: 0, error: null });
   const [databaseRecovery, setDatabaseRecovery] = useState<DatabaseRecoveryStatus>({ status: 'RECOVERY_REQUIRED', previousLaunchBoundary: null, pairsRestored: false, lostEventsAcknowledged: false });
 
@@ -239,8 +242,14 @@ function App() {
       denyAdminAccess();
       throw new Error('Доступ только для администратора Bitrix24');
     }
-    if (!response.ok) throw new Error('Не удалось сохранить направления обмена');
-    setEntities((current) => current.map((item) => item.key === entity.key ? { ...item, bitrix24ToMoysklad, moyskladToBitrix24 } : item));
+    if (!response.ok) {
+      const problem = await response.json().catch(() => null) as { message?: unknown; preflight?: EnablePreflightReport } | null;
+      const blockerText = problem?.preflight?.blockers.map((item) => item.message).join(' ');
+      const message = typeof problem?.message === 'string' ? problem.message : 'Не удалось сохранить направления обмена';
+      throw new Error(blockerText || message);
+    }
+    const refreshed = await fetch('/api/admin/sync-mode/entities', { headers: accessToken ? { authorization: `Bearer ${accessToken}` } : {} });
+    if (refreshed.ok) setEntities(await refreshed.json() as EntityControl[]);
   }
 
   async function resolveIncident(incidentId: string) {
@@ -513,37 +522,62 @@ function Settings({ accessToken, mode, entities, recovery, databaseRecovery, set
   confirmMode: ServiceMode | null;
   setConfirmMode: (mode: ServiceMode | null) => void;
   saveMode: (mode: ServiceMode) => Promise<void>;
-  confirmDirections: { entity: EntityControl; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } | null;
-  setConfirmDirections: (value: { entity: EntityControl; bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean } | null) => void;
+  confirmDirections: DirectionConfirmation | null;
+  setConfirmDirections: (value: DirectionConfirmation | null) => void;
   saveDirections: (entity: EntityControl, bitrix24ToMoysklad: boolean, moyskladToBitrix24: boolean) => Promise<void>;
   error: string;
   setError: (error: string) => void;
 }) {
+  async function requestDirectionChange(entity: EntityControl, direction: 'bitrix24ToMoysklad' | 'moyskladToBitrix24', enabled: boolean) {
+    const next = {
+      entity,
+      bitrix24ToMoysklad: direction === 'bitrix24ToMoysklad' ? enabled : entity.bitrix24ToMoysklad,
+      moyskladToBitrix24: direction === 'moyskladToBitrix24' ? enabled : entity.moyskladToBitrix24,
+      preflightLoading: enabled,
+      preflight: null,
+    };
+    setConfirmDirections(next);
+    if (!enabled) return;
+    const headers: Record<string, string> = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
+    try {
+      const response = await fetch(`/api/admin/sync-mode/entities/${encodeURIComponent(entity.key)}/preflight?direction=${direction}`, { headers });
+      if (response.status === 403) throw new Error('Доступ только для администратора Bitrix24');
+      const report = await response.json() as EnablePreflightReport & { message?: string };
+      if (!response.ok) throw new Error(report.message ?? 'Не удалось проверить готовность направления');
+      setConfirmDirections({ ...next, preflightLoading: false, preflight: report });
+    } catch (cause) {
+      setConfirmDirections({ ...next, preflightLoading: false, preflight: { entityKey: entity.key, direction, settingsVersion: null, canEnable: false, blockers: [{ code: 'PREFLIGHT_UNAVAILABLE', message: cause instanceof Error ? cause.message : 'Не удалось выполнить проверку готовности.' }], warnings: [] } });
+    }
+  }
+
   return <>
     <PageHeading eyebrow="КОНФИГУРАЦИЯ" title="Настройки сущностей и направлений" subtitle="Состояние сервиса и доступные направления для каждой сущности." />
     <section className="panel settings-panel" aria-label="Настройки обмена">
       <div className="panel-heading"><div><p className="eyebrow">ОБЩЕЕ СОСТОЯНИЕ</p><h3>Режим сервиса</h3></div><span className={`mode-chip mode-${mode}`}>{mode === 'on' ? 'Включён' : mode === 'pause' ? 'Пауза' : 'Выключен'}</span></div>
       {recovery.status !== 'idle' && <p className="recovery-line" role="status">Поиск изменений: <strong>{recovery.status}</strong>{recovery.error ? ` · ${recovery.error}` : ''}</p>}
-      <p className="panel-description">Изменение режима требует подтверждения. Переключатели сущностей доступны только для уже настроенных направлений.</p>
+      <p className="panel-description">Включение режима не включает направления и не устанавливает границу рабочего запуска. Каждое направление включается отдельно после проверки настроек и доступа API.</p>
       <div className="mode-buttons">
         {(['on', 'pause', 'off'] as const).map((nextMode) => <button key={nextMode} type="button" aria-label={`Выбрать режим ${nextMode}`} aria-pressed={mode === nextMode} disabled={mode === nextMode} onClick={() => setConfirmMode(nextMode)}>{nextMode === 'on' ? 'Включить' : nextMode === 'pause' ? 'Пауза' : 'Выключить'}</button>)}
       </div>
       {confirmMode && <div role="alertdialog" aria-labelledby="mode-warning-title" aria-describedby="mode-warning-text" className="confirm-box">
         <h4 id="mode-warning-title">Подтвердите изменение режима</h4>
-        <p id="mode-warning-text">{confirmMode === 'on' ? 'Включение разрешит обработку событий и обмен согласно доступным направлениям.' : confirmMode === 'pause' ? 'Пауза остановит обработку; принятые события будут сохранены до возобновления.' : 'Выключение остановит приём событий; после возобновления будет выполнен поиск изменений с сохранённого курсора.'}</p>
+        <p id="mode-warning-text">{confirmMode === 'on' ? 'Включение разрешит обработку только для уже включённых и прошедших preflight направлений. Граница рабочего запуска подтверждается отдельным действием.' : confirmMode === 'pause' ? 'Пауза остановит обработку; принятые события останутся в очереди до возобновления. Граница запуска не изменится.' : 'Выключение остановит приём событий. Пропущенные в период OFF события не будут переигрываться; сохранённые события останутся в очереди.'}</p>
         <button type="button" onClick={() => void saveMode(confirmMode).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Подтвердить</button>
         <button type="button" className="button-secondary" onClick={() => setConfirmMode(null)}>Отмена</button>
       </div>}
       <div className="entity-settings">{entities.map((entity) => <article key={entity.key} className="entity-row">
-        <div className="entity-row-heading"><h4>{entity.label}</h4><span className={entity.ready ? 'entity-state is-configured' : 'entity-state'}>{entity.ready ? 'Настроено частично' : 'Недоступно'}</span></div>
+        <div className="entity-row-heading"><h4>{entity.label}</h4><span className={entity.ready ? 'entity-state is-configured' : 'entity-state'}>{entity.implementation === 'implemented' ? 'Реализовано · preflight перед включением' : entity.ready ? 'Реализовано частично' : 'Недоступно'}</span></div>
         <p>{entity.availability}</p>
-        <label><input type="checkbox" checked={entity.ready && entity.bitrix24ToMoysklad} disabled={!entity.ready} onChange={(event) => setConfirmDirections({ entity, bitrix24ToMoysklad: event.target.checked, moyskladToBitrix24: entity.moyskladToBitrix24 })} /> Bitrix24 → МойСклад</label>
-        <label><input type="checkbox" checked={entity.ready && entity.moyskladToBitrix24} disabled={!entity.ready} onChange={(event) => setConfirmDirections({ entity, bitrix24ToMoysklad: entity.bitrix24ToMoysklad, moyskladToBitrix24: event.target.checked })} /> МойСклад → Bitrix24</label>
+        <label><input type="checkbox" checked={entity.ready && entity.bitrix24ToMoysklad} disabled={!entity.ready || !entity.supportedDirections?.includes('bitrix24ToMoysklad')} onChange={(event) => void requestDirectionChange(entity, 'bitrix24ToMoysklad', event.target.checked)} /> Bitrix24 → МойСклад</label>
+        <label><input type="checkbox" checked={entity.ready && entity.moyskladToBitrix24} disabled={!entity.ready || !entity.supportedDirections?.includes('moyskladToBitrix24')} onChange={(event) => void requestDirectionChange(entity, 'moyskladToBitrix24', event.target.checked)} /> МойСклад → Bitrix24</label>
       </article>)}</div>
       {confirmDirections && <div role="alertdialog" aria-label="Подтвердите изменение направления" className="confirm-box">
         <h4>Подтвердите изменение направления</h4>
-        <p>Изменение направления повлияет на обработку новых событий для этой сущности.</p>
-        <button type="button" onClick={() => void saveDirections(confirmDirections.entity, confirmDirections.bitrix24ToMoysklad, confirmDirections.moyskladToBitrix24).then(() => setConfirmDirections(null)).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Подтвердить</button>
+        <p>Проверка использует только выбранную сущность и направление. Настройки версии: {confirmDirections.preflight?.settingsVersion ?? 'не определена'}. Секреты в отчёт не включаются.</p>
+        {confirmDirections.preflightLoading && <p role="status">Проверяем API и настройки…</p>}
+        {confirmDirections.preflight?.blockers.map((item, index) => <p key={`blocker-${index}`} className="inline-error" role="alert">Блокирует включение: {item.message}{item.referenceId ? ` · ${item.referenceId}` : ''}</p>)}
+        {confirmDirections.preflight?.warnings.map((item, index) => <p key={`warning-${index}`} className="pair-safety-note" role="status">Предупреждение: {item.message}</p>)}
+        <button type="button" disabled={Boolean(confirmDirections.preflightLoading || (confirmDirections.preflight && !confirmDirections.preflight.canEnable))} onClick={() => void saveDirections(confirmDirections.entity, confirmDirections.bitrix24ToMoysklad, confirmDirections.moyskladToBitrix24).then(() => setConfirmDirections(null)).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))}>Подтвердить</button>
         <button type="button" className="button-secondary" onClick={() => setConfirmDirections(null)}>Отмена</button>
       </div>}
       {error && <p role="alert" className="inline-error">{error}</p>}
@@ -628,11 +662,12 @@ function UnavailablePage({ title, eyebrow, description, action, badge = 'Пок�
   </>;
 }
 
-type PairEntityType = 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT';
+type PairEntityType = 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT' | 'INVOICE';
 const pairEntityTypes: { id: PairEntityType; label: string }[] = [
   { id: 'CONTACT', label: 'Контакт' },
   { id: 'COMPANY', label: 'Компания' },
   { id: 'DEAL', label: 'Сделка / заказ покупателя' },
+  { id: 'INVOICE', label: 'Смарт-счёт / счёт покупателю' },
   { id: 'PRODUCT', label: 'Товар / модификация' },
 ];
 const pairReviewReasonLabels: Record<string, string> = {
@@ -646,10 +681,10 @@ const pairReviewReasonLabels: Record<string, string> = {
 };
 type PairRow = { id: string; entityType: PairEntityType; bitrix24Id: string; moyskladId: string; bitrix24Label?: string | null; moyskladLabel?: string | null; labelStatus?: string; moyskladType: string | null; moyskladParentId: string | null; source: string; reason: string | null; createdAt: string };
 type PairReviewRow = { id: string; entityType: PairEntityType; sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceEntityId: string; sourceLabel?: string | null; labelStatus?: string; eventId: string | null; reason: string; openedAt: string };
-type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT';
+type LifecycleEntityType = 'COMPANY' | 'CONTACT' | 'DEAL' | 'PRODUCT' | 'INVOICE';
 type LifecycleMarkerFields = Partial<Record<LifecycleEntityType, string>>;
 type ClientLifecycleRow = { id: string; entityType: LifecycleEntityType; bitrix24Id: string; moyskladId: string; moyskladType: string | null; moyskladParentId: string | null; lifecycleStatus: string; tombstonedAt: string | null; tombstoneSource: string | null; tombstoneReason: string | null; deletionMarkerStatus: string; deletionTimelineStatus: string };
-const lifecycleEntityLabels: Record<LifecycleEntityType, string> = { COMPANY: 'Компания', CONTACT: 'Контакт', DEAL: 'Сделка', PRODUCT: 'Товар' };
+const lifecycleEntityLabels: Record<LifecycleEntityType, string> = { COMPANY: 'Компания', CONTACT: 'Контакт', DEAL: 'Сделка', PRODUCT: 'Товар', INVOICE: 'Счёт' };
 const lifecycleMarkerStatusLabels: Record<string, string> = {
   NOT_REQUIRED: 'Метка не требуется для этого типа записи', PENDING: 'Ожидает записи метки', WRITING: 'Метка записывается',
   MARKED: 'Метка удаления записана', NOT_CONFIGURED: 'Поле метки не настроено', FAILED: 'Не удалось записать метку',
@@ -715,7 +750,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       .finally(() => setLoading(false));
   }, []);
 
-  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) {
+  async function assign(input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) {
     setSaving(true);
     try {
       const response = await fetch('/api/admin/pairs', {
@@ -788,7 +823,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
       <p className="pair-safety-note">Удалённая запись не считается несопоставленной и не удаляет запись партнёра. Восстановление проверяет, что обе исходные записи по тем же ID всё ещё существуют.</p>
       <form className="manual-pair-form" onSubmit={(event) => void saveMarkerFields(event)} aria-label="Поля меток удаления">
         <div className="records-head"><div><h4>Поля меток удаления</h4><p className="panel-description">Точные коды пользовательских полей Bitrix24. Код должен быть настроен на сервере; догадки не применяются.</p></div></div>
-        {markerFieldsAvailable && (['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT'] as const).map((entityType) => <label key={entityType}>{lifecycleEntityLabels[entityType]} · код UF-поля<input maxLength={100} value={markerFields[entityType] ?? ''} onChange={(change) => setMarkerFields((current) => ({ ...current, [entityType]: change.target.value }))} placeholder="UF_CRM_…" /></label>)}
+        {markerFieldsAvailable && (['COMPANY', 'CONTACT', 'DEAL', 'PRODUCT', 'INVOICE'] as const).map((entityType) => <label key={entityType}>{lifecycleEntityLabels[entityType]} · код UF-поля<input maxLength={100} value={markerFields[entityType] ?? ''} onChange={(change) => setMarkerFields((current) => ({ ...current, [entityType]: change.target.value }))} placeholder="UF_CRM_…" /></label>)}
         {markerFieldsError && <p role="alert" className="inline-error">{markerFieldsError}</p>}
         {markerFieldsNotice && <p role="status" className="pair-safety-note">{markerFieldsNotice}</p>}
         {markerFieldsAvailable && <button type="submit" disabled={saving}>Сохранить настройки меток</button>}
@@ -814,7 +849,7 @@ function PairManager({ accessToken, onError, onForbidden }: { accessToken: strin
   </>;
 }
 
-function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: PairReviewRow; saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: PairReviewRow; saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [bitrix24Id, setBitrix24Id] = useState(review.sourceSystem === 'BITRIX24' ? review.sourceEntityId : '');
   const [moyskladId, setMoyskladId] = useState(review.sourceSystem === 'MOYSKLAD' ? review.sourceEntityId : '');
   const [moyskladType, setMoyskladType] = useState<'counterparty' | 'contactperson'>('counterparty');
@@ -850,7 +885,7 @@ function PairReviewForm({ review, saving, existingPairs, onAssign }: { review: P
   </article>;
 }
 
-function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
+function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; existingPairs: PairRow[]; onAssign: (input: { entityType: PairEntityType; bitrix24Id: string; moyskladId: string; moyskladType?: 'counterparty' | 'contactperson' | 'invoiceout'; moyskladParentId?: string; replaceExisting: boolean }) => Promise<void> }) {
   const [entityType, setEntityType] = useState<PairEntityType>('DEAL');
   const [bitrix24Id, setBitrix24Id] = useState('');
   const [moyskladId, setMoyskladId] = useState('');
@@ -865,7 +900,7 @@ function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; 
     event.preventDefault();
     setLocalError('');
     try {
-      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : {}), replaceExisting });
+      await onAssign({ entityType, bitrix24Id: bitrix24Id.trim(), moyskladId: moyskladId.trim(), ...(entityType === 'CONTACT' ? { moyskladType, ...(moyskladType === 'contactperson' ? { moyskladParentId: moyskladParentId.trim() } : {}) } : entityType === 'COMPANY' ? { moyskladType: 'counterparty' as const } : entityType === 'INVOICE' ? { moyskladType: 'invoiceout' as const, ...(moyskladParentId ? { moyskladParentId: moyskladParentId.trim() } : {}) } : {}), replaceExisting });
       setBitrix24Id('');
       setMoyskladId('');
       setReplaceExisting(false);
@@ -880,6 +915,7 @@ function ManualPairForm({ saving, existingPairs, onAssign }: { saving: boolean; 
     <label>Bitrix24 · ID записи<input required maxLength={200} value={bitrix24Id} onChange={(event) => setBitrix24Id(event.target.value)} /></label>
     <label>МойСклад · ID записи<input required maxLength={200} value={moyskladId} onChange={(event) => setMoyskladId(event.target.value)} /></label>
       {entityType === 'CONTACT' && <MoyskladContactTypeFields moyskladType={moyskladType} setMoyskladType={setMoyskladType} moyskladParentId={moyskladParentId} setMoyskladParentId={setMoyskladParentId} />}
+    {entityType === 'INVOICE' && <label>Связанный заказ МойСклад · ID<input maxLength={200} value={moyskladParentId} onChange={(event) => setMoyskladParentId(event.target.value)} /><small>Необязательно; при обработке связь всё равно проверяется через документ счёта.</small></label>}
     {replaceExisting && conflicts.length > 0 && <p className="pair-safety-note" role="status">Будет заменена активная связь: {conflicts.map((pair) => `${pair.bitrix24Label ?? 'Название не загружено'} (${pair.bitrix24Id}) ↔ ${pair.moyskladLabel ?? 'Название не загружено'} (${pair.moyskladId})`).join('; ')} → {bitrix24Id.trim()} ↔ {moyskladId.trim()}. События не переигрываются автоматически; новая пара применяется при следующем событии.</p>}
     <label className="pair-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />Я проверил, что это одна и та же запись в обеих системах.</label>
     <label className="pair-check"><input type="checkbox" checked={replaceExisting} onChange={(event) => setReplaceExisting(event.target.checked)} />Подтверждаю замену показанной активной пары (если она есть).</label>

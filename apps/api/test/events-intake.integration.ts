@@ -31,6 +31,7 @@ let upsertCalls = 0;
 let failNextWrite = false;
 const queuedContactEventIds: string[] = [];
 let intakeMode: 'on' | 'pause' | 'off' = 'on';
+const disabledDirections = new Set<string>();
 const resolvedPairInputs: PairResolutionInput[] = [];
 let pairResolution: PairResolutionResult = { status: 'manual_review', reason: 'NO_APPROVED_MATCH_KEY', entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: 'fixture', reviewCaseId: 'review-test' };
 const inboundEvent = {
@@ -81,7 +82,7 @@ const fakeDatabase: {
   $queryRaw: (strings?: TemplateStringsArray) => Promise<Array<{ serviceMode: string }>>;
   $transaction: <T>(operation: (transaction: unknown) => Promise<T>) => Promise<T>;
   syncSetting: { upsert: () => Promise<{ serviceMode: string }> };
-  syncDirectionSetting: { findUnique: () => Promise<{ bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean }> };
+  syncDirectionSetting: { findUnique: (args: { where: { entityKey: string } }) => Promise<{ bitrix24ToMoysklad: boolean; moyskladToBitrix24: boolean }> };
 } = {
   inboundEvent,
   entityPair: { findFirst: async () => null },
@@ -90,7 +91,10 @@ const fakeDatabase: {
     : [],
   $transaction: async <T>(operation: (transaction: unknown) => Promise<T>) => operation(fakeDatabase as unknown),
   syncSetting: { upsert: async () => ({ serviceMode: intakeMode }) },
-  syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+  syncDirectionSetting: { findUnique: async ({ where }) => ({
+    bitrix24ToMoysklad: !disabledDirections.has(`${where.entityKey}:bitrix24ToMoysklad`),
+    moyskladToBitrix24: !disabledDirections.has(`${where.entityKey}:moyskladToBitrix24`),
+  }) },
 };
 
 @Module({
@@ -506,6 +510,168 @@ test('dry deal and customer-order webhook matrix accepts create, update, and del
   assert.ok([...rows.values()].every((row) => !JSON.stringify(row.payload).includes('bitrix-test-application-token')));
   assert.deepEqual(queuedContactEventIds, []);
   process.env.SYNC_MODE = 'apply';
+});
+
+test('intake routes invoice events and terminally skips disabled entity directions', async () => {
+  rows.clear();
+  disabledDirections.clear();
+
+  const accepted = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMDYNAMICITEMADD',
+      data: { FIELDS: { ID: 'invoice-8101', ENTITY_TYPE_ID: 31 } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(accepted.status, 200);
+  const { eventId: acceptedEventId } = await accepted.json() as { eventId: string };
+  const acceptedEvent = [...rows.values()].find((row) => row.id === acceptedEventId)!;
+  assert.equal(acceptedEvent.externalEntityType, 'invoice');
+  assert.equal(acceptedEvent.externalEntityId, 'invoice-8101');
+  assert.equal((acceptedEvent.payload as Record<string, unknown>).auth, undefined);
+
+  const deletedInvoice = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMDYNAMICITEMDELETE', data: { FIELDS: { ID: 'invoice-8103', ENTITY_TYPE_ID: '31' } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(deletedInvoice.status, 200);
+  const { eventId: deletedInvoiceEventId } = await deletedInvoice.json() as { eventId: string };
+  assert.equal([...rows.values()].find((row) => row.id === deletedInvoiceEventId)?.externalEntityType, 'invoice');
+
+  const nonInvoice = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMDYNAMICITEMUPDATE', data: { FIELDS: { ID: 'dynamic-5', ENTITY_TYPE_ID: 5 } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(nonInvoice.status, 200);
+  const { eventId: nonInvoiceEventId } = await nonInvoice.json() as { eventId: string };
+  assert.equal([...rows.values()].find((row) => row.id === nonInvoiceEventId)?.externalEntityType, null);
+
+  disabledDirections.add('invoices:bitrix24ToMoysklad');
+  const disabledBitrix = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'ONCRMDYNAMICITEMUPDATE', data: { FIELDS: { ID: 'invoice-8102', ENTITY_TYPE_ID: 31 } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(disabledBitrix.status, 200);
+  const { eventId: disabledBitrixEventId } = await disabledBitrix.json() as { eventId: string };
+  const skippedBitrix = [...rows.values()].find((row) => row.id === disabledBitrixEventId)!;
+  assert.equal(skippedBitrix.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(skippedBitrix.lastErrorCategory, 'DIRECTION_DISABLED');
+
+  const moyskladInvoiceBatch = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=invoiceout-actions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: ['CREATE', 'UPDATE', 'DELETE'].map((action, index) => ({
+      meta: { type: 'invoiceout', href: `https://online.moysklad.ru/api/remap/1.2/entity/invoiceout/${index + 1}` },
+      action,
+    })) }),
+  });
+  assert.equal(moyskladInvoiceBatch.status, 200);
+  const { eventIds: moyskladInvoiceEventIds } = await moyskladInvoiceBatch.json() as { eventIds: string[] };
+  assert.deepEqual(moyskladInvoiceEventIds.map((id) => {
+    const event = [...rows.values()].find((row) => row.id === id)!;
+    return [event.eventType, event.externalEntityType];
+  }), [['CREATE', 'invoiceout'], ['UPDATE', 'invoiceout'], ['DELETE', 'invoiceout']]);
+
+  disabledDirections.add('invoices:moyskladToBitrix24');
+  const disabledMoysklad = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=invoice-out-disabled`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'invoiceout', href: 'https://online.moysklad.ru/api/remap/1.2/entity/invoiceout/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      action: 'UPDATE',
+    }] }),
+  });
+  assert.equal(disabledMoysklad.status, 200);
+  const { eventId: disabledMoyskladEventId } = await disabledMoysklad.json() as { eventId: string };
+  const skippedMoysklad = [...rows.values()].find((row) => row.id === disabledMoyskladEventId)!;
+  assert.equal(skippedMoysklad.externalEntityType, 'invoiceout');
+  assert.equal(skippedMoysklad.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(skippedMoysklad.lastErrorCategory, 'DIRECTION_DISABLED');
+
+  disabledDirections.add('deals-orders:moyskladToBitrix24');
+  const disabledOrder = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=disabled-order-direction`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'customerorder', href: 'https://online.moysklad.ru/api/remap/1.2/entity/customerorder/order-991' },
+      action: 'CREATE',
+    }] }),
+  });
+  assert.equal(disabledOrder.status, 200);
+  const { eventId: disabledOrderEventId } = await disabledOrder.json() as { eventId: string };
+  assert.equal([...rows.values()].find((row) => row.id === disabledOrderEventId)?.status, 'SKIPPED_DIRECTION_DISABLED');
+
+  disabledDirections.add('contacts-companies:moyskladToBitrix24');
+  const disabledClientDelete = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=disabled-client-delete`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'counterparty', href: 'https://online.moysklad.ru/api/remap/1.2/entity/counterparty/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+      action: 'DELETE',
+    }] }),
+  });
+  assert.equal(disabledClientDelete.status, 200);
+  const { eventId: disabledClientDeleteEventId } = await disabledClientDelete.json() as { eventId: string };
+  assert.equal([...rows.values()].find((row) => row.id === disabledClientDeleteEventId)?.status, 'SKIPPED_DIRECTION_DISABLED');
+
+  const unsupportedBitrixProduct = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 900 } },
+      auth: { application_token: 'bitrix-test-application-token' },
+    }),
+  });
+  assert.equal(unsupportedBitrixProduct.status, 200);
+  const { eventId: unsupportedProductEventId } = await unsupportedBitrixProduct.json() as { eventId: string };
+  const skippedProduct = [...rows.values()].find((row) => row.id === unsupportedProductEventId)!;
+  assert.equal(skippedProduct.externalEntityType, 'product');
+  assert.equal(skippedProduct.status, 'RECEIVED');
+  assert.equal(skippedProduct.lastErrorCategory, null);
+
+  disabledDirections.clear();
+});
+
+test('legacy product webhook is retained as a safe catalog signal and auth is not persisted', async () => {
+  rows.clear();
+  disabledDirections.add('products-variations:bitrix24ToMoysklad');
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'event=ONCRMPRODUCTUPDATE&auth%5Bapplication_token%5D=bitrix-test-application-token&data%5BFIELDS%5D%5BID%5D=9102',
+  });
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  const event = [...rows.values()].find((row) => row.id === eventId)!;
+  assert.equal(event.eventType, 'ONCRMPRODUCTUPDATE');
+  assert.equal(event.externalEntityType, 'product');
+  assert.equal(event.externalEntityId, '9102');
+  assert.equal(event.status, 'RECEIVED');
+  assert.equal((event.payload as Record<string, unknown>).auth, undefined);
+});
+
+test('MoySklad service events obey the products direction gate', async () => {
+  rows.clear();
+  disabledDirections.add('products-variations:moyskladToBitrix24');
+  const response = await fetch(`${apiUrl}/webhooks/moysklad/moysklad-test-path-secret?requestId=service-direction`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      meta: { type: 'service', href: 'https://online.moysklad.ru/api/remap/1.2/entity/service/service-42' },
+      action: 'CREATE',
+    }] }),
+  });
+  assert.equal(response.status, 200);
+  const { eventId } = await response.json() as { eventId: string };
+  const event = [...rows.values()].find((row) => row.id === eventId)!;
+  assert.equal(event.externalEntityType, 'service');
+  assert.equal(event.externalEntityId, 'service-42');
+  assert.equal(event.status, 'SKIPPED_DIRECTION_DISABLED');
+  assert.equal(event.lastErrorCategory, 'DIRECTION_DISABLED');
+  disabledDirections.clear();
 });
 
 test('first-event intake recognizes persisted confirmed identity without conflating baseline readiness', async () => {

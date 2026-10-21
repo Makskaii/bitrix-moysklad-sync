@@ -26,9 +26,20 @@ import { EventIntakeDisabledError, FieldSettingsService } from './field-settings
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
 import { EventDispatcherService } from './event-dispatcher.service';
 import { DatabaseRecoveryService } from './database-recovery.service';
+import { ControlledLiveTestAdmissionService } from './controlled-live-test-admission.service';
 
 type EventPayload = Record<string, unknown>;
 type InboundSource = 'BITRIX24' | 'MOYSKLAD';
+type Bitrix24IntakeAcknowledgement = { accepted: boolean; eventId?: string; reason?: string };
+type MoySkladIntakeAcknowledgement = {
+  accepted: boolean;
+  eventId?: string;
+  eventIds: string[];
+  contactEventIds: string[];
+  pairEventIds: string[];
+  rejectedCount?: number;
+  reason?: string;
+};
 const webhookLogger = new Logger('WebhookIntake');
 
 @Injectable()
@@ -39,9 +50,10 @@ export class EventIntakeService {
     @Optional() @Inject(WebhookDiagnosticLog) private readonly diagnostics?: WebhookDiagnosticLog,
     @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
     @Optional() @Inject(DatabaseRecoveryService) private readonly databaseRecovery?: DatabaseRecoveryService,
+    @Optional() @Inject(ControlledLiveTestAdmissionService) private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
   ) {}
 
-  async receiveBitrix24(payload: EventPayload) {
+  async receiveBitrix24(payload: EventPayload): Promise<Bitrix24IntakeAcknowledgement> {
     const expectedToken = process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
     if (!expectedToken) {
       throw new ServiceUnavailableException('Bitrix24 event authentication is not configured');
@@ -70,15 +82,23 @@ export class EventIntakeService {
     const data = isRecord(safePayload.data) ? safePayload.data : {};
     const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
     const eventType = typeof safePayload.event === 'string' ? safePayload.event : null;
-    const directionDisabled = eventType?.startsWith('ONCRMCONTACT') === true &&
-      !await this.syncMode.isDirectionEnabled('contacts-companies', 'bitrix24ToMoysklad');
-
+    const externalEntityType = bitrixEntityType(eventType, safePayload);
     const event = {
       eventType,
       externalEntityId: readString(fields.ID) ?? readString(data.ID),
-      externalEntityType: bitrixEntityType(eventType),
+      externalEntityType,
       payload: safePayload,
     };
+    if (!this.isControlledIngressAllowed('BITRIX24', event)) {
+      return { accepted: false, reason: 'controlled_scope_rejected' };
+    }
+    const direction = getEventDirection('BITRIX24', eventType, externalEntityType);
+    const productSignal = externalEntityType === 'product' && isProductCatalogSignal(eventType);
+    const directionDisabled = (!productSignal && direction === 'products-variations:bitrix24ToMoysklad') ||
+      (direction !== null && !productSignal && !await this.syncMode.isDirectionEnabled(
+        direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
+      ));
+
     // Bitrix's webhook body has no documented stable delivery ID. A payload hash
     // would collapse two legitimate identical updates, so preserve each arrival.
     return this.save('BITRIX24', `delivery:${randomUUID()}`, event, directionDisabled);
@@ -89,7 +109,7 @@ export class EventIntakeService {
     requestId: unknown,
     payload: EventPayload | undefined,
     query: Record<string, unknown>,
-  ) {
+  ): Promise<MoySkladIntakeAcknowledgement> {
     const expectedSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
     if (!expectedSecret) {
       throw new ServiceUnavailableException('MoySklad webhook authentication is not configured');
@@ -115,19 +135,39 @@ export class EventIntakeService {
 
     await this.ensureIntakeEnabled();
     if (requestId !== undefined && (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 200)) {
+      if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        return { accepted: false, eventIds: [], contactEventIds: [], pairEventIds: [], rejectedCount: 1, reason: 'controlled_scope_rejected' };
+      }
       throw new BadRequestException('MoySklad requestId must be a non-empty string when provided');
     }
 
     const safePayload = payload ?? {};
-    if (Array.isArray(safePayload.events) &&
+    const controlled = process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled';
+    if (!controlled && Array.isArray(safePayload.events) &&
       (safePayload.events.length === 0 || safePayload.events.some((event) => !isRecord(event)))) {
       throw new BadRequestException('MoySklad events must be a non-empty array of event objects');
     }
-    const events = readMoySkladEvents(safePayload, query);
+    const indexedEvents = controlled && Array.isArray(safePayload.events)
+      ? safePayload.events.map((item, index) => {
+        const parsed = isRecord(item) ? readMoySkladEvents({ events: [item] }, query)[0] : undefined;
+        return {
+          index,
+          event: parsed ?? { eventType: null, externalEntityId: null, externalEntityType: null, payload: {} },
+        };
+      })
+      : readMoySkladEvents(safePayload, query).map((event, index) => ({ event, index }));
+    const emptyBatchRejection = controlled && Array.isArray(safePayload.events) && safePayload.events.length === 0 ? 1 : 0;
+    const selectedEvents = controlled
+      ? indexedEvents.filter(({ event }) => this.isControlledIngressAllowed('MOYSKLAD', event))
+      : indexedEvents;
+    const rejectedCount = indexedEvents.length - selectedEvents.length + emptyBatchRejection;
+    if (controlled && selectedEvents.length === 0) {
+      return { accepted: false, eventIds: [], contactEventIds: [], pairEventIds: [], rejectedCount, reason: 'controlled_scope_rejected' };
+    }
     const eventIds: string[] = [];
     const contactEventIds: string[] = [];
     const pairEventIds: string[] = [];
-    for (const [index, event] of events.entries()) {
+    for (const { index, event } of selectedEvents) {
       const payload = { ...safePayload, ...(Array.isArray(safePayload.events) ? { events: [event.payload] } : {}) };
       const queueEvent = {
         eventType: event.eventType,
@@ -141,8 +181,10 @@ export class EventIntakeService {
         // No stable key means at-least-once intake: retain every arrival rather
         // than risk dropping a later real change with an identical envelope.
         : `delivery:${randomUUID()}`;
-      const directionDisabled = event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty' &&
-        !await this.syncMode.isDirectionEnabled('contacts-companies', 'moyskladToBitrix24');
+      const direction = getEventDirection('MOYSKLAD', event.eventType, event.externalEntityType);
+      const directionDisabled = direction !== null && !await this.syncMode.isDirectionEnabled(
+        direction.split(':')[0], direction.split(':')[1] as 'bitrix24ToMoysklad' | 'moyskladToBitrix24',
+      );
       const acknowledgement = await this.save('MOYSKLAD', deliveryKey, queueEvent, directionDisabled);
       eventIds.push(acknowledgement.eventId);
       if (event.eventType === 'UPDATE' && event.externalEntityType === 'counterparty') {
@@ -152,7 +194,9 @@ export class EventIntakeService {
         pairEventIds.push(acknowledgement.eventId);
       }
     }
-    return { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds };
+    return controlled
+      ? { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds, rejectedCount }
+      : { accepted: true, eventId: eventIds[0], eventIds, contactEventIds, pairEventIds };
   }
 
   private async ensureIntakeEnabled() {
@@ -166,6 +210,21 @@ export class EventIntakeService {
     if ((await this.syncMode.read()).mode === 'off') {
       throw new GoneException('Event intake is disabled');
     }
+  }
+
+  private isControlledIngressAllowed(sourceSystem: InboundSource, event: {
+    eventType: string | null;
+    externalEntityId: string | null;
+    externalEntityType: string | null;
+  }): boolean {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
+    if (!this.controlledAdmission) throw new ServiceUnavailableException('Controlled live ingress policy is not configured');
+    return this.controlledAdmission.allowsIncomingEvent({
+      sourceSystem,
+      eventType: event.eventType,
+      externalEntityType: event.externalEntityType,
+      sourceNativeId: event.externalEntityId,
+    });
   }
 
   private async save(
@@ -257,13 +316,14 @@ export class EventsController {
   ) {
     if (!isRecord(payload)) throw new UnauthorizedException();
     const acknowledgement = await this.intake.receiveBitrix24(payload);
-    if (this.dispatcher) {
-      response.once('finish', () => { void this.dispatcher!.dispatch(acknowledgement.eventId).catch(() => undefined); });
-    } else if (isContactBitrixEvent(readString(payload.event))) {
-      response.once('finish', () => this.contactSync?.enqueue(acknowledgement.eventId));
+    const eventId = acknowledgement.eventId;
+    if (acknowledgement.accepted && eventId && this.dispatcher) {
+      response.once('finish', () => { void this.dispatcher!.dispatch(eventId).catch(() => undefined); });
+    } else if (acknowledgement.accepted && eventId && isContactBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.contactSync?.enqueue(eventId));
     }
-    if (!this.dispatcher && isDealBitrixEvent(readString(payload.event))) {
-      response.once('finish', () => this.pairFirstEvent?.enqueue(acknowledgement.eventId));
+    if (acknowledgement.accepted && eventId && !this.dispatcher && isDealBitrixEvent(readString(payload.event))) {
+      response.once('finish', () => this.pairFirstEvent?.enqueue(eventId));
     }
     return acknowledgement;
   }
@@ -277,16 +337,16 @@ export class EventsController {
     @Body() payload: EventPayload | undefined,
     @Res({ passthrough: true }) response: { once(event: 'finish', listener: () => void): unknown },
   ) {
-    if (payload !== undefined && !isRecord(payload)) throw new UnauthorizedException();
+    if (payload !== undefined && !isRecord(payload) && process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') throw new UnauthorizedException();
     return this.intake.receiveMoySklad(secret, requestId, payload, query).then((acknowledgement) => {
-      if (this.dispatcher) {
+      if (acknowledgement.accepted && this.dispatcher) {
         response.once('finish', () => acknowledgement.eventIds.forEach((eventId) => {
           void this.dispatcher!.dispatch(eventId).catch(() => undefined);
         }));
-      } else if (acknowledgement.contactEventIds.length > 0) {
+      } else if (acknowledgement.accepted && acknowledgement.contactEventIds.length > 0) {
         response.once('finish', () => acknowledgement.contactEventIds.forEach((eventId) => this.contactSync?.enqueue(eventId)));
       }
-      if (!this.dispatcher && acknowledgement.pairEventIds.length > 0) {
+      if (acknowledgement.accepted && !this.dispatcher && acknowledgement.pairEventIds.length > 0) {
         response.once('finish', () => acknowledgement.pairEventIds.forEach((eventId) => this.pairFirstEvent?.enqueue(eventId)));
       }
       const { contactEventIds, pairEventIds, eventIds, ...singleEventAcknowledgement } = acknowledgement;
@@ -385,11 +445,55 @@ function safeDealEventType(value: string | null): string | null {
   return value && /^ONCRMDEAL(?:ADD|UPDATE|DELETE)$/.test(value) ? value : null;
 }
 
-function bitrixEntityType(value: string | null): string | null {
-  if (value === 'CATALOG.PRODUCT.ON.DELETE') return 'product';
+function bitrixEntityType(value: string | null, payload: EventPayload): string | null {
+  if (value?.startsWith('CATALOG.PRODUCT.')) return 'product';
+  if (value?.startsWith('CATALOG.PRICE.')) return 'catalogprice';
+  if (/^ONCRMPRODUCT(?:ADD|UPDATE|DELETE)$/.test(value ?? '')) return 'product';
+  if (/^ONCRMDYNAMICITEM(?:ADD|UPDATE|DELETE)$/.test(value ?? '') && bitrixEntityTypeId(payload) === 31) return 'invoice';
   if (value?.startsWith('ONCRMDEAL')) return 'deal';
   if (value?.startsWith('ONCRMCONTACT')) return 'contact';
   if (value?.startsWith('ONCRMCOMPANY')) return 'company';
+  return null;
+}
+
+function isProductCatalogSignal(value: string | null): boolean {
+  return /^CATALOG\.PRODUCT\.ON\.(?:ADD|UPDATE|DELETE)$/.test(value ?? '') ||
+    /^ONCRMPRODUCT(?:ADD|UPDATE|DELETE)$/.test(value ?? '');
+}
+
+function bitrixEntityTypeId(payload: EventPayload): number | null {
+  const data = isRecord(payload.data) ? payload.data : {};
+  const fields = isRecord(data.FIELDS) ? data.FIELDS : {};
+  const value = fields.ENTITY_TYPE_ID ?? data.ENTITY_TYPE_ID ?? payload.ENTITY_TYPE_ID;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function getEventDirection(
+  source: InboundSource,
+  eventType: string | null,
+  externalEntityType: string | null,
+): string | null {
+  if (source === 'BITRIX24') {
+    if (externalEntityType === 'contact' || externalEntityType === 'company') return 'contacts-companies:bitrix24ToMoysklad';
+    if (externalEntityType === 'deal') return 'deals-orders:bitrix24ToMoysklad';
+    if (externalEntityType === 'invoice') return 'invoices:bitrix24ToMoysklad';
+    if (externalEntityType === 'product' || externalEntityType === 'catalogprice') return 'products-variations:bitrix24ToMoysklad';
+    return null;
+  }
+  if (['counterparty', 'contactperson'].includes(externalEntityType ?? '') && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'contacts-companies:moyskladToBitrix24';
+  }
+  if (externalEntityType === 'customerorder' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'deals-orders:moyskladToBitrix24';
+  }
+  if (externalEntityType === 'invoiceout' && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'invoices:moyskladToBitrix24';
+  }
+  if (['product', 'service'].includes(externalEntityType ?? '') && ['CREATE', 'UPDATE', 'DELETE'].includes(eventType ?? '')) {
+    return 'products-variations:moyskladToBitrix24';
+  }
   return null;
 }
 

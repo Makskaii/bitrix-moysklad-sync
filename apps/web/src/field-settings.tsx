@@ -1,6 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
 
-type Transform = { kind: 'tbd' | 'copy' };
+type Transform =
+  | { kind: 'tbd' | 'copy' }
+  | { kind: 'string-to-number'; numberType: 'integer' | 'decimal'; precision?: number; leadingZeros?: 'reject' | 'allow' }
+  | { kind: 'number-to-string'; precision?: number }
+  | { kind: 'date-to-datetime'; timeZone: string; time?: string }
+  | { kind: 'datetime-to-date'; timeZone: string }
+  | { kind: 'boolean-map'; trueValue: boolean | 'Y' | 'N' | '1' | '0'; falseValue: boolean | 'Y' | 'N' | '1' | '0' }
+  | { kind: 'enum-map' | 'reference-map'; resource?: string; pairs: Array<{ source: string; target: string }> }
+  | { kind: 'multiple-to-single'; strategy: 'only' | 'first' | 'join'; separator?: string }
+  | { kind: 'single-to-multiple' };
 type RuleDirection = { enabled: boolean; transform: Transform };
 type FieldRule = {
   id: string;
@@ -35,6 +44,7 @@ type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Lab
 type DealOrderRuntime = {
   nativeOrderNumberingVerified: boolean;
   bitrix24ProductCatalogId?: string | null;
+  bitrix24DefaultProductSectionId?: string | null;
   moyskladProductFields?: Array<'name' | 'code' | 'description'>;
   defaultOrganizationId: string | null;
   defaultStoreId: string | null;
@@ -45,8 +55,9 @@ type DealOrderRuntime = {
   stores: Array<{ bitrix24Id: string; moyskladId: string }>;
   employees: Array<{ bitrix24Id: string; moyskladId: string }>;
 };
+type ProductCatalogRuntime = { bitrix24CatalogId: string | null; bitrix24DefaultSectionId?: string | null; moyskladFields: Array<'name' | 'code' | 'description'> };
 type DictionaryOption = { id: string; title: string; code: string };
-type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; category?: 'standard' | 'custom' };
+type FieldCandidate = { code: string; title: string; type: string; writable: boolean | null; cardinality?: 'single' | 'multiple' | 'unknown'; shape?: string; enumOptions?: Array<{ id: string; value: string }>; referenceKind?: string; category?: 'standard' | 'custom'; resource?: 'product' | 'service' | 'product-or-service'; reserved?: string };
 type FieldMetadata = { entity: string; bitrix24: FieldCandidate[]; moysklad: FieldCandidate[] };
 type ChildFieldPair = { bitrix24Field: string; moyskladField: string };
 type ChildResourceBinding = {
@@ -54,8 +65,8 @@ type ChildResourceBinding = {
   moyskladCounterpartyId: string; legalFields: ChildFieldPair[];
   bankDetail?: { bitrix24Id: string; moyskladAccountId: string; fields: ChildFieldPair[] };
 };
-type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
-type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
+type ActiveEntityPair = { id: string; entityType: 'CONTACT' | 'COMPANY' | 'DEAL' | 'PRODUCT' | 'INVOICE'; bitrix24Id: string; moyskladId: string; active: true; source: string; reason: string | null; createdAt: string };
+type SettingsConfig = { rules: FieldRule[]; groups: FieldGroup[]; childResourceBindings?: ChildResourceBinding[]; serviceCounterpartyId?: string | null; productCatalogRuntime?: ProductCatalogRuntime; dealOrderRuntime?: DealOrderRuntime; references: { units: UnitPair[]; priceTypes: PriceTypePair[]; dictionaries: DictionaryMap[]; namedPairs?: NamedReferencePair[] } };
 type SettingsDocument = { version: number; createdAt: string; config: SettingsConfig };
 type Catalogs = {
   units: { bitrix24: Array<{ id: string; code: string; label: string }>; moysklad: Array<{ id: string; code: string; label: string }> };
@@ -68,7 +79,7 @@ const emptyCatalogs: Catalogs = { units: { bitrix24: [], moysklad: [] }, priceTy
 const referenceKinds: Array<[ReferenceKind, string]> = [
   ['employees', 'Сотрудники'], ['currencies', 'Валюты'], ['organizations', 'Организации'], ['warehouses', 'Склады'], ['projects', 'Проекты'], ['dealStages', 'Стадии сделок ↔ статусы заказов'],
 ];
-type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
+type PreviewResult = { pairId: string; sourceLabel: string; sourceValues: Record<string, unknown>; transformed: Record<string, { value: unknown; status?: 'mapped' | 'skip' | 'error'; reason?: string; error?: string; transform: string }>; targetCurrent: Record<string, unknown>; errors: string[]; version: number; writes: number };
 type AutoMatch = { source: FieldCandidate; target: FieldCandidate; canBitrix24ToMoysklad: boolean; canMoyskladToBitrix24: boolean };
 type AutoMatchBlock = { matches: AutoMatch[]; unmatched: number; conflicts: number };
 type AutoMatchSummary = { standard: AutoMatchBlock; custom: AutoMatchBlock };
@@ -78,11 +89,11 @@ const entityOptions = [
   ['contacts', 'Контакты'],
   ['companies', 'Компании'],
   ['deals-orders', 'Сделки и заказы покупателей'],
-  ['smart-invoices', 'Смарт-счета (отложено)'],
+  ['smart-invoices', 'Смарт-счета ↔ счета покупателям'],
   ['catalog', 'Товары и услуги каталога'],
 ] as const;
 
-const deferredEntities = new Set(['smart-invoices']);
+const deferredEntities = new Set<string>();
 const requisiteFields: Array<[string, string]> = [
   ['RQ_COMPANY_NAME', 'Краткое наименование'], ['RQ_COMPANY_FULL_NAME', 'Полное наименование'], ['RQ_INN', 'ИНН'],
   ['RQ_KPP', 'КПП'], ['RQ_OGRN', 'ОГРН'], ['RQ_OGRNIP', 'ОГРНИП'], ['RQ_OKPO', 'ОКПО'],
@@ -103,6 +114,7 @@ function entityTypeForUI(entity: string): ActiveEntityPair['entityType'] | null 
     case 'contacts': return 'CONTACT';
     case 'companies': return 'COMPANY';
     case 'deals-orders': return 'DEAL';
+    case 'smart-invoices': return 'INVOICE';
     case 'catalog': return 'PRODUCT';
     default: return null;
   }
@@ -124,6 +136,72 @@ function fieldCategory(field: FieldCandidate, system: 'bitrix24' | 'moysklad', e
   return 'standard';
 }
 
+function fieldOptionLabel(field: FieldCandidate) {
+  const writable = field.writable === true ? 'запись разрешена' : field.writable === false ? 'только чтение' : 'запись не подтверждена';
+  const resource = field.resource === 'product' ? 'товар' : field.resource === 'service' ? 'услуга' : field.resource === 'product-or-service' ? 'товар / услуга' : '';
+  const reserved = field.reserved === 'PRODUCT_CREATE_RECOVERY_IDENTITY' ? 'зарезервировано: ключ восстановления карточки' : field.reserved === 'UNSUPPORTED_PRODUCT_PROPERTY_PAYLOAD' ? 'недоступно: формат записи свойства каталога не подтверждён' : field.reserved;
+  const title = field.title?.trim() && field.title.trim() !== field.code.trim() ? field.title.trim() : 'Без подписи';
+  const cardinality = field.cardinality === 'multiple' ? 'множественное' : field.cardinality === 'single' ? 'одиночное' : 'кратность неизвестна';
+  return `${title} · ${field.code} · ${field.type} · ${cardinality} · ${writable}${resource ? ` · ${resource}` : ''}${reserved ? ` · ${reserved}` : ''}`;
+}
+
+function transformForKind(kind: string): Transform {
+  switch (kind) {
+    case 'copy': return { kind };
+    case 'string-to-number': return { kind, numberType: 'decimal', leadingZeros: 'reject' };
+    case 'number-to-string': return { kind };
+    case 'date-to-datetime': return { kind, timeZone: 'Europe/Moscow', time: '00:00:00' };
+    case 'datetime-to-date': return { kind, timeZone: 'Europe/Moscow' };
+    case 'boolean-map': return { kind, trueValue: 'Y', falseValue: 'N' };
+    case 'enum-map': return { kind, pairs: [] };
+    case 'reference-map': return { kind, resource: '', pairs: [] };
+    case 'multiple-to-single': return { kind, strategy: 'only' };
+    case 'single-to-multiple': return { kind };
+    default: return { kind: 'tbd' };
+  }
+}
+
+function transformKinds(): Array<[string, string]> {
+  return [
+    ['tbd', 'Не задано (TBD)'], ['copy', 'Копировать без преобразования'],
+    ['string-to-number', 'Строка → число (явная политика)'], ['number-to-string', 'Число → строка'],
+    ['date-to-datetime', 'Дата → дата и время (с часовым поясом)'], ['datetime-to-date', 'Дата и время → дата (с часовым поясом)'],
+    ['boolean-map', 'Логическое значение → явные значения'], ['enum-map', 'Сопоставление вариантов перечисления'],
+    ['reference-map', 'Сопоставление ссылок по ID'], ['multiple-to-single', 'Несколько значений → одно (явная политика)'],
+    ['single-to-multiple', 'Одно значение → список'],
+  ];
+}
+
+function BasicTransformOptions({ transform, onChange }: { transform: Transform; onChange: (next: Transform) => void }) {
+  if (transform.kind === 'string-to-number') return <div className="transform-options"><label>Число<select aria-label="Тип числа преобразования" value={transform.numberType} onChange={(event) => onChange({ ...transform, numberType: event.target.value as 'integer' | 'decimal' })}><option value="integer">Целое</option><option value="decimal">Десятичное</option></select></label><label>Точность (десятичные знаки)<input aria-label="Точность числового преобразования" type="number" min="0" max="15" value={transform.precision ?? ''} onChange={(event) => onChange({ ...transform, precision: event.target.value === '' ? undefined : Number(event.target.value) })} /></label><label>Начальные нули<select aria-label="Политика начальных нулей" value={transform.leadingZeros ?? 'reject'} onChange={(event) => onChange({ ...transform, leadingZeros: event.target.value as 'reject' | 'allow' })}><option value="reject">Отклонять (сохранить идентификатор)</option><option value="allow">Разрешить потерю нулей</option></select></label></div>;
+  if (transform.kind === 'number-to-string') return <label>Максимальная точность<input aria-label="Точность числа в строку" type="number" min="0" max="15" value={transform.precision ?? ''} onChange={(event) => onChange({ ...transform, precision: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>;
+  if (transform.kind === 'date-to-datetime' || transform.kind === 'datetime-to-date') return <div className="transform-options"><label>Часовой пояс IANA<input aria-label="Часовой пояс преобразования" value={transform.timeZone} placeholder="Europe/Moscow" onChange={(event) => onChange({ ...transform, timeZone: event.target.value })} /></label>{transform.kind === 'date-to-datetime' && <label>Время по умолчанию<input aria-label="Время преобразования даты" type="time" step="1" value={transform.time} onChange={(event) => onChange({ ...transform, time: event.target.value })} /></label>}</div>;
+  if (transform.kind === 'boolean-map') return <div className="transform-options"><label>Значение «да»<select aria-label="Значение true преобразования" value={String(transform.trueValue)} onChange={(event) => onChange({ ...transform, trueValue: parseBooleanOption(event.target.value) })}>{['true', 'false', 'Y', 'N', '1', '0'].map((value) => <option key={value}>{value}</option>)}</select></label><label>Значение «нет»<select aria-label="Значение false преобразования" value={String(transform.falseValue)} onChange={(event) => onChange({ ...transform, falseValue: parseBooleanOption(event.target.value) })}>{['false', 'true', 'N', 'Y', '0', '1'].map((value) => <option key={value}>{value}</option>)}</select></label></div>;
+  if (transform.kind === 'multiple-to-single') return <div className="transform-options"><label>Политика списка<select aria-label="Политика преобразования списка" value={transform.strategy} onChange={(event) => onChange({ ...transform, strategy: event.target.value as 'only' | 'first' | 'join' })}><option value="only">Только если ровно один элемент</option><option value="first">Первый элемент</option><option value="join">Соединить строки</option></select></label>{transform.strategy === 'join' && <label>Разделитель<input aria-label="Разделитель списка" value={transform.separator ?? ''} onChange={(event) => onChange({ ...transform, separator: event.target.value })} /></label>}</div>;
+  return null;
+}
+
+function EnumMapOptions({ transform, source, target, onChange }: { transform: Transform; source?: FieldCandidate; target?: FieldCandidate; onChange: (next: Transform) => void }) {
+  if (transform.kind !== 'enum-map') return null;
+  const sourceOptions = source?.enumOptions ?? [];
+  const targetOptions = target?.enumOptions ?? [];
+  const updatePair = (index: number, key: 'source' | 'target', value: string) => onChange({ ...transform, pairs: transform.pairs.map((pair, row) => row === index ? { ...pair, [key]: value } : pair) });
+  return <fieldset className="transform-options enum-map-options"><legend>Соответствие вариантов по точным ID</legend>
+    {!sourceOptions.length || !targetOptions.length ? <p role="status">Список вариантов недоступен для одного из полей; сопоставление можно оставить черновиком.</p> : null}
+    {transform.pairs.map((pair, index) => <div className="enum-map-row" key={`${index}-${pair.source}-${pair.target}`}>
+      <label>Вариант источника<select aria-label={`ID варианта источника ${index + 1}`} value={pair.source} onChange={(event) => updatePair(index, 'source', event.target.value)}><option value="">Выберите вариант</option>{sourceOptions.map((option) => <option key={option.id} value={option.id}>{option.value} · {option.id}</option>)}</select></label>
+      <span aria-hidden="true">→</span>
+      <label>Вариант результата<select aria-label={`ID варианта результата ${index + 1}`} value={pair.target} onChange={(event) => updatePair(index, 'target', event.target.value)}><option value="">Выберите вариант</option>{targetOptions.map((option) => <option key={option.id} value={option.id}>{option.value} · {option.id}</option>)}</select></label>
+      <button type="button" className="button-secondary" aria-label={`Удалить пару вариантов ${index + 1}`} onClick={() => onChange({ ...transform, pairs: transform.pairs.filter((_, row) => row !== index) })}>Удалить пару</button>
+    </div>)}
+    <button type="button" className="button-secondary" onClick={() => onChange({ ...transform, pairs: [...transform.pairs, { source: '', target: '' }] })}>Добавить пару вариантов</button>
+  </fieldset>;
+}
+
+function parseBooleanOption(value: string): boolean | 'Y' | 'N' | '1' | '0' {
+  return value === 'true' ? true : value === 'false' ? false : value as 'Y' | 'N' | '1' | '0';
+}
+
 function compatibleFieldTypes(left: string, right: string) {
   const typeClass = (value: string) => {
     const normalized = value.trim().toLowerCase();
@@ -139,8 +217,8 @@ function suggestFieldMatches(metadata: FieldMetadata, entity: string, existingRu
     custom: { matches: [], unmatched: 0, conflicts: 0 },
   };
   for (const category of ['standard', 'custom'] as const) {
-    const sources = metadata.bitrix24.filter((field) => fieldCategory(field, 'bitrix24', entity) === category);
-    const targets = metadata.moysklad.filter((field) => fieldCategory(field, 'moysklad', entity) === category);
+    const sources = metadata.bitrix24.filter((field) => !field.reserved && fieldCategory(field, 'bitrix24', entity) === category);
+    const targets = metadata.moysklad.filter((field) => !field.reserved && fieldCategory(field, 'moysklad', entity) === category);
     const byName = (fields: FieldCandidate[]) => {
       const result = new Map<string, FieldCandidate[]>();
       for (const field of fields) {
@@ -167,7 +245,7 @@ function suggestFieldMatches(metadata: FieldMetadata, entity: string, existingRu
       }
       const source = sourceMatches[0]!;
       const target = targetMatches[0]!;
-      if (usedFields.has(source.code) || usedFields.has(target.code) || !compatibleFieldTypes(source.type, target.type)) {
+      if (usedFields.has(source.code) || usedFields.has(target.code) || !compatibleFieldTypes(source.type, target.type) || source.shape !== target.shape || !source.cardinality || source.cardinality === 'unknown' || source.cardinality !== target.cardinality) {
         summary[category].conflicts += 1;
         blocked.add(source.code);
         blocked.add(target.code);
@@ -210,6 +288,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [previewError, setPreviewError] = useState('');
   const [fieldMetadata, setFieldMetadata] = useState<FieldMetadata | null>(null);
+  const [groupFieldMetadata, setGroupFieldMetadata] = useState<FieldMetadata | null>(null);
+  const [groupMetadataLoading, setGroupMetadataLoading] = useState(false);
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [metadataError, setMetadataError] = useState('');
   const [autoMatchSummary, setAutoMatchSummary] = useState<AutoMatchSummary | null>(null);
@@ -347,6 +427,20 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   useEffect(() => { void loadFieldMetadata(mappingEntity); }, [mappingEntity]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setGroupMetadataLoading(true);
+    fetch(`${endpoint}/fields?entity=${encodeURIComponent(groupForm.entity)}`, { headers })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json() as Promise<FieldMetadata>;
+      })
+      .then((metadata) => { if (!cancelled) setGroupFieldMetadata(metadata); })
+      .catch(() => { if (!cancelled) setGroupFieldMetadata(null); })
+      .finally(() => { if (!cancelled) setGroupMetadataLoading(false); });
+    return () => { cancelled = true; };
+  }, [groupForm.entity, accessToken]);
+
   function addRule() {
     if (!draft) return;
     setAutoMatchSummary(null);
@@ -361,7 +455,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
 
   function addGroup(event: React.FormEvent) {
     event.preventDefault();
-    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
+    if (!draft || !groupForm.targetField.trim() || !groupForm.sourceFields.trim() || groupForm.entity === 'smart-invoices' && groupForm.transformKind !== 'join-non-empty' || groupForm.transformKind === 'split-non-empty' && (!groupForm.valueType || groupForm.sourceFields.split(',').filter(Boolean).length !== 1)) return;
     const group: FieldGroup = {
       id: newLocalId(), entity: groupForm.entity, direction: groupForm.direction,
       targetField: groupForm.targetField.trim(), sourceFields: groupForm.sourceFields.split(',').map((field) => field.trim()).filter(Boolean),
@@ -586,12 +680,12 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             const source = sourceFields.find((field) => field.code === rule.sourceField);
             const target = targetFields.find((field) => field.code === rule.targetField);
             return <article className="field-mapping-row" role="row" key={rule.id}>
-              <select aria-label="Поле Bitrix24" title={source ? `${source.code} · ${source.type}` : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
+              <select aria-label="Поле Bitrix24" title={source ? fieldOptionLabel(source) : rule.sourceField} value={rule.sourceField} disabled={!sourceFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, sourceField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.sourceField && !source && <option value={rule.sourceField}>{rule.sourceField}</option>}{sourceFields.map((field) => <option key={field.code} value={field.code} disabled={Boolean(field.reserved)} title={fieldOptionLabel(field)}>{fieldOptionLabel(field)}</option>)}
               </select>
               <span className="mapping-direction" role="cell" aria-label="Направление">→</span>
-              <select aria-label="Поле МойСклад" title={target ? `${target.code} · ${target.type}` : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
-                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`}>{field.title || field.code} · {field.code}</option>)}
+              <select aria-label="Поле МойСклад" title={target ? fieldOptionLabel(target) : rule.targetField} value={rule.targetField} disabled={!targetFields.length} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, targetField: event.target.value }))}>
+                <option value="">Выберите поле</option>{rule.targetField && !target && <option value={rule.targetField}>{rule.targetField}</option>}{targetFields.map((field) => <option key={field.code} value={field.code} title={fieldOptionLabel(field)}>{fieldOptionLabel(field)}</option>)}
               </select>
               <span className="mapping-equals" role="cell">=</span>
               <button type="button" className="mapping-remove" aria-label={`Удалить соответствие ${rule.sourceField || 'без поля'} → ${rule.targetField || 'без поля'}`} onClick={() => { setAutoMatchSummary(null); changeDraft((current) => ({ ...current, rules: current.rules.filter((item) => item.id !== rule.id) })); }}>⊖</button>
@@ -599,8 +693,8 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <details className="mapping-row-advanced"><summary>Направления и коды</summary>
                 <div className="mapping-advanced-content">
                   <label>Критичность<select aria-label={`Критичность ${rule.sourceField || 'поля'} → ${rule.targetField || 'поля'}`} value={rule.criticality ?? 'tbd'} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, criticality: event.target.value as FieldRule['criticality'] }))}><option value="tbd">Не определена</option><option value="critical">Критичное</option><option value="optional">Необязательное</option></select></label>
-                  <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
-                  <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: { kind: event.target.value as Transform['kind'] } } }))}><option value="tbd">Не задано (TBD)</option><option value="copy">Копировать значение</option></select></label></fieldset>
+                  <fieldset><legend>Bitrix24 → МойСклад</legend><label><input type="checkbox" checked={rule.bitrix24ToMoysklad.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование Bitrix24 в МойСклад" value={rule.bitrix24ToMoysklad.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { enabled: current.bitrix24ToMoysklad.enabled, transform: transformForKind(event.target.value) } }))}>{transformKinds().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><BasicTransformOptions transform={rule.bitrix24ToMoysklad.transform} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform } }))} /><EnumMapOptions transform={rule.bitrix24ToMoysklad.transform} source={source} target={target} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform } }))} /><label>Дополнительные параметры (JSON)<textarea aria-label="Параметры преобразования Bitrix24 в МойСклад" key={`${rule.id}-b24-ms-${JSON.stringify(rule.bitrix24ToMoysklad.transform)}`} defaultValue={JSON.stringify(rule.bitrix24ToMoysklad.transform)} onBlur={(event) => { try { const next = JSON.parse(event.target.value) as Transform; if (next && typeof next === 'object' && 'kind' in next) updateRule(rule.id, (current) => ({ ...current, bitrix24ToMoysklad: { ...current.bitrix24ToMoysklad, transform: next } })); } catch { /* keep the saved transform; validation runs on save */ } }} /></label></fieldset>
+                  <fieldset><legend>МойСклад → Bitrix24</legend><label><input type="checkbox" checked={rule.moyskladToBitrix24.enabled} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, enabled: event.target.checked } }))} /> Включено</label><label>Преобразование<select aria-label="Преобразование МойСклад в Bitrix24" value={rule.moyskladToBitrix24.transform.kind} onChange={(event) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { enabled: current.moyskladToBitrix24.enabled, transform: transformForKind(event.target.value) } }))}>{transformKinds().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><BasicTransformOptions transform={rule.moyskladToBitrix24.transform} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform } }))} /><EnumMapOptions transform={rule.moyskladToBitrix24.transform} source={target} target={source} onChange={(transform) => updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform } }))} /><label>Дополнительные параметры (JSON)<textarea aria-label="Параметры преобразования МойСклад в Bitrix24" key={`${rule.id}-ms-b24-${JSON.stringify(rule.moyskladToBitrix24.transform)}`} defaultValue={JSON.stringify(rule.moyskladToBitrix24.transform)} onBlur={(event) => { try { const next = JSON.parse(event.target.value) as Transform; if (next && typeof next === 'object' && 'kind' in next) updateRule(rule.id, (current) => ({ ...current, moyskladToBitrix24: { ...current.moyskladToBitrix24, transform: next } })); } catch { /* keep the saved transform; validation runs on save */ } }} /></label></fieldset>
                   <details className="mapping-codes"><summary>Технические коды</summary><code>{rule.sourceField || '—'} → {rule.targetField || '—'}</code><small>{source?.type ?? 'тип недоступен'} → {target?.type ?? 'тип недоступен'}</small></details>
                 </div>
               </details>
@@ -619,17 +713,17 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
         <div className="panel-heading"><div><p className="eyebrow">ГРУППЫ ПОЛЕЙ</p><h3>Составное преобразование</h3></div></div>
         <p className="panel-description">Собирайте одно значение из нескольких полей отдельным правилом; пустые части пропускаются.</p>
         <form className="field-rule-form" onSubmit={addGroup}>
-          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
+          <label>Пара сущностей<select aria-label="Пара сущностей группы" value={groupForm.entity} onChange={(event) => setGroupForm({ ...groupForm, entity: event.target.value, targetField: '', sourceFields: '', ...(event.target.value === 'smart-invoices' ? { transformKind: 'join-non-empty' as const } : {}) })}>{entityOptions.map(([value, label]) => <option key={value} value={value} disabled={deferredEntities.has(value)}>{label}</option>)}</select></label>
           <label>Направление<select aria-label="Направление группы" value={groupForm.direction} onChange={(event) => setGroupForm({ ...groupForm, direction: event.target.value as FieldGroup['direction'] })}><option value="BITRIX24_TO_MOYSKLAD" disabled={groupForm.transformKind === 'split-non-empty'}>Bitrix24 → МойСклад</option><option value="MOYSKLAD_TO_BITRIX24">МойСклад → Bitrix24</option></select></label>
           <label>Преобразование<select aria-label="Преобразование группы" value={groupForm.transformKind} onChange={(event) => {
             const transformKind = event.target.value as FieldGroup['transform']['kind'];
             setGroupForm({ ...groupForm, transformKind, ...(transformKind === 'split-non-empty' ? { direction: 'MOYSKLAD_TO_BITRIX24' as const } : {}) });
-          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
+          }}><option value="join-non-empty">Соединить значения</option><option value="split-non-empty" disabled={groupForm.entity === 'smart-invoices' || groupForm.direction !== 'MOYSKLAD_TO_BITRIX24' && groupForm.transformKind !== 'split-non-empty'}>Разделить значение для Bitrix24</option></select></label>
           <label>Поля-источники<select aria-label="Поля источники группы" multiple value={groupForm.sourceFields.split(',').filter(Boolean)} onChange={(event) => {
             const selected = [...event.currentTarget.selectedOptions].map((option) => option.value);
             setGroupForm({ ...groupForm, sourceFields: (groupForm.transformKind === 'split-non-empty' ? selected.slice(0, 1) : selected).join(',') });
-          }} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.bitrix24 : fieldMetadata?.moysklad)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
-          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={!fieldMetadata || fieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? fieldMetadata?.moysklad : fieldMetadata?.bitrix24)?.map((field) => <option key={field.code} value={field.code}>{field.title || 'Название отсутствует'} · {field.code} · {field.type}</option>)}</select></label>
+          }} disabled={groupMetadataLoading || !groupFieldMetadata || groupFieldMetadata.entity !== groupForm.entity}>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? groupFieldMetadata?.bitrix24 : groupFieldMetadata?.moysklad)?.filter((field) => groupForm.entity !== 'smart-invoices' || !['customerOrder', 'parentId2'].includes(field.code)).map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`} disabled={Boolean(field.reserved)}>{fieldOptionLabel(field)}</option>)}</select></label>
+          <label>Поле-результат<select aria-label="Поле результат группы" value={groupForm.targetField} onChange={(event) => setGroupForm({ ...groupForm, targetField: event.target.value })} disabled={groupMetadataLoading || !groupFieldMetadata || groupFieldMetadata.entity !== groupForm.entity}><option value="">Выберите поле</option>{(groupForm.direction === 'BITRIX24_TO_MOYSKLAD' ? groupFieldMetadata?.moysklad : groupFieldMetadata?.bitrix24)?.filter((field) => groupForm.entity !== 'smart-invoices' || !['customerOrder', 'parentId2'].includes(field.code)).map((field) => <option key={field.code} value={field.code} title={`${field.code} · ${field.type}`} disabled={Boolean(field.reserved)}>{fieldOptionLabel(field)}</option>)}</select></label>
           <label>Разделитель<input aria-label="Разделитель группы" value={groupForm.separator} onChange={(event) => setGroupForm({ ...groupForm, separator: event.target.value })} /></label>
           {groupForm.transformKind === 'split-non-empty' && <label>Тип значения Bitrix24<select aria-label="Тип значения Bitrix24" value={groupForm.valueType} onChange={(event) => setGroupForm({ ...groupForm, valueType: event.target.value })}><option value="">Выберите тип</option>{['WORK', 'HOME', 'MOBILE', 'MAILING', 'OTHER', 'FAX', 'PAGER'].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>}
           <button type="submit" className="button-secondary">Добавить составное правило</button>
@@ -668,6 +762,27 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             {suggestion && <span className="exact-match-note">Точный код: {suggestion.code}</span>}
           </article>;
         })}</div>
+      </section>
+
+      <section className="field-editor-section" aria-label="Настройки создания карточек каталога">
+        <div className="panel-heading"><div><p className="eyebrow">КАТАЛОГ МОЙСКЛАД → BITRIX24</p><h3>Новые карточки товаров</h3></div></div>
+        <p className="panel-description">Новая карточка создаётся в выбранном каталоге только для товара МойСклад, созданного после границы запуска. Сопоставленные типы цен переносятся без изменения строк уже созданных сделок и заказов. Раздел Bitrix24 необязателен.</p>
+        {(() => {
+          const runtime = draft.productCatalogRuntime ?? { bitrix24CatalogId: null, bitrix24DefaultSectionId: null, moyskladFields: ['name'] as Array<'name' | 'code' | 'description'> };
+          const setRuntime = (update: (current: ProductCatalogRuntime) => ProductCatalogRuntime) => changeDraft((current) => ({ ...current, productCatalogRuntime: update(current.productCatalogRuntime ?? runtime) }));
+          const toggle = (field: 'code' | 'description', checked: boolean) => setRuntime((current) => ({ ...current, moyskladFields: [...new Set(['name', ...(current.moyskladFields ?? ['name']).filter((item) => item !== field), ...(checked ? [field] : [])])] as Array<'name' | 'code' | 'description'> }));
+          return <div className="reference-map-list">
+            <label>Каталог Bitrix24 для новых карточек<select aria-label="Каталог Bitrix24 для новых карточек" value={runtime.bitrix24CatalogId ?? ''} onChange={(event) => setRuntime((current) => ({ ...current, bitrix24CatalogId: event.currentTarget.value || null, bitrix24DefaultSectionId: event.currentTarget.value ? current.bitrix24DefaultSectionId : null }))}>
+              <option value="">Выберите каталог вручную</option>{catalogs.productCatalogs.map((catalog) => <option key={catalog.id} value={catalog.id}>{catalog.label} · {catalog.id}</option>)}
+            </select></label>
+            <label>Раздел Bitrix24 по умолчанию (необязательно)<input aria-label="Раздел Bitrix24 по умолчанию для новых карточек" inputMode="numeric" pattern="[0-9]*" disabled={!runtime.bitrix24CatalogId} value={runtime.bitrix24DefaultSectionId ?? ''} onChange={(event) => setRuntime((current) => ({ ...current, bitrix24DefaultSectionId: event.currentTarget.value || null }))} /></label>
+            <fieldset><legend>Поля источника, разрешённые при создании карточки</legend>
+              <label><input type="checkbox" checked disabled />Наименование</label>
+              <label><input type="checkbox" checked={runtime.moyskladFields.includes('code')} onChange={(event) => toggle('code', event.currentTarget.checked)} />Код</label>
+              <label><input type="checkbox" checked={runtime.moyskladFields.includes('description')} onChange={(event) => toggle('description', event.currentTarget.checked)} />Описание</label>
+            </fieldset>
+          </div>;
+        })()}
       </section>
 
       <section className="field-editor-section" aria-label="Типы цен каталога">
@@ -749,6 +864,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
             <label>Каталог товаров Bitrix24<select aria-label="Каталог товаров Bitrix24 для создания" value={runtime.bitrix24ProductCatalogId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, bitrix24ProductCatalogId: event.currentTarget.value || null }))}>
               <option value="">Выберите каталог вручную</option>{catalogs.productCatalogs.map((catalog) => <option key={catalog.id} value={catalog.id}>{catalog.label} · {catalog.id}</option>)}
             </select></label>
+            <label>Раздел товаров Bitrix24 по умолчанию (необязательно)<input aria-label="Раздел товаров Bitrix24 по умолчанию" inputMode="numeric" pattern="[0-9]*" value={runtime.bitrix24DefaultProductSectionId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, bitrix24DefaultProductSectionId: event.currentTarget.value || null }))} /></label>
             <fieldset><legend>Разрешённые поля из карточки товара MyСклад</legend>
               <label><input type="checkbox" checked disabled />Наименование (обязательное)</label>
               <label><input type="checkbox" checked={productFields.includes('code')} onChange={(event) => setProductField('code', event.currentTarget.checked)} />Код</label>
@@ -889,6 +1005,7 @@ function runtimeFromConfirmedPairs(config: SettingsConfig, previous?: DealOrderR
   return {
     nativeOrderNumberingVerified: previous?.nativeOrderNumberingVerified ?? false,
     bitrix24ProductCatalogId: previous?.bitrix24ProductCatalogId ?? null,
+    bitrix24DefaultProductSectionId: previous?.bitrix24DefaultProductSectionId ?? null,
     moyskladProductFields: previous?.moyskladProductFields ?? ['name'],
     defaultOrganizationId: preserveOrChoose(previous?.defaultOrganizationId, 'organizations'),
     defaultStoreId: preserveOrChoose(previous?.defaultStoreId, 'warehouses'),

@@ -16,7 +16,15 @@ const createdPairIds: string[] = [];
 const fakeUpstreamMethods: string[] = [];
 const fakeB24ListTypes: Array<{ id: string; type: string }> = [];
 const fakeB24UserFieldStarts: number[] = [];
+let fakeB24DealCategories: Array<{ id: number; name: string }> = [];
+let fakeB24DealStatuses: Record<string, Array<{ STATUS_ID: string; NAME: string }>> = {
+  DEAL_STAGE: [{ STATUS_ID: 'NEW', NAME: 'Новая сделка' }],
+};
 let userFieldPaginationMode: 'two-page' | 'repeating-cursor' | 'missing-next' | 'malformed-result' = 'two-page';
+let omitContactNameFieldType = false;
+let fakeMoyskladAttributeType: string | undefined = 'string';
+let fakeMoyskladUnitListAsArray = false;
+let fakeMoyskladPriceListHasMalformedRow = false;
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -49,12 +57,14 @@ before(async () => {
         : method === 'catalog.priceType.list.json'
           ? fakeB24PriceIds.map((id) => ({ id, code: `p${id}`, name: `Price ${id}` }))
           : method === 'crm.contact.fields.json'
-            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, UF_CRM_PAGE_51: { type: 'string', title: 'UF_CRM_PAGE_51', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
-            : method === 'crm.contact.userfield.list.json'
+            ? { NAME: { type: 'string', title: 'First name', isReadOnly: false }, LAST_NAME: { type: 'string', title: 'Last name', isReadOnly: false }, EMAIL: { type: 'crm_multifield', title: 'Email', isReadOnly: false, isMultiple: true }, UF_CRM_MULTI_STRING: { type: 'string', title: 'Multi string', isReadOnly: false, isMultiple: true }, UF_CRM_CUSTOM: { type: 'string', title: 'UF_CRM_CUSTOM', isReadOnly: false }, UF_CRM_DUPLICATE_A: { type: 'string', title: 'UF_CRM_DUPLICATE_A', isReadOnly: false }, UF_CRM_DUPLICATE_B: { type: 'string', title: 'UF_CRM_DUPLICATE_B', isReadOnly: false }, UF_CRM_PAGE_51: { type: 'string', title: 'UF_CRM_PAGE_51', isReadOnly: false }, READ_ONLY: { type: 'string', title: 'System field', isReadOnly: true } }
+              : method === 'crm.contact.userfield.get.json'
+                ? { userfield: { ID: 31, FIELD_NAME: 'UF_CRM_CUSTOM', LIST: [{ ID: '701', VALUE: 'Preferred' }, { ID: '702', VALUE: 'Standard' }] } }
+              : method === 'crm.contact.userfield.list.json'
               ? (() => {
                 const start = Number(form.get('start') ?? 0);
                 const rows = [
-                  { FIELD_NAME: 'UF_CRM_CUSTOM', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
+                  { ID: 31, FIELD_NAME: 'UF_CRM_CUSTOM', USER_TYPE_ID: 'enumeration', MULTIPLE: 'Y', EDIT_FORM_LABEL: 'Preferred contact', LIST_COLUMN_LABEL: 'Preferred contact', LIST_FILTER_LABEL: 'UF_CRM_CUSTOM' },
                   { FIELD_NAME: 'UF_CRM_DUPLICATE_A', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
                   { FIELD_NAME: 'UF_CRM_DUPLICATE_B', EDIT_FORM_LABEL: 'Shared label', LIST_COLUMN_LABEL: 'Shared label' },
                   ...Array.from({ length: 47 }, (_, index) => ({ FIELD_NAME: `UF_FILLER_${index}`, EDIT_FORM_LABEL: `Filler ${index}` })),
@@ -77,6 +87,8 @@ before(async () => {
               })()
               : method === 'crm.company.fields.json'
                 ? { TITLE: { type: 'string', title: 'Company', isReadOnly: false }, UF_COMPANY_SAMPLE: { type: 'string', title: 'UF_COMPANY_SAMPLE', isReadOnly: false } }
+            : method === 'crm.item.fields.json'
+              ? { fields: { title: { type: 'string', title: 'Invoice title', isReadOnly: false }, ufCrm_123: { type: 'enumeration', title: 'Invoice category', isReadOnly: false, enumOptions: [{ id: '11', value: 'Regular' }] } } }
                 : method === 'crm.company.userfield.list.json'
                   ? [{ FIELD_NAME: 'UF_COMPANY_SAMPLE', EDIT_FORM_LABEL: 'Company sample' }]
             : method === 'crm.deal.fields.json'
@@ -85,16 +97,24 @@ before(async () => {
                 ? [{ FIELD_NAME: 'UF_DEAL_SAMPLE', EDIT_FORM_LABEL: 'Deal sample' }]
             : method === 'catalog.product.getFieldsByFilter.json'
               ? form.get('filter[iblockId]') === '11'
-                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
+                ? { product: { NAME: { type: 'string', name: 'Product name', isReadOnly: false }, weight: { type: 'double', name: 'Weight', isReadOnly: false }, xmlId: { type: 'string', name: 'XML ID', isReadOnly: false }, property108: { type: 'string', name: 'Inventory key', isReadOnly: false }, property109: { type: 'string', name: 'enum type from weaker product schema', isReadOnly: false }, USER_LABEL: { type: 'string', formLabel: 'Пользовательская подпись' }, NO_TITLE: { type: 'string', isReadOnly: false } } }
                 : { product: {} }
+            : method === 'catalog.product.service.getFieldsByFilter.json'
+              ? form.get('filter[iblockId]') === '11'
+                ? { service: { name: { type: 'string', name: 'Service name', isReadOnly: false }, code: { type: 'string', name: 'Service code', isReadOnly: false } } }
+                : { service: {} }
             : method === 'catalog.catalog.list.json'
               ? { catalogs: [{ id: 11, name: 'Товары' }] }
+            : method === 'catalog.productProperty.list.json'
+              ? { productProperties: [{ id: 108, iblockId: 11, name: 'Inventory key', propertyType: 'S', multiple: 'N' }, { id: 109, iblockId: 11, name: 'Product class', propertyType: 'L', multiple: 'Y' }] }
+            : method === 'catalog.productPropertyEnum.list.json'
+              ? { productPropertyEnums: [{ id: 901, propertyId: 109, value: 'Hardware' }, { id: 902, propertyId: 109, value: 'Software' }] }
             : method === 'catalog.product.get.json'
               ? { product: { id: form.get('id'), iblockId: 11, name: 'Sample product', code: 'SKU-1' } }
             : method === 'crm.category.list.json'
-              ? []
+              ? fakeB24DealCategories
               : method === 'crm.status.list.json'
-                ? [{ STATUS_ID: 'NEW', NAME: 'Новая сделка' }]
+                ? fakeB24DealStatuses[form.get('filter[ENTITY_ID]') ?? ''] ?? []
               : method === 'user.get.json'
                 ? [{ ID: 1, NAME: 'Ada', LAST_NAME: 'Lovelace' }]
               : method === 'crm.currency.list.json'
@@ -118,17 +138,22 @@ before(async () => {
       const isPriceList = url.pathname.endsWith('/companysettings/pricetype');
       const serviceDirectory = url.pathname.endsWith('/entity/customentity/f0177126-8e74-11e3-b761-002590a28eca');
       const paymentDirectory = url.pathname.endsWith('/entity/customentity/0ecffb86-d8a3-11eb-0a80-0dbc000256e5');
+      const orderStateMetadata = url.pathname.endsWith('/entity/customerorder/metadata');
       const ids = isUnitList ? fakeMsUnitIds : fakeMsPriceIds;
       const rows = ids.map((id, index) => ({ id, code: `m${index + 1}`, name: `MS ${index + 1}`, externalCode: `m${index + 1}` }));
       const dictionaryRows = serviceDirectory
         ? APPROVED_DICTIONARY_PAIRS.service.map(([, id]) => ({ id, name: `MS service ${id}` }))
         : paymentDirectory ? APPROVED_DICTIONARY_PAIRS.paymentMethod.map(([, id]) => ({ id, name: `MS payment ${id}` })) : [];
-      const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project', '/entity/customerorder/metadata/states'].some((path) => url.pathname.endsWith(path));
-      const body = isUnitList || isPriceList ? { rows, meta: { size: rows.length } }
+      const namedResource = ['/entity/employee', '/entity/currency', '/entity/organization', '/entity/store', '/entity/project'].some((path) => url.pathname.endsWith(path));
+      // MoySklad's company-settings price-type endpoint returns a bare JSON
+      // array, unlike entity list endpoints that return { rows, meta }.
+      const body = isPriceList ? fakeMoyskladPriceListHasMalformedRow ? [...rows, null] : rows
+        : isUnitList ? fakeMoyskladUnitListAsArray ? rows : { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
-        : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: url.pathname.endsWith('/metadata/states') ? 'Новая сделка' : 'Demo reference', code: 'REF' }], meta: { size: 1 } }
-        : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', type: 'string' }] }
+        : orderStateMetadata ? { states: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Новая сделка' }] }
+        : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Demo reference', code: 'REF' }], meta: { size: 1 } }
+        : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', ...(fakeMoyskladAttributeType === undefined ? {} : { type: fakeMoyskladAttributeType }), writable: true }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
           ? { id: '00000000-0000-4000-8000-000000000005', email: 'target@example.test' }
         : { id: url.pathname.split('/').at(-1), name: 'Sample target', updated: '2026-10-07 10:00:00.000', email: 'target@example.test', opaqueField: 'opaque' };
@@ -245,9 +270,9 @@ test('preview rejects arbitrary IDs and applies reverse-direction rules for save
       entity: 'contacts', direction: 'MOYSKLAD_TO_BITRIX24',
       pairIds: [pairsByKey['contact-1']],
       config: { rules: [{
-        id: 'reverse-email', entity: 'contacts', sourceField: 'EMAIL', targetField: 'email',
+        id: 'reverse-email', entity: 'contacts', sourceField: 'UF_CRM_MULTI_STRING', targetField: 'email',
         bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
-        moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'single-to-multiple' } },
       }], groups: [] },
     }),
   });
@@ -255,7 +280,7 @@ test('preview rejects arbitrary IDs and applies reverse-direction rules for save
   assert.equal(response.status, 201, body);
   const preview = JSON.parse(body) as { writes: number; results: Array<{ transformed: Record<string, { value: unknown }>; version: number }> };
   assert.equal(preview.writes, 0);
-  assert.equal(preview.results[0]?.transformed.EMAIL?.value, 'target@example.test');
+  assert.deepEqual(preview.results[0]?.transformed.UF_CRM_MULTI_STRING?.value, ['target@example.test']);
   assert.equal(preview.results[0]?.version, 1);
 });
 
@@ -282,7 +307,10 @@ test('entity field metadata loads without a saved pair or reading record values'
   const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>>; moysklad: Array<Record<string, unknown>> };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.title === 'First name' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NAME' && field.category === 'standard'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'EMAIL' && field.cardinality === 'multiple'), 'standard CRM field metadata preserves its multiple-value shape');
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.title === 'Preferred contact' && field.category === 'custom'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_CUSTOM' && field.type === 'enumeration' && field.cardinality === 'multiple'));
+  assert.deepEqual(catalog.bitrix24.find((field) => field.code === 'UF_CRM_CUSTOM')?.enumOptions, [{ id: '701', value: 'Preferred' }, { id: '702', value: 'Standard' }]);
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_A' && field.title === 'Shared label'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_DUPLICATE_B' && field.title === 'Shared label'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'UF_CRM_PAGE_51' && field.title === 'Page two label'));
@@ -295,8 +323,64 @@ test('entity field metadata loads without a saved pair or reading record values'
   assert.ok([...catalog.bitrix24, ...catalog.moysklad].every((field) => !('value' in field)));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.fields.json'));
   assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.list.json'));
+  assert.ok(fakeUpstreamMethods.includes('crm.contact.userfield.get.json'), 'enumeration options are recovered from the official per-field metadata method when not present in list results');
   assert.deepEqual(fakeB24UserFieldStarts, [0, 50]);
   assert.ok(!fakeUpstreamMethods.includes('crm.contact.get.json'));
+});
+
+test('unknown or missing live MySklad metadata types fail closed with HTTP 400, not a server error', async () => {
+  const unknownTarget = 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  fakeMoyskladAttributeType = 'unknown';
+  const unknownCatalogResponse = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=contacts`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const unknownCatalogBody = await unknownCatalogResponse.text();
+  assert.equal(unknownCatalogResponse.status, 200, unknownCatalogBody);
+  const unknownCatalog = JSON.parse(unknownCatalogBody) as { moysklad: Array<{ code: string; type: string; shape: string }> };
+  const unknownField = unknownCatalog.moysklad.find((field) => field.code === unknownTarget);
+  assert.equal(unknownField?.type, 'unknown');
+  assert.equal(unknownField?.shape, 'unknown');
+
+  const current = await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } }).then((response) => response.json()) as { config: Record<string, unknown> };
+  const config = structuredClone(current.config) as { rules: unknown[]; groups: unknown[]; [key: string]: unknown };
+  config.groups = [];
+  config.rules = [{
+    id: 'unknown-live-target-type', entity: 'contacts', sourceField: 'NAME', targetField: unknownTarget,
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }];
+  const unknownSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
+  });
+  const unknownSaveBody = await unknownSave.text();
+  assert.equal(unknownSave.status, 400, unknownSaveBody);
+  assert.match(unknownSaveBody, /exact type and cardinality compatibility/i);
+
+  fakeMoyskladAttributeType = undefined;
+  const missingSave = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
+  });
+  const missingSaveBody = await missingSave.text();
+  assert.equal(missingSave.status, 400, missingSaveBody);
+  assert.match(missingSaveBody, /not available as a moysklad field/i);
+  fakeMoyskladAttributeType = 'string';
+});
+
+test('admin HTTP rejects an enabled copy rule whose provider field types do not match', async () => {
+  const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  assert.equal(activeResponse.status, 200);
+  const active = await activeResponse.json() as { config: Record<string, unknown> };
+  const config = structuredClone(active.config) as { rules: unknown[]; groups: unknown[]; [key: string]: unknown };
+  config.groups = [];
+  config.rules = [{
+    id: 'invalid-active-copy', entity: 'contacts', sourceField: 'NAME', targetField: 'companyType', criticality: 'optional',
+    bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } },
+  }];
+  const response = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }),
+  });
+  assert.equal(response.status, 400, await response.text());
+  const unchanged = await (await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } })).json() as { config: { rules: unknown[] } };
+  assert.deepEqual(unchanged.config.rules, active.config.rules, 'a rejected active mapping does not replace saved settings');
 });
 
 test('field metadata rejects malformed, truncated, or repeating userfield pagination responses', async () => {
@@ -339,19 +423,40 @@ test('catalog field metadata uses the product information block and API field na
   const body = await response.text();
   assert.equal(response.status, 200, body);
   const catalog = JSON.parse(body) as {
-    bitrix24: Array<{ code: string; title: string; type: string; category: string }>;
-    moysklad: Array<{ code: string; title: string; type: string; category: string }>;
+    bitrix24: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string; reserved?: string }>;
+    moysklad: Array<{ code: string; title: string; type: string; category: string; writable: boolean | null; resource?: string }>;
   };
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.title === 'Inventory key' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'property108' && field.category === 'custom'));
+  assert.deepEqual(catalog.bitrix24.find((field) => field.code === 'property109'), { code: 'property109', title: 'Product class', type: 'enumeration', writable: null, writableEvidence: 'unconfirmed', category: 'custom', cardinality: 'multiple', shape: 'array', enumOptions: [{ id: '901', value: 'Hardware' }, { id: '902', value: 'Software' }], resource: 'product', reserved: 'UNSUPPORTED_PRODUCT_PROPERTY_PAYLOAD' });
   assert.ok(catalog.bitrix24.some((field) => field.code === 'NO_TITLE' && field.title === '' && field.type === 'string'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.title === 'Пользовательская подпись'));
   assert.ok(catalog.bitrix24.some((field) => field.code === 'USER_LABEL' && field.category === 'standard'), 'unknown field codes are not assumed to be user-defined');
-  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.title === 'Наименование товара / услуги'));
   assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.category === 'standard'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'weight' && field.resource === 'product'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'xmlId' && field.writable === true && field.reserved === 'PRODUCT_CREATE_RECOVERY_IDENTITY'));
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'code' && field.title === 'Service code'), 'service schema contributes fields not present in product metadata');
+  assert.ok(catalog.moysklad.some((field) => field.code === 'weight' && field.type === 'double' && field.writable === true));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'article' && field.writable === true));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'barcodes' && field.type === 'array'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'weight' && field.resource === 'product'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'minimumStock' && field.type === 'object' && field.resource === 'product'));
+  assert.ok(catalog.moysklad.some((field) => field.code === 'name' && field.resource === 'product-or-service'));
   assert.ok(fakeUpstreamMethods.includes('catalog.catalog.list.json'));
+  assert.ok(fakeUpstreamMethods.includes('catalog.product.service.getFieldsByFilter.json'));
   assert.ok(!fakeUpstreamMethods.includes('catalog.product.get.json'), 'field metadata must not read a product record');
   assert.ok(!fakeUpstreamMethods.some((method) => method.endsWith('.userfield.list.json')));
+});
+
+test('smart invoice metadata preserves provider titles, enum options, and shape', async () => {
+  const response = await fetch(`${apiUrl}/api/admin/field-settings/fields?entity=smart-invoices`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const body = await response.text();
+  assert.equal(response.status, 200, body);
+  const catalog = JSON.parse(body) as { bitrix24: Array<Record<string, unknown>> };
+  assert.ok(catalog.bitrix24.some((field) => field.code === 'title' && field.title === 'Invoice title' && field.cardinality === 'single'));
+  assert.deepEqual(catalog.bitrix24.find((field) => field.code === 'ufCrm_123')?.enumOptions, [{ id: '11', value: 'Regular' }]);
 });
 
 test('live service and payment catalogs expose current choices and preserve editable dictionary pairs', async () => {
@@ -386,7 +491,7 @@ test('live reference catalogs include both systems, keep exact-name matches as s
   }
   assert.ok(fakeUpstreamMethods.includes('crm.category.list.json'));
   assert.ok(fakeUpstreamMethods.includes('crm.status.list.json'));
-  assert.ok(fakeUpstreamMethods.includes('states'), 'MySklad order states are loaded as read-only metadata');
+  assert.ok(fakeUpstreamMethods.includes('metadata'), 'MySklad order states are loaded as read-only metadata');
   assert.ok(fakeUpstreamMethods.length > before);
 });
 
@@ -396,6 +501,13 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.equal(pageResponse.status, 200);
   assert.equal(page.nextCursor, null);
   assert.ok(page.items.some((item) => item.id === 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+
+  const pricePageResponse = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=priceTypes&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+  const pricePage = await pricePageResponse.json() as { items: Array<{ id: string; code: string; label: string }>; nextCursor: string | null };
+  assert.equal(pricePageResponse.status, 200, 'the public catalog endpoint accepts the provider native price-type list response');
+  assert.equal(pricePage.items.length, fakeMsPriceIds.length);
+  assert.deepEqual(pricePage.items.map((item) => item.id), fakeMsPriceIds, 'all provider price types remain visible in provider order');
+  assert.equal(pricePage.nextCursor, null);
 
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   const active = await activeResponse.json() as { config: { references: { units: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; priceTypes: Array<{ bitrix24Id: number; moyskladId: string | null; status: string }>; dictionaries: Array<{ key: string; pairs: Array<{ bitrix24Id: number; moyskladId: string }> }> } } };
@@ -419,6 +531,7 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
   assert.equal(saveResponse.status, 200);
   assert.equal(saved.config.references.units.find((unit) => unit.bitrix24Id === 14)?.moyskladId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
   assert.equal(saved.config.references.priceTypes.length, active.config.references.priceTypes.length, 'price types survive the settings version roundtrip');
+  assert.deepEqual(saved.config.references.priceTypes, config.references.priceTypes, 'the complete approved price-type mapping survives settings save');
   assert.deepEqual(saved.config.references.dictionaries, active.config.references.dictionaries, 'service and payment dictionary pairs survive the settings version roundtrip');
   assert.deepEqual(saved.config.references.namedPairs, config.references.namedPairs, 'all named reference kinds and confirmation states survive the settings version roundtrip');
 
@@ -437,6 +550,28 @@ test('catalog paging exposes live candidates and allows manual reassignment to a
     body: JSON.stringify({ config: invalidSourceConfig }),
   });
   assert.equal(invalidSourceSave.status, 400, 'stale/deleted Bitrix24 source references cannot be saved');
+});
+
+test('entity list catalogs still fail closed when they return an unexpected top-level array', async () => {
+  fakeMoyskladUnitListAsArray = true;
+  try {
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=units&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /invalid catalog/);
+  } finally {
+    fakeMoyskladUnitListAsArray = false;
+  }
+});
+
+test('price-type catalogs fail closed when their native array contains a malformed row', async () => {
+  fakeMoyskladPriceListHasMalformedRow = true;
+  try {
+    const response = await fetch(`${apiUrl}/api/admin/field-settings/catalogs?kind=priceTypes&system=moysklad`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /invalid catalog/);
+  } finally {
+    fakeMoyskladPriceListHasMalformedRow = false;
+  }
 });
 
 test('deal-order runtime requires unique explicitly confirmed header and stage mappings', async () => {
@@ -468,6 +603,16 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   });
   const accepted = await save(config);
   assert.equal(accepted.status, 200);
+  const configuredSection = structuredClone(config);
+  configuredSection.dealOrderRuntime.bitrix24DefaultProductSectionId = '42';
+  assert.equal((await save(configuredSection)).status, 200, 'an explicitly configured numeric Bitrix24 section is accepted independently of MySklad product groups');
+  const invalidProductSection = structuredClone(config);
+  invalidProductSection.dealOrderRuntime.bitrix24DefaultProductSectionId = 'not-a-number';
+  assert.equal((await save(invalidProductSection)).status, 400, 'non-numeric Bitrix24 section IDs are rejected');
+  const sectionWithoutCatalog = structuredClone(config);
+  sectionWithoutCatalog.dealOrderRuntime.bitrix24ProductCatalogId = null;
+  sectionWithoutCatalog.dealOrderRuntime.bitrix24DefaultProductSectionId = '42';
+  assert.equal((await save(sectionWithoutCatalog)).status, 400, 'a default section cannot be configured without its target catalog');
   const duplicate = structuredClone(config);
   duplicate.dealOrderRuntime.stages.push({ ...duplicate.dealOrderRuntime.stages[0] });
   assert.equal((await save(duplicate)).status, 400, 'duplicate stage source IDs are rejected');
@@ -482,7 +627,120 @@ test('deal-order runtime requires unique explicitly confirmed header and stage m
   assert.equal((await save(missingRequiredProductName)).status, 400, 'new product cards require the explicitly allowed source name');
 });
 
+test('saving a raw main-pipeline stage confirms its single category-qualified catalog key', async () => {
+  const previousCategories = fakeB24DealCategories;
+  const previousStatuses = fakeB24DealStatuses;
+  let originalConfig: Record<string, any> | undefined;
+  try {
+    fakeB24DealCategories = [];
+    fakeB24DealStatuses = { DEAL_STAGE: [{ STATUS_ID: 'PREPARATION', NAME: 'Подготовка' }] };
+
+    const active = await fetch(`${apiUrl}/api/admin/field-settings`).then((response) => response.json()) as { config: Record<string, any> };
+    originalConfig = structuredClone(active.config);
+    const catalogs = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`).then((response) => response.json()) as {
+      namedReferences: { dealStages: { sources: Array<{ source: { id: string; label: string } }>; targets: Array<{ id: string; label: string }> } };
+    };
+    const source = catalogs.namedReferences.dealStages.sources.find((candidate) => candidate.source.id === '0:PREPARATION')?.source;
+    const activeStage = active.config.references.namedPairs.find((pair: any) => pair.kind === 'dealStages' && pair.status === 'confirmed' && pair.moyskladId);
+    assert.ok(source, 'the catalog adapter should expose main-pipeline key 0:PREPARATION');
+    assert.ok(activeStage?.moyskladId, 'the fixture starts with an existing confirmed MySklad order state');
+    const target = catalogs.namedReferences.dealStages.targets.find((candidate) => candidate.id === activeStage.moyskladId);
+    assert.ok(target, 'the selected MySklad state must still exist in the live catalog');
+
+    const config = structuredClone(active.config);
+    config.references.namedPairs = config.references.namedPairs.filter((pair: any) => pair.kind !== 'dealStages');
+    config.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: source.id, bitrix24Label: source.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    config.dealOrderRuntime = {
+      ...config.dealOrderRuntime,
+      stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: target.id, creationEnabled: true }],
+    };
+
+    const save = async (candidate: unknown) => fetch(`${apiUrl}/api/admin/field-settings`, {
+      method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+      body: JSON.stringify({ config: candidate }),
+    });
+    const response = await save(config);
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    const saved = JSON.parse(body) as { config: { dealOrderRuntime: { stages: Array<{ bitrix24StageId: string; moyskladId: string }> }; references: { namedPairs: Array<{ kind: string; bitrix24Id: string; moyskladId: string }> } } };
+    assert.deepEqual(saved.config.dealOrderRuntime.stages, [{ bitrix24StageId: 'PREPARATION', moyskladId: target.id, creationEnabled: true }]);
+    assert.deepEqual(saved.config.references.namedPairs.filter((pair) => pair.kind === 'dealStages'), [{
+      kind: 'dealStages', bitrix24Id: '0:PREPARATION', bitrix24Label: source.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    }]);
+
+    const wrongTarget = structuredClone(config);
+    wrongTarget.dealOrderRuntime.stages[0].moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    assert.equal((await save(wrongTarget)).status, 400, 'raw-stage matching must not loosen exact target confirmation');
+
+    fakeB24DealCategories = [{ id: 2, name: 'Pipeline 2' }];
+    fakeB24DealStatuses = {
+      DEAL_STAGE: [],
+      DEAL_STAGE_2: [{ STATUS_ID: 'C2:PREPARATION', NAME: 'Подготовка воронки 2' }],
+    };
+    const customCatalog = await fetch(`${apiUrl}/api/admin/field-settings/catalogs`).then((result) => result.json()) as {
+      namedReferences: { dealStages: { sources: Array<{ source: { id: string; label: string } }> } };
+    };
+    const customSource = customCatalog.namedReferences.dealStages.sources.find((candidate) => candidate.source.id === '2:C2:PREPARATION')?.source;
+    assert.ok(customSource, 'only an explicit C<n>:status runtime ID can derive its matching custom-category catalog key');
+    const customActive = await fetch(`${apiUrl}/api/admin/field-settings`).then((result) => result.json()) as { config: Record<string, any> };
+    const customConfig = structuredClone(customActive.config);
+    customConfig.references.namedPairs = customConfig.references.namedPairs.filter((pair: any) => pair.kind !== 'dealStages');
+    customConfig.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: customSource.id, bitrix24Label: customSource.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    customConfig.dealOrderRuntime = {
+      ...customConfig.dealOrderRuntime,
+      stages: [{ bitrix24StageId: 'C2:PREPARATION', moyskladId: target.id, creationEnabled: true }],
+    };
+    const customSave = await save(customConfig);
+    assert.equal(customSave.status, 200, await customSave.text());
+
+    const wrongCategory = structuredClone(customConfig);
+    wrongCategory.dealOrderRuntime.stages[0].bitrix24StageId = 'C1:PREPARATION';
+    const wrongCategoryResponse = await save(wrongCategory);
+    const wrongCategoryBody = await wrongCategoryResponse.text();
+    assert.equal(wrongCategoryResponse.status, 400, 'a different custom category cannot inherit the selected target');
+    assert.match(wrongCategoryBody, /one confirmed named reference/);
+
+    const ambiguous = structuredClone(customConfig);
+    ambiguous.references.namedPairs.push({
+      kind: 'dealStages', bitrix24Id: 'C2:PREPARATION', bitrix24Label: customSource.label,
+      moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
+    });
+    const ambiguousResponse = await save(ambiguous);
+    const ambiguousBody = await ambiguousResponse.text();
+    assert.equal(ambiguousResponse.status, 400, 'two candidate source keys for one raw stage are ambiguous even when their targets are equal');
+    assert.match(ambiguousBody, /one confirmed named reference/);
+  } finally {
+    fakeB24DealCategories = previousCategories;
+    fakeB24DealStatuses = previousStatuses;
+    if (originalConfig) {
+      const restore = await fetch(`${apiUrl}/api/admin/field-settings`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+        body: JSON.stringify({ config: originalConfig }),
+      });
+      assert.equal(restore.status, 200, await restore.text());
+    }
+  }
+});
+
 test('saving creates an immutable version and activates it for future events only', async () => {
+  const beforeResetResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
+  assert.equal(beforeResetResponse.status, 200);
+  const beforeReset = await beforeResetResponse.json() as { config: Record<string, unknown> };
+  const baselineConfig = structuredClone(beforeReset.config);
+  baselineConfig.rules = [];
+  baselineConfig.groups = [];
+  const baselineResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: baselineConfig }),
+  });
+  assert.equal(baselineResponse.status, 200, 'the audit assertion starts from a known empty mapping baseline');
   const originalResponse = await fetch(`${apiUrl}/api/admin/field-settings`);
   assert.equal(originalResponse.status, 200);
   const original = await originalResponse.json() as { version: number; config: Record<string, unknown> };
@@ -515,7 +773,8 @@ test('saving creates an immutable version and activates it for future events onl
   assert.deepEqual(reloaded.config.rules, saved.config.rules);
   assert.deepEqual(reloaded.config.groups, saved.config.groups);
   const auditEntries = await app.get(DatabaseService).operationalLog.findMany({ where: { category: 'ADMIN', referenceId: String(saved.version) } });
-  assert.ok(auditEntries.some((entry) => entry.message.includes('added deals-orders:TITLE → name')), 'risky added keys are audited against the activated version');
+  assert.ok(auditEntries.some((entry) => entry.message.includes('added deals-orders:TITLE → name')),
+    `risky added keys are audited against the activated version; version ${saved.version} audit messages: ${JSON.stringify(auditEntries.map((entry) => entry.message))}`);
 
   const legacyConfig = structuredClone(reloaded.config) as { rules: Array<Record<string, unknown>>; groups: Array<Record<string, unknown>>; [key: string]: unknown };
   delete legacyConfig.rules[0]!.criticality;
@@ -582,7 +841,7 @@ test('settings reject unknown field codes and read-only Bitrix24 targets', async
   assert.equal(pairSpecific.status, 201, `entity-wide field mappings must not depend on the selected preview pair: ${await pairSpecific.text()}`);
 });
 
-test('catalog field settings reject Bitrix24-to-MySklad product writes for rules and groups', async () => {
+test('catalog field settings reject unsupported Bitrix24 custom-property writes', async () => {
   const activeResponse = await fetch(`${apiUrl}/api/admin/field-settings`, { headers: { authorization: 'Bearer synthetic-admin-token' } });
   const active = await activeResponse.json() as { config: Record<string, unknown> & { references: Record<string, unknown> } };
   const ruleConfig = {
@@ -611,6 +870,50 @@ test('catalog field settings reject Bitrix24-to-MySklad product writes for rules
     body: JSON.stringify({ config: groupConfig }),
   });
   assert.equal(groupResponse.status, 400, 'catalog groups cannot write Bitrix24 product changes into MySklad');
+
+  const customFieldConfig = {
+    ...active.config,
+    rules: [{
+      id: 'unhandled-catalog-custom-fields', entity: 'catalog', sourceField: 'property108',
+      targetField: 'attributes.bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+    }],
+  };
+  const customFieldResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: customFieldConfig }),
+  });
+  assert.equal(customFieldResponse.status, 400, 'metadata presence alone does not prove a writable Bitrix24 custom-property payload');
+
+  const reservedIdentityConfig = {
+    ...active.config,
+    rules: [{
+      id: 'reserved-recovery-identity', entity: 'catalog', sourceField: 'xmlId', targetField: 'externalCode',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } },
+    }],
+  };
+  const reservedIdentityResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: reservedIdentityConfig }),
+  });
+  assert.equal(reservedIdentityResponse.status, 400);
+  assert.match(await reservedIdentityResponse.text(), /xmlId is reserved for durable product-create recovery/);
+
+  const reservedIdentityGroup = {
+    ...active.config,
+    groups: [{
+      id: 'reserved-recovery-identity-group', entity: 'catalog', direction: 'MOYSKLAD_TO_BITRIX24',
+      sourceFields: ['externalCode'], targetField: 'xmlId', transform: { kind: 'join-non-empty', separator: ' ' },
+    }],
+  };
+  const reservedIdentityGroupResponse = await fetch(`${apiUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' },
+    body: JSON.stringify({ config: reservedIdentityGroup }),
+  });
+  assert.equal(reservedIdentityGroupResponse.status, 400);
+  assert.match(await reservedIdentityGroupResponse.text(), /xmlId is reserved for durable product-create recovery/);
 });
 
 test('accepted events stay pinned across activation and only an explicit one-event recompute changes the pin', async () => {

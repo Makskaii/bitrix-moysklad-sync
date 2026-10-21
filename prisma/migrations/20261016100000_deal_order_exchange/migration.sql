@@ -1,4 +1,4 @@
-CREATE TABLE "DealOrderCreateOperation" (
+CREATE TABLE IF NOT EXISTS "DealOrderCreateOperation" (
   "bitrix24DealId" TEXT NOT NULL,
   "syncId" TEXT NOT NULL,
   "payload" JSONB NOT NULL,
@@ -14,10 +14,12 @@ CREATE TABLE "DealOrderCreateOperation" (
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "DealOrderCreateOperation_pkey" PRIMARY KEY ("bitrix24DealId")
 );
-CREATE UNIQUE INDEX "DealOrderCreateOperation_syncId_key" ON "DealOrderCreateOperation"("syncId");
-CREATE INDEX "DealOrderCreateOperation_status_updatedAt_idx" ON "DealOrderCreateOperation"("status", "updatedAt");
+ALTER TABLE "DealOrderCreateOperation"
+  ADD COLUMN IF NOT EXISTS "confirmedCustomerPairIds" JSONB NOT NULL DEFAULT '[]'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderCreateOperation_syncId_key" ON "DealOrderCreateOperation"("syncId");
+CREATE INDEX IF NOT EXISTS "DealOrderCreateOperation_status_updatedAt_idx" ON "DealOrderCreateOperation"("status", "updatedAt");
 
-CREATE TABLE "DealOrderPositionPair" (
+CREATE TABLE IF NOT EXISTS "DealOrderPositionPair" (
   "id" TEXT NOT NULL,
   "pairId" TEXT NOT NULL,
   "bitrix24ProductRowId" TEXT NOT NULL,
@@ -27,11 +29,23 @@ CREATE TABLE "DealOrderPositionPair" (
   "lastSyncedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "DealOrderPositionPair_pkey" PRIMARY KEY ("id")
 );
-CREATE UNIQUE INDEX "DealOrderPositionPair_pairId_bitrix24ProductRowId_key" ON "DealOrderPositionPair"("pairId", "bitrix24ProductRowId");
-CREATE UNIQUE INDEX "DealOrderPositionPair_pairId_moyskladPositionId_key" ON "DealOrderPositionPair"("pairId", "moyskladPositionId");
-ALTER TABLE "DealOrderPositionPair" ADD CONSTRAINT "DealOrderPositionPair_pairId_fkey" FOREIGN KEY ("pairId") REFERENCES "EntityPair"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderPositionPair_pairId_bitrix24ProductRowId_key" ON "DealOrderPositionPair"("pairId", "bitrix24ProductRowId");
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderPositionPair_pairId_moyskladPositionId_key" ON "DealOrderPositionPair"("pairId", "moyskladPositionId");
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'DealOrderPositionPair_pairId_fkey'
+      AND conrelid = '"DealOrderPositionPair"'::regclass
+  ) THEN
+    ALTER TABLE "DealOrderPositionPair"
+      ADD CONSTRAINT "DealOrderPositionPair_pairId_fkey"
+      FOREIGN KEY ("pairId") REFERENCES "EntityPair"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END
+$migration$;
 
-CREATE TABLE "DealOrderPositionAddOperation" (
+CREATE TABLE IF NOT EXISTS "DealOrderPositionAddOperation" (
   "id" TEXT NOT NULL,
   "pairId" TEXT NOT NULL,
   "bitrix24ProductRowId" TEXT NOT NULL,
@@ -46,11 +60,23 @@ CREATE TABLE "DealOrderPositionAddOperation" (
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "DealOrderPositionAddOperation_pkey" PRIMARY KEY ("id")
 );
-CREATE UNIQUE INDEX "DealOrderPositionAddOperation_pairId_bitrix24ProductRowId_key" ON "DealOrderPositionAddOperation"("pairId", "bitrix24ProductRowId");
-CREATE INDEX "DealOrderPositionAddOperation_status_updatedAt_idx" ON "DealOrderPositionAddOperation"("status", "updatedAt");
-ALTER TABLE "DealOrderPositionAddOperation" ADD CONSTRAINT "DealOrderPositionAddOperation_pairId_fkey" FOREIGN KEY ("pairId") REFERENCES "EntityPair"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderPositionAddOperation_pairId_bitrix24ProductRowId_key" ON "DealOrderPositionAddOperation"("pairId", "bitrix24ProductRowId");
+CREATE INDEX IF NOT EXISTS "DealOrderPositionAddOperation_status_updatedAt_idx" ON "DealOrderPositionAddOperation"("status", "updatedAt");
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'DealOrderPositionAddOperation_pairId_fkey'
+      AND conrelid = '"DealOrderPositionAddOperation"'::regclass
+  ) THEN
+    ALTER TABLE "DealOrderPositionAddOperation"
+      ADD CONSTRAINT "DealOrderPositionAddOperation_pairId_fkey"
+      FOREIGN KEY ("pairId") REFERENCES "EntityPair"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END
+$migration$;
 
-CREATE TABLE "DealOrderReverseCreateOperation" (
+CREATE TABLE IF NOT EXISTS "DealOrderReverseCreateOperation" (
   "moyskladOrderId" TEXT NOT NULL,
   "syncId" TEXT NOT NULL,
   "eventId" TEXT NOT NULL,
@@ -66,10 +92,10 @@ CREATE TABLE "DealOrderReverseCreateOperation" (
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "DealOrderReverseCreateOperation_pkey" PRIMARY KEY ("moyskladOrderId")
 );
-CREATE UNIQUE INDEX "DealOrderReverseCreateOperation_syncId_key" ON "DealOrderReverseCreateOperation"("syncId");
-CREATE INDEX "DealOrderReverseCreateOperation_status_updatedAt_idx" ON "DealOrderReverseCreateOperation"("status", "updatedAt");
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderReverseCreateOperation_syncId_key" ON "DealOrderReverseCreateOperation"("syncId");
+CREATE INDEX IF NOT EXISTS "DealOrderReverseCreateOperation_status_updatedAt_idx" ON "DealOrderReverseCreateOperation"("status", "updatedAt");
 
-CREATE TABLE "DealOrderReversePositionOperation" (
+CREATE TABLE IF NOT EXISTS "DealOrderReversePositionOperation" (
   "id" TEXT NOT NULL,
   "moyskladOrderId" TEXT NOT NULL,
   "moyskladPositionId" TEXT NOT NULL,
@@ -81,6 +107,18 @@ CREATE TABLE "DealOrderReversePositionOperation" (
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "DealOrderReversePositionOperation_pkey" PRIMARY KEY ("id")
 );
-CREATE UNIQUE INDEX "DealOrderReversePositionOperation_moyskladOrderId_moyskladPositionId_key" ON "DealOrderReversePositionOperation"("moyskladOrderId", "moyskladPositionId");
-CREATE INDEX "DealOrderReversePositionOperation_status_updatedAt_idx" ON "DealOrderReversePositionOperation"("status", "updatedAt");
-ALTER TABLE "DealOrderReversePositionOperation" ADD CONSTRAINT "DealOrderReversePositionOperation_moyskladOrderId_fkey" FOREIGN KEY ("moyskladOrderId") REFERENCES "DealOrderReverseCreateOperation"("moyskladOrderId") ON DELETE CASCADE ON UPDATE CASCADE;
+CREATE UNIQUE INDEX IF NOT EXISTS "DealOrderReversePositionOperation_moyskladOrderId_moyskladPositionId_key" ON "DealOrderReversePositionOperation"("moyskladOrderId", "moyskladPositionId");
+CREATE INDEX IF NOT EXISTS "DealOrderReversePositionOperation_status_updatedAt_idx" ON "DealOrderReversePositionOperation"("status", "updatedAt");
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'DealOrderReversePositionOperation_moyskladOrderId_fkey'
+      AND conrelid = '"DealOrderReversePositionOperation"'::regclass
+  ) THEN
+    ALTER TABLE "DealOrderReversePositionOperation"
+      ADD CONSTRAINT "DealOrderReversePositionOperation_moyskladOrderId_fkey"
+      FOREIGN KEY ("moyskladOrderId") REFERENCES "DealOrderReverseCreateOperation"("moyskladOrderId") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END
+$migration$;

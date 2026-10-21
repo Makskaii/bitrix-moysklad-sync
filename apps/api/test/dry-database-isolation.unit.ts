@@ -57,7 +57,7 @@ test('Docker validates target separation before invoking migrations', () => {
   withEnvironment({ SYNC_MODE: 'apply', DATABASE_URL: 'postgresql://apply@localhost/test?schema=apply', DRY_DATABASE_URL: 'postgres://dry@127.0.0.1:5432/test?schema=dry' }, () => {
     assert.doesNotThrow(assertConfiguredDatabaseTargets);
   });
-  const dockerfile = readFileSync(resolve(process.cwd(), 'Dockerfile'), 'utf8');
+  const dockerfile = readFileSync(resolve(process.cwd(), 'apps/api/Dockerfile'), 'utf8');
   assert.ok(dockerfile.indexOf('assertConfiguredDatabaseTargets') < dockerfile.indexOf('prisma migrate deploy'));
   assert.ok(dockerfile.includes(' && { case '), 'mode selection must run only after preflight succeeds');
   assert.ok(dockerfile.includes('} && DATABASE_URL='), 'migration must run only after both preflight and mode selection succeed');

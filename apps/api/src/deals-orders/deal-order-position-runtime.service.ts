@@ -9,6 +9,8 @@ import { DealOrderPairLease, withDealOrderPairLock } from './deal-order-pair-loc
 import { bitrixMoneyToMoySklad, moySkladMoneyToBitrix } from './deal-order-money';
 import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } from '../sync-mode.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from './deal-order-reverse-create.service';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type Result = { status: 'SYNCED'; rowValuesChanged?: boolean } | { status: 'PARTIAL'; reason: 'DEAL_ORDER_POSITION_ROWS_SKIPPED'; skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }> } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
@@ -23,6 +25,14 @@ class InvalidPositionSetError extends Error {}
 @Injectable()
 export class DealOrderPositionRuntimeService {
   constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, private readonly reverseCreate?: DealOrderReverseCreateService) {}
+
+  private async providerRequest(url: URL, init: RequestInit): Promise<unknown> {
+    const result = await withServiceModeOn(this.database, async () => requestJson(url, init));
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
+  private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
   async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
@@ -44,8 +54,9 @@ export class DealOrderPositionRuntimeService {
     let b24Rows: Row[];
     let msRows: Position[];
     try {
-      [b24Rows, msRows] = await Promise.all([readAllBitrixRows(pair.bitrix24Id), readAllMoySkladPositions(pair.moyskladId)]);
+      [b24Rows, msRows] = await Promise.all([readAllBitrixRows(pair.bitrix24Id, this.providerGate), readAllMoySkladPositions(pair.moyskladId, this.providerGate)]);
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       if (error instanceof InvalidPositionSetError) {
         logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, reason: 'DEAL_ORDER_POSITION_SET_INVALID' }));
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_INVALID' };
@@ -55,8 +66,8 @@ export class DealOrderPositionRuntimeService {
     const hasVat = b24Rows.some((row) => row.taxRate !== null && row.taxRate !== undefined) || msRows.some((row) => row.vatEnabled === true);
     let msVatIncluded: boolean | null = null;
     if (hasVat) {
-      try { msVatIncluded = await readMoySkladVatIncluded(pair.moyskladId); }
-      catch { return { status: 'RETRY', reason: 'DEAL_ORDER_VAT_HEADER_READ_FAILED' }; }
+      try { msVatIncluded = await readMoySkladVatIncluded(pair.moyskladId, this.providerGate); }
+      catch (error) { if (error instanceof ServiceModeNotOnError) throw error; return { status: 'RETRY', reason: 'DEAL_ORDER_VAT_HEADER_READ_FAILED' }; }
       if (msVatIncluded === null) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_HEADER_UNAVAILABLE' };
       const sourceVatModes = new Set(b24Rows.filter((row) => row.taxRate !== null && row.taxRate !== undefined).map((row) => row.taxIncluded));
       if (sourceVatModes.size > 1) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_INCLUSION_CONFLICT' };
@@ -94,10 +105,17 @@ export class DealOrderPositionRuntimeService {
     linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
     linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
     const productIds = [...new Set(b24Rows.map((row) => String(row.productId)))];
+    const identityFailure = await this.ensureProductIdentities(productIds, input.eventId, input.eventConfig);
+    if (identityFailure) return identityFailure;
     const productPairs = await this.database.entityPair.findMany({
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },
     });
+    const aliases = await this.database.productDuplicateAlias.findMany({ where: { duplicateBitrix24Id: { in: productIds } }, select: { duplicateBitrix24Id: true, canonicalPairId: true } });
+    const canonicalIds = aliases.map((alias) => alias.canonicalPairId);
+    const canonicalPairs = canonicalIds.length ? await this.database.entityPair.findMany({ where: { id: { in: canonicalIds }, entityType: 'PRODUCT', active: true }, select: { id: true, moyskladId: true } }) : [];
+    const canonicalById = new Map(canonicalPairs.map((pair) => [pair.id, pair.moyskladId]));
+    productPairs.push(...aliases.flatMap((alias) => canonicalById.has(alias.canonicalPairId) ? [{ bitrix24Id: alias.duplicateBitrix24Id, moyskladId: canonicalById.get(alias.canonicalPairId)! }] : []));
     const sourceById = new Map(b24Rows.map((row) => [String(row.id), row]));
     const targetById = new Map(msRows.map((row) => [row.id, row]));
     const plans: Array<{ linkId: string; source: Row; target: Position; quantity: number; price: number; discount: number; vat: number; vatEnabled: boolean; bitrixPrice: number; bitrixDiscountRate: number; bitrixTaxRate: number | null; bitrixTaxIncluded: 'Y' | 'N'; direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'ECHO' }> = [];
@@ -143,7 +161,7 @@ export class DealOrderPositionRuntimeService {
         await skipRow('BITRIX24', link.bitrix24ProductRowId, 'DEAL_ORDER_POSITION_IDENTITY_CHANGED');
         continue;
       }
-      const mappedUnit = input.eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      const mappedUnit = findConfiguredUnitByCode(input.eventConfig.config.references.units, source.measureCode);
       const linkedProducts = productPairs.filter((candidate) => candidate.bitrix24Id === String(source.productId));
       const targetProductId = assortmentId(target.assortment);
       if (!mappedUnit?.moyskladId || linkedProducts.length !== 1 || linkedProducts[0].moyskladId !== targetProductId) {
@@ -151,12 +169,12 @@ export class DealOrderPositionRuntimeService {
         continue;
       }
       try {
-        const product = await requestJson(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
         if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
           await skipRow('BITRIX24', link.bitrix24ProductRowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
           continue;
         }
-      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_READ_FAILED' }; }
+      } catch (error) { if (error instanceof ServiceModeNotOnError) throw error; return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DEPENDENCY_READ_FAILED' }; }
       const sourceChanged = !sameSourceValue(source, link.bitrix24Values);
       const targetChanged = !sameTargetValue(target, link.moyskladValues);
       const direction = targetChanged ? 'MOYSKLAD_TO_BITRIX24' : sourceChanged ? 'BITRIX24_TO_MOYSKLAD' : 'ECHO';
@@ -188,28 +206,28 @@ export class DealOrderPositionRuntimeService {
         let verifiedB24: Row;
         let verifiedMs: Row;
         if (plan.direction === 'BITRIX24_TO_MOYSKLAD') {
-          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
+          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id, this.providerGate);
           if (!sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           if (plan.target.quantity !== plan.quantity || plan.target.price !== plan.price || plan.target.discount !== plan.discount || plan.target.vat !== plan.vat || plan.target.vatEnabled !== plan.vatEnabled) {
-            await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
+            await runMutation('bitrix24ToMoysklad', () => this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), {
               method: 'PUT', headers: msHeaders(), body: JSON.stringify({ quantity: plan.quantity, price: plan.price, discount: plan.discount, vat: plan.vat, vatEnabled: plan.vatEnabled }),
             }));
           }
-          const verified = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+          const verified = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(plan.target.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
           if (!isRecord(verified) || verified.id !== plan.target.id || verified.quantity !== plan.quantity || verified.price !== plan.price || verified.discount !== plan.discount || verified.vat !== plan.vat || verified.vatEnabled !== plan.vatEnabled) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
           verifiedB24 = sourceSnapshot(plan.source);
           verifiedMs = targetSnapshot(verified);
         } else {
-          const currentRows = await readAllBitrixRows(pair.bitrix24Id);
+          const currentRows = await readAllBitrixRows(pair.bitrix24Id, this.providerGate);
           const currentSource = currentRows.find((row) => String(row.id) === String(plan.source.id));
-          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id);
+          const currentTarget = await readMoySkladPosition(pair.moyskladId, plan.target.id, this.providerGate);
           if (!currentSource || !sameSourceValue(currentSource, plan.source) || !sameTargetValue(currentTarget, plan.target) || !sameProductTarget(currentTarget, plan.target)) {
             return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           }
           const quantity = plan.target.quantity;
           const price = plan.bitrixPrice;
-          await runMutation('moyskladToBitrix24', () => updateBitrixRow(plan.source.id, quantity, price, plan.bitrixDiscountRate, plan.bitrixTaxRate, plan.bitrixTaxIncluded));
-          const rows = await readAllBitrixRows(pair.bitrix24Id);
+          await runMutation('moyskladToBitrix24', () => updateBitrixRow(plan.source.id, quantity, price, plan.bitrixDiscountRate, plan.bitrixTaxRate, plan.bitrixTaxIncluded, this.providerGate));
+          const rows = await readAllBitrixRows(pair.bitrix24Id, this.providerGate);
           const verified = rows.find((row) => String(row.id) === String(plan.source.id));
           if (!verified || verified.quantity !== quantity || verified.price !== price || verified.discountRate !== plan.bitrixDiscountRate || verified.taxRate !== plan.bitrixTaxRate || verified.taxIncluded !== plan.bitrixTaxIncluded) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READBACK_MISMATCH' };
           verifiedB24 = sourceSnapshot(verified);
@@ -221,6 +239,7 @@ export class DealOrderPositionRuntimeService {
           data: { bitrix24Values: verifiedB24 as Prisma.InputJsonValue, moyskladValues: verifiedMs as Prisma.InputJsonValue, lastSyncedAt: new Date() },
         });
       } catch (error) {
+        throwIfServiceModeNotOn(error);
         if (error instanceof DealOrderWriteGateError) return { status: 'RETRY', reason: error.message };
         return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_WRITE_FAILED' };
       }
@@ -228,14 +247,14 @@ export class DealOrderPositionRuntimeService {
     for (const deletion of deletions) {
       try {
         if (deletion.direction === 'MOYSKLAD_TO_BITRIX24') {
-          const latestSource = await readAllBitrixRows(pair.bitrix24Id);
-          const latestTargetRows = await readAllMoySkladPositions(pair.moyskladId);
+          const latestSource = await readAllBitrixRows(pair.bitrix24Id, this.providerGate);
+          const latestTargetRows = await readAllMoySkladPositions(pair.moyskladId, this.providerGate);
           const currentSource = latestSource.find((row) => String(row.id) === String(deletion.source?.id));
           if (!currentSource || !sameSourceValue(currentSource, deletion.source) || latestTargetRows.some((row) => row.id === links.find((link) => link.id === deletion.linkId)?.moyskladPositionId)) {
             return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
           }
-          await runMutation('moyskladToBitrix24', () => deleteBitrixRow(deletion.source?.id));
-          const afterDelete = await readAllBitrixRows(pair.bitrix24Id);
+          await runMutation('moyskladToBitrix24', () => deleteBitrixRow(deletion.source?.id, this.providerGate));
+          const afterDelete = await readAllBitrixRows(pair.bitrix24Id, this.providerGate);
           if (afterDelete.some((row) => String(row.id) === String(deletion.source?.id))) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
           const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
           if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
@@ -243,20 +262,20 @@ export class DealOrderPositionRuntimeService {
         }
         const target = deletion.target;
         if (!target) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_PAIR_MISSING' };
-        const latestSource = await readAllBitrixRows(pair.bitrix24Id);
-        const latestTarget = await readMoySkladPosition(pair.moyskladId, target.id);
+        const latestSource = await readAllBitrixRows(pair.bitrix24Id, this.providerGate);
+        const latestTarget = await readMoySkladPosition(pair.moyskladId, target.id, this.providerGate);
         if (latestSource.some((row) => String(row.id) === links.find((link) => link.id === deletion.linkId)?.bitrix24ProductRowId) ||
             !sameTargetValue(latestTarget, target) || !sameProductTarget(latestTarget, target)) {
           return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_CHANGED_BEFORE_WRITE' };
         }
-        await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(target.id)}`, withSlash(moyskladBase())), {
+        await runMutation('bitrix24ToMoysklad', () => this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(pair.moyskladId)}/positions/${encodeURIComponent(target.id)}`, withSlash(moyskladBase())), {
           method: 'DELETE', headers: msHeaders(),
         }));
-        const afterDelete = await readAllMoySkladPositions(pair.moyskladId);
+        const afterDelete = await readAllMoySkladPositions(pair.moyskladId, this.providerGate);
         if (afterDelete.some((row) => row.id === target.id)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_DELETE_READBACK_MISMATCH' };
         const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.delete({ where: { id: deletion.linkId } }));
         if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
-      } catch (error) { return { status: 'RETRY', reason: error instanceof DealOrderWriteGateError ? error.message : 'DEAL_ORDER_POSITION_DELETE_FAILED' }; }
+      } catch (error) { throwIfServiceModeNotOn(error); return { status: 'RETRY', reason: error instanceof DealOrderWriteGateError ? error.message : 'DEAL_ORDER_POSITION_DELETE_FAILED' }; }
     }
     if (alreadyDeleted.length) {
       const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.deleteMany({ where: { id: { in: alreadyDeleted } } }));
@@ -268,6 +287,19 @@ export class DealOrderPositionRuntimeService {
   }
 
   /** Bootstrap only when unique, confirmed product identity produces a one-to-one row relation on both sides. */
+  private async ensureProductIdentities(productIds: string[], eventId: string, eventConfig: VersionedFieldSettingsDto): Promise<Result | null> {
+    try {
+      for (const productId of productIds) await ensureDocumentProductIdentity(this.database, {
+        bitrix24ProductId: productId, eventId,
+        bitrix24CatalogId: eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
+      });
+      return null;
+    } catch (error) {
+      if (error instanceof DocumentProductIdentityError) return { status: 'MANUAL_REVIEW', reason: error.reason };
+      throw error;
+    }
+  }
+
   private async bootstrapHistoricalLinks(
     pairId: string,
     orderId: string,
@@ -290,10 +322,17 @@ export class DealOrderPositionRuntimeService {
     if ([...productCounts.values()].some((count) => count !== 1)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
 
     const productIds = [...productCounts.keys()];
+    const identityFailure = await this.ensureProductIdentities(productIds, eventId, eventConfig);
+    if (identityFailure) return identityFailure;
     const productPairs = await this.database.entityPair.findMany({
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },
     });
+    const aliases = await this.database.productDuplicateAlias.findMany({ where: { duplicateBitrix24Id: { in: productIds } }, select: { duplicateBitrix24Id: true, canonicalPairId: true } });
+    const canonicalIds = aliases.map((alias) => alias.canonicalPairId);
+    const canonicalPairs = canonicalIds.length ? await this.database.entityPair.findMany({ where: { id: { in: canonicalIds }, entityType: 'PRODUCT', active: true }, select: { id: true, moyskladId: true } }) : [];
+    const canonicalById = new Map(canonicalPairs.map((pair) => [pair.id, pair.moyskladId]));
+    productPairs.push(...aliases.flatMap((alias) => canonicalById.has(alias.canonicalPairId) ? [{ bitrix24Id: alias.duplicateBitrix24Id, moyskladId: canonicalById.get(alias.canonicalPairId)! }] : []));
     const productBySource = new Map<string, string>();
     for (const id of productIds) {
       const candidates = productPairs.filter((candidate) => candidate.bitrix24Id === id);
@@ -318,18 +357,18 @@ export class DealOrderPositionRuntimeService {
       const target = msRows.find((candidate) => candidate.assortment && assortmentId(candidate.assortment) === targetProductId);
       if (!target || !targetProductId || linkedTargets.has(target.id)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
       const desired = sourceValues(source);
-      const mappedUnit = eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      const mappedUnit = findConfiguredUnitByCode(eventConfig.config.references.units, source.measureCode);
       if (!desired || !mappedUnit?.moyskladId || !isUuid(mappedUnit.moyskladId) ||
           !isRecord(target.assortment) || !isRecord(target.assortment.meta) || target.assortment.meta.type !== 'product' || !Number.isFinite(target.quantity) || target.quantity <= 0 ||
           !Number.isFinite(target.price) || target.price < 0 || (target.discount ?? 0) !== 0 || (target.vatEnabled ?? false) || (target.vat ?? 0) !== 0) {
         return hold('DEAL_ORDER_POSITION_BOOTSTRAP_VALUE_OR_UNIT_UNSUPPORTED');
       }
       try {
-        const product = await requestJson(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
         if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || !isRecord(product.uom) || product.uom.id !== mappedUnit.moyskladId) {
           return hold('DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_MISMATCH');
         }
-      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_READ_FAILED' }; }
+      } catch (error) { if (error instanceof ServiceModeNotOnError) throw error; return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_READ_FAILED' }; }
       linkedTargets.add(target.id);
       snapshots.push({
         bitrix24ProductRowId: sourceId, moyskladPositionId: target.id,
@@ -353,17 +392,23 @@ export class DealOrderPositionRuntimeService {
       const desired = sourceValues(row);
       const productId = String(row.productId ?? '');
       const measureCode = row.measureCode;
-      const unit = units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
+      const unit = findConfiguredUnitByCode(units, measureCode);
       if (!desired || !/^\d{1,20}$/.test(rowId) || !/^\d{1,20}$/.test(productId) || !Number.isInteger(measureCode) || !unit?.moyskladId) {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
         continue;
       }
-      const candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      let candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      if (!candidates.length) {
+        const alias = await this.database.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId }, select: { canonicalPairId: true } });
+        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true } }) : null;
+        if (canonical) candidates = [canonical];
+      }
       if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) { await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED'); continue; }
       let product: unknown;
       try {
-        product = await requestJson(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
       } catch (error) {
+        throwIfServiceModeNotOn(error);
         if (error instanceof PositionProviderRequestError && error.status === 404) {
           await skipRow('BITRIX24', rowId, 'DEAL_ORDER_PRODUCT_NOT_FOUND');
           continue;
@@ -408,21 +453,21 @@ export class DealOrderPositionRuntimeService {
       });
       try {
         if (operation.moyskladPositionId) {
-          const recovered = await readMoySkladPosition(orderId, operation.moyskladPositionId);
+          const recovered = await readMoySkladPosition(orderId, operation.moyskladPositionId, this.providerGate);
           if (!positionMatches(recovered, payload)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH' };
           return await this.persistAddedRow(pairId, row, operation.moyskladPositionId, payload, operation.id, leaseToken, assertOwner);
         }
-        const latestSourceRows = await readAllBitrixRows((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { bitrix24Id: true } })).bitrix24Id);
+        const latestSourceRows = await readAllBitrixRows((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { bitrix24Id: true } })).bitrix24Id, this.providerGate);
         const latestSource = latestSourceRows.find((candidate) => String(candidate.id) === rowId);
         if (!latestSource || !sameSourceValue(latestSource, row) || !sameProductAndUnit(latestSource, row)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_SOURCE_CHANGED');
-        const currentRows = await readAllMoySkladPositions(orderId);
+        const currentRows = await readAllMoySkladPositions(orderId, this.providerGate);
         const knownLinks = await this.database.dealOrderPositionPair.findMany({ where: { pairId }, select: { moyskladPositionId: true } });
         const known = new Set(knownLinks.map((link) => link.moyskladPositionId));
         const unlinked = currentRows.filter((position) => !known.has(position.id));
         const exact = unlinked.filter((position) => positionMatches(position, payload));
         const recoveryError = classifyPositionAddRecovery(isRetryAfterAttempt, exact.length);
         if (recoveryError) return this.addUncertain(operation.id, leaseToken, recoveryError);
-        const created = await runMutation('bitrix24ToMoysklad', () => requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
+        const created = await runMutation('bitrix24ToMoysklad', () => this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
           method: 'POST', headers: msHeaders(), body: JSON.stringify(payload),
         }));
         if (!isRecord(created) || !isUuid(created.id)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
@@ -430,10 +475,11 @@ export class DealOrderPositionRuntimeService {
           where: { id: operation.id, leaseToken }, data: { moyskladPositionId: created.id },
         });
         if (savedPositionId.count !== 1) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_LEASE_LOST_AFTER_PROVIDER_SUCCESS' };
-        const readback = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(created.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        const readback = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(created.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
         if (!isRecord(readback) || readback.id !== created.id || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
         return await this.persistAddedRow(pairId, row, created.id, payload, operation.id, leaseToken, assertOwner);
       } catch (error) {
+        throwIfServiceModeNotOn(error);
         await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operation.id, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'ADD_OUTCOME_UNKNOWN' } }).catch(() => undefined);
         if (error instanceof DealOrderWriteGateError) return { status: 'RETRY', reason: error.message };
         return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN' };
@@ -444,7 +490,7 @@ export class DealOrderPositionRuntimeService {
 
   private async persistAddedRow(pairId: string, source: Row, positionId: string, payload: Row, operationId: string, leaseToken?: string, assertOwner?: () => Promise<boolean>): Promise<Result> {
     try {
-      const position = await requestJson(new URL(`entity/customerorder/${encodeURIComponent((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { moyskladId: true } })).moyskladId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+      const position = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent((await this.database.entityPair.findUniqueOrThrow({ where: { id: pairId }, select: { moyskladId: true } })).moyskladId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
       if (!isRecord(position) || position.id !== positionId || !positionMatches(position, payload)) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH' };
       if (assertOwner && !await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
       await this.database.$transaction(async (transaction) => {
@@ -456,7 +502,8 @@ export class DealOrderPositionRuntimeService {
         await transaction.dealOrderPositionAddOperation.update({ where: { id: operationId }, data: { status: 'SUCCEEDED', moyskladPositionId: positionId, lastErrorCategory: null, leaseToken: null, leaseUntil: null } });
       });
       return { status: 'SYNCED' };
-    } catch {
+    } catch (error) {
+      throwIfServiceModeNotOn(error);
       return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_STORE_FAILED' };
     }
   }
@@ -480,6 +527,12 @@ function sourceValues(row: Row): { quantity: number; price: number; discount: nu
   if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0) return null;
   const money = bitrixMoneyToMoySklad(row);
   return money ? { quantity, price: money.price, discount: money.discount, vat: money.vat, vatEnabled: money.vatEnabled, vatIncluded: money.vatIncluded } : null;
+}
+
+function findConfiguredUnitByCode<T extends { bitrix24Code: string; status: string; moyskladId: string | null }>(units: readonly T[], measureCode: unknown): T | null {
+  if (typeof measureCode !== 'number' || !Number.isInteger(measureCode) || measureCode < 1) return null;
+  const candidates = units.filter((unit) => unit.bitrix24Code === String(measureCode));
+  return candidates.length === 1 && candidates[0]?.status === 'configured' && candidates[0].moyskladId ? candidates[0] : null;
 }
 
 function sameProductAndUnit(source: Row, old: unknown): boolean {
@@ -514,14 +567,16 @@ function stableJson(value: unknown): string { return JSON.stringify(value, (_key
 function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
 function targetSnapshot(row: Row): Row { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
 
-async function readAllBitrixRows(id: string): Promise<Row[]> {
+type ProviderGate = (url: URL, init: RequestInit) => Promise<unknown>;
+
+async function readAllBitrixRows(id: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const all: Row[] = [];
   let start = 0;
   let expectedTotal: number | null = null;
   do {
     const url = new URL('crm.item.productrow.list', withSlash(bitrixBase()));
     url.searchParams.set('filter[=ownerType]', 'D'); url.searchParams.set('filter[=ownerId]', id); url.searchParams.set('start', String(start));
-    const body = await requestJson(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ 'filter[=ownerType]': 'D', 'filter[=ownerId]': id, start: String(start) }) });
+    const body = await gate(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ 'filter[=ownerType]': 'D', 'filter[=ownerId]': id, start: String(start) }) });
     if (!isRecord(body) || !isRecord(body.result) || !Array.isArray(body.result.productRows) || typeof body.total !== 'number' || body.result.productRows.some((row) => !isRecord(row))) throw new Error();
     if (expectedTotal === null) expectedTotal = body.total;
     else if (body.total !== expectedTotal) throw new InvalidPositionSetError();
@@ -535,14 +590,14 @@ async function readAllBitrixRows(id: string): Promise<Row[]> {
   return all;
 }
 
-async function readAllMoySkladPositions(orderId: string): Promise<Position[]> {
+async function readAllMoySkladPositions(orderId: string, gate: ProviderGate = requestJson): Promise<Position[]> {
   const base = moyskladBase();
   const first = new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(base));
   const rows: Position[] = [];
   let next: URL | null = first;
   let expectedSize: number | null = null;
   while (next) {
-    const page = await requestJson(next, { method: 'GET', headers: msHeaders() });
+    const page = await gate(next, { method: 'GET', headers: msHeaders() });
     if (!isRecord(page) || !Array.isArray(page.rows) || !isRecord(page.meta) || typeof page.meta.size !== 'number') throw new Error();
     if (expectedSize === null) expectedSize = page.meta.size;
     if (page.rows.some((row) => !isRecord(row) || !isUuid(row.id))) throw new Error();
@@ -555,37 +610,42 @@ async function readAllMoySkladPositions(orderId: string): Promise<Position[]> {
   return rows;
 }
 
-async function readMoySkladVatIncluded(orderId: string): Promise<boolean | null> {
-  const value = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+async function readMoySkladVatIncluded(orderId: string, gate: ProviderGate = requestJson): Promise<boolean | null> {
+  const value = await gate(new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
   if (!isRecord(value) || value.id !== orderId || typeof value.vatIncluded !== 'boolean') return null;
   return value.vatIncluded;
 }
 
-async function readMoySkladPosition(orderId: string, positionId: string): Promise<Position> {
-  const value = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+async function readMoySkladPosition(orderId: string, positionId: string, gate: ProviderGate = requestJson): Promise<Position> {
+  const value = await gate(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(positionId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
   if (!isRecord(value) || value.id !== positionId || typeof value.quantity !== 'number' || typeof value.price !== 'number') throw new Error();
   return value as Position;
 }
 
-async function updateBitrixRow(rowId: unknown, quantity: number, price: number, discountRate: number, taxRate: number | null, taxIncluded: 'Y' | 'N'): Promise<void> {
+async function updateBitrixRow(rowId: unknown, quantity: number, price: number, discountRate: number, taxRate: number | null, taxIncluded: 'Y' | 'N', gate: ProviderGate = requestJson): Promise<void> {
   if (!/^\d{1,20}$/.test(String(rowId))) throw new Error();
   const body = JSON.stringify({ id: String(rowId), fields: { quantity, price, discountTypeId: 2, discountRate, discountSum: 0, taxRate, taxIncluded } });
-  const result = await requestJson(new URL('crm.item.productrow.update', withSlash(bitrixBase())), {
+  const result = await gate(new URL('crm.item.productrow.update', withSlash(bitrixBase())), {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
   if (!isRecord(result) || !isRecord(result.result) || !isRecord(result.result.productRow) || String(result.result.productRow.id) !== String(rowId)) throw new Error();
 }
 
-async function deleteBitrixRow(rowId: unknown): Promise<void> {
+async function deleteBitrixRow(rowId: unknown, gate: ProviderGate = requestJson): Promise<void> {
   if (!/^\d{1,20}$/.test(String(rowId))) throw new Error();
   const body = new URLSearchParams({ id: String(rowId) });
-  await requestJson(new URL('crm.item.productrow.delete', withSlash(bitrixBase())), {
+  await gate(new URL('crm.item.productrow.delete', withSlash(bitrixBase())), {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
   });
 }
 
 class PositionProviderRequestError extends Error {
   constructor(readonly status: number | null, readonly failure: 'NETWORK' | 'HTTP' | 'INVALID_BODY') { super(`POSITION_PROVIDER_${failure}`); }
+}
+function throwIfServiceModeNotOn(error: unknown): void {
+  if (error instanceof ServiceModeNotOnError || error instanceof DealOrderWriteGateError && (error.reason === 'OFF' || error.reason === 'PAUSE')) {
+    throw new ServiceModeNotOnError();
+  }
 }
 function isTransientProductLookupFailure(error: unknown): boolean {
   if (!(error instanceof PositionProviderRequestError)) return false;

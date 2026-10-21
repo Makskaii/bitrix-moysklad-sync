@@ -43,23 +43,35 @@ test('field settings select, save, and reload field pairs while preview stays re
     const query = new URL(route.request().url()).searchParams;
     expect(query.get('pairId')).toBeNull();
     const entity = query.get('entity') ?? 'contacts';
-    return route.fulfill({ json: { entity,
+    if (entity === 'smart-invoices') return route.fulfill({ json: { entity,
       bitrix24: [
-        { code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true, category: 'standard' },
-        { code: 'NAME', title: 'Full Name', type: 'string', writable: true, category: 'standard' },
-        { code: 'UF_CRM_ALIAS', title: 'Custom Alias', type: 'string', writable: true, category: 'custom' },
-        { code: 'UF_CRM_DUP_1', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
-        { code: 'UF_CRM_DUP_2', title: 'Duplicate', type: 'string', writable: true, category: 'custom' },
-        { code: 'UF_CRM_LOCKED', title: 'Reserved Custom', type: 'string', writable: true, category: 'custom' },
-        { code: 'UF_CRM_GENERIC', title: 'Пользовательское поле (Строка)', type: 'string', writable: true, category: 'custom' },
+        { code: 'title', title: 'Заголовок счёта', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'description', title: 'Описание счёта', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'parentId2', title: 'Связанная сделка', type: 'integer', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
       ],
       moysklad: [
-        { code: 'email', title: 'Email', type: 'string', writable: null, category: 'standard' },
-        { code: 'name', title: '  full   name ', type: 'string', writable: true, category: 'standard' },
-        { code: 'attributes.alias', title: 'custom alias', type: 'string', writable: null, category: 'custom' },
-        { code: 'attributes.duplicate', title: 'Duplicate', type: 'string', writable: null, category: 'custom' },
-        { code: 'attributes.locked', title: 'Reserved Custom', type: 'string', writable: null, category: 'custom' },
-        { code: 'attributes.generic', title: 'Пользовательское поле (Строка)', type: 'string', writable: null, category: 'custom' },
+        { code: 'name', title: 'Наименование счёта', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'description', title: 'Комментарий счёта', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'customerOrder', title: 'Заказ покупателя', type: 'object', writable: true, category: 'standard', cardinality: 'single', shape: 'object' },
+      ],
+    } });
+    return route.fulfill({ json: { entity,
+      bitrix24: [
+        { code: 'EMAIL', title: 'Email', type: 'crm_multifield', writable: true, category: 'standard', cardinality: 'multiple', shape: 'object', enumOptions: [{ id: '17', value: 'Рабочий' }, { id: '18', value: 'Личный' }] },
+        { code: 'NAME', title: 'Full Name', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'UF_CRM_ALIAS', title: 'Custom Alias', type: 'string', writable: true, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'UF_CRM_DUP_1', title: 'Duplicate', type: 'string', writable: true, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'UF_CRM_DUP_2', title: 'Duplicate', type: 'string', writable: true, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'UF_CRM_LOCKED', title: 'Reserved Custom', type: 'string', writable: true, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'UF_CRM_GENERIC', title: 'Пользовательское поле (Строка)', type: 'string', writable: true, category: 'custom', cardinality: 'single', shape: 'scalar' },
+      ],
+      moysklad: [
+        { code: 'email', title: 'Email', type: 'string', writable: null, category: 'standard', cardinality: 'single', shape: 'scalar', enumOptions: [{ id: 'work', value: 'Рабочий email' }, { id: 'private', value: 'Личный email' }] },
+        { code: 'name', title: '  full   name ', type: 'string', writable: true, category: 'standard', cardinality: 'single', shape: 'scalar' },
+        { code: 'attributes.alias', title: 'custom alias', type: 'string', writable: null, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'attributes.duplicate', title: 'Duplicate', type: 'string', writable: null, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'attributes.locked', title: 'Reserved Custom', type: 'string', writable: null, category: 'custom', cardinality: 'single', shape: 'scalar' },
+        { code: 'attributes.generic', title: 'Пользовательское поле (Строка)', type: 'string', writable: null, category: 'custom', cardinality: 'single', shape: 'scalar' },
       ],
     } });
   });
@@ -92,7 +104,7 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByText('Версия 1', { exact: true })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'Bitrix24' })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'МойСклад' })).toBeVisible();
-  await expect(page.locator('option[value="smart-invoices"]').first()).toHaveAttribute('disabled', '');
+  await expect(page.getByLabel('Пара сущностей группы').locator('option[value="smart-invoices"]')).toBeEnabled();
   await page.locator('details.field-advanced-settings > summary').click();
   await expect(page.getByRole('heading', { name: 'Услуги и способы оплаты' })).toBeVisible();
   await expect(page.getByLabel('Пара сущностей группы')).toHaveValue('contacts');
@@ -128,8 +140,27 @@ test('field settings select, save, and reload field pairs while preview stays re
   await page.getByLabel('Критичность EMAIL → email').selectOption('critical');
   await expect(page.getByLabel('Поле Bitrix24').last()).toHaveValue('EMAIL');
   await expect(page.getByLabel('Поле МойСклад').last()).toHaveValue('email');
-  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', 'EMAIL · crm_multifield');
+  await expect(page.getByLabel('Поле Bitrix24').last()).toHaveAttribute('title', /Email · EMAIL · crm_multifield · множественное/);
   await mappingRow.getByRole('group', { name: 'Bitrix24 → МойСклад' }).getByRole('checkbox').check();
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
+  await expect(mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').locator('option[value="enum-map"]')).toBeAttached();
+  await expect(mappingRow.getByLabel('Параметры преобразования Bitrix24 в МойСклад')).toHaveValue('{"kind":"copy"}');
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('enum-map');
+  await mappingRow.getByRole('button', { name: 'Добавить пару вариантов' }).click();
+  await mappingRow.getByLabel('ID варианта источника 1').selectOption('17');
+  await mappingRow.getByLabel('ID варианта результата 1').selectOption('work');
+  await expect(mappingRow.getByLabel('ID варианта источника 1').locator('option[value="17"]')).toHaveText('Рабочий · 17');
+  await expect(mappingRow.getByLabel('Параметры преобразования Bitrix24 в МойСклад')).toHaveValue('{"kind":"enum-map","pairs":[{"source":"17","target":"work"}]}');
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('date-to-datetime');
+  await expect(mappingRow.getByLabel('Часовой пояс преобразования')).toHaveValue('Europe/Moscow');
+  await expect(mappingRow.getByLabel('Время преобразования даты')).toHaveValue('00:00:00');
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('boolean-map');
+  await expect(mappingRow.getByLabel('Значение true преобразования')).toHaveValue('Y');
+  await expect(mappingRow.getByLabel('Значение false преобразования')).toHaveValue('N');
+  await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('string-to-number');
+  await expect(mappingRow.getByLabel('Тип числа преобразования')).toHaveValue('decimal');
+  await mappingRow.getByLabel('Точность числового преобразования').fill('2');
+  await expect(mappingRow.getByLabel('Параметры преобразования Bitrix24 в МойСклад')).toHaveValue('{"kind":"string-to-number","numberType":"decimal","leadingZeros":"reject","precision":2}');
   await mappingRow.getByLabel('Преобразование Bitrix24 в МойСклад').selectOption('copy');
   await mappingRow.getByText('Технические коды').click();
   await expect(mappingRow.getByText('EMAIL → email')).toBeVisible();
@@ -214,4 +245,25 @@ test('field settings select, save, and reload field pairs while preview stays re
   await expect(page.getByText('Версия 3', { exact: true })).toBeVisible();
   await expect(page.getByLabel('ID реквизита Bitrix24 1')).toHaveValue('9001');
   await expect(page.getByLabel('UUID счёта МойСклад 1')).toHaveValue('ffffffff-ffff-4fff-8fff-ffffffffffff');
+
+  await page.locator('details.field-advanced-settings > summary').click();
+  await page.getByLabel('Пара сущностей группы').selectOption('smart-invoices');
+  const invoiceSources = page.getByLabel('Поля источники группы');
+  await expect(invoiceSources.locator('option[value="title"]')).toHaveText('Заголовок счёта · title · string · одиночное · запись разрешена');
+  await expect(invoiceSources.locator('option[value="parentId2"]')).toHaveCount(0);
+  await expect(page.getByLabel('Поле результат группы').locator('option[value="customerOrder"]')).toHaveCount(0);
+  await invoiceSources.selectOption(['title', 'description']);
+  await page.getByLabel('Поле результат группы').selectOption('name');
+  await expect(page.getByLabel('Преобразование группы').locator('option[value="split-non-empty"]')).toHaveJSProperty('disabled', true);
+  await page.getByRole('button', { name: 'Добавить составное правило' }).click();
+  await expect(page.getByText('title + description → name')).toBeVisible();
+  await page.getByRole('button', { name: 'Сохранить новую версию' }).click();
+  await page.getByRole('button', { name: 'Подтвердить и сохранить' }).click();
+  await expect(page.getByText('Версия 4', { exact: true })).toBeVisible();
+  expect(config.groups).toEqual([expect.objectContaining({ entity: 'smart-invoices', sourceFields: ['title', 'description'], targetField: 'name', transform: { kind: 'join-non-empty', separator: ' ' } })]);
+  await page.reload();
+  await page.getByRole('button', { name: 'Соответствия полей' }).click();
+  await expect(page.getByText('Версия 4', { exact: true })).toBeVisible();
+  await page.locator('details.field-advanced-settings > summary').click();
+  await expect(page.getByText('title + description → name')).toBeVisible();
 });

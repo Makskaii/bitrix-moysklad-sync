@@ -2,6 +2,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { PairFirstEventProcessor } from './pairs/pair-first-event.processor';
+import { legacyOwnsContactEvent } from './contact-event-owner';
 
 export const ADDITIONAL_EVENT_PROCESSORS = Symbol('ADDITIONAL_EVENT_PROCESSORS');
 
@@ -34,6 +35,10 @@ export class EventDispatcherService {
       select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
     });
     if (!event) return;
+    if (await legacyOwnsContactEvent(this.database, event)) {
+      this.contacts.enqueue(eventId);
+      return;
+    }
     const supported = this.additional.filter((processor) => processor.supports(event));
     if (supported.length) {
       // An explicitly registered processor owns its event class. In particular,

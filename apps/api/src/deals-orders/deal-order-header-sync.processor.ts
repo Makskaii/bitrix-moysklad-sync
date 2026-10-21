@@ -9,6 +9,7 @@ import { SyncModeService } from '../sync-mode.service';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure, providerResponseFailure } from '../provider-failure';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
 type Pair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type HeaderResult = 'DISABLED' | 'UNSUPPORTED' | 'BASELINE_MISSING' | 'BASELINE_INITIALIZED' | 'NOOP' | 'UPDATED' | 'HOLD_CONFLICT' | 'HOLD_READ_FAILED' | 'HOLD_WRITE_FAILED' | { status: 'RETRYABLE_FAILURE'; retryAfter: Date };
@@ -44,8 +45,9 @@ export class DealOrderHeaderSyncProcessor {
       if (previous.settingsVersion !== baseline.settingsVersion) return 'BASELINE_MISSING';
       let b24: Record<string, unknown>;
       let ms: Record<string, unknown>;
-      try { [ms, b24] = await Promise.all([this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId), this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id)]); }
+      try { [ms, b24] = await this.readCurrentDocuments(input.pair.moyskladId, input.pair.bitrix24Id); }
       catch (error) {
+        if (error instanceof ServiceModeNotOnError) return 'DISABLED';
         if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
         return 'HOLD_READ_FAILED';
       }
@@ -99,11 +101,9 @@ export class DealOrderHeaderSyncProcessor {
     let b24: Record<string, unknown>;
     let ms: Record<string, unknown>;
     try {
-      [ms, b24] = await Promise.all([
-        this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
-        this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id),
-      ]);
+      [ms, b24] = await this.readCurrentDocuments(input.pair.moyskladId, input.pair.bitrix24Id);
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) return 'DISABLED';
       if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
       return 'HOLD_READ_FAILED';
     }
@@ -159,16 +159,16 @@ export class DealOrderHeaderSyncProcessor {
           if (!(error instanceof ProviderFailure)) throw error;
           if (!isRetryableFailure(error)) return 'HOLD_WRITE_FAILED';
           const readback = writeTo === 'MOYSKLAD'
-            ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
-            : await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
+            ? await this.readMoySkladCustomerOrder(input.pair.moyskladId)
+            : await this.readBitrix24Deal(input.pair.bitrix24Id);
           if (scalar(writeTo === 'MOYSKLAD' ? readback.description : readback.COMMENTS) !== value) {
             return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, input.attempt ?? 1) };
           }
         }
       }
       const verified = writeTo === 'MOYSKLAD'
-        ? await this.reader.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId)
-        : await this.reader.readBitrix24DealForBaseline(input.pair.bitrix24Id);
+        ? await this.readMoySkladCustomerOrder(input.pair.moyskladId)
+        : await this.readBitrix24Deal(input.pair.bitrix24Id);
       if (scalar(writeTo === 'MOYSKLAD' ? verified.description : verified.COMMENTS) !== value) return 'HOLD_WRITE_FAILED';
       await input.assertWorkerLease?.();
       await this.persist(transaction, pair.id, baseline.settingsVersion, writeTo === 'BITRIX24' ? value : b24Value, writeTo === 'MOYSKLAD' ? value : msValue);
@@ -179,6 +179,28 @@ export class DealOrderHeaderSyncProcessor {
       throw error;
     }
     }, { timeout: 60_000 });
+  }
+
+  private async readCurrentDocuments(moyskladOrderId: string, bitrix24DealId: string) {
+    // Keep one bounded provider request inside each durable-mode gate. A mode
+    // update may commit between reads, in which case the next read fails closed.
+    const ms = await this.readMoySkladCustomerOrder(moyskladOrderId);
+    const b24 = await this.readBitrix24Deal(bitrix24DealId);
+    return [ms, b24] as const;
+  }
+
+  private async readProvider<T>(read: () => Promise<T>): Promise<T> {
+    const result = await withServiceModeOn(this.database, async () => read());
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
+  private readMoySkladCustomerOrder(id: string) {
+    return this.readProvider(() => this.reader.readMoySkladCustomerOrderForBaseline(id));
+  }
+
+  private readBitrix24Deal(id: string) {
+    return this.readProvider(() => this.reader.readBitrix24DealForBaseline(id));
   }
 
   private async syncCompanyClient(input: {
@@ -245,7 +267,7 @@ export class DealOrderHeaderSyncProcessor {
         let verified: Record<string, unknown>;
         try {
           if (!proposed) await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await input.assertWorkerLease?.(); return true; }, [{ id: input.pairId, entityType: 'DEAL' }, ...(targetCompanyPairId ? [{ id: targetCompanyPairId, entityType: 'COMPANY' }] : [])], () => this.writeBitrixCompany(base24, input.bitrix24DealId, targetCompanyId));
-          verified = await this.reader.readBitrix24DealForBaseline(input.bitrix24DealId);
+          verified = await this.readBitrix24Deal(input.bitrix24DealId);
         } catch (error) { return providerResult(error); }
         if (documentCompanyId(verified.COMPANY_ID) !== targetCompanyId) return 'HOLD_WRITE_FAILED';
       }
@@ -260,7 +282,7 @@ export class DealOrderHeaderSyncProcessor {
         let verified: Record<string, unknown>;
         try {
           if (!proposed) await this.mode.runDealOrderExternalWrite('bitrix24ToMoysklad', async () => { await input.assertWorkerLease?.(); return true; }, [{ id: input.pairId, entityType: 'DEAL' }, ...(targetCompanyPairId ? [{ id: targetCompanyPairId, entityType: 'COMPANY' }] : [])], () => this.writeMoySkladAgent(baseMs, input.moyskladOrderId, agent));
-          verified = await this.reader.readMoySkladCustomerOrderForBaseline(input.moyskladOrderId);
+          verified = await this.readMoySkladCustomerOrder(input.moyskladOrderId);
         } catch (error) { return providerResult(error); }
         if (referenceCompanyId(verified.agent) !== targetAgentId) return 'HOLD_WRITE_FAILED';
       }
@@ -360,6 +382,7 @@ function referenceCompanyId(value: unknown): string | null {
 }
 function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
 function providerResult(error: unknown): HeaderResult {
+  if (error instanceof ServiceModeNotOnError) return 'DISABLED';
   if (error instanceof ProviderFailure && isRetryableFailure(error)) return { status: 'RETRYABLE_FAILURE', retryAfter: retryAtForFailure(error, 1) };
   return 'HOLD_WRITE_FAILED';
 }

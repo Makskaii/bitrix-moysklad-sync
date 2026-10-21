@@ -89,7 +89,11 @@ function fixture(input: { b24: string | null; ms: string; oldB24: string | null;
     entityPair: { async findMany(args: { where: Record<string, unknown> }) { return args.where.moyskladId === input.ms ? [{ bitrix24Id: input.sourceMap }] : [{ moyskladId: input.sourceMap }]; } },
     entityPairSyncState: { async findUnique() { return null; }, async upsert(args: { create: any; update: any }) { state.saved = args.update; return state.saved; } },
   };
-  const database = {} as never;
+  const database = {
+    async $transaction<T>(work: (transaction: { $queryRaw: () => Promise<Array<{ serviceMode: string }>> }) => Promise<T>) {
+      return work({ async $queryRaw() { return [{ serviceMode: 'on' }]; } });
+    },
+  } as never;
   const reader = {
     async readBitrix24DealForBaseline() { return { ID: 'deal-id', COMPANY_ID: companyId }; },
     async readMoySkladCustomerOrderForBaseline() { return { id: 'order-id', agent: { id: agentId } }; },

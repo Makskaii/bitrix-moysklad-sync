@@ -20,7 +20,7 @@ CREATE TABLE "ClientInventoryJob" (
   "checkpointAt" TIMESTAMP(3),
   "leaseOwner" TEXT,
   "leaseUntil" TIMESTAMP(3),
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "ClientInventoryJob_pkey" PRIMARY KEY ("id")
 );
 CREATE INDEX "ClientInventoryJob_leaseUntil_idx" ON "ClientInventoryJob"("leaseUntil");

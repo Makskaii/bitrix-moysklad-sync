@@ -20,6 +20,7 @@ model SyncSetting {
   offSince                  DateTime?
   lastInactiveAt            DateTime?
   lastActiveAt              DateTime?
+  modeHistoryTrackedFrom    DateTime?
   resumeStatus              String    @default("idle")
   resumeFrom                DateTime?
   resumeThrough             DateTime?
@@ -38,6 +39,10 @@ model SyncSetting {
   nightlyBitrixEntityTypeId Int       @default(3)
   nightlyBitrixLastId       String?
   nightlyMoyskladOffset     Int       @default(0)
+  nightlyMoyskladEntity     String    @default("counterparty")
+  nightlyActiveSegments     Json      @default("[]")
+  nightlySegmentIndex       Int       @default(0)
+  nightlyCoverage           Json      @default("{}")
   nightlyBitrixStatus       String    @default("pending")
   nightlyMoyskladStatus     String    @default("pending")
   nightlyLeaseToken         String?
@@ -46,6 +51,15 @@ model SyncSetting {
   nightlyAttempts           Int       @default(0)
   nightlyError              String?
   updatedAt                 DateTime  @updatedAt
+}
+
+model SyncModeTransition {
+  id             String   @id @default(cuid())
+  fromMode       String
+  toMode         String
+  transitionedAt DateTime @default(now())
+
+  @@index([transitionedAt])
 }
 
 model DatabaseRecoveryState {
@@ -119,9 +133,51 @@ model InboundEvent {
   lastErrorCategory   String?
   retryAfter          DateTime?
   settings            InboundEventSettings?
+  controlledTestAdmission ControlledTestAdmission?
 
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
+  @@index([status, retryAfter])
+}
+
+model ControlledTestAdmission {
+  eventId       String       @id
+  runId         String
+  entity        String
+  sourceSystem  String
+  sourceNativeId String
+  targetSystem  String
+  targetNativeId String?
+  bitrix24PortalOrigin String?
+  bitrix24UserId String?
+  moyskladAccountId String?
+  sourceName    String
+  sourceCreatedAt DateTime
+  admittedAt    DateTime     @default(now())
+  bindingId     String
+  event         InboundEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  binding       ControlledTestSourceBinding @relation(fields: [bindingId], references: [id], onDelete: Restrict)
+
+  @@index([runId, entity, sourceSystem, sourceNativeId], map: "ctl_test_admission_source_idx")
+}
+
+/** Stable run-scoped pair reservation shared by multiple event-specific admissions. */
+model ControlledTestSourceBinding {
+  id             String       @id @default(cuid())
+  runId         String
+  entity        String
+  bitrix24NativeId String?
+  moyskladNativeId String?
+  bitrix24PortalOrigin String?
+  bitrix24UserId String?
+  moyskladAccountId String?
+  sourceName    String
+  sourceCreatedAt DateTime
+  createReservedByEventId String?
+  admissions    ControlledTestAdmission[]
+
+  @@unique([runId, entity, bitrix24NativeId], map: "ctl_test_source_binding_b24_uq")
+  @@unique([runId, entity, moyskladNativeId], map: "ctl_test_source_binding_ms_uq")
 }
 
 model FieldSettingsVersion {
@@ -268,6 +324,8 @@ model EntityPair {
   createdAt        DateTime             @default(now())
   baseline         EntityPairBaseline?
   syncState        EntityPairSyncState?
+  duplicateProductAliases ProductDuplicateAlias[] @relation("CanonicalProductPair")
+  settingsRevisions EntityPairSettingsRevision[]
   dealOrderPositions DealOrderPositionPair[]
   dealOrderPositionAdds DealOrderPositionAddOperation[]
 
@@ -275,6 +333,23 @@ model EntityPair {
   @@index([entityType, bitrix24Id, active])
   @@index([entityType, moyskladId, active])
   @@index([lifecycleStatus, tombstonedAt])
+}
+
+model ProductDuplicateAlias {
+  id                  String     @id @default(cuid())
+  duplicateBitrix24Id String     @unique
+  canonicalBitrix24Id String
+  canonicalMoyskladId String
+  canonicalPairId     String
+  moyskladType        String     @default("product")
+  reason              String
+  evidence            Json
+  createdAt           DateTime   @default(now())
+  canonicalPair       EntityPair @relation("CanonicalProductPair", fields: [canonicalPairId], references: [id], onDelete: Restrict)
+
+  @@index([canonicalPairId, createdAt])
+  @@index([canonicalBitrix24Id])
+  @@index([canonicalMoyskladId])
 }
 
 model ClientDependencyRetry {
@@ -290,7 +365,7 @@ model ClientDependencyRetry {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  @@unique([eventId, sourceSystem, sourceEntityId, companySourceId])
+  @@unique([eventId, sourceSystem, sourceEntityId, companySourceId], map: "ClientDependencyRetry_eventId_sourceSystem_sourceEntityId_compa")
   @@index([status, retryAfter])
 }
 
@@ -363,6 +438,24 @@ model EntityPairSyncState {
   pair            EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
 }
 
+model EntityPairSettingsRevision {
+  id                   String     @id @default(cuid())
+  pairId               String
+  fromSettingsVersion  Int?
+  toSettingsVersion    Int
+  status               String     @default("PREPARED")
+  semanticFingerprint  String
+  previousBaseline     Json
+  currentBaseline      Json?
+  errorCategory        String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  pair                 EntityPair @relation(fields: [pairId], references: [id], onDelete: Cascade)
+
+  @@unique([pairId, toSettingsVersion])
+  @@index([status, updatedAt])
+}
+
 model DealOrderCreateOperation {
   bitrix24DealId String   @id
   syncId         String   @unique
@@ -379,6 +472,26 @@ model DealOrderCreateOperation {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
+  @@index([status, updatedAt])
+}
+
+model DependencyCreateOperation {
+  id              String   @id @default(cuid())
+  entityType      String
+  bitrix24Id      String
+  targetEntityType String
+  syncId          String   @unique
+  payload         Json
+  status          String   @default("PENDING")
+  moyskladId      String?
+  attemptedAt     DateTime?
+  leaseToken      String?
+  leaseUntil      DateTime?
+  lastErrorCategory String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([entityType, bitrix24Id])
   @@index([status, updatedAt])
 }
 
@@ -434,7 +547,7 @@ model DealOrderReversePositionOperation {
   updatedAt           DateTime @updatedAt
   operation           DealOrderReverseCreateOperation @relation(fields: [moyskladOrderId], references: [moyskladOrderId], onDelete: Cascade)
 
-  @@unique([moyskladOrderId, moyskladPositionId])
+  @@unique([moyskladOrderId, moyskladPositionId], map: "DealOrderReversePositionOperation_moyskladOrderId_moyskladPosit")
   @@index([status, updatedAt])
 }
 
@@ -582,7 +695,7 @@ model HistoricalDealOrderMatchResult {
   updatedAt      DateTime                       @updatedAt
   run            HistoricalDealOrderMatchingRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
-  @@unique([runId, sourceSystem, sourceEntityId])
+  @@unique([runId, sourceSystem, sourceEntityId], map: "HistoricalDealOrderMatchResult_runId_sourceSystem_sourceEntityI")
   @@index([runId, category, id])
   @@index([runId, linkedEntityId])
 }

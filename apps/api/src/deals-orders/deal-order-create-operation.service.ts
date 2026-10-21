@@ -1,9 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database.service';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
 type CustomerOrderPosition = {
   assortment: { meta: { type: string; href: string } };
@@ -27,7 +29,7 @@ export type DealOrderPreparedInput = {
   sourceRowValues: Array<Record<string, unknown>>;
   sourceMeasureCodes: number[];
   skippedRows?: Array<{ sourceRowId: string; reason: string }>;
-  unitMappings: Array<{ bitrix24Id: number; moyskladId: string | null; status: 'configured' | 'unmapped' }>;
+  unitMappings: Array<{ bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; status: 'configured' | 'unmapped' }>;
   payload: {
     agent: Reference;
     organization: Reference;
@@ -53,7 +55,38 @@ export class DealOrderPairConflictError extends Error {
 /** Durable, retry-safe MySklad creation for a fully preflighted new deal. */
 @Injectable()
 export class DealOrderCreateOperationService {
-  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService) {}
+  constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
+
+  private async providerRead(url: URL, init: RequestInit): Promise<unknown> {
+    const result = await withServiceModeOn(this.database, async () => requestJson(url, init));
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
+  private async writeBitrixOrderNumber(input: DealOrderPreparedInput, leaseToken: string, assertWorkerLease: (() => Promise<boolean>) | undefined, orderName: string) {
+    const base = bitrixBase();
+    const read = async () => {
+      const body = await this.providerRead(new URL('crm.deal.get.json', withSlash(base)), {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id: input.bitrix24DealId }),
+      }).catch((error: unknown) => {
+        if (error instanceof ServiceModeNotOnError) throw error;
+        throw new Error('Bitrix24 customer-order number read failed');
+      });
+      if (!isRecord(body) || body.error || !isRecord(body.result)) throw new Error('Bitrix24 customer-order number read failed');
+      return body.result;
+    };
+    const current = await read();
+    if (current.UF_CRM_1729757435964 !== orderName) {
+      const body = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('crm.deal.update.json', withSlash(base)), {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName }),
+      }));
+      if (!isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
+    }
+    const verified = await read();
+    if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
+  }
 
   /** Record that a new B24 deal is waiting for complete dependencies. This is
    * deliberately separate from the vendor POST: no external document exists
@@ -135,10 +168,12 @@ export class DealOrderCreateOperationService {
     const payload = operation.payload as unknown as DealOrderPreparedInput['payload'];
     const leaseToken = randomUUID();
     const leaseNow = new Date();
-    const lease = await this.database.dealOrderCreateOperation.updateMany({
+    const gatedLease = await withServiceModeOn(this.database, (transaction) => transaction.dealOrderCreateOperation.updateMany({
       where: { bitrix24DealId: input.bitrix24DealId, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lte: leaseNow } }] },
       data: { attemptedAt: operation.attemptedAt ?? leaseNow, leaseToken, leaseUntil: new Date(leaseNow.getTime() + 60_000) },
-    });
+    }));
+    if (!gatedLease.enabled) throw new ServiceModeNotOnError();
+    const lease = gatedLease.value;
     if (lease.count !== 1) throw new Error('Customer-order create is already in progress');
     const base = moyskladBase();
     const token = process.env.MOYSKLAD_API_TOKEN;
@@ -161,7 +196,8 @@ export class DealOrderCreateOperationService {
         orderId = created.id;
       }
 
-      const order = await requestJson(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('MOYSKLAD', orderId);
+      const order = await this.providerRead(new URL(`entity/customerorder/${encodeURIComponent(orderId)}?expand=positions`, withSlash(base)), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
       const expectedNativeFields = {
@@ -172,10 +208,18 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
-      await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => writeBitrixOrderNumber(input.bitrix24DealId, order.name));
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
+        const createdAt = parseMoySkladCreatedAt(order.created);
+        if (order.description !== scope.admittedSourceName || !createdAt) throw new Error('CONTROLLED_LIVE_TEST_TARGET_READBACK_INVALID');
+        await this.controlledAdmission.bindCreatedTarget(input.eventId, orderId, orderId, order.name, createdAt, scope.runId);
+      }
+      const shouldWriteSourceNumber = !this.controlledAdmission || process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled' || await this.controlledAdmission.allowsSourceSideWrite(input.eventId);
+      if (shouldWriteSourceNumber) await this.writeBitrixOrderNumber(input, leaseToken, assertWorkerLease, order.name);
 
       return await this.persistPair(input, orderId, leaseToken, verifiedPositions);
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       await this.database.dealOrderCreateOperation.updateMany({
         where: { bitrix24DealId: input.bitrix24DealId, leaseToken },
         data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'CREATE_RETRYABLE' },
@@ -223,7 +267,7 @@ export class DealOrderCreateOperationService {
       [input.payload.rate.currency, 'currency'],
       [input.payload.state, 'state'],
     ] as Array<[Reference, string]>) {
-      const result = await requestJson(new URL(reference.meta.href), {
+      const result = await this.providerRead(new URL(reference.meta.href), {
         method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
       });
       const expectedId = referenceId(reference.meta.href);
@@ -243,7 +287,10 @@ export class DealOrderCreateOperationService {
       if (!/^\d{1,20}$/.test(sourceProductId) || !Number.isInteger(sourceMeasureCode) || sourceMeasureCode < 1) {
         throw new Error('Prepared customer-order product or unit identity is invalid');
       }
-      const mappedUnit = input.unitMappings.find((unit) => unit.bitrix24Id === sourceMeasureCode && unit.status === 'configured' && unit.moyskladId);
+      const unitCandidates = input.unitMappings.filter((unit) => unit.bitrix24Code === String(sourceMeasureCode));
+      const mappedUnit = unitCandidates.length === 1 && unitCandidates[0]?.status === 'configured' && unitCandidates[0].moyskladId
+        ? unitCandidates[0]
+        : null;
       if (!mappedUnit?.moyskladId) throw new Error(`Customer-order unit ${sourceMeasureCode} is not mapped`);
       const targetId = referenceId(positions[index].assortment.meta.href);
       const productPair = await this.database.entityPair.findFirst({
@@ -257,7 +304,7 @@ export class DealOrderCreateOperationService {
         continue;
       }
       const pathType = positions[index].assortment.meta.type;
-      const product = await requestJson(new URL(`entity/${pathType}/${encodeURIComponent(targetId)}`, withSlash(moyskladBase())), {
+      const product = await this.providerRead(new URL(`entity/${pathType}/${encodeURIComponent(targetId)}`, withSlash(moyskladBase())), {
         method: 'GET', headers: { authorization: `Bearer ${process.env.MOYSKLAD_API_TOKEN ?? ''}`, accept: 'application/json' },
       });
       if (!isRecord(product) || product.id !== targetId || !isRecord(product.meta) || product.meta.type !== pathType ||
@@ -532,31 +579,6 @@ function moyskladBase(): URL {
   } catch { throw new Error('Customer-order API endpoint is invalid'); }
 }
 
-async function writeBitrixOrderNumber(dealId: string, orderName: string) {
-  const base = bitrixBase();
-  const read = async () => {
-    const response = await fetch(new URL('crm.deal.get.json', withSlash(base)), {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id: dealId }), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new Error('Bitrix24 customer-order number read failed'); });
-    const body: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(body) || body.error || !isRecord(body.result)) throw new Error('Bitrix24 customer-order number read failed');
-    return body.result;
-  };
-  const current = await read();
-  if (current.UF_CRM_1729757435964 !== orderName) {
-    const response = await fetch(new URL('crm.deal.update.json', withSlash(base)), {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id: dealId, 'fields[UF_CRM_1729757435964]': orderName }),
-      redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new Error('Bitrix24 customer-order number update failed'); });
-    const body: unknown = await response.json().catch(() => null);
-    if (!response.ok || !isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
-  }
-  const verified = await read();
-  if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
-}
-
 function bitrixBase(): URL {
   try {
     const base = new URL(process.env.BITRIX24_REST_BASE_URL ?? '');
@@ -585,3 +607,9 @@ function isStateHref(value: unknown, base: URL): value is string {
 }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isUniqueConstraintViolation(error: unknown): boolean { return isRecord(error) && error.code === 'P2002'; }
+function parseMoySkladCreatedAt(value: unknown): Date | null {
+  if (typeof value !== 'string') return null;
+  const local = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)$/.exec(value);
+  const date = new Date(local ? `${local[1]}T${local[2]}+03:00` : value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}

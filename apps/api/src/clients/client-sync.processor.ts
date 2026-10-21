@@ -5,7 +5,7 @@ import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { SyncModeService } from '../sync-mode.service';
 import { ClientRecord, ClientSyncGateway } from './client-sync.gateway';
-import { chooseCandidate, ClientRuntimeResolver, ClientSource, ClientSystem } from './client-runtime-resolver';
+import { chooseCandidate, ClientResolution, ClientRuntimeResolver, ClientSource, ClientSystem } from './client-runtime-resolver';
 import { CLIENT_CANDIDATE_GATEWAY, WritableClientCandidateGateway } from './client-candidate.gateway';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { ClientDependencyInput, ClientDependencyResolution, ClientDependencyResolver } from './client-dependency-resolver';
@@ -13,6 +13,11 @@ import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worke
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { ClientChildResourceSync, ClientChildResourceSnapshot, syncPinnedClientChildResources } from './client-child-resource-sync';
 import { manualReviewFields, sanitizeReviewDiagnosticForStorage } from '../admin/manual-review-details';
+import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { enterControlledLiveEventScope } from '../controlled-live-test-policy';
+import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
+import { parseClientMoyskladTimestamp } from './client-moysklad-date';
+import { legacyOwnsContactEvent } from '../contact-event-owner';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -31,15 +36,28 @@ const CLIENT_EVENT_LEASE_MS = 60_000;
 @Injectable()
 export class ClientSyncProcessor implements ClientDependencyResolver {
   private readonly active = new Set<string>();
+  private readonly gateway?: ClientSyncGateway;
+  private readonly candidateGateway?: WritableClientCandidateGateway;
+  private readonly childResources?: ClientChildResourceSync;
   constructor(
     private readonly database: DatabaseService,
     private readonly settings: FieldSettingsService,
     private readonly syncMode: SyncModeService,
-    @Optional() @Inject(CLIENT_SYNC_GATEWAY) private readonly gateway?: ClientSyncGateway,
-    @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) private readonly candidateGateway?: WritableClientCandidateGateway,
+    @Optional() @Inject(CLIENT_SYNC_GATEWAY) gateway?: ClientSyncGateway,
+    @Optional() @Inject(CLIENT_CANDIDATE_GATEWAY) candidateGateway?: WritableClientCandidateGateway,
     @Optional() private readonly workerLease?: EventWorkerLeaseService,
-    @Optional() private readonly childResources?: ClientChildResourceSync,
-  ) {}
+    @Optional() childResources?: ClientChildResourceSync,
+    @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
+  ) {
+    this.gateway = gateway ? serviceModeBoundProvider(database, gateway) : undefined;
+    this.candidateGateway = candidateGateway ? serviceModeBoundProvider(database, candidateGateway) : undefined;
+    this.childResources = childResources;
+    childResources?.setProviderModeGate(async (work) => {
+      const result = await withServiceModeOn(database, async () => work());
+      if (!result.enabled) throw new ServiceModeNotOnError();
+      return result.value;
+    });
+  }
 
   async verifyServiceCounterparty(counterpartyId: string): Promise<boolean> {
     if (!this.candidateGateway) throw new Error('CLIENT_CANDIDATE_GATEWAY_UNAVAILABLE');
@@ -52,8 +70,9 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
   }
 
   async recoverPending(): Promise<void> {
-    const now = new Date();
-    const pending = await this.database.inboundEvent.findMany({
+    const scan = await withServiceModeOn(this.database, async (transaction) => {
+      const now = new Date();
+      const pending = await transaction.inboundEvent.findMany({
       where: {
         AND: [
           { OR: [
@@ -67,31 +86,37 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           ] },
         ],
       },
-      select: { id: true, status: true },
+      select: { id: true, status: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
       take: 100,
+      });
+      return { now, pending };
     });
+    if (!scan.enabled) return;
+    const { now, pending } = scan.value;
     for (const event of pending) {
+      if (await legacyOwnsContactEvent(this.database, event)) continue;
       if (event.status === 'RETRYABLE_FAILURE') {
-        const reset = await this.database.inboundEvent.updateMany({
+        const reset = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
           where: { id: event.id, status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
           data: { status: 'RECEIVED', retryAfter: null, lastErrorCategory: null },
-        });
-        if (reset.count !== 1) continue;
+        }));
+        if (!reset.enabled || reset.value.count !== 1) continue;
       }
       this.enqueue(event.id);
     }
-    const dependencyRetries = await this.database.clientDependencyRetry.findMany({
+    const retryScan = await withServiceModeOn(this.database, async (transaction) => transaction.clientDependencyRetry.findMany({
       where: { OR: [
         { status: 'PENDING', retryAfter: { lte: now } },
         { status: 'RUNNING', updatedAt: { lt: new Date(now.getTime() - CLIENT_EVENT_LEASE_MS) } },
       ] }, orderBy: { retryAfter: 'asc' }, take: 50,
-    });
-    for (const retry of dependencyRetries) {
-      const claimed = await this.database.clientDependencyRetry.updateMany({
+    }));
+    if (!retryScan.enabled) return;
+    for (const retry of retryScan.value) {
+      const claim = await withServiceModeOn(this.database, (transaction) => transaction.clientDependencyRetry.updateMany({
         where: { id: retry.id, status: retry.status, ...(retry.status === 'PENDING' ? { retryAfter: { lte: now } } : { updatedAt: { lt: new Date(now.getTime() - CLIENT_EVENT_LEASE_MS) } }) },
         data: { status: 'RUNNING', attempts: { increment: 1 } },
-      });
-      if (claimed.count !== 1) continue;
+      }));
+      if (!claim.enabled || claim.value.count !== 1) continue;
       const result = await this.resolveForDocument({
         eventId: retry.eventId, sourceSystem: retry.sourceSystem as ClientSystem, entity: 'CONTACT',
         sourceId: retry.sourceEntityId, primaryCompanySourceId: retry.companySourceId || null,
@@ -99,10 +124,10 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       });
       const complete = result.status === 'RESOLVED' || result.status === 'OMITTED';
       const nextAttempt = retry.attempts + 1;
-      await this.database.clientDependencyRetry.updateMany({ where: { id: retry.id, status: 'RUNNING' }, data: {
+      await withServiceModeOn(this.database, (transaction) => transaction.clientDependencyRetry.updateMany({ where: { id: retry.id, status: 'RUNNING' }, data: {
         status: complete ? 'SUCCEEDED' : 'PENDING', reason: result.status === 'RESOLVED' ? result.reason : result.reason,
         retryAfter: complete ? now : result.status === 'RETRY' && result.retryAfter ? result.retryAfter : retryAtForFailure(new Error(result.reason), nextAttempt),
-      } });
+      } }));
     }
   }
 
@@ -111,16 +136,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     const companySourceId = input.primaryCompanySourceId ?? '';
     const key = { eventId: input.eventId, sourceSystem: input.sourceSystem, sourceEntityId: input.sourceId, companySourceId };
     const dueAt = retryAfter ?? new Date();
-    await this.database.clientDependencyRetry.createMany({
-      data: [{ ...key, reason, retryAfter: dueAt }], skipDuplicates: true,
+    await withServiceModeOn(this.database, async (transaction) => {
+      await transaction.clientDependencyRetry.createMany({ data: [{ ...key, reason, retryAfter: dueAt }], skipDuplicates: true });
+      await transaction.clientDependencyRetry.updateMany({ where: { ...key, status: 'PENDING' }, data: { reason, retryAfter: dueAt } });
+      await transaction.operationalLog.create({ data: {
+        category: 'CLIENT_DEPENDENCY', referenceId: input.eventId,
+        message: `Optional contactperson dependency queued for separate retry (${input.sourceSystem} ${input.sourceId}; company ${companySourceId || 'none'}): ${reason}.`,
+      } });
     });
-    await this.database.clientDependencyRetry.updateMany({
-      where: { ...key, status: 'PENDING' }, data: { reason, retryAfter: dueAt },
-    });
-    await this.database.operationalLog.create({ data: {
-      category: 'CLIENT_DEPENDENCY', referenceId: input.eventId,
-      message: `Optional contactperson dependency queued for separate retry (${input.sourceSystem} ${input.sourceId}; company ${companySourceId || 'none'}): ${reason}.`,
-    } });
   }
 
   async resolveForDocument(input: ClientDependencyInput, workerLease?: EventWorkerLeaseContext): Promise<ClientDependencyResolution> {
@@ -190,6 +213,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         const companyPair = companyResolution.pair;
         try { await gateway.readMoysklad('counterparty', companyPair.moyskladId, null); }
         catch (error) {
+          if (error instanceof ServiceModeNotOnError) throw error;
           if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
           return await holdDependency('DUPLICATE_CONTACT_COMPANY_TARGET_UNAVAILABLE', { companyId, pairId: companyPair.id });
         }
@@ -260,6 +284,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           await this.logDependencyResolution(event.id, input, pair, reason, fence);
           return { status: 'RESOLVED', pair, companyPair: input.entity === 'COMPANY' ? pair : resolvedCompanyPair, selectedSourceId, reason };
         } catch (error) {
+          if (error instanceof ServiceModeNotOnError) throw error;
           if (isRetryableFailure(error)) return { status: 'RETRY', reason: 'CLIENT_PERSISTED_TARGET_UNAVAILABLE', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
           return await holdDependency('CLIENT_PERSISTED_TARGET_UNAVAILABLE', { entity: input.entity, selectedSourceId, pairId: pair.id });
         }
@@ -281,6 +306,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         : primaryCompanySourceId ? await this.findPersistedPair('COMPANY', primaryCompanySourceId, input.sourceSystem) : null;
       return { status: 'RESOLVED', pair: resolved, companyPair: resolvedCompanyPair, selectedSourceId, reason };
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) throw error;
       if (error instanceof Error && error.message === 'CLIENT_ENTITY_LOCK_BUSY') {
         await workerLease?.assertOwned();
         return { status: 'RETRY', reason: 'CLIENT_ENTITY_LOCK_BUSY', retryAfter: retryAtForFailure(error, input.attempt ?? event.attempts) };
@@ -370,21 +396,24 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
   }
 
   async process(eventId: string): Promise<'IGNORED' | 'REVIEW' | 'BASELINE' | 'UNCHANGED' | 'SYNCED' | 'RETRY'> {
-    if (this.workerLease) return await this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease)) ?? 'IGNORED';
-    return this.processWithLease(eventId);
+    const run = async () => this.workerLease
+      ? await this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease)) ?? 'IGNORED'
+      : this.processWithLease(eventId);
+    return this.controlledAdmission ? this.controlledAdmission.runForEvent(eventId, run) : run();
   }
 
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<'IGNORED' | 'REVIEW' | 'BASELINE' | 'UNCHANGED' | 'SYNCED' | 'RETRY'> {
     if (this.active.has(eventId)) return 'IGNORED';
     const event = await this.database.inboundEvent.findUnique({ where: { id: eventId } }) as PersistedEvent | null;
-    if (!event || !this.supports(event) || !(event.status === 'RECEIVED' || (event.status === 'PROCESSING' && (!event.processingStartedAt || event.processingStartedAt.getTime() < Date.now() - CLIENT_EVENT_LEASE_MS)))) return 'IGNORED';
+    if (!event || !this.supports(event) || await legacyOwnsContactEvent(this.database, event) ||
+        !(event.status === 'RECEIVED' || (event.status === 'PROCESSING' && (!event.processingStartedAt || event.processingStartedAt.getTime() < Date.now() - CLIENT_EVENT_LEASE_MS)))) return 'IGNORED';
     let entity = entityForEvent(event)!;
     let fence = workerLease;
     let releaseSourceLease: (() => Promise<void>) | undefined;
     let releasePairLease: (() => Promise<void>) | undefined;
     this.active.add(eventId);
     try {
-      const claimed = await this.database.$transaction(async (tx) => {
+      const claim = await withServiceModeOn(this.database, async (tx) => {
         await assertFenceInTransaction(workerLease, tx);
         return tx.inboundEvent.updateMany({
           where: { id: event.id, OR: [
@@ -394,7 +423,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           data: { status: 'PROCESSING', processingStartedAt: new Date(), attempts: { increment: 1 }, lastErrorCategory: null, retryAfter: null },
         });
       });
-      if (claimed.count !== 1) return 'IGNORED';
+      if (!claim.enabled || claim.value.count !== 1) return 'IGNORED';
       event.status = 'PROCESSING';
       if (event.externalEntityId) {
         const sourceSystem: ClientSystem = event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD';
@@ -416,8 +445,13 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const eventConfig = await this.settings.eventConfig(event.id);
       const sourceSystem: ClientSystem = event.source === 'BITRIX24' ? 'BITRIX24' : 'MOYSKLAD';
       let bitrixSourceRecord: ClientRecord | null = null;
+      let moyskladSourceRecord: ClientRecord | null = null;
       if (sourceSystem === 'BITRIX24') {
-        bitrixSourceRecord = await this.gateway.readBitrix(entity, event.externalEntityId);
+        const read = () => this.gateway!.readBitrix(entity, event.externalEntityId!);
+        bitrixSourceRecord = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+          ? await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, event.externalEntityId, `client:${entity}`, read)
+          : await read();
+        await this.admitControlledSource(event.id, event, entity, sourceSystem, bitrixSourceRecord);
         if (entity === 'COMPANY' && isMarkedDuplicate(bitrixSourceRecord.UF_CRM_1789126724375)) {
           await this.skipDuplicateEvent(event, 'DUPLICATE_COMPANY_EXCLUDED_FROM_ORDINARY_SYNC', fence);
           return 'UNCHANGED';
@@ -431,9 +465,24 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           return 'UNCHANGED';
         }
       }
+      else {
+        const parentId = event.externalEntityType === 'contactperson' ? parentIdFromEvent(event) : null;
+        const type = event.externalEntityType === 'contactperson' ? 'contactperson' : 'counterparty';
+        const sourceEntityHint = type === 'contactperson' ? 'client:CONTACT' : null;
+        const read = () => this.gateway!.readMoysklad(type, event.externalEntityId!, parentId);
+        moyskladSourceRecord = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+          ? await this.controlledAdmission.withCurrentSourceRead(event.id, sourceSystem, event.externalEntityId, sourceEntityHint, read)
+          : await read();
+        if (type === 'counterparty' && stringValue(moyskladSourceRecord.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
+        await this.admitControlledSource(event.id, event, entity, sourceSystem, moyskladSourceRecord);
+      }
+      const sourceNativeId = event.externalEntityId;
+      const gateway = this.gateway;
+      if (!sourceNativeId || !gateway) return await this.hold(event, 'CLIENT_RUNTIME_GATEWAY_UNAVAILABLE', { source: event.source, entity }, fence);
+      const continueAfterAdmission = async () => {
       if (entity === 'CONTACT' && sourceSystem === 'BITRIX24') {
         const contextPairs = await this.database.entityPair.findMany({
-          where: { entityType: 'CONTACT', active: true, bitrix24Id: event.externalEntityId },
+          where: { entityType: 'CONTACT', active: true, bitrix24Id: sourceNativeId },
           orderBy: [{ moyskladParentId: 'asc' }, { id: 'asc' }],
         });
         if (contextPairs.length) return await this.processContactPairFanout(event, eventConfig, bitrixSourceRecord!, contextPairs, fence);
@@ -462,12 +511,11 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           : parentIdFromEvent(event)
         : undefined;
       let pair = await this.database.entityPair.findFirst({
-        where: { entityType: entity, active: true, ...(event.source === 'BITRIX24' ? { bitrix24Id: event.externalEntityId } : { moyskladId: event.externalEntityId }),
+        where: { entityType: entity, active: true, ...(event.source === 'BITRIX24' ? { bitrix24Id: sourceNativeId } : { moyskladId: sourceNativeId }),
           ...(entity === 'CONTACT' ? { moyskladParentId: contactPairParentId ?? null } : {}) },
       });
       if (!pair && sourceSystem === 'MOYSKLAD' && event.externalEntityType === 'counterparty') {
-        const record = await this.gateway.readMoysklad('counterparty', event.externalEntityId, null);
-        if (stringValue(record.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
+        if (stringValue(moyskladSourceRecord?.companyType)?.toLowerCase() === 'individual') entity = 'CONTACT';
       }
       if (!pair) pair = await this.resolveUnpaired(event, entity, sourceSystem, eventConfig.config, contactPrimaryCompanySourceId, fence);
       if (!pair) return 'REVIEW';
@@ -485,14 +533,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const config = eventConfig;
       const bitrixEntity = entity === 'COMPANY' ? 'COMPANY' : 'CONTACT';
       const msType = pair.moyskladType === 'contactperson' ? 'contactperson' : 'counterparty';
-      const [bitrix, moysklad] = await Promise.all([
-        this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
-        this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
+      let [bitrix, moysklad] = await Promise.all([
+        gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+        gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
       ]);
       if (entity === 'COMPANY') {
         try {
           const [bitrixInn, moyskladInn] = await Promise.all([
-            this.candidateGateway.readCompanyInn('BITRIX24', pair.bitrix24Id),
+            this.candidateGateway!.readCompanyInn('BITRIX24', pair.bitrix24Id!),
             Promise.resolve(stringValue(moysklad.inn)),
           ]);
           if (bitrixInn && moyskladInn && bitrixInn !== moyskladInn) {
@@ -511,7 +559,27 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const rules = Array.isArray(config.config.rules) ? config.config.rules : [];
       const applicable = rules.filter((rule: any) => rule?.entity === mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
       const groups = Array.isArray(config.config.groups) ? config.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
-      const prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+      let prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+      if (prior) {
+        const revision = await this.rebaseClientSettings({ pair, event, eventConfig: config, mappingEntity, bitrixEntity, msType, bitrix, moysklad, state: prior, fence });
+        if (revision.status === 'RETRY') throw new Error(revision.reason);
+        if (revision.status === 'MANUAL_REVIEW') return await this.hold(event, revision.reason, { pairId: pair.id }, fence);
+        if (revision.status === 'STALE_PINNED_EVENT') {
+          await this.database.$transaction(async (tx) => {
+            await assertFenceInTransaction(fence, tx);
+            await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: 'UNCHANGED', processingStartedAt: null, direction: null, lastSuccessfulAt: new Date(), lastErrorCategory: 'STALE_PINNED_CLIENT_SETTINGS' } });
+            await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Older pinned client settings ${config.version} skipped for pair ${pair.id}; version ${revision.currentVersion} is already active or has a prepared revision.`, referenceId: event.id } });
+          });
+          return 'UNCHANGED';
+        }
+        prior = revision.state;
+        if (revision.rebased) {
+          [bitrix, moysklad] = await Promise.all([
+            gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+            gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
+          ]);
+        }
+      }
       const current = { bitrix24Values: selectFields(bitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(moysklad, applicable, groups, 'MOYSKLAD') };
       let childResourceState = prior?.childResourceState ?? null;
       let childResourceFields: string[] = [];
@@ -559,11 +627,11 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         });
       }
       if (writes.ambiguous) return this.hold(event, writes.ambiguous, { pairId: pair.id });
-      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await this.gateway.updateMoysklad(msType, pair.moyskladId, pair.moyskladParentId, writes.moysklad, event.id); }
-      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await this.gateway.updateBitrix(bitrixEntity, pair.bitrix24Id, writes.bitrix24, event.id); }
+      if (Object.keys(writes.moysklad).length) { await fence?.assertOwned(); await gateway.updateMoysklad(msType, pair.moyskladId!, pair.moyskladParentId, writes.moysklad, event.id); }
+      if (Object.keys(writes.bitrix24).length) { await fence?.assertOwned(); await gateway.updateBitrix(bitrixEntity, pair.bitrix24Id!, writes.bitrix24, event.id); }
       const [afterBitrix, afterMoysklad] = await Promise.all([
-        this.gateway.readBitrix(bitrixEntity, pair.bitrix24Id),
-        this.gateway.readMoysklad(msType, pair.moyskladId, pair.moyskladParentId),
+        gateway.readBitrix(bitrixEntity, pair.bitrix24Id!),
+        gateway.readMoysklad(msType, pair.moyskladId!, pair.moyskladParentId),
       ]);
       const confirmed = { bitrix24Values: selectFields(afterBitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(afterMoysklad, applicable, groups, 'MOYSKLAD') };
       if (!matchesWrittenFields(writes.bitrix24, confirmed.bitrix24Values) || !matchesWrittenFields(writes.moysklad, confirmed.moyskladValues)) {
@@ -580,7 +648,12 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: updatedFields.length ? `Configured fields synchronized (MoySklad wins conflicts): ${updatedFields.join(', ')} (pair ${pair.id}).` : `No configured field changes to synchronize (pair ${pair.id}).`, referenceId: event.id } });
       });
       return Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length || childResourceChanged ? 'SYNCED' : 'UNCHANGED';
+      };
+      return this.controlledAdmission
+        ? await this.controlledAdmission.runForEvent(event.id, continueAfterAdmission)
+        : await continueAfterAdmission();
     } catch (error) {
+      if (error instanceof ServiceModeNotOnError) return 'IGNORED';
       const retryable = isRetryableFailure(error);
       const reason = error instanceof ProviderFailure && !retryable ? 'CLIENT_PROVIDER_REJECTED' : 'CLIENT_SYNC_FAILURE';
       await this.database.$transaction(async (tx) => {
@@ -602,6 +675,198 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     }
   }
 
+  private async admitControlledSource(eventId: string, _event: PersistedEvent, entity: 'COMPANY' | 'CONTACT', sourceSystem: ClientSystem, record: ClientRecord): Promise<void> {
+    if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return;
+    if (!this.controlledAdmission) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_SERVICE_UNAVAILABLE');
+    const currentName = controlledClientName(entity, record);
+    const createdValue = sourceSystem === 'BITRIX24' ? record.DATE_CREATE : record.created;
+    const sourceCreatedAt = createdValue instanceof Date ? createdValue : new Date(String(createdValue ?? ''));
+    if (!currentName || !Number.isFinite(sourceCreatedAt.getTime())) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_READBACK_INVALID');
+    await this.controlledAdmission.admit(eventId, { entity: `client:${entity}`, sourceSystem, sourceNativeId: String(_event.externalEntityId),
+      currentNativeId: String(record.ID ?? record.id ?? ''), currentName, sourceCreatedAt });
+    enterControlledLiveEventScope(await this.controlledAdmission.scopeForEvent(eventId));
+  }
+
+  private async rebaseClientSettings(input: {
+    pair: Prisma.EntityPairGetPayload<Record<string, never>>;
+    event: PersistedEvent;
+    eventConfig: Awaited<ReturnType<FieldSettingsService['eventConfig']>>;
+    mappingEntity: string;
+    bitrixEntity: 'COMPANY' | 'CONTACT';
+    msType: 'counterparty' | 'contactperson';
+    bitrix: ClientRecord;
+    moysklad: ClientRecord;
+    state: Prisma.EntityPairSyncStateGetPayload<Record<string, never>>;
+    fence?: EventWorkerLeaseContext;
+  }): Promise<
+    | { status: 'READY'; state: Prisma.EntityPairSyncStateGetPayload<Record<string, never>>; rebased: boolean }
+    | { status: 'STALE_PINNED_EVENT'; currentVersion: number }
+    | { status: 'RETRY'; reason: string }
+    | { status: 'MANUAL_REVIEW'; reason: string }
+  > {
+    const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId: input.pair.id } });
+    if (!baseline) return { status: 'MANUAL_REVIEW', reason: 'CLIENT_SETTINGS_BASELINE_MISSING' };
+    if (input.eventConfig.version < baseline.settingsVersion) return { status: 'STALE_PINNED_EVENT', currentVersion: baseline.settingsVersion };
+    const prepared = await this.database.entityPairSettingsRevision.findFirst({
+      where: { pairId: input.pair.id, toSettingsVersion: { gt: input.eventConfig.version }, status: 'PREPARED' },
+      orderBy: { toSettingsVersion: 'desc' }, select: { toSettingsVersion: true },
+    });
+    if (prepared) return { status: 'STALE_PINNED_EVENT', currentVersion: prepared.toSettingsVersion };
+    if (input.eventConfig.version === baseline.settingsVersion) {
+      if (input.state.settingsVersion !== baseline.settingsVersion) return { status: 'MANUAL_REVIEW', reason: 'CLIENT_SETTINGS_STATE_VERSION_MISMATCH' };
+      return { status: 'READY', state: input.state, rebased: false };
+    }
+    if (input.state.settingsVersion !== baseline.settingsVersion) return { status: 'MANUAL_REVIEW', reason: 'CLIENT_SETTINGS_STATE_VERSION_MISMATCH' };
+
+    const oldSettings = await this.settings.version(baseline.settingsVersion).catch(() => null);
+    if (!oldSettings) return { status: 'MANUAL_REVIEW', reason: 'CLIENT_SETTINGS_PREVIOUS_VERSION_UNAVAILABLE' };
+    const oldProjection = semanticClientSettings(oldSettings.config, input.mappingEntity);
+    const newProjection = semanticClientSettings(input.eventConfig.config, input.mappingEntity);
+    const fingerprint = createHash('sha256').update(stableClientJson(newProjection)).digest('hex');
+    const previousBaseline = {
+      settingsVersion: baseline.settingsVersion,
+      bitrix24Values: baseline.bitrix24Values,
+      moyskladValues: baseline.moyskladValues,
+      syncState: { bitrix24Values: input.state.bitrix24Values, moyskladValues: input.state.moyskladValues, childResourceState: input.state.childResourceState },
+    } as Prisma.InputJsonValue;
+    try {
+      await this.database.entityPairSettingsRevision.upsert({
+        where: { pairId_toSettingsVersion: { pairId: input.pair.id, toSettingsVersion: input.eventConfig.version } },
+        create: { pairId: input.pair.id, fromSettingsVersion: baseline.settingsVersion, toSettingsVersion: input.eventConfig.version, status: 'PREPARED', semanticFingerprint: fingerprint, previousBaseline },
+        update: { fromSettingsVersion: baseline.settingsVersion, status: 'PREPARED', semanticFingerprint: fingerprint, previousBaseline, currentBaseline: Prisma.DbNull, errorCategory: null },
+      });
+    } catch { return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_PREPARE_FAILED' }; }
+
+    const oldRuleKeys = new Set(oldProjection.rules.map(stableClientJson));
+    const oldGroupKeys = new Set(oldProjection.groups.map(stableClientJson));
+    const changedRules = newProjection.rules.filter((rule) => !oldRuleKeys.has(stableClientJson(rule)));
+    const changedGroups = newProjection.groups.filter((group) => !oldGroupKeys.has(stableClientJson(group)));
+    const oldChildBindings = new Set(oldProjection.childResourceBindings.map(stableClientJson));
+    const changedChildBindings = newProjection.childResourceBindings.filter((binding) => !oldChildBindings.has(stableClientJson(binding)));
+    let revisedChildState = input.state.childResourceState;
+    if (changedChildBindings.length) {
+      const applicable = changedChildBindings.filter((binding) => isRecord(binding) && binding.bitrix24CompanyId === input.pair.bitrix24Id && binding.moyskladCounterpartyId === input.pair.moyskladId);
+      if (applicable.length !== 1 || !this.childResources || input.mappingEntity !== 'companies') {
+        const bindingIds = changedChildBindings.map((binding) => isRecord(binding) ? String(binding.id ?? 'unknown') : 'unknown').join(',');
+        const reason = `CLIENT_SETTINGS_REVISION_CHILD_BINDING_REQUIRES_REVIEW:${bindingIds}`;
+        await this.database.entityPairSettingsRevision.updateMany({ where: { pairId: input.pair.id, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' }, data: { status: 'FAILED', errorCategory: reason } }).catch(() => undefined);
+        return { status: 'MANUAL_REVIEW', reason };
+      }
+      const binding = applicable[0] as any;
+      const previous = oldProjection.childResourceBindings.find((candidate) => isRecord(candidate) && candidate.id === binding.id) as Record<string, any> | undefined;
+      const mappingPairs = (source: any) => [
+        ...(Array.isArray(source?.legalFields) ? source.legalFields : []),
+        ...(Array.isArray(source?.bankDetail?.fields) ? source.bankDetail.fields : []),
+      ].filter((field: any) => typeof field?.bitrix24Field === 'string' && typeof field?.moyskladField === 'string');
+      const previousPairs = new Set(mappingPairs(previous).map(stableClientJson));
+      const idsChanged = Boolean(previous && (previous.bitrix24CompanyId !== binding.bitrix24CompanyId || previous.bitrix24RequisiteId !== binding.bitrix24RequisiteId || previous.moyskladCounterpartyId !== binding.moyskladCounterpartyId || stableClientJson(previous.bankDetail?.bitrix24Id ?? null) !== stableClientJson(binding.bankDetail?.bitrix24Id ?? null) || stableClientJson(previous.bankDetail?.moyskladAccountId ?? null) !== stableClientJson(binding.bankDetail?.moyskladAccountId ?? null)));
+      const revisionFields = mappingPairs(binding).filter((field: any) => idsChanged || !previousPairs.has(stableClientJson(field)));
+      if (revisionFields.length) try {
+        const result = await this.childResources.syncForPair({
+          eventId: input.event.id, direction: 'MOYSKLAD_TO_BITRIX24', bindings: [binding],
+          bitrix24CompanyId: input.pair.bitrix24Id, moyskladCounterpartyId: input.pair.moyskladId,
+          prior: input.state.childResourceState as ClientChildResourceSnapshot | null, revisionFields, assertLease: input.fence?.assertOwned,
+        });
+        if (result.status === 'MANUAL_REVIEW') {
+          const reason = `CLIENT_SETTINGS_REVISION_CHILD_${result.reason}:${String(binding.id)}`;
+          await this.database.entityPairSettingsRevision.updateMany({ where: { pairId: input.pair.id, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' }, data: { status: 'FAILED', errorCategory: reason } }).catch(() => undefined);
+          return { status: 'MANUAL_REVIEW', reason };
+        }
+        revisedChildState = result.state as unknown as Prisma.JsonValue;
+      } catch (error) {
+        if (error instanceof ServiceModeNotOnError) throw error;
+        return { status: 'RETRY', reason: `CLIENT_SETTINGS_REVISION_CHILD_READBACK_FAILED:${safeReason(error)}` };
+      }
+    }
+    const bitrixWrites: Record<string, unknown> = {};
+    const sourceFields = new Set<string>();
+    const skipped: string[] = [];
+    let mappingError: string | null = null;
+
+    for (const rule of changedRules) {
+      sourceFields.add(rule.targetField);
+      if (!rule.moyskladToBitrix24.enabled) {
+        mappingError = 'CLIENT_SETTINGS_REVISION_REVERSE_MAPPING_REQUIRED';
+        continue;
+      }
+      const transformed = this.settings.transformFieldResult(input.eventConfig.config, input.mappingEntity, 'MOYSKLAD_TO_BITRIX24', rule.sourceField, input.moysklad);
+      if (transformed?.status === 'mapped') bitrixWrites[rule.sourceField] = transformed.value;
+      else if (transformed?.status === 'error' && rule.criticality === 'critical') mappingError = `CLIENT_SETTINGS_REVISION_TRANSFORM_FAILED:${rule.sourceField}`;
+      else skipped.push(`${rule.sourceField} → ${rule.targetField}:${transformed?.status === 'skip' ? transformed.reason : 'reverse transform unavailable'}`);
+    }
+    for (const group of changedGroups) {
+      if (group.direction !== 'MOYSKLAD_TO_BITRIX24') {
+        mappingError = 'CLIENT_SETTINGS_REVISION_GROUP_REVERSE_MAPPING_REQUIRED';
+        continue;
+      }
+      for (const field of group.sourceFields) sourceFields.add(field);
+      const transformed = this.settings.transformFieldResult(input.eventConfig.config, input.mappingEntity, group.direction, group.targetField, input.moysklad);
+      if (transformed?.status === 'mapped') bitrixWrites[group.targetField] = transformed.value;
+      else if (transformed?.status === 'error' && group.criticality === 'critical') mappingError = `CLIENT_SETTINGS_REVISION_GROUP_TRANSFORM_FAILED:${group.targetField}`;
+      else skipped.push(`${group.targetField}:${transformed?.status === 'skip' ? transformed.reason : 'group transform unavailable'}`);
+    }
+    if (mappingError) {
+      await this.database.entityPairSettingsRevision.updateMany({ where: { pairId: input.pair.id, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' }, data: { status: 'FAILED', errorCategory: mappingError } }).catch(() => undefined);
+      return { status: 'MANUAL_REVIEW', reason: mappingError };
+    }
+
+    let verifiedBitrix = input.bitrix;
+    let verifiedMoysklad = input.moysklad;
+    if (Object.keys(bitrixWrites).length) {
+      try {
+        const [beforeBitrix, beforeMoysklad] = await Promise.all([
+          this.gateway!.readBitrix(input.bitrixEntity, input.pair.bitrix24Id),
+          this.gateway!.readMoysklad(input.msType, input.pair.moyskladId, input.pair.moyskladParentId),
+        ]);
+        if ([...sourceFields].some((field) => !equal(beforeMoysklad[field], input.moysklad[field])) ||
+            Object.keys(bitrixWrites).some((field) => !equal(beforeBitrix[field], input.bitrix[field]))) {
+          return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_SOURCE_CHANGED' };
+        }
+        await input.fence?.assertOwned();
+        await this.gateway!.updateBitrix(input.bitrixEntity, input.pair.bitrix24Id, bitrixWrites, input.event.id);
+        [verifiedBitrix, verifiedMoysklad] = await Promise.all([
+          this.gateway!.readBitrix(input.bitrixEntity, input.pair.bitrix24Id),
+          this.gateway!.readMoysklad(input.msType, input.pair.moyskladId, input.pair.moyskladParentId),
+        ]);
+      } catch { return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_READBACK_FAILED' }; }
+      if (!matchesWrittenFields(bitrixWrites, verifiedBitrix) ||
+          [...sourceFields].some((field) => !equal(verifiedMoysklad[field], input.moysklad[field]))) {
+        return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_READBACK_MISMATCH' };
+      }
+    }
+
+    const rules = Array.isArray(input.eventConfig.config.rules) ? input.eventConfig.config.rules.filter((rule: any) => rule?.entity === input.mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string') : [];
+    const groups = Array.isArray(input.eventConfig.config.groups) ? input.eventConfig.config.groups.filter((group: any) => group?.entity === input.mappingEntity) : [];
+    const currentB = selectFields(verifiedBitrix, rules, groups, 'BITRIX24');
+    const currentM = selectFields(verifiedMoysklad, rules, groups, 'MOYSKLAD');
+    const preserveB = unchangedClientFields(oldProjection, newProjection, 'BITRIX24');
+    const preserveM = unchangedClientFields(oldProjection, newProjection, 'MOYSKLAD');
+    const bitrix24Values = preservePriorClientFields(currentB, baseline.bitrix24Values, preserveB);
+    const moyskladValues = preservePriorClientFields(currentM, baseline.moyskladValues, preserveM);
+    const stateBitrix24Values = preservePriorClientFields(currentB, input.state.bitrix24Values, preserveB);
+    const stateMoyskladValues = preservePriorClientFields(currentM, input.state.moyskladValues, preserveM);
+    try {
+      const committed = await this.database.$transaction(async (tx) => {
+        await assertFenceInTransaction(input.fence, tx);
+        const latest = await tx.entityPairBaseline.findUnique({ where: { pairId: input.pair.id } });
+        if (!latest || latest.settingsVersion !== baseline.settingsVersion) throw new Error('CLIENT_SETTINGS_REVISION_BASELINE_CHANGED');
+        await tx.entityPairBaseline.update({ where: { pairId: input.pair.id }, data: { settingsVersion: input.eventConfig.version, bitrix24Values: bitrix24Values as Prisma.InputJsonValue, moyskladValues: moyskladValues as Prisma.InputJsonValue } });
+        const nextState = await tx.entityPairSyncState.upsert({
+          where: { pairId: input.pair.id },
+          create: { pairId: input.pair.id, settingsVersion: input.eventConfig.version, bitrix24Values: stateBitrix24Values as Prisma.InputJsonValue, moyskladValues: stateMoyskladValues as Prisma.InputJsonValue, ...(revisedChildState ? { childResourceState: revisedChildState as Prisma.InputJsonValue } : {}) },
+          update: { settingsVersion: input.eventConfig.version, bitrix24Values: stateBitrix24Values as Prisma.InputJsonValue, moyskladValues: stateMoyskladValues as Prisma.InputJsonValue, ...(revisedChildState ? { childResourceState: revisedChildState as Prisma.InputJsonValue } : {}) },
+        });
+        await tx.entityPairSettingsRevision.update({ where: { pairId_toSettingsVersion: { pairId: input.pair.id, toSettingsVersion: input.eventConfig.version } }, data: {
+          status: 'COMPLETE', currentBaseline: { settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues, childResourceState: revisedChildState } as Prisma.InputJsonValue,
+          errorCategory: skipped.length ? 'OPTIONAL_MAPPING_SKIPPED' : null,
+        } });
+        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client mapping settings advanced from ${baseline.settingsVersion} to ${input.eventConfig.version}; MySklad-authoritative initial values verified for pair ${input.pair.id}.${skipped.length ? ` Optional mappings skipped: ${skipped.join('; ')}.` : ''}`, referenceId: input.event.id } });
+        return nextState;
+      });
+      return { status: 'READY', state: committed, rebased: true };
+    } catch { return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_PERSIST_FAILED' }; }
+  }
+
   private async processContactPairFanout(
     event: PersistedEvent,
     eventConfig: Awaited<ReturnType<FieldSettingsService['eventConfig']>>,
@@ -613,6 +878,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
     const failures: Array<{ pairId: string; reason: string; retryable: boolean; retryAfter?: Date }> = [];
     let baselines = 0;
     let syncs = 0;
+    let staleSettings = 0;
     for (const pair of pairs) {
       let lease: ClientRuntimeLease | undefined;
       try {
@@ -637,19 +903,43 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           if (!companyPair) throw new Error('CLIENT_CONTACT_PAIR_COMPANY_CONTEXT_UNRESOLVED');
         }
         if (pair.moyskladType !== 'counterparty' && pair.moyskladType !== 'contactperson') throw new Error('CLIENT_PERSISTED_PAIR_TYPE_UNKNOWN');
-        const ms = await this.gateway.readMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId);
+        let ms = await this.gateway.readMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId);
         if (pair.moyskladType === 'contactperson') {
           const actualParent = idFromMeta(ms.company) ?? idFromMeta(ms.agent);
           if (actualParent && actualParent !== pair.moyskladParentId) throw new Error('CLIENT_CONTACTPERSON_PARENT_MISMATCH');
         } else if (stringValue(ms.companyType)?.toLowerCase() !== 'individual') {
           throw new Error('CLIENT_CONTACT_TARGET_NOT_INDIVIDUAL');
         }
-        const bitrix = await this.gateway.readBitrix('CONTACT', pair.bitrix24Id);
+        let bitrix = await this.gateway.readBitrix('CONTACT', pair.bitrix24Id);
         const mappingEntity = 'contacts-companies';
         const rules = Array.isArray(eventConfig.config.rules) ? eventConfig.config.rules : [];
         const applicable = rules.filter((rule: any) => rule?.entity === mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
         const groups = Array.isArray(eventConfig.config.groups) ? eventConfig.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
-        const prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+        let prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
+        if (prior) {
+          const revision = await this.rebaseClientSettings({ pair, event, eventConfig, mappingEntity, bitrixEntity: 'CONTACT', msType: pair.moyskladType, bitrix, moysklad: ms, state: prior, fence });
+          if (revision.status === 'RETRY') throw new Error(revision.reason);
+          if (revision.status === 'MANUAL_REVIEW') {
+            const failure = new ProviderFailure('BITRIX24', 400);
+            failure.message = revision.reason;
+            throw failure;
+          }
+          if (revision.status === 'STALE_PINNED_EVENT') {
+            staleSettings++;
+            await this.database.$transaction(async (tx) => {
+              await assertFenceInTransaction(fence, tx);
+              await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Older pinned contact settings ${eventConfig.version} skipped for pair ${pair.id}; version ${revision.currentVersion} is already active or has a prepared revision.`, referenceId: event.id } });
+            });
+            continue;
+          }
+          prior = revision.state;
+          if (revision.rebased) {
+            [bitrix, ms] = await Promise.all([
+              this.gateway.readBitrix('CONTACT', pair.bitrix24Id),
+              this.gateway.readMoysklad(pair.moyskladType, pair.moyskladId, pair.moyskladParentId),
+            ]);
+          }
+        }
         const current = { bitrix24Values: selectFields(bitrix, applicable, groups, 'BITRIX24'), moyskladValues: selectFields(ms, applicable, groups, 'MOYSKLAD') };
         if (!prior) {
           await this.database.$transaction(async (tx) => {
@@ -682,6 +972,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         });
         if (Object.keys(writes.moysklad).length || Object.keys(writes.bitrix24).length) syncs++;
       } catch (error) {
+        if (error instanceof ServiceModeNotOnError) throw error;
         const reason = safeReason(error);
         failures.push({ pairId: pair.id, reason, retryable: isRetryableFailure(error), retryAfter: isRetryableFailure(error) ? retryAtForFailure(error, event.attempts + 1) : undefined });
       } finally {
@@ -770,7 +1061,17 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       phone: firstValue(record.PHONE ?? record.phone), email: firstValue(record.EMAIL ?? record.email),
       companyId: primaryCompanySourceId,
     };
-    const resolution = await new ClientRuntimeResolver(candidateGateway).resolve(source, primaryCompanyTargetId);
+    let resolution: ClientResolution;
+    if (process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+      const targetSystem: ClientSystem = sourceSystem === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24';
+      if (!this.controlledAdmission) throw new Error('CONTROLLED_LIVE_TEST_ADMISSION_SERVICE_UNAVAILABLE');
+      if (primaryCompanyTargetId) throw new Error('CONTROLLED_LIVE_TEST_SHARED_COMPANY_DEPENDENCY_NOT_ALLOWED');
+      await this.controlledAdmission.assertCreateReserved(event.id, `client:${entity}`, targetSystem);
+      resolution = { action: 'CREATE', targetSystem, reason: entity === 'CONTACT' ? 'NO_CONTACT_KEYS' : 'NO_CANDIDATE',
+        targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : entity === 'CONTACT' ? 'contact' : 'company' };
+    } else {
+      resolution = await new ClientRuntimeResolver(candidateGateway).resolve(source, primaryCompanyTargetId);
+    }
     if (resolution.action === 'MANUAL_REVIEW') {
       await this.hold(event, `CLIENT_${resolution.reason}`, { entity, sourceSystem, sourceId, primaryCompanySourceId, candidates: resolution.candidates }, fence);
       return null;
@@ -791,12 +1092,26 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         entity, targetSystem: resolution.targetSystem, targetType: resolution.targetType,
         parentId: primaryCompanyTargetId, source: record, configuredFields, eventId: event.id,
       });
+      if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+        this.controlledAdmission.allowTargetReadback(resolution.targetSystem, targetId);
+        const readback = await candidateGateway.readRecord(resolution.targetSystem, entity, targetId, contactPairParentId);
+        const targetCreatedValue = resolution.targetSystem === 'BITRIX24' ? readback.DATE_CREATE : readback.created;
+        const targetCreatedAt = targetCreatedValue instanceof Date
+          ? targetCreatedValue
+          : resolution.targetSystem === 'MOYSKLAD'
+            ? parseClientMoyskladTimestamp(targetCreatedValue) ?? new Date(Number.NaN)
+            : new Date(String(targetCreatedValue ?? ''));
+        await this.controlledAdmission.bindCreatedTarget(event.id, targetId, String(readback.ID ?? readback.id ?? ''), controlledClientName(entity, readback), targetCreatedAt);
+      }
       targetType = resolution.targetType;
     }
 
     if (!targetId) {
       await this.hold(event, 'CLIENT_RUNTIME_TARGET_ID_MISSING', { entity, sourceSystem, sourceId, resolution: resolution.action }, fence);
       return null;
+    }
+    if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
+      await this.controlledAdmission.assertTargetAllowed(event.id, resolution.targetSystem, targetId);
     }
     const bitrix24Id = sourceSystem === 'BITRIX24' ? sourceId : targetId;
     const moyskladId = sourceSystem === 'BITRIX24' ? targetId : sourceId;
@@ -964,6 +1279,71 @@ function selectFields(record: ClientRecord, rules: any[], groups: any[], side: '
   return Object.fromEntries([...keys].filter((key) => Object.prototype.hasOwnProperty.call(record, key)).map((key) => [key, record[key]]));
 }
 
+type ClientSettingsProjection = {
+  rules: Array<{
+    entity: string; sourceField: string; targetField: string; criticality: string;
+    bitrix24ToMoysklad: { enabled: boolean; transform: unknown };
+    moyskladToBitrix24: { enabled: boolean; transform: unknown };
+  }>;
+  groups: Array<{ entity: string; direction: string; sourceFields: string[]; targetField: string; criticality: string; transform: unknown }>;
+  childResourceBindings: unknown[];
+};
+
+function semanticClientSettings(config: unknown, entity: string): ClientSettingsProjection {
+  const source = isRecord(config) ? config : {};
+  const rules = (Array.isArray(source.rules) ? source.rules : []).filter((rule): rule is Record<string, any> =>
+    isRecord(rule) && rule.entity === entity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string' &&
+    (isRecord(rule.bitrix24ToMoysklad) && rule.bitrix24ToMoysklad.enabled === true || isRecord(rule.moyskladToBitrix24) && rule.moyskladToBitrix24.enabled === true))
+    .map((rule) => ({
+      entity, sourceField: rule.sourceField, targetField: rule.targetField, criticality: rule.criticality,
+      bitrix24ToMoysklad: { enabled: rule.bitrix24ToMoysklad?.enabled === true, transform: rule.bitrix24ToMoysklad?.transform ?? null },
+      moyskladToBitrix24: { enabled: rule.moyskladToBitrix24?.enabled === true, transform: rule.moyskladToBitrix24?.transform ?? null },
+    })).sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)));
+  const groups = (Array.isArray(source.groups) ? source.groups : []).filter((group): group is Record<string, any> =>
+    isRecord(group) && group.entity === entity && typeof group.targetField === 'string' && Array.isArray(group.sourceFields))
+    .map((group) => ({ entity, direction: group.direction, sourceFields: group.sourceFields.filter((field: unknown): field is string => typeof field === 'string'),
+      targetField: group.targetField, criticality: group.criticality, transform: group.transform ?? null }))
+    .sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)));
+  const childResourceBindings = entity === 'companies' && Array.isArray(source.childResourceBindings)
+    ? source.childResourceBindings.map((binding) => isRecord(binding) ? {
+      id: binding.id, entity: binding.entity, bitrix24CompanyId: binding.bitrix24CompanyId,
+      bitrix24RequisiteId: binding.bitrix24RequisiteId, moyskladCounterpartyId: binding.moyskladCounterpartyId,
+      legalFields: binding.legalFields, bankDetail: binding.bankDetail ?? null,
+    } : binding).sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)))
+    : [];
+  return { rules, groups, childResourceBindings };
+}
+
+function unchangedClientFields(oldProjection: ClientSettingsProjection, newProjection: ClientSettingsProjection, side: 'BITRIX24' | 'MOYSKLAD'): Set<string> {
+  const newRules = new Set(newProjection.rules.map(stableClientJson));
+  const newGroups = new Set(newProjection.groups.map(stableClientJson));
+  const fields = new Set<string>();
+  for (const rule of oldProjection.rules) {
+    if (!newRules.has(stableClientJson(rule))) continue;
+    fields.add(side === 'BITRIX24' ? rule.sourceField : rule.targetField);
+  }
+  for (const group of oldProjection.groups) {
+    if (!newGroups.has(stableClientJson(group))) continue;
+    const sourceSide = group.direction === 'BITRIX24_TO_MOYSKLAD' ? 'BITRIX24' : 'MOYSKLAD';
+    if (side === sourceSide) for (const field of group.sourceFields) fields.add(field);
+    else fields.add(group.targetField);
+  }
+  return fields;
+}
+
+function preservePriorClientFields(current: Record<string, unknown>, previous: unknown, preservedFields: Set<string>): Record<string, unknown> {
+  const values = { ...current };
+  if (!isRecord(previous)) return values;
+  for (const field of preservedFields) if (Object.prototype.hasOwnProperty.call(previous, field)) values[field] = previous[field];
+  return values;
+}
+
+function stableClientJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableClientJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableClientJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
 function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24', bitrix: ClientRecord, ms: ClientRecord, prior: { bitrix24Values: unknown; moyskladValues: unknown }, rules: any[], settings: FieldSettingsService, protectEmptyFallbackInn = false) {
   const bitrix24: Record<string, unknown> = {};
   const moysklad: Record<string, unknown> = {};
@@ -991,18 +1371,25 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
       // The documented conflict policy is deterministic: MoySklad's current
       // value wins even when the event was triggered by the Bitrix24 edit.
       if (direction === 'MOYSKLAD_TO_BITRIX24') {
-        const transformed = settings.transformField(config, entity, direction, destField, sourceNow);
-        if (transformed && !transformed.error) bitrix24[destField] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, direction, destField, sourceNow);
+        if (transformed?.status === 'mapped') bitrix24[destField] = transformed.value;
+        else if (transformed?.status === 'error' && rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${destField}:${transformed.reason}`;
       } else {
         const sourceField = rule.sourceField;
-        const transformed = settings.transformField(config, entity, 'MOYSKLAD_TO_BITRIX24', sourceField, ms);
-        if (transformed && !transformed.error) bitrix24[sourceField] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, 'MOYSKLAD_TO_BITRIX24', sourceField, ms);
+        if (transformed?.status === 'mapped') bitrix24[sourceField] = transformed.value;
+        else if (transformed?.status === 'error' && rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${sourceField}:${transformed.reason}`;
       }
       continue;
     }
     if (!sourceChanged || equal(sourceNow[srcField], targetNow[destField])) continue;
-    const transformed = settings.transformField(config, entity, direction, destField, sourceNow);
-    if (!transformed || transformed.error) continue;
+    const transformed = settings.transformFieldResult(config, entity, direction, destField, sourceNow);
+    if (!transformed || transformed.status === 'skip') continue;
+    if (transformed.status === 'error') {
+      if (rule.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${destField}:${transformed.reason}`;
+      else logger.warn(`Optional field transform skipped (${entity}; ${destField}): ${transformed.reason}`);
+      continue;
+    }
     if (rule.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[destField])) {
       criticalClears.push({ fieldTitle: destField, previousValue: targetNow[destField], restoreValue: targetNow[destField], sourceProposedValue: transformed.value });
       continue;
@@ -1017,16 +1404,18 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
     const targetChanged = !equal(targetNow[group.targetField], targetPrior[group.targetField]);
     if (targetChanged && !equal(targetNow[group.targetField], sourceNow[group.targetField])) {
       if (direction === 'BITRIX24_TO_MOYSKLAD') {
-        const transformed = settings.transformField(config, entity, 'MOYSKLAD_TO_BITRIX24', group.sourceFields[0], ms);
-        if (transformed?.error) ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.error}`;
-        else if (transformed) bitrix24[group.sourceFields[0]] = transformed.value;
+        const transformed = settings.transformFieldResult(config, entity, 'MOYSKLAD_TO_BITRIX24', group.sourceFields[0], ms);
+        if (transformed?.status === 'error' && group.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`;
+        else if (transformed?.status === 'mapped') bitrix24[group.sourceFields[0]] = transformed.value;
       }
       continue;
     }
     if (targetChanged) continue;
-    const transformed = settings.transformField(config, entity, direction, group.targetField, sourceNow);
-    if (transformed?.error) ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.error}`;
-    else if (transformed && !equal(transformed.value, targetNow[group.targetField])) {
+    const transformed = settings.transformFieldResult(config, entity, direction, group.targetField, sourceNow);
+    if (transformed?.status === 'error') {
+      if (group.criticality === 'critical') ambiguous = `CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`;
+      else logger.warn(`Optional field group transform skipped (${entity}; ${group.targetField}): ${transformed.reason}`);
+    } else if (transformed?.status === 'mapped' && !equal(transformed.value, targetNow[group.targetField])) {
       if (group.criticality === 'critical' && isEmptyValue(transformed.value) && !isEmptyValue(targetNow[group.targetField])) {
         criticalClears.push({ fieldTitle: group.targetField, previousValue: targetNow[group.targetField], restoreValue: targetNow[group.targetField], sourceProposedValue: transformed.value });
       } else defaultTarget[group.targetField] = transformed.value;
@@ -1064,6 +1453,10 @@ function personNameFromBitrix(record: ClientRecord): string | null {
   const parts = [record.LAST_NAME, record.NAME, record.SECOND_NAME].filter((part): part is string => typeof part === 'string' && Boolean(part.trim()));
   return parts.length ? parts.join(' ').trim() : null;
 }
+function controlledClientName(entity: 'COMPANY' | 'CONTACT', record: ClientRecord): string {
+  if (entity === 'COMPANY') return String(record.TITLE ?? record.name ?? '').trim();
+  return personNameFromBitrix(record) ?? String(record.name ?? '').trim();
+}
 function idFromMeta(value: unknown): string | null {
   if (typeof value === 'string') return value.split('/').filter(Boolean).at(-1) ?? null;
   if (!isRecord(value)) return null;
@@ -1090,14 +1483,16 @@ function configuredCreateFields(config: unknown, entity: string, direction: 'BIT
     const configKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!isRecord(rule[configKey]) || rule[configKey].enabled !== true) continue;
     const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
-    const transformed = settings.transformField(config, entity, direction, targetField, source);
-    if (transformed && !transformed.error) output[targetField] = transformed.value;
+    const transformed = settings.transformFieldResult(config, entity, direction, targetField, source);
+    if (transformed?.status === 'mapped') output[targetField] = transformed.value;
+    else if (transformed?.status === 'error' && rule.criticality === 'critical') throw new Error(`CLIENT_FIELD_TRANSFORM_FAILED:${targetField}:${transformed.reason}`);
   }
   const groups = Array.isArray(config.groups) ? config.groups : [];
   for (const group of groups) {
     if (!isRecord(group) || group.entity !== entity || group.direction !== direction || typeof group.targetField !== 'string') continue;
-    const transformed = settings.transformField(config, entity, direction, group.targetField, source);
-    if (transformed && !transformed.error) output[group.targetField] = transformed.value;
+    const transformed = settings.transformFieldResult(config, entity, direction, group.targetField, source);
+    if (transformed?.status === 'mapped') output[group.targetField] = transformed.value;
+    else if (transformed?.status === 'error' && group.criticality === 'critical') throw new Error(`CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`);
   }
   return output;
 }

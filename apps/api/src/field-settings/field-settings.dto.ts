@@ -1,3 +1,5 @@
+import { FieldTransform } from './field-transform';
+
 export type UnitReference = {
   bitrix24Id: number;
   bitrix24Code: string;
@@ -39,8 +41,8 @@ export type FieldRuleDto = {
   sourceField: string;
   targetField: string;
   criticality: 'critical' | 'optional' | 'tbd';
-  bitrix24ToMoysklad: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
-  moyskladToBitrix24: { enabled: boolean; transform: { kind: 'copy' | 'tbd' } };
+  bitrix24ToMoysklad: { enabled: boolean; transform: FieldTransform };
+  moyskladToBitrix24: { enabled: boolean; transform: FieldTransform };
 };
 
 export type FieldGroupDto = {
@@ -57,6 +59,8 @@ export type DealOrderRuntimeDto = {
   nativeOrderNumberingVerified: boolean;
   /** Explicitly selected Bitrix24 product catalog for the MS→B24 prerequisite path. */
   bitrix24ProductCatalogId?: string | null;
+  /** Optional explicit default Bitrix24 catalog section for newly created products. */
+  bitrix24DefaultProductSectionId?: string | null;
   /** MySklad product fields permitted on newly created Bitrix24 product cards. Name is mandatory. */
   moyskladProductFields?: Array<'name' | 'code' | 'description'>;
   defaultOrganizationId: string | null;
@@ -68,6 +72,12 @@ export type DealOrderRuntimeDto = {
   organizations: Array<{ bitrix24Id: string; moyskladId: string }>;
   stores: Array<{ bitrix24Id: string; moyskladId: string }>;
   employees: Array<{ bitrix24Id: string; moyskladId: string }>;
+};
+
+export type ProductCatalogRuntimeDto = {
+  bitrix24CatalogId: string | null;
+  bitrix24DefaultSectionId?: string | null;
+  moyskladFields: Array<'name' | 'code' | 'description'>;
 };
 
 /** Explicit binding for child endpoints. IDs are selected by an operator and are never discovered/guessed by runtime. */
@@ -89,6 +99,7 @@ export type FieldSettingsConfigDto = {
   groups: FieldGroupDto[];
   childResourceBindings?: ClientChildResourceBindingDto[];
   references: { units: UnitReference[]; priceTypes: PriceTypeReference[]; dictionaries: DictionaryReference[]; namedPairs?: NamedReferencePair[] };
+  productCatalogRuntime?: ProductCatalogRuntimeDto;
   dealOrderRuntime?: DealOrderRuntimeDto;
 } & Record<string, unknown>;
 

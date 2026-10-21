@@ -1,26 +1,36 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { DryRunDocumentReader } from '../dry-run-document-reader';
 import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { FieldSettingsService } from '../field-settings/field-settings.service';
+import { DealOrderFieldRuntimeService, RevisionMappingResult } from './deal-order-field-runtime.service';
+import { withDealOrderPairLock } from './deal-order-pair-lock';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
   | { status: 'READY'; baselineId: string; created: boolean; settingsVersion: number; capturedAt: string; bitrix24UpdatedAt: string | null; moyskladUpdatedAt: string | null }
-  | { status: 'RETRYABLE_FAILURE'; reason: 'SOURCE_READ_FAILED'; retryAfter: Date }
+  | { status: 'RETRYABLE_FAILURE'; reason: string; retryAfter: Date }
   | { status: 'DATABASE_FAILURE' }
-  | { status: 'MANUAL_REVIEW'; reason: 'SOURCE_READ_FAILED' | 'BASELINE_STORE_FAILED' | 'UNSUPPORTED_ENTITY' | 'PAIR_NOT_ACTIVE' | 'SETTINGS_VERSION_MISMATCH' };
+  | { status: 'STALE_PINNED_EVENT'; currentSettingsVersion: number }
+  | { status: 'MANUAL_REVIEW'; reason: string };
 
 /**
  * Captures the first bilateral, approved-field state for an already-confirmed
- * deal/order pair. The row is immutable: later events must compare against it
- * and persist successful runtime state separately, never replace this baseline.
+ * deal/order pair. Value snapshots are preserved; a semantically unchanged
+ * settings transition records a revision and advances only the version pointer.
  */
 @Injectable()
 export class DealOrderBaselineService {
-  constructor(private readonly database: DatabaseService, private readonly reader: DryRunDocumentReader) {}
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly reader: DryRunDocumentReader,
+    @Optional() @Inject(FieldSettingsService) private readonly fieldSettings?: FieldSettingsService,
+    @Optional() @Inject(DealOrderFieldRuntimeService) private readonly fieldRuntime?: DealOrderFieldRuntimeService,
+  ) {}
 
   async ensureForConfirmedPair(input: {
     pair: ConfirmedPair;
@@ -54,8 +64,11 @@ export class DealOrderBaselineService {
       return { status: 'DATABASE_FAILURE' };
     }
     if (existing) {
+      if (input.eventConfig.version < existing.settingsVersion) {
+        return { status: 'STALE_PINNED_EVENT', currentSettingsVersion: existing.settingsVersion };
+      }
       if (existing.settingsVersion !== input.eventConfig.version) {
-        return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
+        return this.rebaseSettings(input, pair.id);
       }
       return result(existing, false);
     }
@@ -100,6 +113,96 @@ export class DealOrderBaselineService {
     } catch {
       return { status: 'DATABASE_FAILURE' };
     }
+  }
+
+  private async rebaseSettings(
+    input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto; attempt?: number },
+    pairId: string,
+  ): Promise<DealOrderBaselineResult> {
+    if (!this.fieldSettings) return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
+    const locked = await withDealOrderPairLock(this.database, pairId, input.eventId, async (lease) => {
+      const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId } });
+      if (!baseline) return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' } as const;
+      if (input.eventConfig.version < baseline.settingsVersion) return { status: 'STALE_PINNED_EVENT', currentSettingsVersion: baseline.settingsVersion } as const;
+      const [oldSettings, state] = await Promise.all([
+        this.fieldSettings!.version(baseline.settingsVersion),
+        this.database.entityPairSyncState.findUnique({ where: { pairId } }),
+      ]);
+      const oldProjection = semanticDealOrderSettings(oldSettings.config);
+      const newProjection = semanticDealOrderSettings(input.eventConfig.config);
+      const fingerprint = createHash('sha256').update(stableJson(newProjection)).digest('hex');
+      const previousBaseline = {
+        settingsVersion: baseline.settingsVersion, bitrix24Values: baseline.bitrix24Values,
+        moyskladValues: baseline.moyskladValues, capturedAt: baseline.capturedAt.toISOString(),
+        syncState: state ? { bitrix24Values: state.bitrix24Values, moyskladValues: state.moyskladValues, childResourceState: state.childResourceState } : null,
+      } as Prisma.InputJsonValue;
+      try {
+        await this.database.entityPairSettingsRevision.upsert({
+          where: { pairId_toSettingsVersion: { pairId, toSettingsVersion: input.eventConfig.version } },
+          create: {
+            pairId, fromSettingsVersion: baseline.settingsVersion, toSettingsVersion: input.eventConfig.version,
+            status: 'PREPARED', semanticFingerprint: fingerprint, previousBaseline,
+          },
+          update: {},
+        });
+      } catch { return { status: 'DATABASE_FAILURE' } as const; }
+      let revisionValues: RevisionMappingResult | null = null;
+      if (stableJson(oldProjection) !== stableJson(newProjection)) {
+        if (!this.fieldRuntime) return { status: 'MANUAL_REVIEW', reason: 'SETTINGS_REBASE_RUNTIME_UNAVAILABLE' } as const;
+        revisionValues = await this.fieldRuntime.reconcileRevisionMappings({
+          pair: input.pair, eventId: input.eventId, oldConfig: oldSettings, newConfig: input.eventConfig,
+          assertLease: lease.assertOwner,
+        });
+        if (revisionValues.status === 'retry') {
+          await this.database.entityPairSettingsRevision.updateMany({
+            where: { pairId, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' },
+            data: { errorCategory: revisionValues.reason },
+          }).catch(() => undefined);
+          return { status: 'RETRYABLE_FAILURE', reason: revisionValues.reason, retryAfter: retryAtForFailure(new Error(revisionValues.reason), input.attempt ?? 1) } as const;
+        }
+        if (revisionValues.status === 'manual_review') {
+          await this.database.entityPairSettingsRevision.updateMany({
+            where: { pairId, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' },
+            data: { status: 'FAILED', errorCategory: revisionValues.reason },
+          }).catch(() => undefined);
+          return { status: 'MANUAL_REVIEW', reason: revisionValues.reason } as const;
+        }
+      }
+      const bitrix24Values = mergeRevisionValues(baseline.bitrix24Values, oldSettings.config, input.eventConfig.config, revisionValues?.status === 'verified' ? revisionValues.bitrix24Values : {});
+      const moyskladValues = mergeRevisionValues(baseline.moyskladValues, oldSettings.config, input.eventConfig.config, revisionValues?.status === 'verified' ? revisionValues.moyskladValues : {});
+      const stateBitrix24Values = mergeRevisionValues(state?.bitrix24Values ?? baseline.bitrix24Values, oldSettings.config, input.eventConfig.config, revisionValues?.status === 'verified' ? revisionValues.bitrix24Values : {});
+      const stateMoyskladValues = mergeRevisionValues(state?.moyskladValues ?? baseline.moyskladValues, oldSettings.config, input.eventConfig.config, revisionValues?.status === 'verified' ? revisionValues.moyskladValues : {});
+      try {
+        const committed = await lease.commit(async (transaction) => {
+          const current = await transaction.entityPairBaseline.findUnique({ where: { pairId } });
+          if (!current || current.settingsVersion !== baseline.settingsVersion) throw new Error('SETTINGS_REBASE_BASELINE_CHANGED');
+          await transaction.entityPairBaseline.update({ where: { pairId }, data: {
+            settingsVersion: input.eventConfig.version,
+            bitrix24Values: bitrix24Values as Prisma.InputJsonValue,
+            moyskladValues: moyskladValues as Prisma.InputJsonValue,
+          } });
+          await transaction.entityPairSyncState.upsert({
+            where: { pairId },
+            create: { pairId, settingsVersion: input.eventConfig.version, bitrix24Values: stateBitrix24Values as Prisma.InputJsonValue, moyskladValues: stateMoyskladValues as Prisma.InputJsonValue },
+            update: { settingsVersion: input.eventConfig.version, bitrix24Values: stateBitrix24Values as Prisma.InputJsonValue, moyskladValues: stateMoyskladValues as Prisma.InputJsonValue },
+          });
+          await transaction.entityPairSettingsRevision.update({
+            where: { pairId_toSettingsVersion: { pairId, toSettingsVersion: input.eventConfig.version } },
+            data: { status: 'COMPLETE', currentBaseline: { settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues } as Prisma.InputJsonValue },
+          });
+          return transaction.entityPairBaseline.findUnique({ where: { pairId } });
+        });
+        if (!committed.committed || !committed.value) return { status: 'DATABASE_FAILURE' } as const;
+        return result(committed.value, false);
+      } catch {
+        await this.database.entityPairSettingsRevision.updateMany({
+          where: { pairId, toSettingsVersion: input.eventConfig.version, status: 'PREPARED' },
+          data: { status: 'FAILED', errorCategory: 'REVISION_STATE_PERSIST_FAILED' },
+        }).catch(() => undefined);
+        return { status: 'DATABASE_FAILURE' } as const;
+      }
+    });
+    return locked ?? { status: 'MANUAL_REVIEW', reason: 'SETTINGS_VERSION_MISMATCH' };
   }
 }
 
@@ -177,4 +280,100 @@ function result(row: {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function semanticDealOrderSettings(config: VersionedFieldSettingsDto['config']): Record<string, unknown> {
+  const rules = (Array.isArray(config.rules) ? config.rules : []).filter((rule) => rule.entity === 'deals-orders')
+    .map((rule) => ({
+      entity: rule.entity, sourceField: rule.sourceField, targetField: rule.targetField, criticality: rule.criticality,
+      bitrix24ToMoysklad: { enabled: rule.bitrix24ToMoysklad.enabled, transform: rule.bitrix24ToMoysklad.transform },
+      moyskladToBitrix24: { enabled: rule.moyskladToBitrix24.enabled, transform: rule.moyskladToBitrix24.transform },
+    }))
+    .sort((left, right) => stableJson(left).localeCompare(stableJson(right)));
+  const groups = (Array.isArray(config.groups) ? config.groups : []).filter((group) => group.entity === 'deals-orders')
+    .map((group) => ({
+      entity: group.entity, direction: group.direction, sourceFields: group.sourceFields,
+      targetField: group.targetField, criticality: group.criticality, transform: group.transform,
+    }))
+    .sort((left, right) => stableJson(left).localeCompare(stableJson(right)));
+  return { rules, groups };
+}
+
+function rekeyRuleValues(value: Prisma.JsonValue, oldConfig: VersionedFieldSettingsDto['config'], newConfig: VersionedFieldSettingsDto['config']): Record<string, unknown> {
+  const result: Record<string, unknown> = isRecord(value) ? { ...value } : {};
+  const oldRules = Array.isArray(oldConfig.rules) ? oldConfig.rules.filter((rule) => rule.entity === 'deals-orders') : [];
+  const newRules = Array.isArray(newConfig.rules) ? newConfig.rules.filter((rule) => rule.entity === 'deals-orders') : [];
+  for (const oldRule of oldRules) {
+    const semantic = stableJson({
+      entity: oldRule.entity, sourceField: oldRule.sourceField, targetField: oldRule.targetField, criticality: oldRule.criticality,
+      bitrix24ToMoysklad: { enabled: oldRule.bitrix24ToMoysklad.enabled, transform: oldRule.bitrix24ToMoysklad.transform },
+      moyskladToBitrix24: { enabled: oldRule.moyskladToBitrix24.enabled, transform: oldRule.moyskladToBitrix24.transform },
+    });
+    const newRule = newRules.find((candidate) => stableJson({
+      entity: candidate.entity, sourceField: candidate.sourceField, targetField: candidate.targetField, criticality: candidate.criticality,
+      bitrix24ToMoysklad: { enabled: candidate.bitrix24ToMoysklad.enabled, transform: candidate.bitrix24ToMoysklad.transform },
+      moyskladToBitrix24: { enabled: candidate.moyskladToBitrix24.enabled, transform: candidate.moyskladToBitrix24.transform },
+    }) === semantic);
+    if (newRule) moveKey(result, `rule:${oldRule.id}`, `rule:${newRule.id}`);
+  }
+  const oldGroups = Array.isArray(oldConfig.groups) ? oldConfig.groups.filter((group) => group.entity === 'deals-orders') : [];
+  const newGroups = Array.isArray(newConfig.groups) ? newConfig.groups.filter((group) => group.entity === 'deals-orders') : [];
+  for (const oldGroup of oldGroups) {
+    const semantic = stableJson({ entity: oldGroup.entity, direction: oldGroup.direction, sourceFields: oldGroup.sourceFields, targetField: oldGroup.targetField, criticality: oldGroup.criticality, transform: oldGroup.transform });
+    const newGroup = newGroups.find((candidate) => stableJson({ entity: candidate.entity, direction: candidate.direction, sourceFields: candidate.sourceFields, targetField: candidate.targetField, criticality: candidate.criticality, transform: candidate.transform }) === semantic);
+    if (newGroup) {
+      moveKey(result, `group:${oldGroup.id}:source`, `group:${newGroup.id}:source`);
+      moveKey(result, `group:${oldGroup.id}:target`, `group:${newGroup.id}:target`);
+    }
+  }
+  return result;
+}
+
+function mergeRevisionValues(
+  snapshot: Prisma.JsonValue,
+  oldConfig: VersionedFieldSettingsDto['config'],
+  newConfig: VersionedFieldSettingsDto['config'],
+  verifiedChanges: Record<string, unknown>,
+): Record<string, unknown> {
+  const rekeyed = rekeyRuleValues(snapshot, oldConfig, newConfig);
+  const preservedKeys = new Set<string>();
+  const oldRules = (oldConfig.rules ?? []).filter((rule) => rule.entity === 'deals-orders');
+  const newRules = (newConfig.rules ?? []).filter((rule) => rule.entity === 'deals-orders');
+  for (const oldRule of oldRules) {
+    const projected = stableJson({
+      entity: oldRule.entity, sourceField: oldRule.sourceField, targetField: oldRule.targetField, criticality: oldRule.criticality,
+      bitrix24ToMoysklad: { enabled: oldRule.bitrix24ToMoysklad.enabled, transform: oldRule.bitrix24ToMoysklad.transform },
+      moyskladToBitrix24: { enabled: oldRule.moyskladToBitrix24.enabled, transform: oldRule.moyskladToBitrix24.transform },
+    });
+    const next = newRules.find((candidate) => stableJson({
+      entity: candidate.entity, sourceField: candidate.sourceField, targetField: candidate.targetField, criticality: candidate.criticality,
+      bitrix24ToMoysklad: { enabled: candidate.bitrix24ToMoysklad.enabled, transform: candidate.bitrix24ToMoysklad.transform },
+      moyskladToBitrix24: { enabled: candidate.moyskladToBitrix24.enabled, transform: candidate.moyskladToBitrix24.transform },
+    }) === projected);
+    if (next) preservedKeys.add(`rule:${next.id}`);
+  }
+  const oldGroups = (oldConfig.groups ?? []).filter((group) => group.entity === 'deals-orders');
+  const newGroups = (newConfig.groups ?? []).filter((group) => group.entity === 'deals-orders');
+  for (const oldGroup of oldGroups) {
+    const projected = stableJson({ entity: oldGroup.entity, direction: oldGroup.direction, sourceFields: oldGroup.sourceFields, targetField: oldGroup.targetField, criticality: oldGroup.criticality, transform: oldGroup.transform });
+    const next = newGroups.find((candidate) => stableJson({ entity: candidate.entity, direction: candidate.direction, sourceFields: candidate.sourceFields, targetField: candidate.targetField, criticality: candidate.criticality, transform: candidate.transform }) === projected);
+    if (next) { preservedKeys.add(`group:${next.id}:source`); preservedKeys.add(`group:${next.id}:target`); }
+  }
+  const merged: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(rekeyed)) {
+    if (!key.startsWith('rule:') && !key.startsWith('group:') || preservedKeys.has(key)) merged[key] = item;
+  }
+  return { ...merged, ...verifiedChanges };
+}
+
+function moveKey(record: Record<string, unknown>, oldKey: string, newKey: string) {
+  if (oldKey === newKey || !(oldKey in record)) return;
+  if (!(newKey in record)) record[newKey] = record[oldKey];
+  delete record[oldKey];
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
 }
