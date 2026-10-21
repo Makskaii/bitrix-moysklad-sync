@@ -26,6 +26,7 @@ import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
+import { productIdentityUserAction } from '../products/document-product-identity';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -253,15 +254,33 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const config = await this.fieldSettings.eventConfig(event.id);
-        const prepared = await this.creationPreparer.prepare({ bitrix24DealId: input.externalId, eventId: event.id, eventConfig: config }, workerLease);
+        const prepared = await this.creationPreparer.prepare({ bitrix24DealId: input.externalId, eventId: event.id, eventConfig: config, attempt: event.attempts + 1 }, workerLease);
+        if (prepared.status === 'MANUAL_REVIEW') {
+          const operation = await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
+          if (operation?.status === 'PENDING' && operation.attemptedAt) {
+            // This event may own an uncertain provider write. Preserve the
+            // pre-existing recovery path/journal rather than relabel its result.
+            await this.finish(event.id, 'RETRYABLE_FAILURE', prepared.reason, workerLease, retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
+            return null;
+          }
+          await this.finishProductIdentityReview(event.id, prepared.reason, prepared.userAction, workerLease);
+          return null;
+        }
         if (prepared.status === 'WAITING') {
-          await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
+          const operation = await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
+          // Only bounded preflight identity reads: never terminalize an
+          // uncertain, already-sent order CREATE or change its recovery path.
+          if (prepared.productIdentityReadFailure && event.attempts + 1 >= 8 && !(operation?.status === 'PENDING' && operation.attemptedAt)) {
+            const reason = 'PRODUCT_UUID_READ_RETRY_LIMIT_EXCEEDED';
+            await this.finishProductIdentityReview(event.id, reason, productIdentityUserAction(reason), workerLease);
+            return null;
+          }
           const inactiveStage = prepared.reason === 'STAGE_NOT_READY';
           const unconfiguredStage = prepared.reason === 'STAGE_NOT_CONFIGURED';
           const invalidOrigin = ['REVERSE_DEAL_ORIGIN_INVALID', 'REVERSE_DEAL_ORIGIN_UNRESOLVED'].includes(prepared.reason);
           await this.finish(event.id, inactiveStage ? 'SUCCEEDED' : unconfiguredStage || invalidOrigin ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
             inactiveStage ? 'DEAL_ORDER_STAGE_NOT_ENABLED' : prepared.reason, workerLease,
-            inactiveStage || unconfiguredStage || invalidOrigin ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
+            inactiveStage || unconfiguredStage || invalidOrigin ? null : prepared.retryAfter ?? retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
           return null;
         }
         if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
@@ -604,6 +623,24 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       return { status: 'RETRY' as const, reason: 'CLIENT_DEPENDENCY_READ_FAILED', retryAfter: retryAtForFailure(error, attempt) };
     }
+  }
+
+  private async finishProductIdentityReview(eventId: string, reason: string, userAction: string, workerLease?: EventWorkerLeaseContext) {
+    await withServiceModeOn(this.database, async (transaction) => {
+      await assertWorkerFenceInTransaction(workerLease, transaction);
+      const event = await transaction.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+      const changed = await transaction.inboundEvent.updateMany({ where: { id: eventId, status: 'PROCESSING' },
+        data: { status: 'MANUAL_REVIEW', lastErrorCategory: reason, processingStartedAt: null, retryAfter: null } });
+      if (changed.count !== 1) return;
+      // Event-specific incident, not an entity PairReviewCase: a corrected
+      // source is eligible via a NEW genuine callback without replaying this one.
+      const diagnostic = { fieldTitle: 'Товары UUID', userAction, continuation: 'NEW_SOURCE_EVENT_AFTER_CORRECTION' };
+      await transaction.manualReviewCase.upsert({ where: { eventId }, create: {
+        eventId, source: event.source, eventType: event.eventType, externalEntityType: event.externalEntityType,
+        externalEntityId: event.externalEntityId, reason, fieldTitle: 'Товары UUID', diagnostic,
+      }, update: { reason, diagnostic } });
+      await transaction.operationalLog.create({ data: { category: 'ERROR', referenceId: eventId, message: `${reason}: ${userAction}` } });
+    });
   }
 
   private async finish(eventId: string, status: string, reason: string | null, workerLease?: EventWorkerLeaseContext, retryAfter?: Date | null) {

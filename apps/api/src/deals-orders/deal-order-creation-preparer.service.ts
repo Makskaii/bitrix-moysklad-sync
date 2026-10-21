@@ -8,7 +8,8 @@ import { DealOrderPreparedInput } from './deal-order-create-operation.service';
 import { bitrixMoneyToMoySklad } from './deal-order-money';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
-import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
+import { DocumentProductIdentityError, DocumentProductIdentityReadError, ensureDocumentProductIdentity, productIdentityResponseFailure, productIdentityUserAction } from '../products/document-product-identity';
+import { retryAtForFailure } from '../provider-failure';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
@@ -35,7 +36,8 @@ export type RuntimeReferenceSettings = {
 
 export type DealOrderPreparationResult =
   | { status: 'READY'; input: DealOrderPreparedInput }
-  | { status: 'WAITING'; reason: string };
+  | { status: 'WAITING'; reason: string; productIdentityReadFailure?: true; retryAfter?: Date }
+  | { status: 'MANUAL_REVIEW'; reason: string; userAction: string };
 
 /** Resolves a complete create payload from the event-pinned config and persisted dependency pairs. */
 @Injectable()
@@ -51,7 +53,7 @@ export class DealOrderCreationPreparer {
     return result.value;
   }
 
-  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto }, workerLease?: EventWorkerLeaseContext): Promise<DealOrderPreparationResult> {
+  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; attempt?: number }, workerLease?: EventWorkerLeaseContext): Promise<DealOrderPreparationResult> {
     await workerLease?.assertOwned();
     const references = readRuntimeReferences(input.eventConfig.config.dealOrderRuntime);
     if (!references) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
@@ -244,7 +246,8 @@ export class DealOrderCreationPreparer {
           bitrix24CatalogId: input.eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? input.eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
         });
       } catch (error) {
-        if (error instanceof DocumentProductIdentityError) return { status: 'WAITING', reason: error.reason };
+        const failure = productIdentityPreparationFailure(error, input.attempt ?? 1);
+        if (failure) return failure;
         throw error;
       }
       const productPairs = await this.database.entityPair.findMany({
@@ -268,7 +271,13 @@ export class DealOrderCreationPreparer {
         }
         await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_DUPLICATE_ALIAS_USED_FOR_DOCUMENT_ROW', eventId: input.eventId, dealId: input.bitrix24DealId, sourceProductId: productId }), input.eventId);
       } else { await skipRow('PRODUCT_PAIR_AMBIGUOUS'); continue; }
-      const assortment = await readMoySkladAssortment(targetProductId, (work) => this.providerModeGate(work));
+      let assortment: Awaited<ReturnType<typeof readMoySkladAssortment>>;
+      try { assortment = await readMoySkladAssortment(targetProductId, (work) => this.providerModeGate(work)); }
+      catch (error) {
+        const failure = productIdentityPreparationFailure(error, input.attempt ?? 1);
+        if (failure) return failure;
+        throw error;
+      }
       if (!assortment || assortment.uomId !== unit.moyskladId) { await skipRow('PRODUCT_UNIT_MISMATCH'); continue; }
 
       rowsPrepared.push({
@@ -511,15 +520,30 @@ async function readMoySkladAssortment(id: string, gate: ProviderModeGate): Promi
   const url = new URL('entity/assortment', withSlash(base));
   url.searchParams.set('filter', `id=${id}`);
   url.searchParams.set('limit', '2');
-  const response = await gate(() => fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) }));
+  const response = await gate(async () => {
+    try { return await fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) }); }
+    catch { throw new DocumentProductIdentityReadError('MOYSKLAD', null); }
+  });
+  if (response.status === 404) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_NOT_FOUND');
+  if (!response.ok) throw productIdentityResponseFailure('MOYSKLAD', response);
   const body: unknown = await response.json().catch(() => null);
-  if (!response.ok || !isRecord(body) || !Array.isArray(body.rows) || body.rows.length !== 1 || !isRecord(body.rows[0])) throw new Error('MySklad assortment read failed');
+  if (!isRecord(body) || !Array.isArray(body.rows)) throw new DocumentProductIdentityReadError('MOYSKLAD', null);
+  if (body.rows.length === 0) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_NOT_FOUND');
+  if (body.rows.length !== 1 || !isRecord(body.rows[0])) throw new DocumentProductIdentityReadError('MOYSKLAD', null);
   const row = body.rows[0];
   const type = isRecord(row.meta) ? row.meta.type : null;
+  if (row.id !== id || type !== 'product' || row.archived === true) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_INVALID');
   const uomId = moyskladUomReferenceId(row.uom, base);
   if (row.id !== id || type !== 'product' || !uomId) return null;
   const href = isRecord(row.meta) && typeof row.meta.href === 'string' ? row.meta.href : '';
   return { type, uomId, href };
+}
+
+function productIdentityPreparationFailure(error: unknown, attempt: number): Exclude<DealOrderPreparationResult, { status: 'READY' }> | null {
+  if (error instanceof DocumentProductIdentityError) return { status: 'MANUAL_REVIEW', reason: error.reason, userAction: productIdentityUserAction(error.reason) };
+  if (!(error instanceof DocumentProductIdentityReadError)) return null;
+  if (!error.retryable) return { status: 'MANUAL_REVIEW', reason: 'PRODUCT_UUID_PROVIDER_READ_REJECTED', userAction: productIdentityUserAction('PRODUCT_UUID_PROVIDER_READ_REJECTED') };
+  return { status: 'WAITING', reason: 'PRODUCT_UUID_PROVIDER_READ_FAILED', productIdentityReadFailure: true, retryAfter: retryAtForFailure(error, attempt) };
 }
 
 async function verifyMySkladReference(type: 'organization' | 'store' | 'employee' | 'currency' | 'state', id: string, gate: ProviderModeGate): Promise<boolean> {

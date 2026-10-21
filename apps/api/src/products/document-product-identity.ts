@@ -1,11 +1,33 @@
 import { DatabaseService } from '../database.service';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 
 /** Portal catalog identity: property108 (Товары UUID) is the native MS ID.
  * XML_ID is a different field and must never be guessed as this identity. */
 export class DocumentProductIdentityError extends Error {
   constructor(readonly reason: string) { super(reason); }
+}
+
+/** A failed identity read is not evidence that the UUID is invalid. */
+export class DocumentProductIdentityReadError extends ProviderFailure {}
+
+export function productIdentityUserAction(reason: string): string {
+  if (reason === 'PRODUCT_UUID_PROVIDER_READ_REJECTED') return 'Проверьте доступ интеграции к каталогу в указанной системе, затем сохраните сделку ещё раз.';
+  if (reason === 'PRODUCT_UUID_READ_RETRY_LIMIT_EXCEEDED') return 'Не удалось прочитать товар после повторных попыток. Проверьте доступность системы и сохраните сделку ещё раз.';
+  if (reason === 'PRODUCT_UUID_PAIR_CONFLICT' || reason === 'PRODUCT_UUID_ALIAS_CONFLICT') return 'Товар уже связан с другой карточкой или связь отключена. Проверьте связь товаров; автоматическая подмена запрещена. После исправления сохраните сделку ещё раз.';
+  return 'Выберите корректный товар через «Подбор товаров» или исправьте поле «Товары UUID»: нужен ID существующего неархивного товара МС. Затем сохраните сделку ещё раз. Старое событие переигрывать не нужно.';
+}
+
+export function productIdentityResponseFailure(provider: 'BITRIX24' | 'MOYSKLAD', response: Response): DocumentProductIdentityReadError {
+  const failure = providerResponseFailure(provider, response.status, response.headers.get('retry-after'));
+  let retryAt = failure.retryAfterAt;
+  const native = response.headers.get('x-lognex-retry-after');
+  if (provider === 'MOYSKLAD' && response.status === 429 && native && /^\d+$/.test(native) && Number.isSafeInteger(Number(native))) {
+    const nativeAt = new Date(Date.now() + Math.min(Number(native), 60 * 60_000));
+    if (!retryAt || nativeAt > retryAt) retryAt = nativeAt;
+  }
+  return new DocumentProductIdentityReadError(provider, response.status, retryAt);
 }
 
 export async function ensureDocumentProductIdentity(database: DatabaseService, input: {
@@ -27,12 +49,15 @@ export async function ensureDocumentProductIdentity(database: DatabaseService, i
   }
   if (!/^\d{1,20}$/.test(input.bitrix24CatalogId)) fail('PRODUCT_UUID_CATALOG_OR_ID_INVALID');
 
-  const read = async (url: URL, init: RequestInit): Promise<Record<string, any>> => {
+  const read = async (provider: 'BITRIX24' | 'MOYSKLAD', url: URL, init: RequestInit): Promise<Record<string, any>> => {
     const result = await withServiceModeOn(database, async () => {
-      const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) });
-      if (response.status === 404) fail('PRODUCT_UUID_TARGET_NOT_FOUND');
+      let response: Response;
+      try { response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) }); }
+      catch { throw new DocumentProductIdentityReadError(provider, null); }
+      if (response.status === 404) fail(provider === 'MOYSKLAD' ? 'PRODUCT_UUID_TARGET_NOT_FOUND' : 'PRODUCT_UUID_SOURCE_NOT_FOUND');
+      if (!response.ok) throw productIdentityResponseFailure(provider, response);
       const body: unknown = await response.json().catch(() => null);
-      if (!response.ok || !record(body) || body.error) fail('PRODUCT_UUID_PROVIDER_READ_FAILED');
+      if (!record(body) || body.error || body.errors) throw new DocumentProductIdentityReadError(provider, null);
       return body;
     });
     if (!result.enabled) throw new ServiceModeNotOnError();
@@ -44,12 +69,12 @@ export async function ensureDocumentProductIdentity(database: DatabaseService, i
   const bitrixUrl = new URL('catalog.product.get.json', slash(b24Base));
   const msUrl = new URL(slash(msBase));
   if (bitrixUrl.protocol !== 'https:' || msUrl.protocol !== 'https:') fail('PRODUCT_UUID_PROVIDER_NAMESPACE_INVALID');
-  const sourceBody = await read(bitrixUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ id: productId }) });
+  const sourceBody = await read('BITRIX24', bitrixUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ id: productId }) });
   const source = record(sourceBody.result) && record(sourceBody.result.product) ? sourceBody.result.product : null;
   if (!source || String(source.id) !== productId || String(source.iblockId) !== input.bitrix24CatalogId || Number(source.type) !== 1 || source.active === 'N') fail('PRODUCT_UUID_SOURCE_INVALID');
   const identity = record(source.property108) ? source.property108.value : source.property108;
   if (!uuid(identity)) fail(identity === null || identity === undefined || identity === '' ? 'PRODUCT_UUID_MISSING' : 'PRODUCT_UUID_INVALID');
-  const target = await read(new URL(`entity/product/${identity}`, slash(msBase)), { method: 'GET', headers: {
+  const target = await read('MOYSKLAD', new URL(`entity/product/${identity}`, slash(msBase)), { method: 'GET', headers: {
     Authorization: `Bearer ${process.env.MOYSKLAD_API_TOKEN ?? ''}`, Accept: 'application/json;charset=utf-8', 'Accept-Encoding': 'gzip',
   } });
   if (target.id !== identity || !record(target.meta) || target.meta.type !== 'product' || target.archived === true) fail('PRODUCT_UUID_TARGET_INVALID');
