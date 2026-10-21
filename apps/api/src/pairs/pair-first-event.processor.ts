@@ -246,7 +246,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const config = await this.fieldSettings.eventConfig(event.id);
-        const prepared = await this.creationPreparer.prepare({ bitrix24DealId: input.externalId, eventId: event.id, eventConfig: config });
+        const prepared = await this.creationPreparer.prepare({ bitrix24DealId: input.externalId, eventId: event.id, eventConfig: config }, workerLease);
         if (prepared.status === 'WAITING') {
           await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
           const inactiveStage = prepared.reason === 'STAGE_NOT_READY';

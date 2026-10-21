@@ -10,6 +10,7 @@ import { assertApplyExternalWrite } from '../external-write-guard';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
+import { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -49,7 +50,8 @@ export class DealOrderCreationPreparer {
     return result.value;
   }
 
-  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<DealOrderPreparationResult> {
+  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto }, workerLease?: EventWorkerLeaseContext): Promise<DealOrderPreparationResult> {
+    await workerLease?.assertOwned();
     const references = readRuntimeReferences(input.eventConfig.config.dealOrderRuntime);
     if (!references) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
     if (!references.nativeOrderNumberingVerified) return { status: 'WAITING', reason: 'NATIVE_ORDER_NUMBERING_UNVERIFIED' };
@@ -127,7 +129,7 @@ export class DealOrderCreationPreparer {
     if (companyId) {
       const company = await this.dependencies.resolveForDocument({
         eventId: input.eventId, sourceSystem: 'BITRIX24', entity: 'COMPANY', sourceId: companyId,
-      });
+      }, workerLease);
       if (company.status !== 'RESOLVED') return { status: 'WAITING', reason: company.reason };
       companyPair = company.pair;
     }
@@ -135,7 +137,7 @@ export class DealOrderCreationPreparer {
       const contact = await this.dependencies.resolveForDocument({
         eventId: input.eventId, sourceSystem: 'BITRIX24', entity: 'CONTACT', sourceId: contactId,
         primaryCompanySourceId: companyId, optionalDependency: true,
-      });
+      }, workerLease);
       if (contact.status === 'RESOLVED') {
         contactPair = contact.pair;
         companyPair ??= contact.companyPair;

@@ -17,7 +17,8 @@ const uuids = {
 const originalEnv = new Map<string, string | undefined>();
 const originalFetch = globalThis.fetch;
 const clientResolver = {
-  async resolveForDocument(input: { entity: string }) {
+  async resolveForDocument(input: { entity: string }, lease?: unknown) {
+    if (expectedOwnerLease) assert.equal(lease, expectedOwnerLease);
     const pair = { id: 'company-pair', entityType: 'COMPANY', bitrix24Id: '200', moyskladId: uuids.company };
     return { status: 'RESOLVED', pair, companyPair: pair, selectedSourceId: '200', reason: 'TEST' } as const;
   },
@@ -26,6 +27,7 @@ const clientResolver = {
 };
 const preparer = new DealOrderCreationPreparer(createPreparerDatabase(), clientResolver as never);
 let productPairExists = true;
+let expectedOwnerLease: {assertOwned():Promise<void>} | undefined;
 let rows: Record<string, unknown>[] = [];
 let deal: Record<string, unknown>;
 let requestCount = 0;
@@ -61,6 +63,18 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.sourceRowValues.length, 2);
   assert.equal(result.input.payload.organization.meta.href, msRef('organization', uuids.organization));
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
+});
+
+test('claimed deal worker lease is forwarded unchanged to client dependencies, never replaced by a RECEIVED assumption', async()=>{
+  reset(); rows=[productRow(10,1)];
+  let asserted=0;
+  expectedOwnerLease={async assertOwned(){asserted++;}};
+  try{
+    const result=await preparer.prepare({bitrix24DealId:'100',eventId:'event-1',eventConfig:eventConfig()},expectedOwnerLease);
+    assert.equal(result.status,'READY');assert.ok(asserted>=1);
+    expectedOwnerLease={async assertOwned(){throw new Error('EVENT_WORKER_LEASE_LOST');}};
+    await assert.rejects(preparer.prepare({bitrix24DealId:'100',eventId:'event-1',eventConfig:eventConfig()},expectedOwnerLease),/EVENT_WORKER_LEASE_LOST/);
+  }finally{expectedOwnerLease=undefined;}
 });
 
 test('deal-order reference probes use the required MySklad JSON charset and gzip headers', async () => {
