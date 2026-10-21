@@ -109,11 +109,13 @@ export class DatabaseRecoveryService {
           UNION ALL SELECT 1 FROM "DealOrderPositionPair" UNION ALL SELECT 1 FROM "DealOrderPositionAddOperation"
           UNION ALL SELECT 1 FROM "HistoricalInventoryEntry" UNION ALL SELECT 1 FROM "HistoricalDealOrderDuplicateKey"
           UNION ALL SELECT 1 FROM "HistoricalDealOrderMatchResult"
+          UNION ALL SELECT 1 FROM "SyncModeTransition" WHERE "toMode" = 'on' OR "fromMode" = 'on'
         ) AS occupied`;
       if (occupied[0]?.occupied !== false) throw new ConflictException('First launch requires an empty exchange database; existing history must not be reset');
       await transaction.$queryRaw`SELECT "id" FROM "SyncSetting" WHERE "id" = 'global' FOR UPDATE`;
       const mode = await transaction.syncSetting.findUnique({ where: { id: 'global' } });
       if (mode && mode.serviceMode !== 'off') throw new ConflictException('First launch requires service mode Off');
+      if (mode?.lastActiveAt) throw new ConflictException('First launch cannot reset prior activation history');
       const boundary = new Date();
       const data = { status: 'READY_FRESH', previousLaunchBoundary: boundary, pairsRestored: false,
         lostEventsAcknowledged: false, acknowledgedAt: boundary, acknowledgement };
