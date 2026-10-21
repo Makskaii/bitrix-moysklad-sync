@@ -120,8 +120,10 @@ function isInput(input: PairResolutionInput): boolean {
 }
 
 function isEligibleFirstDealCreate(input: PairResolutionInput): boolean {
-  return input.entityType === 'DEAL' && input.sourceSystem === 'BITRIX24' &&
-    (input.eventType === 'ONCRMDEALADD' || input.eventType === 'ONCRMDEALUPDATE');
+  return input.entityType === 'DEAL' && (
+    input.sourceSystem === 'BITRIX24' && (input.eventType === 'ONCRMDEALADD' || input.eventType === 'ONCRMDEALUPDATE') ||
+    input.sourceSystem === 'MOYSKLAD' && input.eventType === 'CREATE'
+  );
 }
 
 function manualReviewResult(input: PairResolutionInput, reviewCaseId: string, reason: PairResolutionReason): PairResolutionResult {

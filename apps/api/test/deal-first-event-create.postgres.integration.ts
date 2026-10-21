@@ -20,6 +20,7 @@ import { PairResolutionProvider } from '../src/pairs/pair-resolution.provider';
 import { PAIR_RESOLVER } from '../src/pairs/pair-resolver';
 import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor';
 import { setDatabaseRecoveryReady } from '../src/external-write-guard';
+import { DealOrderReverseCreateService } from '../src/deals-orders/deal-order-reverse-create.service';
 
 const company = { bitrix24Id: `81${Date.now()}`, moyskladId: '11111111-1111-4111-8111-111111111111' };
 const product = { bitrix24Id: `82${Date.now()}`, moyskladId: '22222222-2222-4222-8222-222222222222' };
@@ -41,6 +42,9 @@ let b24OrderNumber: string | null = null;
 let orderPayload: Record<string, any> | null = null;
 const createdEventIds: string[] = [];
 const sourceCreatedAt = new Map<string, Date>();
+const reverseOrderId = randomUUID();
+let reverseItem: Record<string, unknown> | null = null;
+let reverseAdds = 0;
 
 const fieldSettingsFake = {
   saveAcceptedEvent: async (input: {
@@ -52,7 +56,13 @@ const fieldSettingsFake = {
     payload: input.payload, status: input.directionDisabled ? 'SKIPPED_DIRECTION_DISABLED' : 'RECEIVED',
     lastErrorCategory: input.directionDisabled ? 'DIRECTION_DISABLED' : null,
   }, select: { id: true } }),
-  eventConfig: async () => ({ version: 1, createdAt: new Date(), config: {} }),
+  eventConfig: async (id: string) => {
+    const event=await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({where:{id}});
+    return event.source==='MOYSKLAD' ? { version:1, createdAt:new Date(), config:{
+      schemaVersion:1,rules:[],groups:[],references:{units:[],priceTypes:[],dictionaries:[],namedPairs:[{kind:'dealStages',bitrix24Id:'0:PREPARATION',moyskladId:refs.state,status:'confirmed'}]},
+      dealOrderRuntime:{nativeOrderNumberingVerified:true,unmappedReferencePolicy:'confirmed-defaults',stages:[{bitrix24StageId:'PREPARATION',moyskladId:refs.state,creationEnabled:true}],currencies:[{bitrix24Code:'RUB',moyskladId:refs.currency}]},
+    }} : {version:1,createdAt:new Date(),config:{}};
+  },
 };
 
 @Module({
@@ -80,6 +90,9 @@ const fieldSettingsFake = {
       } },
     },
     DealOrderCreateOperationService,
+    {provide:DealOrderReverseCreateService,inject:[DatabaseService,SyncModeService],useFactory:(database:DatabaseService,mode:SyncModeService)=>new DealOrderReverseCreateService(database,mode,{
+      async resolveForDocument(){const pair={id:companyPairId,entityType:'COMPANY',bitrix24Id:company.bitrix24Id,moyskladId:company.moyskladId};return {status:'RESOLVED',pair,companyPair:pair};},
+    } as never)},
   ],
 })
 class DealFirstEventCreatePostgresModule {}
@@ -93,6 +106,7 @@ before(async () => {
   process.env.SYNC_MODE = 'apply';
   process.env.SYNC_STATE = 'on';
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-b24-event-token';
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'synthetic-ms-first-create';
   setDatabaseRecoveryReady(true);
 
   server = createServer((request, response) => { void reply(request, response); });
@@ -123,6 +137,7 @@ after(async () => {
     if (pairs.length) await database.dealOrderPositionPair.deleteMany({ where: { pairId: { in: pairs.map((pair) => pair.id) } } });
     await database.pairReviewCase.deleteMany({ where: { sourceSystem: 'BITRIX24', sourceEntityId: { startsWith: '83' } } });
     await database.dealOrderCreateOperation.deleteMany({ where: { bitrix24DealId: { startsWith: '83' } } });
+    await database.dealOrderReverseCreateOperation.deleteMany({where:{moyskladOrderId:reverseOrderId}});
     await database.entityPair.deleteMany({ where: { entityType: 'DEAL', bitrix24Id: { startsWith: '83' } } });
     await database.entityPair.deleteMany({ where: { id: { in: [companyPairId, productPairId] } } });
     await database.inboundEvent.deleteMany({ where: { id: { in: createdEventIds } } });
@@ -154,6 +169,19 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   const retry = await postDealEvent('ONCRMDEALUPDATE', dealId);
   await waitForEvent(retry.eventId, 'SUCCEEDED');
   assert.equal(createPosts, 1, 'a later event for the already-paired source must not create a duplicate order');
+});
+
+test('public authenticated MS CREATE reaches real reverse creation and default stage through the production resolver',async()=>{
+  const response=await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-first-create?requestId=${randomUUID()}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({events:[{action:'CREATE',accountId:'11111111-1111-4111-8111-111111111111',meta:{type:'customerorder',href:`${providerBase}api/remap/1.2/entity/customerorder/${reverseOrderId}`}}]})});
+  assert.equal(response.status,200,await response.clone().text());
+  const body=await response.json() as {eventId:string};
+  await waitForEvent(body.eventId,'SUCCEEDED');
+  assert.equal(reverseAdds,1);
+  assert.equal(reverseItem?.stageId,'PREPARATION');
+  const database=app.get(DatabaseService);
+  assert.ok(await database.entityPair.findFirst({where:{entityType:'DEAL',moyskladId:reverseOrderId,active:true}}));
+  assert.equal(await database.pairReviewCase.count({where:{sourceSystem:'MOYSKLAD',sourceEntityId:reverseOrderId}}),0);
+  assert.equal((await database.dealOrderReverseCreateOperation.findUniqueOrThrow({where:{moyskladOrderId:reverseOrderId}})).status,'SUCCEEDED');
 });
 
 test('public DELETE and pre-boundary events never enter first-order creation', async () => {
@@ -232,6 +260,15 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const text = Buffer.concat(chunks).toString('utf8');
   const form = new URLSearchParams(text);
   const url = new URL(request.url ?? '/', providerBase);
+  if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}`)return send(response,{id:reverseOrderId,name:'SYNTHETIC-REVERSE',sum:0,agent:{id:company.moyskladId,meta:{type:'counterparty'}},state:{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc'},rate:{currency:{id:refs.currency}}});
+  if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}/positions`)return send(response,{rows:[],meta:{size:0,offset:0,limit:1000}});
+  if(url.pathname==='/rest/crm.item.list')return send(response,{result:{items:reverseItem?[reverseItem]:[]}});
+  if(url.pathname==='/rest/crm.item.add'){
+    reverseAdds++;reverseItem={...JSON.parse(text).fields,id:`83${Date.now()}99`};
+    return send(response,{result:{item:reverseItem}});
+  }
+  if(url.pathname==='/rest/crm.item.get')return send(response,{result:{item:reverseItem}});
+  if(url.pathname==='/rest/crm.item.productrow.list')return send(response,{result:{productRows:[]},total:0});
   const typeAndId = url.pathname.match(/\/entity\/(counterparty|organization|store|employee|currency|product)\/([0-9a-f-]{36})$/i);
   if (typeAndId) {
     const [, type, id] = typeAndId;
