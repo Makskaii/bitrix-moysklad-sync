@@ -9,6 +9,7 @@ import { PrismaClient } from '@prisma/client';
 import { LocalAdminPreviewModule } from '../src/admin/local-preview.module';
 import { DatabaseRecoveryService } from '../src/database-recovery.service';
 import { DatabaseService } from '../src/database.service';
+import { ProductCardEventProcessor } from '../src/products/product-card-event.processor';
 
 const databaseUrl = process.env.PRODUCT_CREATE_EVENT_TEST_DATABASE_URL;
 const activeApps: INestApplication[] = [];
@@ -30,7 +31,7 @@ const oldEnv = new Map<string, string | undefined>();
 function assertIsolatedTarget(value: string) {
   const target = new URL(value);
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test', '/sync_issue79_product_audit_20261021_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
   const schema = target.searchParams.get('schema') ?? '';
   assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_validation_test' && schema === 'issue79_date_validation', 'requires a dedicated fresh test schema');
 }
@@ -175,6 +176,124 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
   assert.equal(requests.length, providerCallsBeforeDisabledPrice, 'the disabled Bitrix24 price direction cannot read or write catalog/document APIs');
 
   assert.equal(requests.some(({ path }) => /crm\.deal|customerorder|invoiceout|document/i.test(path)), false, 'catalog create and retries do not touch document APIs');
+});
+
+test('MySklad CREATE audit moment is an exact, bounded fallback only when provider created is absent', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const database = app.get(DatabaseService);
+  const boundary = await app.get(DatabaseRecoveryService).launchBoundary();
+  assert.ok(boundary);
+  const settingsVersion = 1_310_000 + Math.floor(Math.random() * 80_000);
+  await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config: {
+    schemaVersion: 1, productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name', 'code'] },
+    rules: [{ id: 'catalog-create-audit-test', entity: 'catalog', sourceField: 'name', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+    groups: [], references: { units: [], priceTypes: [], dictionaries: [], namedPairs: [] }, serviceCounterpartyId: null,
+  } } });
+  await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
+
+  const validMoment = new Date(Date.now() - 5_000);
+  const primaryId = randomUUID();
+  const mixedFirstId = randomUUID();
+  const primaryName = `audit-create mixed-batch ${randomUUID()}`;
+  const mixedName = `audit-create mixed-batch-first ${randomUUID()}`;
+  sourceRecords.set(primaryId, auditBackedProduct(primaryId, primaryName));
+  sourceRecords.set(mixedFirstId, { ...auditBackedProduct(mixedFirstId, mixedName), created: '2026-10-01T00:00:00.000Z' });
+  const primaryAddCount = requests.filter(({ path }) => isCreatePath(path, 'product')).length;
+  const batch = await sendMoyskladBatch([
+    auditProductEvent(mixedFirstId, 'product', 'CREATE'),
+    auditProductEvent(primaryId, 'product', 'CREATE'),
+  ], auditContext(validMoment), `audit-batch-${randomUUID()}`);
+  assert.equal(batch.status, 200);
+  const batchBody = await batch.json() as { eventIds?: string[] };
+  assert.equal(batchBody.eventIds?.length, 2);
+  for (const eventId of batchBody.eventIds ?? []) await waitForStatus(database, eventId, 'SUCCEEDED');
+  const primaryPair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: primaryId, active: true } });
+  assert.equal(primaryPair.source, 'AUTO');
+  assert.equal(requests.filter(({ path }) => isCreatePath(path, 'product')).length, primaryAddCount + 2);
+  const provenance = await database.operationalLog.findFirstOrThrow({ where: { referenceId: batchBody.eventIds![1], message: { contains: 'PRODUCT_CREATE_LAUNCH_TIMESTAMP_ACCEPTED' } } });
+  assert.equal(JSON.parse(provenance.message).timestampSource, 'MOYSKLAD_CREATE_AUDIT_CONTEXT_MOMENT');
+  assert.equal(JSON.parse(provenance.message).createdAt, validMoment.toISOString());
+
+  const serviceId = randomUUID();
+  sourceRecords.set(serviceId, { ...auditBackedProduct(serviceId, `audit-service-${serviceId}`),
+    meta: { type: 'service', href: `${fakeBase}ms/api/remap/1.2/entity/service/${serviceId}` } });
+  const beforeServiceCreates = requests.filter(({ path }) => isCreatePath(path, 'service')).length;
+  const serviceResponse = await sendMoyskladBatch([auditProductEvent(serviceId, 'service')], auditContext(validMoment), `audit-service-${randomUUID()}`);
+  assert.equal(serviceResponse.status, 200);
+  await waitForStatus(database, oneEventId(await serviceResponse.json()), 'SUCCEEDED');
+  assert.equal(requests.filter(({ path }) => isCreatePath(path, 'service')).length, beforeServiceCreates + 1);
+  assert.equal((await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: serviceId, active: true } })).moyskladType, 'service');
+
+  const beforeRejectedCreates = requests.filter(({ path }) => isCreatePath(path, 'product')).length;
+  const cases: Array<{ label: string; created?: unknown; moment?: Date; eventOverrides?: Record<string, unknown>; auditHref?: string; audit?: boolean; expectedStatus: string; expectedReason?: string }> = [
+    { label: 'missing-audit-context', audit: false, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'future-moment', moment: new Date(Date.now() + 60_000), expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'pre-boundary-moment', moment: new Date(boundary.getTime() - 1_000), expectedStatus: 'SKIPPED_PRE_LAUNCH' },
+    { label: 'foreign-audit-href', moment: validMoment, auditHref: 'https://attacker.invalid/api/remap/1.2/audit/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'foreign-entity-href', moment: validMoment, eventOverrides: { meta: { type: 'product', href: 'https://attacker.invalid/api/remap/1.2/entity/product/REPLACE' } }, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'wrong-account', moment: validMoment, eventOverrides: { accountId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'malformed-provider-created', created: 'not-a-provider-date', moment: validMoment, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'null-provider-created', created: null, moment: validMoment, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'invalid-calendar-provider-created', created: '2026-02-30T12:00:00Z', moment: validMoment, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'invalid-offset-provider-created', created: '2026-10-21T12:00:00+24:00', moment: validMoment, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+    { label: 'future-provider-created', created: new Date(Date.now() + 60_000).toISOString(), moment: validMoment, expectedStatus: 'MANUAL_REVIEW', expectedReason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE' },
+  ];
+  for (const scenario of cases) {
+    const id = randomUUID();
+    const name = `audit-create reject-${scenario.label} ${randomUUID()}`;
+    sourceRecords.set(id, { ...auditBackedProduct(id, name), ...(scenario.created === undefined ? {} : { created: scenario.created }) });
+    const event = auditProductEvent(id, 'product', 'CREATE', scenario.eventOverrides);
+    if (scenario.label === 'foreign-entity-href') (event.meta as { href: string }).href = (event.meta as { href: string }).href.replace('REPLACE', id);
+    const response = await sendMoyskladBatch([event], scenario.audit === false ? undefined : auditContext(scenario.moment ?? validMoment, scenario.auditHref), `audit-reject-${scenario.label}-${randomUUID()}`);
+    assert.equal(response.status, 200);
+    const eventId = oneEventId(await response.json());
+    await waitForStatus(database, eventId, scenario.expectedStatus);
+    const saved = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId }, select: { lastErrorCategory: true } });
+    if (scenario.expectedReason) assert.equal(saved.lastErrorCategory, scenario.expectedReason);
+    assert.equal(await database.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: id } }), 0);
+  }
+
+  const preBoundaryId = randomUUID();
+  const preBoundaryName = `audit-create provider-pre-boundary ${randomUUID()}`;
+  sourceRecords.set(preBoundaryId, { ...auditBackedProduct(preBoundaryId, preBoundaryName), created: '2025-12-31T23:59:59.000Z' });
+  const preBoundaryResponse = await sendMoyskladBatch([auditProductEvent(preBoundaryId, 'product', 'CREATE')], auditContext(validMoment), `audit-provider-pre-boundary-${randomUUID()}`);
+  assert.equal(preBoundaryResponse.status, 200);
+  const preBoundaryEventId = oneEventId(await preBoundaryResponse.json());
+  await waitForStatus(database, preBoundaryEventId, 'SKIPPED_PRE_LAUNCH');
+  assert.equal(await database.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: preBoundaryId } }), 0);
+  assert.equal(requests.filter(({ path }) => isCreatePath(path, 'product')).length, beforeRejectedCreates,
+    'all rejected/freshness-negative cases and the pre-boundary provider-created record perform no B24 CREATE');
+
+  const updateId = randomUUID();
+  const updateName = `audit-create update-must-not-create ${randomUUID()}`;
+  sourceRecords.set(updateId, auditBackedProduct(updateId, updateName));
+  const updateResponse = await sendMoyskladBatch([auditProductEvent(updateId, 'product', 'UPDATE')], auditContext(validMoment), `audit-update-${randomUUID()}`);
+  assert.equal(updateResponse.status, 200);
+  const updateEventId = oneEventId(await updateResponse.json());
+  await waitForStatus(database, updateEventId, 'MANUAL_REVIEW');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: updateEventId }, select: { lastErrorCategory: true } })).lastErrorCategory, 'PRODUCT_PAIR_NOT_ACTIVE');
+  assert.equal(requests.filter(({ path }) => isCreatePath(path, 'product')).length, beforeRejectedCreates,
+    'an UPDATE event never uses its audit moment to enter the CREATE path');
+
+  const conflictingId = randomUUID();
+  sourceRecords.set(conflictingId, auditBackedProduct(conflictingId, `audit-create conflicting duplicate ${randomUUID()}`));
+  const duplicatePayload = { auditContext: auditContext(validMoment), events: [
+    auditProductEvent(conflictingId, 'product', 'CREATE'), auditProductEvent(conflictingId, 'product', 'UPDATE'),
+  ] };
+  const conflictEvent = await database.inboundEvent.create({ data: {
+    source: 'MOYSKLAD', deliveryKey: `audit-conflicting-duplicate-${randomUUID()}`, eventType: 'CREATE',
+    externalEntityType: 'product', externalEntityId: conflictingId, payload: duplicatePayload,
+    receivedAt: new Date(), status: 'RECEIVED',
+  } });
+  await app.get(ProductCardEventProcessor).process(conflictEvent.id);
+  await waitForStatus(database, conflictEvent.id, 'MANUAL_REVIEW');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: conflictEvent.id }, select: { lastErrorCategory: true } })).lastErrorCategory,
+    'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE');
+  assert.equal(await database.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: conflictingId } }), 0);
+  assert.equal(requests.filter(({ path }) => isCreatePath(path, 'product')).length, beforeRejectedCreates,
+    'conflicting same-ID events cannot create a B24 card using shared audit metadata');
 });
 
 test('public Bitrix24 catalog webhook persists earliest-date, deterministic ties, and never redefines a saved pair', { skip: !databaseUrl }, async () => {
@@ -356,6 +475,33 @@ async function sendCreate(kind: 'product' | 'service', id: string, requestId: st
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ events: [{ action: 'CREATE', meta: { type: kind, href: `${fakeBase}entity/${kind}/${id}` } }] }),
   });
+}
+
+async function sendMoyskladBatch(events: Array<Record<string, unknown>>, audit: Record<string, unknown> | undefined, requestId: string) {
+  return fetch(`${apiUrl}/webhooks/moysklad/synthetic-product-create-secret?requestId=${encodeURIComponent(requestId)}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events, ...(audit ? { auditContext: audit } : {}) }),
+  });
+}
+
+const syntheticMoyskladAccountId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+function auditProductEvent(id: string, kind: 'product' | 'service', action: 'CREATE' | 'UPDATE' = 'CREATE', overrides: Record<string, unknown> = {}) {
+  return { action, accountId: syntheticMoyskladAccountId, meta: { type: kind, href: `${fakeBase}ms/api/remap/1.2/entity/${kind}/${id}` }, ...overrides };
+}
+
+function auditContext(moment: Date, href?: string) {
+  return { moment: toMoyskladLocal(moment), meta: { type: 'audit', href: href ?? `${fakeBase}ms/api/remap/1.2/audit/${randomUUID()}` } };
+}
+
+function toMoyskladLocal(date: Date): string {
+  const local = new Date(date.getTime() + 3 * 60 * 60 * 1_000);
+  return `${local.toISOString().slice(0, 10)} ${local.toISOString().slice(11, 23)}`;
+}
+
+function auditBackedProduct(id: string, name: string): Record<string, unknown> {
+  return { id, accountId: syntheticMoyskladAccountId, meta: { type: 'product', href: `${fakeBase}ms/api/remap/1.2/entity/product/${id}` },
+    name, code: `audit-${id.slice(0, 8)}`, description: 'synthetic authenticated CREATE audit fallback' };
 }
 
 async function sendUpdate(kind: 'product' | 'service', id: string, requestId: string) {

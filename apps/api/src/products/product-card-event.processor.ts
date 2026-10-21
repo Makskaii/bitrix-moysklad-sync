@@ -16,6 +16,7 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { chooseProductCatalogCandidate, comparableCatalogPrice, ProductCatalogCandidate } from './product-catalog-match-policy';
 import { writeOperationalLog } from '../monitoring-log';
 import { withServiceModeOn } from '../service-mode-transaction';
+import { parseClientMoyskladTimestamp } from '../clients/client-moysklad-date';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -252,7 +253,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   private async createPostBoundaryProduct(input: { productId: string; kind: 'product' | 'service'; eventId: string; attempt: number; workerLease?: EventWorkerLeaseContext }): Promise<boolean> {
-    const pendingEvent = await this.database.inboundEvent.findUnique({ where: { id: input.eventId }, select: { source: true, eventType: true, externalEntityType: true, externalEntityId: true, attempts: true } });
+    const pendingEvent = await this.database.inboundEvent.findUnique({ where: { id: input.eventId }, select: { source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, receivedAt: true, attempts: true } });
     if (!pendingEvent) return false;
     try {
       const gate = await this.runtime.preflight('MOYSKLAD');
@@ -264,15 +265,32 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const record = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? await this.controlledAdmission.withCurrentSourceRead(input.eventId, 'MOYSKLAD', input.productId, entity, () => this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind)))
         : await this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind));
-      const createdAt = typeof record.created === 'string' ? new Date(record.created) : null;
+      const hasProviderCreated = Object.prototype.hasOwnProperty.call(record, 'created');
+      const createdAt = hasProviderCreated
+        ? parseClientMoyskladTimestamp(record.created)
+        : authenticatedMoyskladCreateMoment({
+          pendingEvent,
+          productId: input.productId,
+          kind: input.kind,
+          record,
+          receivedAt: pendingEvent.receivedAt,
+          baseUrl: process.env.MOYSKLAD_API_BASE_URL,
+        });
       const boundary = await this.databaseRecovery?.launchBoundary().catch(() => null);
-      if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime())) {
+      if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime()) || createdAt.getTime() > pendingEvent.receivedAt.getTime()) {
         await this.applyResult(input.eventId, pendingEvent, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE', changedFields: [] }, input.workerLease);
         return false;
       }
       if (createdAt.getTime() < boundary.getTime()) {
         await this.finish(input.eventId, 'SKIPPED_PRE_LAUNCH', 'PRE_LAUNCH_PRODUCT', null, input.workerLease);
         return false;
+      }
+      if (!hasProviderCreated) {
+        await writeOperationalLog(this.database, 'EVENT', JSON.stringify({
+          type: 'PRODUCT_CREATE_LAUNCH_TIMESTAMP_ACCEPTED', eventId: input.eventId, productId: input.productId,
+          kind: input.kind, timestampSource: 'MOYSKLAD_CREATE_AUDIT_CONTEXT_MOMENT', createdAt: createdAt.toISOString(),
+          receivedAt: pendingEvent.receivedAt.toISOString(),
+        }), input.eventId);
       }
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         if (typeof record.name !== 'string' || !record.name) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
@@ -480,6 +498,78 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 }
 
+function authenticatedMoyskladCreateMoment(input: {
+  pendingEvent: { source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; payload: Prisma.JsonValue };
+  productId: string;
+  kind: 'product' | 'service';
+  record: Record<string, unknown>;
+  receivedAt: Date;
+  baseUrl: string | undefined;
+}): Date | null {
+  const { pendingEvent, productId, kind, record, receivedAt } = input;
+  if (pendingEvent.source !== 'MOYSKLAD' || pendingEvent.eventType !== 'CREATE' ||
+      pendingEvent.externalEntityType !== kind || pendingEvent.externalEntityId !== productId ||
+      record.id !== productId || !isRecord(record.meta) || record.meta.type !== kind ||
+      !isUuid(productId) || !isUuid(String(record.accountId ?? '')) || !(receivedAt instanceof Date) || !Number.isFinite(receivedAt.getTime())) return null;
+
+  const base = parseMoyskladEventBase(input.baseUrl);
+  if (!base || !hasExactMoyskladEntityHref(record.meta.href, base, kind, productId)) return null;
+
+  const root = asRecord(pendingEvent.payload);
+  const entries = Array.isArray(root.events) ? root.events.filter(isRecord) : [];
+  const sameEntity = entries.filter((entry) => {
+    const meta = asRecord(entry.meta);
+    const href = typeof meta.href === 'string' ? parseSafeUrl(meta.href) : null;
+    const hrefId = href?.pathname.split('/').filter(Boolean).at(-1);
+    return hrefId === productId || entry.id === productId;
+  });
+  if (sameEntity.length !== 1) return null;
+  const event = sameEntity[0]!;
+  const eventMeta = asRecord(event.meta);
+  if (event.action !== 'CREATE' || event.accountId !== record.accountId || eventMeta.type !== kind ||
+      !hasExactMoyskladEntityHref(eventMeta.href, base, kind, productId)) return null;
+
+  const audit = asRecord(root.auditContext);
+  const auditMeta = asRecord(audit.meta);
+  if (auditMeta.type !== 'audit' || !hasExactMoyskladAuditHref(auditMeta.href, base)) return null;
+  const moment = parseClientMoyskladTimestamp(audit.moment);
+  if (!moment || moment.getTime() > receivedAt.getTime()) return null;
+  return moment;
+}
+
+function parseMoyskladEventBase(value: string | undefined): URL | null {
+  if (!value) return null;
+  const base = parseSafeUrl(value);
+  if (!base || base.username || base.password || base.search || base.hash || !base.pathname.replace(/\/+$/, '').endsWith('/api/remap/1.2')) return null;
+  const localHttp = base.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(base.hostname.toLowerCase().replace(/^\[|\]$/g, ''));
+  if (base.protocol !== 'https:' && !localHttp) return null;
+  return base;
+}
+
+function parseSafeUrl(value: unknown): URL | null {
+  if (typeof value !== 'string') return null;
+  try { return new URL(value); } catch { return null; }
+}
+
+function hasExactMoyskladEntityHref(value: unknown, base: URL, kind: 'product' | 'service', id: string): boolean {
+  const href = parseSafeUrl(value);
+  if (!href || href.origin !== base.origin || href.username || href.password || href.search || href.hash) return false;
+  const basePath = base.pathname.replace(/\/+$/, '');
+  return href.pathname === `${basePath}/entity/${kind}/${id}`;
+}
+
+function hasExactMoyskladAuditHref(value: unknown, base: URL): boolean {
+  const href = parseSafeUrl(value);
+  if (!href || href.origin !== base.origin || href.username || href.password || href.search || href.hash) return false;
+  const basePath = base.pathname.replace(/\/+$/, '');
+  return new RegExp(`^${escapeRegExp(basePath)}/audit/${UUID_PATTERN}$`).test(href.pathname);
+}
+
+const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 async function assertWorkerLeaseInTransaction(
   workerLease: EventWorkerLeaseContext | undefined,
   transaction: Prisma.TransactionClient,
