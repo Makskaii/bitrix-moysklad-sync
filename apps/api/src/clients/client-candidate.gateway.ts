@@ -185,6 +185,11 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       const body: Record<string, unknown> = process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? { ...input.configuredFields, name: sourceName }
         : { name: sourceName, ...input.configuredFields };
+      // An absent optional address is not an explicit clear on CREATE.
+      // Keep UPDATE serialization unchanged so intentional clears still propagate.
+      if (input.entity === 'COMPANY' && input.targetType === 'counterparty' && body.actualAddress == null) {
+        delete body.actualAddress;
+      }
       if (input.entity === 'CONTACT' && input.targetType === 'counterparty') body.companyType = 'individual';
       const path = input.targetType === 'contactperson'
         ? `entity/counterparty/${encodeURIComponent(required(input.parentId, 'CLIENT_CONTACT_PARENT_REQUIRED'))}/contactpersons`
