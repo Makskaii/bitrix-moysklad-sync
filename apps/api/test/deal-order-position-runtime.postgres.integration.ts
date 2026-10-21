@@ -342,7 +342,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_SHAPE') return send(response, { id: productId, meta: { type: 'service' }, uom: { id: unitId } });
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_UOM') return send(response, { id: productId, meta: { type: 'product' }, uom: { id: 796 } });
     if (productReadCalls > 1 && productReadBehavior === 'UNAUTHORIZED') return send(response, {}, 401);
-    return send(response, { id: productId, meta: { type: 'product' }, uom: { id: unitId } });
+    return send(response, { id: productId, meta: { type: 'product' }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${unitId}`} } });
   }
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);
