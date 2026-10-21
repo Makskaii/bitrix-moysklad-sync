@@ -321,7 +321,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           : await this.dependencyHold(event, 'CLIENT_CREATE_RESPONSE_UNCERTAIN', details, fence ?? workerLease);
       }
       if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
-        const details = { provider: error.provider, status: error.status, entity: input.entity, sourceId: input.sourceId };
+        const details = { provider: error.provider, status: error.status, operation: error.operation, entity: input.entity, sourceId: input.sourceId };
         return input.optionalDependency
           ? await this.optionalDependencyHold(event, 'CLIENT_PROVIDER_REJECTED', details, fence ?? workerLease)
           : await this.dependencyHold(event, 'CLIENT_PROVIDER_REJECTED', details, fence ?? workerLease);
@@ -665,7 +665,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         });
         const dueAt = retryAtForFailure(error, event.attempts + 1);
         await tx.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING' }, data: { status: retryable ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW', processingStartedAt: null, lastErrorCategory: reason, retryAfter: retryable ? dueAt : null } });
-        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client sync held for retry: ${safeReason(error)}.`, referenceId: event.id } });
+        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client sync held for retry: ${safeReason(error)} (${safeFailureDiagnostic(error)}).`, referenceId: event.id } });
       }).catch(() => undefined);
       return 'RETRY';
     } finally {
@@ -1459,6 +1459,15 @@ function matchesWrittenFields(writes: Record<string, unknown>, readback: Record<
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function safeReason(error: unknown) { return error instanceof Error ? error.message.slice(0, 120) : 'unknown'; }
+function safeFailureDiagnostic(error: unknown): string {
+  if (error instanceof ProviderFailure) {
+    return `provider=${error.provider};status=${error.status ?? 'none'};operation=${error.operation ?? 'unknown'}`;
+  }
+  const className = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(error.constructor.name)
+    ? error.constructor.name
+    : 'unknown';
+  return `errorClass=${className}`;
+}
 function isUniqueConstraintError(error: unknown) { return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'P2002'; }
 function isMarkedDuplicate(value: unknown) {
   return value === true || value === 1 || value === '1' || value === 'Y' || value === 'y' || value === 'true'

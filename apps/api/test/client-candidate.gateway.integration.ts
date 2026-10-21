@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { HttpClientCandidateGateway } from '../src/clients/client-candidate.gateway';
 import { HttpClientInventoryProvider } from '../src/clients/client-inventory.provider';
 import { chooseCandidate, ClientRuntimeResolver } from '../src/clients/client-runtime-resolver';
+import { ProviderFailure } from '../src/provider-failure';
 
 const fakeDb = {
   entityPair: {
@@ -72,6 +73,21 @@ test('runtime create sends only required identity plus explicitly configured fie
   });
   assert.equal(created, '33333333-3333-4333-8333-333333333333');
   assert.deepEqual(posted, { name: 'A New Company', notes: 'configured' });
+});
+
+test('client create failure retains safe provider status and operation without response details', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://candidate.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-candidate-token';
+  const fetcher: typeof fetch = async () => new Response(JSON.stringify({ error: 'do-not-expose-this-response' }), { status: 422 });
+  const gateway = new HttpClientCandidateGateway(fakeDb, fetcher);
+  await assert.rejects(gateway.createTarget({
+    entity: 'COMPANY', targetSystem: 'MOYSKLAD', targetType: 'counterparty', parentId: null,
+    source: { TITLE: 'A New Company' }, configuredFields: { actualAddress: null },
+  }), (error: unknown) => error instanceof ProviderFailure
+    && error.provider === 'MOYSKLAD'
+    && error.status === 422
+    && error.operation === 'CLIENT_COUNTERPARTY_CREATE'
+    && !error.message.includes('do-not-expose-this-response'));
 });
 
 test('temporary usage failures retry before evidence is classified as incomplete', async () => {

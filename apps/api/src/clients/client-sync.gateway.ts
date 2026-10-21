@@ -1,6 +1,6 @@
 export type ClientRecord = Record<string, unknown>;
 import { assertApplyExternalWrite } from '../external-write-guard';
-import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { ClientProviderOperation, ProviderFailure, providerResponseFailure } from '../provider-failure';
 
 export interface ClientSyncGateway {
   readBitrix(entity: 'COMPANY' | 'CONTACT', id: string): Promise<ClientRecord>;
@@ -20,7 +20,7 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const created = await this.dryWrites?.createdRecord('BITRIX24', type, id);
     if (created) return { ID: id, ...created };
     const method = entity === 'COMPANY' ? 'crm.company.get.json' : 'crm.contact.get.json';
-    const payload = await this.bitrixRequest(method, { id });
+    const payload = await this.bitrixRequest(method, { id }, entity === 'COMPANY' ? 'CLIENT_COMPANY_READ' : 'CLIENT_CONTACT_READ');
     if (!isRecord(payload)) throw new Error('BITRIX24_CLIENT_READ_INVALID');
     const fields = await this.dryWrites?.readback('BITRIX24', entity === 'COMPANY' ? 'company' : 'contact', id);
     return fields ? { ...payload, ...fields } : payload;
@@ -29,7 +29,7 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
   async readMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null): Promise<ClientRecord> {
     const created = await this.dryWrites?.createdRecord('MOYSKLAD', type, id);
     if (created) return { id, ...created, meta: { type } };
-    const payload = await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'GET');
+    const payload = await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'GET', undefined, type === 'counterparty' ? 'CLIENT_COUNTERPARTY_READ' : 'CLIENT_CONTACTPERSON_READ');
     if (!isRecord(payload)) throw new Error('MOYSKLAD_CLIENT_READ_INVALID');
     const fields = await this.dryWrites?.readback('MOYSKLAD', type, id);
     return fields ? { ...payload, ...fields } : payload;
@@ -41,17 +41,17 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const method = entity === 'COMPANY' ? 'crm.company.update.json' : 'crm.contact.update.json';
     const form = new URLSearchParams({ id });
     for (const [field, value] of Object.entries(fields)) appendFormValue(form, `fields[${field}]`, value);
-    const payload = await this.bitrixRequest(method, form);
+    const payload = await this.bitrixRequest(method, form, entity === 'COMPANY' ? 'CLIENT_COMPANY_UPDATE' : 'CLIENT_CONTACT_UPDATE');
     if (payload !== true) throw new Error('BITRIX24_CLIENT_WRITE_REJECTED');
   }
 
   async updateMoysklad(type: 'counterparty' | 'contactperson', id: string, parentId: string | null, fields: Record<string, unknown>, eventId?: string): Promise<void> {
     if (await this.dryWrites?.propose({ eventId, provider: 'MOYSKLAD', entityType: type, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', id, `client:${type === 'counterparty' ? 'COMPANY' : 'CONTACT'}`);
-    await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'PUT', fields);
+    await this.moyskladRequest(moyskladRecordUrl(type, id, parentId), 'PUT', fields, type === 'counterparty' ? 'CLIENT_COUNTERPARTY_UPDATE' : 'CLIENT_CONTACTPERSON_UPDATE');
   }
 
-  private async bitrixRequest(method: string, body: URLSearchParams | Record<string, string>): Promise<unknown> {
+  private async bitrixRequest(method: string, body: URLSearchParams | Record<string, string>, operation: ClientProviderOperation): Promise<unknown> {
     if (/\.(?:add|update|delete)(?:\.json)?$/i.test(method)) {
       const form = body instanceof URLSearchParams ? body : new URLSearchParams(body);
       const nativeId = /\.add(?:\.json)?$/i.test(method) ? null : form.get('id');
@@ -64,14 +64,14 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const response = await this.fetcher(new URL(method, withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
       redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
-    const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null, null, operation); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'), operation);
+    const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null, null, operation); });
+    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400, null, operation);
     return payload.result;
   }
 
-  private async moyskladRequest(path: string, method: 'GET' | 'PUT', body?: Record<string, unknown>): Promise<unknown> {
+  private async moyskladRequest(path: string, method: 'GET' | 'PUT', body: Record<string, unknown> | undefined, operation: ClientProviderOperation): Promise<unknown> {
     if (method !== 'GET') {
       const nativeId = new URL(path, 'https://local.invalid').pathname.match(/\/(?:counterparty|contactpersons)\/([^/]+)$/)?.[1] ?? null;
       const entity = path.includes('/contactpersons/') ? 'client:CONTACT' : 'client:COMPANY';
@@ -83,10 +83,10 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const response = await this.fetcher(new URL(path, withSlash(base)), {
       method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
-    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null, null, operation); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'), operation);
     if (response.status === 204) return {};
-    return await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    return await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null, null, operation); });
   }
 }
 

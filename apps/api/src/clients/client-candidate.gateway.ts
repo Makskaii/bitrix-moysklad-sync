@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { assertApplyExternalWrite } from '../external-write-guard';
-import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { ClientProviderOperation, ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { DatabaseService } from '../database.service';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { randomUUID } from 'node:crypto';
@@ -370,13 +370,14 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     if (!base) throw new Error('BITRIX24_REST_NOT_CONFIGURED');
     const form = new URLSearchParams();
     appendForm(form, '', parameters);
+    const operation = clientBitrixOperation(method);
     const response = await this.fetcher(new URL(method, withSlash(base)), {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
       redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new ProviderFailure('BITRIX24', null); });
-    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
+    }).catch(() => { throw new ProviderFailure('BITRIX24', null, null, operation); });
+    if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'), operation);
     const payload: unknown = await response.json().catch(() => null);
-    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
+    if (!isRecord(payload) || payload.error || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400, null, operation);
     return payload;
   }
 
@@ -404,13 +405,34 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
     }
     const token = process.env.MOYSKLAD_API_TOKEN;
     if (!token) throw new Error('MOYSKLAD_API_NOT_CONFIGURED');
+    const operation = clientMoyskladOperation(url.pathname, method);
     const response = await this.fetcher(url, {
       method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(10_000),
-    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
-    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
-    return response.json().catch(() => ({}));
+    }).catch(() => { throw new ProviderFailure('MOYSKLAD', null, null, operation); });
+    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'), operation);
+    return response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null, null, operation); });
   }
+}
+
+function clientBitrixOperation(method: string): ClientProviderOperation {
+  if (method === 'crm.company.add' || method === 'crm.company.add.json') return 'CLIENT_COMPANY_CREATE';
+  if (method === 'crm.contact.add' || method === 'crm.contact.add.json') return 'CLIENT_CONTACT_CREATE';
+  if (method === 'crm.company.list' || method === 'crm.company.list.json' || method === 'crm.requisite.list') return 'CLIENT_COMPANY_SEARCH';
+  if (method === 'crm.contact.list' || method === 'crm.contact.list.json') return 'CLIENT_CONTACT_SEARCH';
+  if (method === 'crm.company.get' || method === 'crm.company.get.json') return 'CLIENT_COMPANY_READ';
+  if (method === 'crm.contact.get' || method === 'crm.contact.get.json') return 'CLIENT_CONTACT_READ';
+  return 'CLIENT_PROVIDER_REQUEST';
+}
+
+function clientMoyskladOperation(pathname: string, method: 'GET' | 'POST'): ClientProviderOperation {
+  const contactperson = pathname.includes('/contactpersons');
+  if (contactperson) return method === 'POST' ? 'CLIENT_CONTACTPERSON_CREATE' : 'CLIENT_CONTACTPERSON_READ';
+  if (pathname === '/api/remap/1.2/entity/counterparty' || pathname.endsWith('/entity/counterparty')) {
+    return method === 'POST' ? 'CLIENT_COUNTERPARTY_CREATE' : 'CLIENT_COUNTERPARTY_SEARCH';
+  }
+  if (/\/entity\/counterparty\/[^/]+$/.test(pathname)) return 'CLIENT_COUNTERPARTY_READ';
+  return 'CLIENT_PROVIDER_REQUEST';
 }
 
 function appendForm(form: URLSearchParams, prefix: string, value: unknown) {
