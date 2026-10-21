@@ -181,7 +181,13 @@ export class DealOrderCreationPreparer {
       const rowId = sourceRowId;
       const productId = readNumericId(row.productId);
       const measureCode = readNumber(row.measureCode);
-      const unit = measureCode === null ? null : units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
+      // Bitrix product rows expose MEASURE_CODE (catalog.measure.code), not
+      // catalog.measure.id. Resolve only a unique saved catalog-code mapping;
+      // duplicate codes or an ID-only match must remain unmapped.
+      const unitCandidates = measureCode === null ? [] : units.filter((candidate) => candidate.bitrix24Code === String(measureCode));
+      const unit = unitCandidates.length === 1 && unitCandidates[0]?.status === 'configured' && unitCandidates[0].moyskladId
+        ? unitCandidates[0]
+        : null;
       const quantity = readNumber(row.quantity);
       const priceCents = toMinorUnits(row.price);
       const discountTypeId = readNumber(row.discountTypeId);

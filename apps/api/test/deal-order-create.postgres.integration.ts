@@ -32,6 +32,7 @@ let requestsAfterOff = 0;
 let numberUpdates = 0;
 let headerContractDealId: string | null = null;
 let headerContractRequests: Array<{ path: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
+let headerContractMeasureCode = 796;
 const suffix = randomUUID();
 let companyPairId = '';
 let productPairId = '';
@@ -115,11 +116,12 @@ test('durable OFF acknowledged after number read blocks the next B24 provider re
   }
 });
 
-test('production preparer validates MySklad refs and assortment with required headers under the PostgreSQL mode gate', async () => {
+test('production preparer resolves a Bitrix unit mapping by catalog code under the PostgreSQL mode gate', async () => {
   const mode = await db.syncSetting.findUniqueOrThrow({ where: { id: 'global' }, select: { serviceMode: true } });
   assert.equal(mode.serviceMode, 'on');
   headerContractDealId = `903${Date.now()}`;
   headerContractRequests = [];
+  headerContractMeasureCode = 796;
   const resolver = {
     async resolveForDocument() {
       const pair = await db.entityPair.findUniqueOrThrow({ where: { id: companyPairId } });
@@ -129,7 +131,7 @@ test('production preparer validates MySklad refs and assortment with required he
     async verifyServiceCounterparty() { return true; },
   };
   const preparer = new DealOrderCreationPreparer(database, resolver as never);
-  const settings = {
+  const settings: any = {
     version: 4,
     createdAt: new Date(0),
     config: {
@@ -137,7 +139,7 @@ test('production preparer validates MySklad refs and assortment with required he
       rules: [],
       groups: [],
       references: {
-        units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }],
+        units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }],
         priceTypes: [], dictionaries: [],
       },
       dealOrderRuntime: {
@@ -152,16 +154,59 @@ test('production preparer validates MySklad refs and assortment with required he
       },
     },
     references: { units: [], priceTypes: [], dictionaries: [] },
-  } as never;
+  };
   try {
-    const result = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `headers-${suffix}`, eventConfig: settings });
+    const result = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `unit-code-${suffix}`, eventConfig: settings });
     assert.equal(result.status, 'READY');
-    if (result.status === 'READY') assert.deepEqual(result.input.sourceRowIds, ['301'], 'the synthetic product row must reach the verified assortment endpoint');
+    if (result.status === 'READY') {
+      assert.deepEqual(result.input.sourceRowIds, ['301'], 'measureCode 796 must resolve the saved catalog row id 9/code 796 mapping');
+      assert.deepEqual(result.input.sourceMeasureCodes, [796]);
+      assert.deepEqual(result.input.unitMappings, [{ bitrix24Id: 9, moyskladId: ids.unit, status: 'configured' }], 'resolution must not rewrite the saved mapping');
+      assert.equal(result.input.payload.positions.length, 1);
+      assert.equal(result.input.payload.positions[0]?.quantity, 1);
+      assert.equal(result.input.payload.positions[0]?.price, 1000);
+    }
     assert.equal(headerContractRequests.length, 6, 'five named refs and one product assortment are read through the preparer');
     assert.ok(headerContractRequests.every((request) => request.accept === 'application/json;charset=utf-8' && request.acceptEncoding === 'gzip'));
+
+    headerContractRequests = [];
+    settings.config.references.units = [
+      { bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' },
+      { bitrix24Id: 10, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' },
+    ];
+    const ambiguous = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `unit-ambiguous-${suffix}`, eventConfig: settings });
+    assert.equal(ambiguous.status, 'READY');
+    if (ambiguous.status === 'READY') {
+      assert.equal(ambiguous.input.payload.positions.length, 0, 'duplicate source catalog codes must not guess one saved mapping');
+      assert.deepEqual(ambiguous.input.skippedRows, [{ sourceRowId: '301', reason: 'UNIT_UNMAPPED' }]);
+    }
+
+    headerContractRequests = [];
+    settings.config.references.units = [
+      { bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' },
+    ];
+    headerContractMeasureCode = 797;
+    const unknown = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `unit-unknown-${suffix}`, eventConfig: settings });
+    assert.equal(unknown.status, 'READY');
+    if (unknown.status === 'READY') {
+      assert.equal(unknown.input.payload.positions.length, 0, 'unknown source measure codes must remain unmapped');
+      assert.deepEqual(unknown.input.skippedRows, [{ sourceRowId: '301', reason: 'UNIT_UNMAPPED' }]);
+    }
+
+    headerContractMeasureCode = 796;
+    settings.config.references.units = [
+      { bitrix24Id: 796, bitrix24Code: '797', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' },
+    ];
+    const mismatched = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `unit-mismatched-${suffix}`, eventConfig: settings });
+    assert.equal(mismatched.status, 'READY');
+    if (mismatched.status === 'READY') {
+      assert.equal(mismatched.input.payload.positions.length, 0, 'an ID match cannot override a mismatched source catalog code');
+      assert.deepEqual(mismatched.input.skippedRows, [{ sourceRowId: '301', reason: 'UNIT_UNMAPPED' }]);
+    }
   } finally {
     headerContractDealId = null;
     headerContractRequests = [];
+    headerContractMeasureCode = 796;
   }
 });
 
@@ -256,7 +301,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { result: { ID: body.get('id'), UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.item.productrow.list' && body.get('filter[=ownerId]') === headerContractDealId) {
-    return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: 796, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
+    return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: headerContractMeasureCode, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
     numberUpdates++;
