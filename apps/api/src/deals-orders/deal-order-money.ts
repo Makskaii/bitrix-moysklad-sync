@@ -1,6 +1,7 @@
 export type BitrixMoneyRow = {
   price?: unknown;
   priceNetto?: unknown;
+  priceBrutto?: unknown;
   discountTypeId?: unknown;
   discountRate?: unknown;
   discountSum?: unknown;
@@ -18,8 +19,7 @@ export type MoySkladMoney = {
 
 export type BitrixMoney = { price: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N' };
 
-/** Maps an MS base unit price to Bitrix24's documented row price (after discount,
- * and including VAT only when the row says the tax is included). */
+/** MS price already includes VAT when vatIncluded=true; Bitrix price is final. */
 export function moySkladMoneyToBitrix(input: { price: unknown; discount: unknown; vat: unknown; vatEnabled: unknown; vatIncluded: unknown }): BitrixMoney | null {
   if (typeof input.price !== 'number' || !Number.isSafeInteger(input.price) || input.price < 0 ||
       typeof input.discount !== 'number' || !Number.isFinite(input.discount) || input.discount < 0 || input.discount > 100 ||
@@ -33,7 +33,7 @@ export function moySkladMoneyToBitrix(input: { price: unknown; discount: unknown
   const afterDiscountCents = roundRatio(baseCents * BigInt(100_000_000 - discountMicros), 100_000_000n);
   const taxMicros = percentMicros(tax);
   if (taxMicros === null) return null;
-  const finalCents = input.vatEnabled && input.vatIncluded === true
+  const finalCents = input.vatEnabled && input.vatIncluded === false
     ? roundRatio(afterDiscountCents * BigInt(100_000_000 + taxMicros), 100_000_000n)
     : afterDiscountCents;
   if (finalCents > BigInt(Number.MAX_SAFE_INTEGER)) return null;
@@ -42,43 +42,50 @@ export function moySkladMoneyToBitrix(input: { price: unknown; discount: unknown
 
 /**
  * Converts documented B24 row values into the Remap customer-order position
- * shape. This deliberately requires Bitrix's calculated pre-discount/net
- * `priceNetto` whenever a discount or VAT is present; deriving a base from the
- * final `price` would depend on undocumented rounding/order of operations.
+ * shape. Select the provider's own pre-discount amount in the same VAT mode:
+ * priceBrutto when VAT is included, priceNetto otherwise. Never re-price from
+ * the catalog or derive a rounded net value from an inclusive sale price.
  */
 export function bitrixMoneyToMoySklad(row: BitrixMoneyRow): MoySkladMoney | null {
   const price = minorUnits(row.price);
   const priceNetto = minorUnits(row.priceNetto);
+  const priceBrutto = minorUnits(row.priceBrutto);
   const type = row.discountTypeId;
   const rate = finite(row.discountRate);
   const sum = finite(row.discountSum);
   const sumMinor = minorUnits(row.discountSum);
   const tax = row.taxRate === null ? null : finite(row.taxRate);
-  if (price === null || rate === null || sum === null || (tax !== null && (tax === null || tax < 0 || tax > 100))) return null;
+  if (price === null || rate === null || sum === null || (row.taxRate !== null && tax === null) || (tax !== null && (tax < 0 || tax > 100))) return null;
   if (type !== 1 && type !== 2) return null;
   if (rate < 0 || rate > 100 || sum < 0) return null;
   const hasDiscount = type === 1 ? sum !== 0 : rate !== 0;
   const hasVat = tax !== null;
-  if (hasDiscount || hasVat) {
-    if (priceNetto === null) return null;
-  }
+  if (hasVat && row.taxIncluded !== 'Y' && row.taxIncluded !== 'N') return null;
+  const base = hasVat && row.taxIncluded === 'Y'
+    ? priceBrutto ?? (!hasDiscount && row.priceBrutto === undefined ? price : null)
+    : hasDiscount || hasVat ? priceNetto : price;
+  if (base === null) return null;
   let discount = 0;
   if (type === 2) discount = rate;
   else if (sum !== 0) {
-    if (sumMinor === null || !priceNetto || sumMinor > priceNetto) return null;
-    discount = roundRate(sumMinor / priceNetto * 100);
+    const netBase = finite(row.priceNetto);
+    if (sumMinor === null || !netBase || sum > netBase) return null;
+    discount = roundRate(sum / netBase * 100);
     // MySklad stores a percentage, not an absolute value. Accept only an
     // equivalent percentage that reproduces the exact source discount in cents.
-    if (Math.round(priceNetto * discount / 100) !== sumMinor) return null;
+    if (Math.round(netBase * discount) !== sumMinor) return null;
   }
-  if (hasVat && row.taxIncluded !== 'Y' && row.taxIncluded !== 'N') return null;
-  return {
-    price: hasDiscount || hasVat ? priceNetto! : price,
+  const result = {
+    price: base,
     discount,
     vat: tax ?? 0,
     vatEnabled: tax !== null,
     vatIncluded: hasVat ? row.taxIncluded === 'Y' : null,
   };
+  const final = moySkladMoneyToBitrix({...result,vatIncluded:result.vatIncluded ?? false});
+  // A format conversion must reproduce the source sale amount, not alter it.
+  if (!final || minorUnits(final.price) !== price) return null;
+  return result;
 }
 
 function minorUnits(value: unknown): number | null {

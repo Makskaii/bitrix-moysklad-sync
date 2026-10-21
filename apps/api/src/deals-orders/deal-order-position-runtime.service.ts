@@ -565,7 +565,7 @@ function positionMatches(value: unknown, expected: Row): boolean {
     value.quantity === expected.quantity && value.price === expected.price && value.discount === expected.discount && value.vat === expected.vat && value.vatEnabled === expected.vatEnabled;
 }
 function stableJson(value: unknown): string { return JSON.stringify(value, (_key, child) => child && typeof child === 'object' && !Array.isArray(child) ? Object.fromEntries(Object.entries(child).sort(([a], [b]) => a.localeCompare(b))) : child); }
-function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
+function sourceSnapshot(row: Row): Row { return { productId: String(row.productId), measureCode: row.measureCode, quantity: row.quantity, price: row.price, priceNetto: row.priceNetto, priceBrutto: row.priceBrutto, discountTypeId: row.discountTypeId, discountRate: row.discountRate, discountSum: row.discountSum, taxRate: row.taxRate, taxIncluded: row.taxIncluded }; }
 function targetSnapshot(row: Row): Row { return { assortment: row.assortment, quantity: row.quantity, price: row.price, discount: row.discount, vat: row.vat, vatEnabled: row.vatEnabled }; }
 
 type ProviderGate = (url: URL, init: RequestInit) => Promise<unknown>;
