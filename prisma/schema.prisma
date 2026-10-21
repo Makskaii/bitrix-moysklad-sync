@@ -154,10 +154,30 @@ model ControlledTestAdmission {
   sourceName    String
   sourceCreatedAt DateTime
   admittedAt    DateTime     @default(now())
+  bindingId     String
   event         InboundEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  binding       ControlledTestSourceBinding @relation(fields: [bindingId], references: [id], onDelete: Restrict)
 
-  @@unique([runId, entity, sourceSystem, sourceNativeId], map: "ctl_test_admission_source_uq")
-  @@unique([runId, entity, targetSystem, targetNativeId], map: "ctl_test_admission_target_uq")
+  @@index([runId, entity, sourceSystem, sourceNativeId], map: "ctl_test_admission_source_idx")
+}
+
+/** Stable run-scoped pair reservation shared by multiple event-specific admissions. */
+model ControlledTestSourceBinding {
+  id             String       @id @default(cuid())
+  runId         String
+  entity        String
+  bitrix24NativeId String?
+  moyskladNativeId String?
+  bitrix24PortalOrigin String?
+  bitrix24UserId String?
+  moyskladAccountId String?
+  sourceName    String
+  sourceCreatedAt DateTime
+  createReservedByEventId String?
+  admissions    ControlledTestAdmission[]
+
+  @@unique([runId, entity, bitrix24NativeId], map: "ctl_test_source_binding_b24_uq")
+  @@unique([runId, entity, moyskladNativeId], map: "ctl_test_source_binding_ms_uq")
 }
 
 model FieldSettingsVersion {
