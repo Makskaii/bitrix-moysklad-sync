@@ -64,7 +64,12 @@ export function installControlledLiveFetchGuard(expectedNamespaceValue?: unknown
           : typeof init?.body === 'string' ? init.body
           : await request.clone().text();
         const recoverySourceId = exactRecoverySourceId(match.provider, relativePath, url, bodyText);
-        assertControlledExternalRead(match.provider, recoverySourceId ?? extractMutationTarget(match.provider, relativePath, bodyText), mutationEntity(match.provider, relativePath, bodyText), recoverySourceId ? 'CONTROLLED_RECOVERY_READ' : 'CONTROLLED_READ');
+        const assortmentProductId = match.provider === 'MOYSKLAD' && method === 'GET' && relativePath === 'entity/assortment'
+          && url.searchParams.getAll('filter').length === 1 && url.searchParams.getAll('limit').length === 1 && url.searchParams.get('limit') === '2'
+          && [...url.searchParams.keys()].every((key) => key === 'filter' || key === 'limit')
+          ? /^id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.searchParams.get('filter') ?? '')?.[1] : undefined;
+        assertControlledExternalRead(match.provider, recoverySourceId ?? assortmentProductId ?? extractMutationTarget(match.provider, relativePath, bodyText),
+          assortmentProductId ? 'catalog-product' : mutationEntity(match.provider, relativePath, bodyText), recoverySourceId ? 'CONTROLLED_RECOVERY_READ' : 'CONTROLLED_READ');
       }
     } else {
       const bodyText = init?.body instanceof URLSearchParams ? init.body.toString()
