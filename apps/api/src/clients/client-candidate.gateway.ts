@@ -126,7 +126,9 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       const path = companyId
         ? `entity/counterparty/${encodeURIComponent(companyId)}/contactpersons`
         : 'entity/counterparty';
-      const rows = await this.moyskladList(path, { filter: `email=${email}` });
+      // Nested contactpersons reject filter=email (412/1034). Search is only a
+      // candidate prefilter: exact normalized email + parent scope remain mandatory.
+      const rows = await this.moyskladList(path, companyId ? { search: email } : { filter: `email=${email}` });
       return this.candidates(rows.filter((row) => row.archived !== true && exactEmail(row.email, email) &&
         (companyId ? true : row.companyType === 'individual')), 'CONTACT', targetSystem,
       (row) => ({ ...row, ...(companyId ? { parentId: companyId } : {}) }));
@@ -203,7 +205,12 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
       }
       assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CREATE', null, `client:${input.entity}`);
       const created = await this.moyskladRequest(path, 'POST', body);
-      const resultId = isRecord(created) ? id(created.id) : null;
+      // This one endpoint documents a one-element array even for one object.
+      // Do not generalize bulk acknowledgements to counterparties/other APIs.
+      const single = input.targetType === 'contactperson' && Array.isArray(created) && created.length === 1
+        && isRecord(created[0]) && typeof created[0].id === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(created[0].id)
+        && !('errors' in created[0]) && !('error' in created[0]) ? created[0] : created;
+      const resultId = isRecord(single) ? id(single.id) : null;
       if (!resultId) throw new Error('CLIENT_CREATE_RESPONSE_INVALID');
       return resultId;
     }

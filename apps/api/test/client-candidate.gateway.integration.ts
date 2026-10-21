@@ -199,3 +199,54 @@ test('Bitrix24 company search fails closed when the requested duplicate marker i
     /CLIENT_COMPANY_DUPLICATE_MARKER_UNVERIFIED/,
   );
 });
+
+test('linked email lookup uses parent-scoped search and still requires exact normalized email', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://candidate.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-candidate-token';
+  const parent='33333333-3333-4333-8333-333333333333';
+  const fetcher: typeof fetch = async input => {
+    const url=new URL(String(input));
+    assert.equal(url.pathname,`/api/remap/1.2/entity/counterparty/${parent}/contactpersons`);
+    assert.equal(url.searchParams.get('search'),'owned@example.invalid');
+    assert.equal(url.searchParams.has('filter'),false,'MS rejects nested filter=email with 412/1034');
+    assert.equal(url.searchParams.get('limit'),'1000');
+    return response({rows:[
+      {id:'exact',name:'Different Name',email:' OWNED@EXAMPLE.INVALID ',created:'2026-01-01'},
+      {id:'substring-only',email:'not-owned@example.invalid'},
+      {id:'archived',email:'owned@example.invalid',archived:true},
+    ],meta:{size:3}});
+  };
+  const rows=await new HttpClientCandidateGateway(fakeDb,fetcher).contactByEmail('owned@example.invalid',parent);
+  assert.deepEqual(rows.map(row=>({id:row.id,parent:row.parentId,type:row.type})),[{id:'exact',parent,type:'contactperson'}]);
+});
+
+test('standalone email lookup retains counterparty filter and excludes legal companies', async () => {
+  const fetcher: typeof fetch = async input => {
+    const url=new URL(String(input));
+    if(url.pathname.endsWith('/entity/customerorder'))return response({rows:[],meta:{size:0}});
+    assert.ok(url.pathname.endsWith('/entity/counterparty'));
+    assert.equal(url.searchParams.get('filter'),'email=owned@example.invalid');
+    return response({rows:[{id:'person',companyType:'individual',email:'owned@example.invalid'},{id:'legal',companyType:'legal',email:'owned@example.invalid'}],meta:{size:2}});
+  };
+  assert.deepEqual((await new HttpClientCandidateGateway(fakeDb,fetcher).contactByEmail('owned@example.invalid')).map(row=>row.id),['person']);
+});
+
+test('nested email search never accepts an incomplete candidate page or an ambiguous exact email', async () => {
+  const parent='33333333-3333-4333-8333-333333333333';
+  const incomplete=new HttpClientCandidateGateway(fakeDb,async()=>response({rows:[{id:'first',email:'owned@example.invalid'}],meta:{size:2}}));
+  await assert.rejects(incomplete.contactByEmail('owned@example.invalid',parent),/CLIENT_CANDIDATE_SEARCH_INCOMPLETE/);
+  const gateway=new HttpClientCandidateGateway(fakeDb,async()=>response({rows:[{id:'first',email:'owned@example.invalid'},{id:'second',email:'owned@example.invalid'}],meta:{size:2}}));
+  const result=await new ClientRuntimeResolver(gateway).resolve({id:'owned-b24',entity:'CONTACT',email:'owned@example.invalid',companyId:'owned-company'},parent);
+  assert.equal(result.action,'MANUAL_REVIEW');
+  assert.equal(result.reason,'AMBIGUOUS_CANDIDATES');
+});
+
+test('only nested contactperson CREATE accepts a strict single native acknowledgement array', async () => {
+  const uuid='55555555-5555-4555-8555-555555555555';
+  const input={entity:'CONTACT' as const,targetSystem:'MOYSKLAD' as const,targetType:'contactperson' as const,parentId:'33333333-3333-4333-8333-333333333333',source:{NAME:'Owned'},configuredFields:{email:'owned@example.invalid'}};
+  assert.equal(await new HttpClientCandidateGateway(fakeDb,async()=>response([{id:uuid}])).createTarget(input),uuid);
+  for(const payload of [[],[{id:uuid},{id:uuid}],[{}],[{id:'not-native-uuid'}],[{id:uuid,errors:[]}]]) {
+    await assert.rejects(new HttpClientCandidateGateway(fakeDb,async()=>response(payload)).createTarget(input),/CLIENT_CREATE_RESPONSE_INVALID/);
+  }
+  await assert.rejects(new HttpClientCandidateGateway(fakeDb,async()=>response([{id:uuid}])).createTarget({...input,targetType:'counterparty',parentId:null}),/CLIENT_CREATE_RESPONSE_INVALID/);
+});
