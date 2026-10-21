@@ -443,6 +443,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
   if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
+    assert.equal(new URL(request.url ?? '/', base).searchParams.get('expand'), 'assortment');
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
     return send(response, { rows: orderPositions.slice(offset, offset + 100) });
   }

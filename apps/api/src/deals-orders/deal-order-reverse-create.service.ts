@@ -514,6 +514,7 @@ async function msGetAllPositions(orderId: string, gate: ProviderGate = requestJs
   for (let offset = 0; offset < 10_000;) {
     const url = new URL(`entity/customerorder/${orderId}/positions`, ensureSlash(base));
     url.searchParams.set('limit', '100'); url.searchParams.set('offset', String(offset));
+    url.searchParams.set('expand', 'assortment');
     const body = await gate(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' } });
     const rows = isRecord(body) && Array.isArray(body.rows) ? body.rows.filter(isRecord) : null;
     if (!rows) throw new Error('MySklad positions response is invalid');
