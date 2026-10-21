@@ -39,6 +39,7 @@ let productPairId = '';
 let createPosts = 0;
 let nextPrepareWaiting = false;
 let b24OrderNumber: string | null = null;
+let b24DealTitle: string | null = 'Original source title';
 let orderPayload: Record<string, any> | null = null;
 const createdEventIds: string[] = [];
 const sourceCreatedAt = new Map<string, Date>();
@@ -165,6 +166,7 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   const operation = await app.get(DatabaseService).dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } });
   assert.equal(operation.status, 'SUCCEEDED');
   assert.equal(operation.moyskladOrderId, refs.order);
+  assert.equal(b24DealTitle, 'SO-TEST-1'); assert.equal(b24OrderNumber, 'SO-TEST-1');
   const pair = await app.get(DatabaseService).entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: dealId, active: true } });
   assert.equal(pair.moyskladId, refs.order);
   assert.equal(await app.get(DatabaseService).dealOrderPositionPair.count({ where: { pairId: pair.id } }), 1);
@@ -334,9 +336,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { id: refs.order, name: 'SO-TEST-1', meta: { type: 'customerorder' },
       positions: { rows: (positions ?? []).map((position) => ({ ...position, id: refs.position })) } });
   }
-  if (url.pathname === '/rest/crm.deal.get.json') return send(response, { result: { ID: form.get('id'), UF_CRM_1729757435964: b24OrderNumber } });
+  if (url.pathname === '/rest/crm.deal.get.json') return send(response, { result: { ID: form.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
   if (url.pathname === '/rest/crm.deal.update.json') {
     b24OrderNumber = form.get('fields[UF_CRM_1729757435964]');
+    b24DealTitle = form.get('fields[TITLE]');
     return send(response, { result: true });
   }
   response.writeHead(404, { 'content-type': 'application/json' });

@@ -20,7 +20,7 @@ import { PairFirstEventProcessor } from '../src/pairs/pair-first-event.processor
 import { setDatabaseRecoveryReady } from '../src/external-write-guard';
 
 type Mode = 'valid' | 'missing' | 'empty' | 'source-missing' | 'malformed' | 'archived' | 'occupied' | '429' | '503' | 'network' | 'bad-json' | '403' | 'assortment-missing';
-type Source = { id: string; cardId: string; uuid: string; mode: Mode; number: string | null };
+type Source = { id: string; cardId: string; uuid: string; mode: Mode; number: string | null; title: string | null };
 const sources = new Map<string, Source>();
 const orders = new Map<string, Record<string, any>>();
 const refs = { company: randomUUID(), organization: randomUUID(), store: randomUUID(), employee: randomUUID(), currency: randomUUID(), state: randomUUID(), unit: randomUUID() };
@@ -172,7 +172,7 @@ test('OFF prevents actual preparer provider reads and all new links', async () =
 });
 
 function fixture(mode: Mode): Source {
-  const source = { id: `96${Date.now()}${++sequence}`, cardId: `97${Date.now()}${sequence}`, uuid: randomUUID(), mode, number: null };
+  const source = { id: `96${Date.now()}${++sequence}`, cardId: `97${Date.now()}${sequence}`, uuid: randomUUID(), mode, number: null, title: 'Original source title' };
   sources.set(source.id, source); return source;
 }
 async function callback(id: string): Promise<string> {
@@ -197,8 +197,8 @@ async function providerFetch(input: string | URL | Request, init?: RequestInit):
       return Response.json({ result: { product: { id: source.cardId, iblockId: 14, active: 'Y', type: 1, property108: { value: source.mode === 'malformed' ? 'invalid-uuid' : source.mode === 'empty' ? '' : source.uuid } } } });
     }
     const dealId = form.get('id') ?? form.get('filter[=ownerId]'), source = sources.get(dealId!)!;
-    if (url.pathname.endsWith('/crm.deal.get.json')) return Response.json({ result: { ID: source.id, COMPANY_ID: '960001', CURRENCY_ID: 'RUB', STAGE_ID: 'PREPARATION', UF_CRM_1729757435964: source.number } });
-    if (url.pathname.endsWith('/crm.deal.update.json')) { source.number = form.get('fields[UF_CRM_1729757435964]'); return Response.json({ result: true }); }
+    if (url.pathname.endsWith('/crm.deal.get.json')) return Response.json({ result: { ID: source.id, TITLE: source.title, COMPANY_ID: '960001', CURRENCY_ID: 'RUB', STAGE_ID: 'PREPARATION', UF_CRM_1729757435964: source.number } });
+    if (url.pathname.endsWith('/crm.deal.update.json')) { source.number = form.get('fields[UF_CRM_1729757435964]'); source.title = form.get('fields[TITLE]'); return Response.json({ result: true }); }
     if (url.pathname.endsWith('/crm.item.productrow.list')) return Response.json({ result: { productRows: [{ id: '301', productId: source.cardId, measureCode: 796, quantity: 2, price: 12.34, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
     throw new Error(`Unexpected synthetic Bitrix operation ${url.pathname.split('/').pop()}`);
   }
