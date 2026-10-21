@@ -33,6 +33,8 @@ let numberUpdates = 0;
 let headerContractDealId: string | null = null;
 let headerContractRequests: Array<{ path: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
 let headerContractMeasureCode = 796;
+let headerContractOverrides: Record<string, unknown> = {};
+let missingHeaderStore = false;
 const suffix = randomUUID();
 let companyPairId = '';
 let productPairId = '';
@@ -210,6 +212,47 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
   }
 });
 
+test('confirmed defaults preserve custom forward stages and revalidate the selected store through PostgreSQL gates', async () => {
+  headerContractDealId = `9037${Date.now()}`;
+  headerContractRequests = [];
+  headerContractOverrides = { STAGE_ID: 'C2:PREPARATION', UF_CRM_1732004209: '98765', ASSIGNED_BY_ID: '98766' };
+  const resolver = { async resolveForDocument() {
+    return { status: 'RESOLVED', pair: { id: companyPairId, entityType: 'COMPANY', bitrix24Id: '902', moyskladId: ids.company }, companyPair: { id: companyPairId, bitrix24Id: '902', moyskladId: ids.company } };
+  } };
+  const preparer = new DealOrderCreationPreparer(database, resolver as never);
+  const settings: any = { version: 1, createdAt: new Date(0), references: {}, config: {
+    schemaVersion: 1, rules: [], groups: [], references: {
+      units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }], priceTypes: [], dictionaries: [],
+    }, dealOrderRuntime: {
+      nativeOrderNumberingVerified: true, unmappedReferencePolicy: 'confirmed-defaults',
+      defaultOrganizationId: ids.organization, defaultStoreId: ids.store, defaultEmployeeId: ids.employee,
+      currencies: [{ bitrix24Code: 'RUB', moyskladId: ids.currency }],
+      stages: [{ bitrix24StageId: 'C2:PREPARATION', moyskladId: ids.state, creationEnabled: true }],
+      organizations: [], stores: [], employees: [],
+    },
+  } };
+  const priorPosts = posts;
+  try {
+    const result = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `defaults-${suffix}`, eventConfig: settings });
+    assert.equal(result.status, 'READY');
+    if (result.status === 'READY') {
+      assert.equal(result.input.payload.store.meta.href, `${base}api/remap/1.2/entity/store/${ids.store}`);
+      assert.equal(result.input.payload.positions.length, 1);
+    }
+    assert.ok(headerContractRequests.some((row) => row.path.endsWith(`/store/${ids.store}`)), 'fallback store is read from the provider, not just trusted from config');
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED' } } }));
+    missingHeaderStore = true;
+    const missing = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `missing-default-${suffix}`, eventConfig: settings });
+    assert.equal(missing.status, 'WAITING');
+    assert.equal(posts, priorPosts, 'a missing selected default never creates an order');
+  } finally {
+    headerContractDealId = null;
+    headerContractOverrides = {};
+    missingHeaderStore = false;
+    headerContractRequests = [];
+  }
+});
+
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
   posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
   activeOrderId = ids.order;
@@ -295,6 +338,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       captureHeaderContractRequest(request, url.pathname);
       if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
     }
+    if (missingHeaderStore && entity[1] === 'store') return send(response, {}, 404);
     return send(response, { id: entity[2], meta: { type: entity[1] } });
   }
   const state = url.pathname.match(/\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/);
@@ -311,6 +355,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (body.get('id') === headerContractDealId) return send(response, { result: {
       ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,
       OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture',
+      ...headerContractOverrides,
     } });
     if (nextNumberReadBarrier) {
       const barrier = nextNumberReadBarrier;

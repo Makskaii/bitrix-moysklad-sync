@@ -57,6 +57,8 @@ export type FieldGroupDto = {
 
 export type DealOrderRuntimeDto = {
   nativeOrderNumberingVerified: boolean;
+  /** Explicit opt-in to safe stage/store/employee fallbacks; omitted configs retain strict behavior. */
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
   /** Explicitly selected Bitrix24 product catalog for the MS→B24 prerequisite path. */
   bitrix24ProductCatalogId?: string | null;
   /** Optional explicit default Bitrix24 catalog section for newly created products. */

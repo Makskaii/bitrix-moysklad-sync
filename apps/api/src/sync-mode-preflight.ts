@@ -69,11 +69,19 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
       const pair = object(candidate);
       const pairSource = input.direction === 'bitrix24ToMoysklad' ? pair?.bitrix24Id : pair?.moyskladId;
       const pairTarget = input.direction === 'bitrix24ToMoysklad' ? pair?.moyskladId : pair?.bitrix24Id;
-      return pair?.kind === kind && pairSource === sourceId && pairTarget === targetId && pair.status === 'confirmed';
+      const canonicalStageId = kind === 'dealStages' && input.direction === 'bitrix24ToMoysklad'
+        ? bitrixStageCatalogId(sourceId)
+        : kind === 'dealStages' && input.direction === 'moyskladToBitrix24'
+          ? bitrixStageCatalogId(targetId)
+          : null;
+      const sourceMatches = pairSource === sourceId || (kind === 'dealStages' && input.direction === 'bitrix24ToMoysklad' && pairSource === canonicalStageId);
+      const targetMatches = pairTarget === targetId || (kind === 'dealStages' && input.direction === 'moyskladToBitrix24' && pairTarget === canonicalStageId);
+      return pair?.kind === kind && sourceMatches && targetMatches && pair.status === 'confirmed';
     });
 
     if (input.entityKey === 'deals-orders') {
       const runtime = object(config.dealOrderRuntime);
+      const usesConfirmedDefaults = runtime?.unmappedReferencePolicy === 'confirmed-defaults';
       if (!runtime) blockers.push(finding('DEAL_ORDER_RUNTIME_UNCONFIGURED', 'Настройки создания и сопоставления заказов не заполнены.'));
       else {
         if (input.direction === 'bitrix24ToMoysklad') {
@@ -94,18 +102,66 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
       if (!availableCurrencies.length) blockers.push(finding('DEAL_CURRENCIES_UNAVAILABLE', 'API не вернул применимые валюты для проверки подтверждённых пар.'));
 
       if (input.direction === 'moyskladToBitrix24') {
-        for (const stageId of availableStages) {
-          const runtimeMapped = array(object(runtime)?.stages).map(object).some((stage) =>
-            String(stage?.moyskladId) === stageId && nonEmpty(stage?.bitrix24StageId) && nonEmpty(stage?.moyskladId));
-          if (!confirmed('dealStages', stageId) || !runtimeMapped) {
-            blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Для стадии сделки нет подтверждённой пары в активной версии настроек МойСклад.', stageId));
+        const runtimeStages = array(runtime?.stages).map(object).filter((item): item is Record<string, unknown> => item !== null);
+        if (usesConfirmedDefaults) {
+          const fallbackStages = runtimeStages.filter((stage) =>
+            isMainPreparationStage(String(stage.bitrix24StageId ?? '')) && stage.creationEnabled === true &&
+            nonEmpty(stage.moyskladId) && confirmed('dealStages', String(stage.moyskladId)) && availableStages.includes(String(stage.moyskladId)));
+          if (fallbackStages.length !== 1) {
+            blockers.push(finding('DEAL_STAGE_DEFAULT_UNAVAILABLE', 'Для безопасного перехода незнакомой стадии нужна ровно одна подтверждённая стадия PREPARATION, разрешённая для создания.'));
+          }
+          const configuredTargets = new Set<string>();
+          for (const stage of runtimeStages) {
+            const sourceId = nonEmpty(stage.moyskladId) ? String(stage.moyskladId) : '';
+            const targetId = nonEmpty(stage.bitrix24StageId) ? String(stage.bitrix24StageId) : '';
+            const duplicateTarget = !!sourceId && configuredTargets.has(sourceId);
+            if (sourceId) configuredTargets.add(sourceId);
+            if (!sourceId || !targetId || !availableStages.includes(sourceId) || duplicateTarget || !hasConfirmedPair('dealStages', sourceId, targetId)) {
+              blockers.push(finding(duplicateTarget ? 'STAGE_MAPPING_AMBIGUOUS' : 'STAGE_MAPPING_UNCONFIRMED', 'Настроенная стадия заказа отсутствует, неоднозначна или не подтверждена.', sourceId || undefined));
+            }
+          }
+          const mappedStages = new Set(runtimeStages.map((stage) => String(stage.moyskladId ?? '')).filter(Boolean));
+          if (availableStages.some((id) => mappedStages.has(id)) && new Set(availableStages).size !== availableStages.length) {
+            blockers.push(finding('STAGE_CATALOG_AMBIGUOUS', 'В каталоге МойСклад повторяется ID стадии заказа.'));
+          }
+          if (availableStages.some((id) => !mappedStages.has(id))) {
+            warnings.push(finding('UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED', 'Неиспользуемые стадии МойСклад без пары не блокируют направление; конкретный заказ использует подтверждённую стадию PREPARATION.'));
+          }
+        } else {
+          for (const stageId of availableStages) {
+            const runtimeMapped = runtimeStages.some((stage) =>
+              String(stage.moyskladId) === stageId && nonEmpty(stage.bitrix24StageId) && nonEmpty(stage.moyskladId));
+            if (!confirmed('dealStages', stageId) || !runtimeMapped) {
+              blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Для стадии сделки нет подтверждённой пары в активной версии настроек МойСклад.', stageId));
+            }
           }
         }
-        for (const currencyId of availableCurrencies) {
-          const runtimeMapped = array(object(runtime)?.currencies).map(object).some((currency) =>
-            String(currency?.moyskladId) === currencyId && nonEmpty(currency?.bitrix24Code) && nonEmpty(currency?.moyskladId));
-          if (!confirmed('currencies', currencyId) || !runtimeMapped) {
-            blockers.push(finding('CURRENCY_MAPPING_UNCONFIRMED', 'Для валюты нет подтверждённой пары в активной версии настроек МойСклад.', currencyId));
+
+        const runtimeCurrencies = array(runtime?.currencies).map(object).filter((item): item is Record<string, unknown> => item !== null);
+        if (usesConfirmedDefaults) {
+          if (!runtimeCurrencies.length) blockers.push(finding('DEAL_CURRENCY_MAPPING_REQUIRED', 'Нужна хотя бы одна подтверждённая пара валюты для заказов.'));
+          const configuredTargets = new Set<string>();
+          for (const currency of runtimeCurrencies) {
+            const sourceId = nonEmpty(currency.moyskladId) ? String(currency.moyskladId) : '';
+            const targetId = nonEmpty(currency.bitrix24Code) ? String(currency.bitrix24Code) : '';
+            const duplicateTarget = !!sourceId && configuredTargets.has(sourceId);
+            if (sourceId) configuredTargets.add(sourceId);
+            const catalogMatches = sourceId ? availableCurrencies.filter((id) => id === sourceId).length : 0;
+            if (!sourceId || !targetId || duplicateTarget || catalogMatches !== 1 || !hasConfirmedPair('currencies', sourceId, targetId)) {
+              blockers.push(finding(duplicateTarget || catalogMatches > 1 ? 'CURRENCY_MAPPING_AMBIGUOUS' : 'CURRENCY_MAPPING_UNCONFIRMED', 'Каждая настроенная валюта должна иметь единственную существующую подтверждённую пару.', sourceId || undefined));
+            }
+          }
+          const mappedCurrencies = new Set(runtimeCurrencies.map((currency) => String(currency.moyskladId ?? '')).filter(Boolean));
+          if (availableCurrencies.some((id) => !mappedCurrencies.has(id))) {
+            warnings.push(finding('UNUSED_PROVIDER_CURRENCY_UNMAPPED', 'Неиспользуемые валюты МойСклад не блокируют направление; заказ с неподтверждённой валютой останется заблокированным.'));
+          }
+        } else {
+          for (const currencyId of availableCurrencies) {
+            const runtimeMapped = runtimeCurrencies.some((currency) =>
+              String(currency.moyskladId) === currencyId && nonEmpty(currency.bitrix24Code) && nonEmpty(currency.moyskladId));
+            if (!confirmed('currencies', currencyId) || !runtimeMapped) {
+              blockers.push(finding('CURRENCY_MAPPING_UNCONFIRMED', 'Для валюты нет подтверждённой пары в активной версии настроек МойСклад.', currencyId));
+            }
           }
         }
       } else {
@@ -129,6 +185,17 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
         const configured = nonEmpty(sourceId) && nonEmpty(targetId) && availableStages.includes(catalogId) && !duplicate;
         if (!configured || !hasConfirmedPair('dealStages', sourceId, targetId)) {
           blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Для выбранной стадии сделки нет подтверждённой пары в активной версии настроек и каталоге провайдера.', catalogId || undefined));
+        }
+      }
+      if (usesConfirmedDefaults) {
+        if (runtimeStages.length) {
+          const configuredCatalogStages = new Set(runtimeStages.map((value) => {
+            const stage = object(value);
+            return bitrixStageCatalogId(String(stage?.bitrix24StageId ?? ''));
+          }));
+          if (availableStages.some((id) => !configuredCatalogStages.has(id))) {
+            warnings.push(finding('UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED', 'Стадия сделки без настроенной пары не разрешает создание заказа; направление остаётся готовым для явно разрешённых стадий.'));
+          }
         }
       }
 
@@ -256,4 +323,8 @@ function bitrixStageCatalogId(runtimeStageId: string): string {
   if (/^\d+:.+$/.test(runtimeStageId)) return runtimeStageId;
   const customPipeline = runtimeStageId.match(/^C(\d+):/);
   return `${customPipeline?.[1] ?? '0'}:${runtimeStageId}`;
+}
+
+function isMainPreparationStage(stageId: string): boolean {
+  return stageId === 'PREPARATION' || stageId === '0:PREPARATION';
 }

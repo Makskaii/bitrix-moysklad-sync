@@ -20,6 +20,9 @@ const ids = {
   state: '44444444-4444-4444-8444-444444444444',
   currency: '55555555-5555-4555-8555-555555555555',
   unit: '66666666-6666-4666-8666-666666666666',
+  preparationState: '77777777-7777-4777-8777-777777777777',
+  unmappedState: '88888888-8888-4888-8888-888888888888',
+  unknownCurrency: '99999999-9999-4999-8999-999999999999',
 };
 let server: Server;
 let base = '';
@@ -33,6 +36,8 @@ let rows: Record<string, unknown>[] = [];
 let products: Record<string, unknown>[] = [];
 let orderPositions: Record<string, unknown>[] = [];
 let activeOrderId = ids.order;
+let activeOrderStateId = ids.state;
+let activeOrderCurrencyId = ids.currency;
 let sourceProductName = 'MS product name';
 let productAdds = 0;
 let msProductWrites = 0;
@@ -326,6 +331,75 @@ test('missing confirmed product-catalog selection holds an unpaired product for 
   assert.equal(dealAdds, 0);
 });
 
+test('confirmed-defaults uses the uniquely confirmed main PREPARATION stage for an unmapped reverse stage', async () => {
+  const orderId = randomUUID();
+  activeOrderId = orderId;
+  activeOrderStateId = ids.unmappedState;
+  activeOrderCurrencyId = ids.currency;
+  orderPositions = [];
+  items = [];
+  rows = [];
+  dealAdds = 0;
+  const eventConfig = config();
+  eventConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  eventConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  eventConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+
+  const result = await service.createAndPair({ moyskladOrderId: orderId, eventId: `event-${suffix}-stage-fallback`, eventConfig });
+  assert.equal(result.status, 'CREATED');
+  assert.equal(items[0]?.stageId, 'PREPARATION');
+  assert.equal(dealAdds, 1);
+  assert.ok(await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId, active: true } }));
+
+  const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+  if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+  await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+  await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+  activeOrderId = ids.order;
+  activeOrderStateId = ids.state;
+});
+
+test('confirmed defaults never use a preparation fallback for mapped-disabled stages or unknown currencies', async () => {
+  const disabledOrderId = randomUUID();
+  activeOrderId = disabledOrderId;
+  activeOrderStateId = ids.state;
+  activeOrderCurrencyId = ids.currency;
+  orderPositions = [];
+  items = [];
+  dealAdds = 0;
+  const disabledConfig = config();
+  disabledConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  disabledConfig.config.dealOrderRuntime.stages[0].creationEnabled = false;
+  disabledConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  disabledConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+  await assert.rejects(service.createAndPair({ moyskladOrderId: disabledOrderId, eventId: `event-${suffix}-disabled-stage`, eventConfig: disabledConfig }),
+    (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  assert.equal(dealAdds, 0);
+
+  const currencyOrderId = randomUUID();
+  activeOrderId = currencyOrderId;
+  activeOrderStateId = ids.unmappedState;
+  activeOrderCurrencyId = ids.unknownCurrency;
+  const currencyConfig = config();
+  currencyConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  currencyConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  currencyConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+  await assert.rejects(service.createAndPair({ moyskladOrderId: currencyOrderId, eventId: `event-${suffix}-unknown-currency`, eventConfig: currencyConfig }),
+    (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  assert.equal(dealAdds, 0);
+  assert.equal(await db.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: { in: [disabledOrderId, currencyOrderId] } } }), 0);
+
+  activeOrderId = ids.order;
+  activeOrderStateId = ids.state;
+  activeOrderCurrencyId = ids.currency;
+});
+
 test('ambiguous Bitrix24 product recovery identity is held for review without creating a deal', async () => {
   activeOrderId = ids.order;
   await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: ids.order } });
@@ -367,7 +441,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const pathname = new URL(request.url ?? '/', base).pathname;
   const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/product\/([0-9a-f-]+)$/i);
   if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
-  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: ids.state }, rate: { currency: { id: ids.currency } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
+  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
     return send(response, { rows: orderPositions.slice(offset, offset + 100) });

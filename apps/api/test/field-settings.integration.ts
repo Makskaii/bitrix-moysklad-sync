@@ -672,6 +672,21 @@ test('saving a raw main-pipeline stage confirms its single category-qualified ca
       moyskladId: target.id, moyskladLabel: target.label, status: 'confirmed',
     }]);
 
+    assert.equal('unmappedReferencePolicy' in saved.config.dealOrderRuntime, false, 'saving a legacy config must not silently change its fallback behavior');
+    const fallbackConfig = structuredClone(config);
+    fallbackConfig.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+    const fallbackResponse = await save(fallbackConfig);
+    assert.equal(fallbackResponse.status, 200, await fallbackResponse.clone().text());
+    const fallbackSaved = await fallbackResponse.json() as { config: Record<string, any> };
+    assert.equal(fallbackSaved.config.dealOrderRuntime.unmappedReferencePolicy, 'confirmed-defaults');
+    const invalidPolicy = structuredClone(fallbackConfig);
+    invalidPolicy.dealOrderRuntime.unmappedReferencePolicy = 'guess-anything';
+    assert.equal((await save(invalidPolicy)).status, 400);
+    const disabledDefault = structuredClone(fallbackConfig);
+    disabledDefault.dealOrderRuntime.stages[0].creationEnabled = false;
+    assert.equal((await save(disabledDefault)).status, 400, 'a default stage must itself be confirmed and creation-enabled');
+    assert.equal((await save(config)).status, 200, 'normal settings save can remove the opt-in without altering legacy mappings');
+
     const wrongTarget = structuredClone(config);
     wrongTarget.dealOrderRuntime.stages[0].moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     assert.equal((await save(wrongTarget)).status, 400, 'raw-stage matching must not loosen exact target confirmation');

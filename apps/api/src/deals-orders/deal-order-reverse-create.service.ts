@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database.service';
 import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients/client-dependency-resolver';
-import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
+import { NamedReferencePair, VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { writeOperationalLog } from '../monitoring-log';
@@ -17,6 +17,22 @@ import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transa
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
 type Prepared = { orderId: string; eventId: string; settingsVersion: number; sourceSnapshot: Row; fields: Row; rows: PreparedRow[]; skippedRows: Array<{ sourceRowId: string; reason: string }>; companyPairId: string | null; companyId: string | null };
+type ReverseStage = { bitrix24StageId: string; moyskladId: string; creationEnabled: boolean };
+
+export function resolveReverseOrderStage(input: {
+  sourceStageId: string;
+  stages: readonly ReverseStage[];
+  namedPairs: readonly Pick<NamedReferencePair, 'kind' | 'bitrix24Id' | 'moyskladId' | 'status'>[];
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
+}): { status: 'MAPPED' | 'FALLBACK' | 'UNMAPPED' | 'DISABLED'; stage?: ReverseStage } {
+  const mapped = input.stages.find((candidate) => candidate.moyskladId === input.sourceStageId);
+  if (mapped) return mapped.creationEnabled ? { status: 'MAPPED', stage: mapped } : { status: 'DISABLED' };
+  if (input.unmappedReferencePolicy !== 'confirmed-defaults') return { status: 'UNMAPPED' };
+  const candidates = input.stages.filter((candidate) =>
+    isMainPreparationStage(candidate.bitrix24StageId) && candidate.creationEnabled &&
+    hasUniqueConfirmedStagePair(candidate, input.namedPairs));
+  return candidates.length === 1 ? { status: 'FALLBACK', stage: candidates[0] } : { status: 'UNMAPPED' };
+}
 
 export type ReverseCreateResult = { status: 'CREATED' | 'PARTIAL' | 'ALREADY_PAIRED'; bitrix24DealId: string; skippedRows?: Array<{ sourceRowId: string; reason: string }> };
 export class DealOrderReverseManualReviewError extends Error {}
@@ -211,7 +227,17 @@ export class DealOrderReverseCreateService {
     if (!isRecord(order) || order.id !== input.moyskladOrderId || !isRecord(order.agent) || !isRecord(order.agent.meta) || !isUuid(order.agent.id) || !isRecord(order.state) || !isUuid(order.state.id) || !isRecord(order.rate) || !isRecord(order.rate.currency) || !isUuid(order.rate.currency.id) || typeof order.name !== 'string' || !order.name.trim()) {
       throw new DealOrderReverseManualReviewError('Customer-order header is incomplete');
     }
-    const stage = config.stages.find((item) => item.moyskladId === order.state?.id);
+    const stageResolution = resolveReverseOrderStage({
+      sourceStageId: order.state.id,
+      stages: config.stages,
+      namedPairs: input.eventConfig.config.references.namedPairs ?? [],
+      unmappedReferencePolicy: config.unmappedReferencePolicy,
+    });
+    const stage = stageResolution.stage;
+    if (stageResolution.status === 'DISABLED') {
+      throw new DealOrderReverseManualReviewError('Mapped customer-order stage is not enabled for deal creation');
+    }
+    const stageFallbackUsed = stageResolution.status === 'FALLBACK';
     const currency = config.currencies.find((item) => item.moyskladId === order.rate.currency.id);
     if (!stage || !currency) throw new DealOrderReverseManualReviewError('Customer-order stage or currency has no confirmed Bitrix24 mapping');
 
@@ -311,6 +337,9 @@ export class DealOrderReverseCreateService {
       ...(typeof order.description === 'string' ? { comments: order.description } : {}),
     };
     const fields = mapConfiguredFields(input.eventConfig, order, dealFields);
+    if (stageFallbackUsed) {
+      await writeOperationalLog(this.database, 'EVENT', 'MySklad customer order used configured Bitrix24 PREPARATION stage; reason=UNMAPPED_SOURCE_STAGE_DEFAULT_APPLIED', input.eventId);
+    }
     return { orderId: input.moyskladOrderId, eventId: input.eventId, settingsVersion: input.eventConfig.version, sourceSnapshot: order, fields, rows, skippedRows, companyPairId, companyId };
   }
 
@@ -541,6 +570,19 @@ function categoryFromStage(stageId: string): number {
   const prefix = stageId.match(/^C(\d+):/);
   if (prefix) return Number(prefix[1]);
   return 0;
+}
+function isMainPreparationStage(stageId: string): boolean {
+  return stageId === 'PREPARATION' || stageId === '0:PREPARATION';
+}
+function hasUniqueConfirmedStagePair(
+  stage: ReverseStage,
+  pairs: readonly Pick<NamedReferencePair, 'kind' | 'bitrix24Id' | 'moyskladId' | 'status'>[],
+): boolean {
+  const sourceKeys = stage.bitrix24StageId === 'PREPARATION'
+    ? new Set(['PREPARATION', '0:PREPARATION'])
+    : new Set([stage.bitrix24StageId]);
+  const matches = pairs.filter((pair) => pair.kind === 'dealStages' && sourceKeys.has(pair.bitrix24Id));
+  return matches.length === 1 && matches[0]?.status === 'confirmed' && matches[0]?.moyskladId === stage.moyskladId;
 }
 async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
   const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(12_000) });

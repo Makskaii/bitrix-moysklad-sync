@@ -90,6 +90,133 @@ test('deal preflight accepts confirmed reverse mappings against MySklad source I
   assert.deepEqual(result.blockers, []);
 });
 
+test('configured fallback policy warns on unused reverse stage/currency catalog entries but requires a valid configured pair', () => {
+  const report = evaluateEnablePreflight({
+    entityKey: 'deals-orders', direction: 'moyskladToBitrix24',
+    settings: { version: 10, config: {
+      rules: [],
+      references: { namedPairs: [
+        { kind: 'dealStages', bitrix24Id: '0:PREPARATION', moyskladId: 'ms-preparation', status: 'confirmed' },
+        { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'ms-rub', status: 'confirmed' },
+      ] },
+      dealOrderRuntime: {
+        unmappedReferencePolicy: 'confirmed-defaults',
+        nativeOrderNumberingVerified: true,
+        defaultOrganizationId: 'org-1', defaultStoreId: 'store-1', defaultEmployeeId: 'employee-1',
+        stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: 'ms-preparation', creationEnabled: true }],
+        currencies: [{ bitrix24Code: 'RUB', moyskladId: 'ms-rub' }],
+      },
+    } },
+    apiAccess: true, webhookAuthConfigured: true,
+    applicableStages: ['ms-preparation', 'unused-ms-stage'],
+    applicableCurrencies: ['ms-rub', 'unused-ms-currency'],
+  });
+
+  assert.equal(report.canEnable, true);
+  assert.deepEqual(report.blockers, []);
+  assert.ok(report.warnings.some((item) => item.code === 'UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED'));
+  assert.ok(report.warnings.some((item) => item.code === 'UNUSED_PROVIDER_CURRENCY_UNMAPPED'));
+});
+
+test('configured fallback policy never makes an invalid configured currency safe', () => {
+  const report = evaluateEnablePreflight({
+    entityKey: 'deals-orders', direction: 'moyskladToBitrix24',
+    settings: { version: 10, config: {
+      rules: [],
+      references: { namedPairs: [
+        { kind: 'dealStages', bitrix24Id: '0:PREPARATION', moyskladId: 'ms-preparation', status: 'confirmed' },
+        { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'ms-rub', status: 'confirmed' },
+      ] },
+      dealOrderRuntime: {
+        unmappedReferencePolicy: 'confirmed-defaults',
+        nativeOrderNumberingVerified: true,
+        defaultOrganizationId: 'org-1', defaultStoreId: 'store-1', defaultEmployeeId: 'employee-1',
+        stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: 'ms-preparation', creationEnabled: true }],
+        currencies: [
+          { bitrix24Code: 'RUB', moyskladId: 'ms-rub' },
+          { bitrix24Code: 'USD', moyskladId: 'ms-usd' },
+        ],
+      },
+    } },
+    apiAccess: true, webhookAuthConfigured: true,
+    applicableStages: ['ms-preparation'], applicableCurrencies: ['ms-rub', 'ms-usd'],
+  });
+
+  assert.equal(report.canEnable, false);
+  assert.ok(report.blockers.some((item) => item.code === 'CURRENCY_MAPPING_UNCONFIRMED' && item.referenceId === 'ms-usd'));
+});
+
+test('missing fallback policy retains strict reverse catalog validation', () => {
+  const result = evaluateEnablePreflight({
+    entityKey: 'deals-orders', direction: 'moyskladToBitrix24', settings: {
+      version: 9, config: {
+        rules: [],
+        references: { namedPairs: [
+          { kind: 'dealStages', bitrix24Id: '0:PREPARATION', moyskladId: 'ms-preparation', status: 'confirmed' },
+          { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'ms-rub', status: 'confirmed' },
+        ] },
+        dealOrderRuntime: {
+          nativeOrderNumberingVerified: true, defaultOrganizationId: 'org-1', defaultStoreId: 'store-1', defaultEmployeeId: 'employee-1',
+          stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: 'ms-preparation', creationEnabled: true }],
+          currencies: [{ bitrix24Code: 'RUB', moyskladId: 'ms-rub' }],
+        },
+      },
+    }, apiAccess: true, webhookAuthConfigured: true,
+    applicableStages: ['ms-preparation', 'unused-ms-stage'], applicableCurrencies: ['ms-rub'],
+  });
+  assert.equal(result.canEnable, false);
+  assert.ok(result.blockers.some((item) => item.code === 'STAGE_MAPPING_UNCONFIRMED' && item.referenceId === 'unused-ms-stage'));
+});
+
+test('confirmed defaults allow unused forward stage catalog entries but retain a confirmed PREPARATION create stage', () => {
+  const report = evaluateEnablePreflight({
+    ...baseInput,
+    settings: { version: 11, config: {
+      rules: [],
+      references: { namedPairs: [
+        { kind: 'dealStages', bitrix24Id: '0:PREPARATION', moyskladId: 'ms-preparation', status: 'confirmed' },
+        { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'ms-rub', status: 'confirmed' },
+      ] },
+      dealOrderRuntime: {
+        unmappedReferencePolicy: 'confirmed-defaults', nativeOrderNumberingVerified: true,
+        defaultOrganizationId: 'org-1', defaultStoreId: 'store-1', defaultEmployeeId: 'employee-1',
+        stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: 'ms-preparation', creationEnabled: true }],
+        currencies: [{ bitrix24Code: 'RUB', moyskladId: 'ms-rub' }],
+      },
+    } },
+    applicableStages: ['0:PREPARATION', '0:NEW'],
+    applicableCurrencies: ['RUB'],
+  });
+
+  assert.equal(report.canEnable, true);
+  assert.deepEqual(report.blockers, []);
+  assert.ok(report.warnings.some((item) => item.code === 'UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED'));
+
+  const unsafe = evaluateEnablePreflight({
+    ...baseInput,
+    settings: { version: 12, config: {
+      rules: [],
+      references: { namedPairs: [
+        { kind: 'dealStages', bitrix24Id: '0:PREPARATION', moyskladId: 'ms-preparation', status: 'confirmed' },
+        { kind: 'dealStages', bitrix24Id: '0:NEW', moyskladId: 'ms-new', status: 'confirmed' },
+        { kind: 'currencies', bitrix24Id: 'RUB', moyskladId: 'ms-rub', status: 'confirmed' },
+      ] },
+      dealOrderRuntime: {
+        unmappedReferencePolicy: 'confirmed-defaults', nativeOrderNumberingVerified: true,
+        defaultOrganizationId: 'org-1', defaultStoreId: 'store-1', defaultEmployeeId: 'employee-1',
+        stages: [
+          { bitrix24StageId: 'PREPARATION', moyskladId: 'ms-preparation', creationEnabled: true },
+          { bitrix24StageId: 'NEW', moyskladId: 'ms-new', creationEnabled: true },
+        ],
+        currencies: [{ bitrix24Code: 'RUB', moyskladId: 'ms-rub' }],
+      },
+    } },
+    applicableStages: ['0:PREPARATION', '0:NEW'],
+    applicableCurrencies: ['RUB'],
+  });
+  assert.equal(unsafe.canEnable, true, 'the new fallback policy does not revoke explicitly configured forward stage eligibility');
+});
+
 test('product preflight rejects the unsupported reverse direction and requires a catalog and authenticated APIs', () => {
   const unsupported = evaluateEnablePreflight({
     ...baseInput,

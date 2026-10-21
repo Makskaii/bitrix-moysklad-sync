@@ -20,6 +20,7 @@ const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
 };
 
 export type RuntimeReferenceSettings = {
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
   nativeOrderNumberingVerified: boolean;
   defaultOrganizationId: string;
   defaultStoreId: string;
@@ -83,20 +84,26 @@ export class DealOrderCreationPreparer {
     const currencyCode = readString(deal.CURRENCY_ID);
     const currency = references.currencies.find((candidate) => candidate.bitrix24Code === currencyCode);
     if (!currency) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
+    const rawStoreSource = deal.UF_CRM_1732004209;
     const storeSource = readOptionalId(deal.UF_CRM_1732004209);
-    const targetStoreId = storeSource
-      ? references.stores.find((candidate) => candidate.bitrix24Id === storeSource)?.moyskladId
-      : references.defaultStoreId;
+    if (hasOptionalValue(rawStoreSource) && !storeSource) return { status: 'WAITING', reason: 'STORE_SOURCE_INVALID' };
+    const mappedStoreId = storeSource ? references.stores.find((candidate) => candidate.bitrix24Id === storeSource)?.moyskladId : undefined;
+    const storeFallbackUsed = !!storeSource && !mappedStoreId && references.unmappedReferencePolicy === 'confirmed-defaults';
+    if (storeSource && !mappedStoreId && !storeFallbackUsed) return { status: 'WAITING', reason: 'STORE_MAPPING_UNCONFIRMED' };
+    const targetStoreId = mappedStoreId ?? references.defaultStoreId;
     const organizationSource = readOptionalId(deal.UF_CRM_1776347243);
     const targetOrganizationId = organizationSource
       ? references.organizations.find((candidate) => candidate.bitrix24Id === organizationSource)?.moyskladId
       : references.defaultOrganizationId;
     if (!targetStoreId || !targetOrganizationId) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
-    const assignedBy = readOptionalId(deal.ASSIGNED_BY_ID);
-    const targetEmployeeId = assignedBy
-      ? references.employees.find((candidate) => candidate.bitrix24Id === assignedBy)?.moyskladId ?? references.defaultEmployeeId
-      : references.defaultEmployeeId;
-    const employeeFallbackUsed = !!assignedBy && !references.employees.some((candidate) => candidate.bitrix24Id === assignedBy);
+    const rawAssignedBy = deal.ASSIGNED_BY_ID;
+    const assignedBy = readOptionalId(rawAssignedBy);
+    if (hasOptionalValue(rawAssignedBy) && !assignedBy) return { status: 'WAITING', reason: 'EMPLOYEE_SOURCE_INVALID' };
+    const mappedEmployeeId = assignedBy ? references.employees.find((candidate) => candidate.bitrix24Id === assignedBy)?.moyskladId : undefined;
+    const employeeFallbackAllowed = references.unmappedReferencePolicy !== 'hold';
+    const employeeFallbackUsed = !!assignedBy && !mappedEmployeeId && employeeFallbackAllowed;
+    if (assignedBy && !mappedEmployeeId && !employeeFallbackUsed) return { status: 'WAITING', reason: 'EMPLOYEE_MAPPING_UNCONFIRMED' };
+    const targetEmployeeId = mappedEmployeeId ?? references.defaultEmployeeId;
 
     const referencesVerified = await Promise.all([
       verifyMySkladReference('organization', targetOrganizationId, (work) => this.providerModeGate(work)),
@@ -295,7 +302,11 @@ export class DealOrderCreationPreparer {
         ...preparedAttributes.nativeFields,
       },
     };
-    if (employeeFallbackUsed) await writeOperationalLog(this.database, 'ADMIN', 'Deal order used configured default MySklad responsible', input.bitrix24DealId);
+    if (storeFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad store; reason=UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED', input.eventId);
+    if (employeeFallbackUsed) {
+      await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad responsible; reason=UNMAPPED_SOURCE_EMPLOYEE_DEFAULT_APPLIED', input.eventId);
+      await writeOperationalLog(this.database, 'ADMIN', 'Deal order used configured default MySklad responsible', input.eventId);
+    }
     return { status: 'READY', input: inputPrepared };
   }
 }
@@ -514,6 +525,8 @@ async function verifyMySkladReference(type: 'organization' | 'store' | 'employee
 export function readRuntimeReferences(value: unknown): RuntimeReferenceSettings | null {
   if (!isRecord(value) || typeof value.nativeOrderNumberingVerified !== 'boolean' || !isUuid(value.defaultOrganizationId) || !isUuid(value.defaultStoreId) || !isUuid(value.defaultEmployeeId) ||
       !Array.isArray(value.currencies) || !Array.isArray(value.stages) || !Array.isArray(value.organizations) || !Array.isArray(value.stores) || !Array.isArray(value.employees)) return null;
+  const unmappedReferencePolicy = value.unmappedReferencePolicy;
+  if (unmappedReferencePolicy !== undefined && unmappedReferencePolicy !== 'hold' && unmappedReferencePolicy !== 'confirmed-defaults') return null;
   const currencies = value.currencies.filter((entry): entry is { bitrix24Code: string; moyskladId: string } =>
     isRecord(entry) && typeof entry.bitrix24Code === 'string' && /^[A-Z]{3}$/.test(entry.bitrix24Code) && isUuid(entry.moyskladId));
   const stages = value.stages.filter((entry): entry is { bitrix24StageId: string; moyskladId: string; creationEnabled: boolean } =>
@@ -528,7 +541,7 @@ export function readRuntimeReferences(value: unknown): RuntimeReferenceSettings 
   if (new Set(currencies.map((entry) => entry.bitrix24Code)).size !== currencies.length || new Set(stages.map((entry) => entry.bitrix24StageId)).size !== stages.length ||
       new Set(organizations.map((entry) => entry.bitrix24Id)).size !== organizations.length || new Set(stores.map((entry) => entry.bitrix24Id)).size !== stores.length || new Set(employees.map((entry) => entry.bitrix24Id)).size !== employees.length) return null;
   const defaultProductGroupId = value.defaultProductGroupId === null || value.defaultProductGroupId === undefined ? null : isUuid(value.defaultProductGroupId) ? value.defaultProductGroupId : null;
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, defaultOrganizationId: value.defaultOrganizationId, defaultStoreId: value.defaultStoreId, defaultEmployeeId: value.defaultEmployeeId, defaultProductGroupId, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, unmappedReferencePolicy, defaultOrganizationId: value.defaultOrganizationId, defaultStoreId: value.defaultStoreId, defaultEmployeeId: value.defaultEmployeeId, defaultProductGroupId, currencies, stages, organizations, stores, employees };
 }
 
 function toMinorUnits(value: unknown): number | null {
@@ -544,6 +557,7 @@ function readString(value: unknown): string | null { return typeof value === 'st
 function readNumericId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readRowId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readOptionalId(value: unknown): string | null { if (value === null || value === undefined || value === '') return null; return readNumericId(value); }
+function hasOptionalValue(value: unknown): boolean { return value !== null && value !== undefined && value !== ''; }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function bitrixBase(): URL { return configuredBase('BITRIX24_REST_BASE_URL', true); }

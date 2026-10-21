@@ -663,6 +663,10 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
   if (!isRecord(value) || typeof value.nativeOrderNumberingVerified !== 'boolean' || !Array.isArray(value.currencies) || !Array.isArray(value.stages) || !Array.isArray(value.organizations) || !Array.isArray(value.stores) || !Array.isArray(value.employees)) {
     throw new BadRequestException('dealOrderRuntime must include confirmed currency, stage, organization, store, and employee mappings');
   }
+  const unmappedReferencePolicy = value.unmappedReferencePolicy;
+  if (unmappedReferencePolicy !== undefined && unmappedReferencePolicy !== 'hold' && unmappedReferencePolicy !== 'confirmed-defaults') {
+    throw new BadRequestException('unmappedReferencePolicy must be hold or confirmed-defaults');
+  }
   const id = (candidate: unknown) => isString(candidate) && isUuid(candidate);
   const productCatalogId = value.bitrix24ProductCatalogId === undefined || value.bitrix24ProductCatalogId === null || value.bitrix24ProductCatalogId === ''
     ? null
@@ -713,6 +717,14 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
   const confirmed = (kind: NamedReferenceKind, sourceId: string, targetId: string) => namedPairs.some((pair) => pair.kind === kind && pair.bitrix24Id === sourceId && pair.moyskladId === targetId && pair.status === 'confirmed');
   for (const item of currencies) if (!confirmed('currencies', item.bitrix24Code, item.moyskladId)) throw new BadRequestException(`Currency ${item.bitrix24Code} must be a confirmed named reference`);
   for (const item of stages) if (!confirmedDealStageReference(item.bitrix24StageId, item.moyskladId, namedPairs)) throw new BadRequestException(`Deal stage ${item.bitrix24StageId} must resolve to one confirmed named reference`);
+  if (unmappedReferencePolicy === 'confirmed-defaults') {
+    const preparationStages = stages.filter((item) =>
+      (item.bitrix24StageId === 'PREPARATION' || item.bitrix24StageId === '0:PREPARATION') &&
+      item.creationEnabled && confirmedDealStageReference(item.bitrix24StageId, item.moyskladId, namedPairs));
+    if (preparationStages.length !== 1) {
+      throw new BadRequestException('confirmed-defaults requires exactly one confirmed creation-enabled PREPARATION stage');
+    }
+  }
   for (const item of organizations) if (!confirmed('organizations', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Organization ${item.bitrix24Id} must be a confirmed named reference`);
   for (const item of stores) if (!confirmed('warehouses', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Store ${item.bitrix24Id} must be a confirmed warehouse named reference`);
   for (const item of employees) if (!confirmed('employees', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Employee ${item.bitrix24Id} must be a confirmed named reference`);
@@ -721,7 +733,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {
