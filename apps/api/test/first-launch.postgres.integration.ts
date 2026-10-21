@@ -31,6 +31,12 @@ test('first launch is exclusive, audited, restart-safe and cannot reset an occup
     assert.equal(await db.inboundEvent.count(), 1);
     // Delete only this locally-created disposable fixture, never production history.
     await db.inboundEvent.delete({ where: { id: event.id } });
+    const transition = await db.syncModeTransition.create({ data: { fromMode: 'on', toMode: 'off', transitionedAt: new Date() } });
+    await assert.rejects(service.confirmFirstLaunch(input, 'BITRIX24_USER:3664'), /empty exchange database/);
+    await db.syncModeTransition.delete({ where: { id: transition.id } });
+    await db.syncSetting.update({ where: { id: 'global' }, data: { lastActiveAt: new Date() } });
+    await assert.rejects(service.confirmFirstLaunch(input, 'BITRIX24_USER:3664'), /prior activation history/);
+    await db.syncSetting.update({ where: { id: 'global' }, data: { lastActiveAt: null } });
     const before = Date.now();
     const result = await Promise.allSettled([
       service.confirmFirstLaunch(input, 'BITRIX24_USER:3664'),
