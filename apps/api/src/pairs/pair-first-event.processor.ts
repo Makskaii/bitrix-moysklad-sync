@@ -236,6 +236,12 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       result = { status: 'unavailable', reason: 'PAIR_STORE_UNAVAILABLE' };
     }
 
+    if (result.status === 'unavailable' && result.reason === 'PAIR_CREATE_PENDING') {
+      await this.finish(event.id, 'RETRYABLE_FAILURE', 'PAIR_CREATE_PENDING', workerLease,
+        retryAtForFailure(new Error('PAIR_CREATE_PENDING'), event.attempts + 1));
+      return result;
+    }
+
     let partialDealOrderCreation = false;
     // A post-boundary, unpaired Bitrix deal is eligible to create exactly one
     // customer order. The operation is durable and provider-idempotent; all

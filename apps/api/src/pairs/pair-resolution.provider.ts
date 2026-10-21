@@ -62,6 +62,18 @@ export class PairResolutionProvider implements PairResolver {
       return manualReviewResult(input, review.id, 'PAIR_INACTIVE');
     }
 
+    // MS may deliver the automatic UPDATE immediately after CREATE. A faster
+    // UPDATE must not open a permanent review that prevents the authentic
+    // pending CREATE from establishing its durable operation and pair.
+    if (input.entityType === 'DEAL' && input.sourceSystem === 'MOYSKLAD' && input.eventType === 'UPDATE') {
+      const pendingCreate = await transaction.inboundEvent.findFirst({
+        where: { source: 'MOYSKLAD', externalEntityType: 'customerorder', externalEntityId: input.externalId,
+          eventType: 'CREATE', status: { in: ['RECEIVED', 'PROCESSING', 'RETRYABLE_FAILURE'] } },
+        select: { id: true },
+      });
+      if (pendingCreate) return { status: 'unavailable', reason: 'PAIR_CREATE_PENDING' };
+    }
+
     if (isEligibleFirstDealCreate(input)) return { status: 'unmatched', reason: 'NO_CANDIDATES' };
 
     const review = await transaction.pairReviewCase.create({

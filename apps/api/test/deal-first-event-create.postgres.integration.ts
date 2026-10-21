@@ -214,6 +214,29 @@ test('public eligible deal obeys the existing stage-preparer hold without creati
   assert.equal(createPosts, before);
 });
 
+test('public MS UPDATE waits for the already accepted CREATE instead of opening a blocking review', async () => {
+  const database = app.get(DatabaseService), id = randomUUID();
+  const create = await database.inboundEvent.create({ data: {
+    source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'customerorder', externalEntityId: id,
+    deliveryKey: `delayed-create-${randomUUID()}`, payload: {}, status: 'RETRYABLE_FAILURE', retryAfter: new Date(Date.now() + 86_400_000),
+  } });
+  createdEventIds.push(create.id);
+  const addsBefore = reverseAdds;
+  const response = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-first-create?requestId=${randomUUID()}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ events: [{
+      action: 'UPDATE', accountId: '11111111-1111-4111-8111-111111111111',
+      meta: { type: 'customerorder', href: `${providerBase}api/remap/1.2/entity/customerorder/${id}` },
+    }] }),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  const acknowledgement = await response.json() as { eventId: string };
+  const update = await waitForEvent(acknowledgement.eventId, 'RETRYABLE_FAILURE');
+  assert.equal(update.lastErrorCategory, 'PAIR_CREATE_PENDING');
+  assert.equal(await database.pairReviewCase.count({ where: { sourceSystem: 'MOYSKLAD', sourceEntityId: id } }), 0);
+  assert.equal(reverseAdds, addsBefore, 'an UPDATE itself must never create a new B24 deal');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: create.id } })).status, 'RETRYABLE_FAILURE');
+});
+
 async function postDealEvent(event: string, id: string): Promise<{ eventId: string }> {
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
