@@ -30,3 +30,17 @@ legacy `contacts-companies`. Both supported labels now resolve to CONTACT in
 field selection, transformations, CREATE fields, document dependencies and
 settings-revision projections. They never match COMPANY. Saving conflicting
 writes across the two aliases is rejected. Persisted configuration is not rewritten.
+
+## Live verification — 21 October, 18:42 Moscow time
+
+Actual primary `ae67e377091a784da2a4894f14f551f3a96c1182`, configv4, modeON.
+Existing owned contact227114 received a normal source email update, genuine
+eventSUCCEEDED2; native MS readback matched the SAME contactperson
+`63a3f849-cd64-11f1-0a80-17730087f34d`, owned parent and exact new email.
+
+Fresh owned contact227116 created exactly one nested native contactperson
+`e6ea64e2-cd65-11f1-0a80-1b480087b4f2`. Genuine ADD completedUNCHANGED1 with
+active pair; independent native GET verified name, email, account, parent and
+one exact email match. No target was manually created or pair seeded.
+Earlier held227106 remains untouched. Final alias/config/revision publicPG8/8
+and gateway14/14 passed after implementation; API build/test compilation passed.
