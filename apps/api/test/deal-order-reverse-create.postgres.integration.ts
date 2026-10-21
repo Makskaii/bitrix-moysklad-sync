@@ -114,6 +114,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(products[0].detailText, 'MS product description');
   assert.equal(products[0].measure, 9, 'Bitrix catalog product measure uses the catalog measure ID');
   assert.equal(products[0].xmlId, `MOYSKLAD_PRODUCT_${ids.product}`);
+  assert.equal((products[0].property108 as { value: string }).value, ids.product);
   assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '903');
   assert.equal(dealAdds, 1, 'deal is never duplicated');
   assert.equal(rowAdds, 3, 'ambiguous row response recovered by durable sort slots, no duplicate row is added');
@@ -332,7 +333,7 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
   await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
   await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
   dealAdds = 0; rowAdds = 0; productAdds = 0; items = []; rows = [];
-  const candidate = { id: 905, iblockId: 42, type: 1, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 9 };
+  const candidate = { id: 905, iblockId: 42, type: 1, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, property108: { value: ids.product }, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 9 };
   products = [candidate, { ...candidate, id: 906 }];
   orderPositions = [position('ambiguous-1', 1)];
   await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof ProductCatalogManualReviewError);
@@ -411,6 +412,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       code: { type: 'string', isReadOnly: false },
       detailText: { type: 'string', isReadOnly: false },
       measure: { type: 'integer', isReadOnly: false },
+      property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false },
     } } });
   }
   if (pathname === '/rest/catalog.product.add') {

@@ -15,7 +15,7 @@ User-approved scope: resolve an existing product when its Bitrix deal row is pro
 
 The path is called during initial deal/order preparation and existing-order position reconciliation/bootstrap. This is backend processing of the row selected through «Подбор товаров», not a new hook inside that third-party picker UI. No general ON, new callback subscription or primary migration is introduced.
 
-New MS→B24 catalog creation still owns its separate technical recovery `xmlId = MOYSKLAD_PRODUCT_<uuid>`. This change does not claim that creation automatically populates `property108`; that is separate from binding existing cards.
+New MS→B24 catalog creation retains its separate technical recovery `xmlId = MOYSKLAD_PRODUCT_<uuid>` and, with explicit user approval, now also writes `property108.value = <uuid>`. Live metadata confirmed a writable single string product property. Missing/readonly/multiple/wrong-type metadata fails closed before creation. Readback checks the value rather than property-value object identity. Generic configured create rules cannot override this identity. Previously completed or frozen legacy create operations are not retroactively rewritten.
 
 ## Verification after implementation (not TDD)
 

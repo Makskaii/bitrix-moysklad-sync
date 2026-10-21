@@ -45,7 +45,7 @@ export class ProductCatalogCreateService {
       throw new ProductCatalogManualReviewError('PRODUCT_CREATE_SOURCE_INVALID');
     }
     const xmlId = `MOYSKLAD_${kind.toUpperCase()}_${input.productId}`;
-    const fields: Row = { iblockId: Number(catalogId), active: 'Y', xmlId, name: input.product.name.trim() };
+    const fields: Row = { iblockId: Number(catalogId), active: 'Y', xmlId, property108: { value: input.productId }, name: input.product.name.trim() };
     if (input.bitrix24MeasureId !== undefined) fields.measure = input.bitrix24MeasureId;
     const defaultSectionId = productSettings?.bitrix24DefaultSectionId ?? runtime?.bitrix24DefaultProductSectionId;
     if (defaultSectionId) {
@@ -55,7 +55,7 @@ export class ProductCatalogCreateService {
     if (allowedFields.includes('code') && typeof input.product.code === 'string' && input.product.code.trim()) fields.code = input.product.code.trim();
     if (allowedFields.includes('description') && typeof input.product.description === 'string' && input.product.description.trim()) fields.detailText = input.product.description;
     for (const rule of configuredCatalogCreateRules(input.eventConfig.config.rules, input.product)) {
-      if (['name', 'iblockId', 'active', 'xmlId', 'measure', 'detailPicture', 'previewPicture', 'iblockSection', 'iblockSectionId'].includes(rule.bitrix24Field)) continue;
+      if (['name', 'iblockId', 'active', 'xmlId', 'property108', 'measure', 'detailPicture', 'previewPicture', 'iblockSection', 'iblockSectionId'].includes(rule.bitrix24Field)) continue;
       fields[rule.bitrix24Field] = rule.value;
     }
     await assertCatalogCreateFieldsWritable(catalogId, kind, fields);
@@ -239,7 +239,9 @@ async function bitrixCall(method: string, params: Row): Promise<unknown> {
 function readbackMatches(actual: Row, expected: Row, kind: 'product' | 'service'): boolean {
   if (!numericId(actual.id) || String(actual.iblockId) !== String(expected.iblockId)) return false;
   if (Number(actual.type) !== (kind === 'service' ? 7 : 1)) return false;
-  return Object.entries(expected).every(([key, value]) => key === 'iblockId' ? String(actual[key]) === String(value) : actual[key] === value);
+  return Object.entries(expected).every(([key, value]) => key === 'iblockId' ? String(actual[key]) === String(value)
+    : key === 'property108' ? (isRecord(actual[key]) ? actual[key].value : actual[key]) === value.value
+    : actual[key] === value);
 }
 function configuredCatalogCreateRules(value: unknown, product: Row): Array<{ bitrix24Field: string; value: string | number | boolean }> {
   if (!Array.isArray(value)) return [];
@@ -265,6 +267,13 @@ async function assertCatalogCreateFieldsWritable(catalogId: string, kind: 'produ
     if (['iblockId', 'active', 'xmlId'].includes(key)) continue;
     const definition = definitions[key];
     const fieldValue = fields[key];
+    if (key === 'property108') {
+      if (!isRecord(definition) || definition.isReadOnly !== false || definition.isMultiple !== false || definition.type !== 'productproperty' || definition.propertyType !== 'S' ||
+          !isRecord(fieldValue) || typeof fieldValue.value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(fieldValue.value)) {
+        throw new ProductCatalogManualReviewError('PRODUCT_CREATE_UUID_FIELD_NOT_CONFIRMED_WRITABLE');
+      }
+      continue;
+    }
     if (neverWrite.has(key) || !isRecord(definition) || definition.isReadOnly !== false || !['string', 'char', 'integer', 'double', 'datetime'].includes(String(definition.type)) || !compatibleCreateScalar(String(definition.type), fieldValue)) {
       throw new ProductCatalogManualReviewError('PRODUCT_CREATE_FIELD_NOT_CONFIRMED_WRITABLE');
     }

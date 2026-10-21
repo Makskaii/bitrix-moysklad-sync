@@ -126,6 +126,7 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
     assert.equal(operation.status, 'SUCCEEDED');
     assert.equal(operation.bitrix24ProductId, pair.bitrix24Id);
     assert.equal(createdCards.get(pair.bitrix24Id)?.xmlId, `MOYSKLAD_${kind.toUpperCase()}_${id}`);
+    assert.equal((createdCards.get(pair.bitrix24Id)?.property108 as { value: string }).value, id);
 
     const addsBeforeRepeat = requests.filter(({ path }) => isCreatePath(path, kind)).length;
     const repeated = await sendCreate(kind, id, `post-boundary-${kind}-2`);
@@ -433,6 +434,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (method.endsWith('catalog.product.getFieldsByFilter') || method.endsWith('catalog.product.service.getFieldsByFilter')) {
     const kind = method.includes('.service.') ? 'service' : 'product';
     const definitions = Object.fromEntries(['name', 'code', 'detailText'].map((key) => [key, { type: 'string', isReadOnly: false }]));
+    Object.assign(definitions, { property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } });
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind]: definitions } })); return;
   }
   if (method.endsWith('catalog.product.list') || method.endsWith('catalog.product.service.list')) {
