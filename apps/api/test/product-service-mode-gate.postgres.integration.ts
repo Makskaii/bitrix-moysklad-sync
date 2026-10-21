@@ -12,8 +12,8 @@ function assertIsolatedTarget(value: string, enabled: string | undefined) {
   assert.equal(enabled, '1', 'PRODUCT_MODE_GATE_TEST_ISOLATED=1 is required');
   const url = new URL(value);
   assert.ok(['localhost', '127.0.0.1', '::1'].includes(url.hostname), 'test DB must use loopback');
-  assert.equal(url.pathname, '/sync_issue79_mode_gate_codex_test', 'test must use its dedicated database');
-  assert.equal(url.searchParams.get('schema'), 'issue79_mode_gate_codex', 'test must use its dedicated schema');
+  assert.equal(url.pathname, '/sync_issue79_mode_gate_validation_test', 'test must use its dedicated database');
+  assert.equal(url.searchParams.get('schema'), 'issue79_mode_gate_validation', 'test must use its dedicated schema');
 }
 
 test('product bootstrap and worker preserve pending queue in OFF/PAUSE and process in ON', { skip: !databaseUrl }, async () => {

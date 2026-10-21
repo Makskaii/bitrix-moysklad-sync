@@ -30,9 +30,9 @@ const oldEnv = new Map<string, string | undefined>();
 function assertIsolatedTarget(value: string) {
   const target = new URL(value);
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_codex_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
   const schema = target.searchParams.get('schema') ?? '';
-  assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_codex_test' && schema === 'issue79_date_codex', 'requires a dedicated fresh test schema');
+  assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_validation_test' && schema === 'issue79_date_validation', 'requires a dedicated fresh test schema');
 }
 
 before(async () => {
@@ -88,8 +88,8 @@ after(async () => {
 
 test('product-create event harness accepts only its dedicated loopback databases and fresh schemas', () => {
   assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'));
-  assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_codex_test?schema=issue79_date_codex'));
-  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_codex_test?schema=public'), /dedicated fresh test schema/);
+  assert.doesNotThrow(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_validation_test?schema=issue79_date_validation'));
+  assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_date_validation_test?schema=public'), /dedicated fresh test schema/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/production?schema=issue61_create_event_issue79'), /allowlisted disposable database/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@example.invalid:58341/sync_issue79_integration_create_event_test?schema=issue61_create_event_issue79'), /non-local/);
   assert.throws(() => assertIsolatedTarget('postgresql://x@127.0.0.1:58341/sync_issue79_integration_create_event_test?schema=public'), /dedicated fresh test schema/);

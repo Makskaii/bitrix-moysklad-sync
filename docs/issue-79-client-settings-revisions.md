@@ -1,9 +1,0 @@
-# Issue #79 client settings revisions
-
-Existing company and contact pairs now advance their field mapping baseline when an event is pinned to a newer settings version. The revision is serialized by the existing pair-scoped client lease and stored in the generic `EntityPairSettingsRevision` table.
-
-The processor compares semantic scalar rules, field groups, and explicit child-resource bindings. Unchanged mappings keep their previous comparison values, newly added or materially changed mappings are initialized from MySklad, and removed mappings leave the active projection without writing a clear. Scalar and group writes are read back from Bitrix before the baseline and sync state advance. Child mappings use the existing requisite/bank-detail adapter with the explicitly configured parent and child IDs; changed/new child fields are initialized MySklad-to-Bitrix and verified by exact child readback. Unchanged child fields are not rewritten, and removed bindings never clear or delete child records. A critical mapping that cannot be reversed from MySklad is held for review instead of being guessed.
-
-Events retain their accepted settings version. An older event is skipped after the pair advances, and a prepared newer revision also fences older events while a retry is pending. A failed readback leaves the revision prepared and the previous baseline intact; a later event can finish the revision idempotently after verifying current external values.
-
-The PostgreSQL APPLY acceptance test exercises the admin settings HTTP endpoint, Bitrix webhook HTTP intake, and loopback Bitrix/MySklad APIs. It covers scalar/reference/group additions, child-only requisite mapping changes, contact pairs with a company parent, removal without clearing, stale pinned events, and retry after an external write whose readback fails.
