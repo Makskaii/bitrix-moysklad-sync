@@ -528,19 +528,25 @@ async function b24(method: string, params: Row, gate: ProviderGate = requestJson
   return gate(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(params) }).then((response) => {
     if (!isRecord(response) || response.error) throw new Error(`Bitrix24 ${method} failed`);
     const result = response.result;
-    if (isRecord(result) && typeof response.total === 'number' && result.total === undefined) return { ...result, total: response.total };
+    if (isRecord(result)) return {
+      ...result,
+      ...(typeof response.total === 'number' && result.total === undefined ? { total: response.total } : {}),
+      ...(typeof response.next === 'number' && result.next === undefined ? { next: response.next } : {}),
+    };
     return result;
   });
 }
 async function b24AllRows(dealId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const result: Row[] = [];
   for (let start = 0; start < 10_000;) {
-    const value = await b24('crm.item.productrow.list', { filter: { ownerId: Number(dealId), ownerType: 'D' }, select: ['*'], start }, gate);
-    const rows = isRecord(value) && Array.isArray(value.productRows) ? value.productRows.filter(isRecord) : null;
-    if (!rows) throw new Error('Bitrix24 product-row readback is invalid');
+    const value = await b24('crm.item.productrow.list', { filter: { '=ownerId': Number(dealId), '=ownerType': 'D' }, start }, gate);
+    const rows = isRecord(value) && Array.isArray(value.productRows) ? value.productRows : null;
+    if (!rows || rows.some((row) => !isRecord(row) || !readNumericId(row.id) || String(row.ownerId) !== dealId || row.ownerType !== 'D')) throw new Error('Bitrix24 product-row readback is invalid');
+    if (rows.some((row) => result.some((prior) => String(prior.id) === String(row.id))) || new Set(rows.map((row) => String(row.id))).size !== rows.length) throw new Error('Bitrix24 product-row identities are duplicated');
     result.push(...rows);
     const next = isRecord(value) ? value.next : undefined;
     if (typeof next !== 'number') return result;
+    if (!Number.isSafeInteger(next) || next <= start || !rows.length) throw new Error('Bitrix24 product-row pagination is invalid');
     start = next;
   }
   throw new Error('Bitrix24 returned too many product rows');
@@ -604,7 +610,8 @@ function isRecord(value: unknown): value is Record<string, any> { return typeof 
 function readId(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value : null; }
 function readNumericId(value: unknown): string | null { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^\d{1,20}$/.test(value)) ? String(value) : null; }
 function isUniqueViolation(error: unknown): boolean { return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'; }
-function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+// MySklad native identifiers use UUID-shaped hex groups without RFC variant/version restrictions.
+function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value); }
 function parseBitrixCreatedAt(value: unknown): Date | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   const date = new Date(value);

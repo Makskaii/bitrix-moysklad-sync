@@ -14,11 +14,11 @@ const db = new PrismaClient();
 const database = new DatabaseService();
 const portMarker = 'issue54_reverse_test';
 const ids = {
-  order: '11111111-1111-4111-8111-111111111111',
-  company: '22222222-2222-4222-8222-222222222222',
-  product: '33333333-3333-4333-8333-333333333333',
+  order: '11111111-1111-11f1-0a80-111111111111',
+  company: '22222222-2222-11f1-0a80-222222222222',
+  product: '33333333-3333-11f1-0a80-333333333333',
   state: '44444444-4444-4444-8444-444444444444',
-  currency: '55555555-5555-4555-8555-555555555555',
+  currency: '55555555-5555-11e2-4ba4-555555555555',
   unit: '66666666-6666-4666-8666-666666666666',
   preparationState: '77777777-7777-4777-8777-777777777777',
   unmappedState: '88888888-8888-4888-8888-888888888888',
@@ -455,8 +455,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (pathname === '/rest/crm.item.get') return send(response, { result: { item: items.find((item) => String(item.id) === String(body.id)) } });
   if (pathname === '/rest/crm.item.productrow.list') {
+    if (!body.filter?.['=ownerType'] || !body.filter?.['=ownerId']) {
+      response.writeHead(400); response.end(JSON.stringify({ error: 'REQUIRED_ARG_MISSING' })); return;
+    }
+    assert.equal(body.filter['=ownerType'], 'D');
+    assert.equal(body.select, undefined);
     const start = Number(body.start ?? 0);
-    return send(response, { result: { productRows: rows.slice(start, start + 50) } });
+    const owned = rows.filter((row) => Number(row.ownerId) === Number(body.filter['=ownerId']));
+    return send(response, { result: { productRows: owned.slice(start, start + 50) }, total: owned.length, ...(start + 50 < owned.length ? { next: start + 50 } : {}) });
   }
   if (pathname === '/rest/crm.item.productrow.add') {
     rowAdds++;
