@@ -146,7 +146,7 @@ test('configured fallback policy never makes an invalid configured currency safe
   assert.ok(report.blockers.some((item) => item.code === 'CURRENCY_MAPPING_UNCONFIRMED' && item.referenceId === 'ms-usd'));
 });
 
-test('missing fallback policy retains strict reverse catalog validation', () => {
+test('missing fallback policy preserves deployed selected-scope readiness without inventing record mappings', () => {
   const result = evaluateEnablePreflight({
     entityKey: 'deals-orders', direction: 'moyskladToBitrix24', settings: {
       version: 9, config: {
@@ -164,8 +164,8 @@ test('missing fallback policy retains strict reverse catalog validation', () => 
     }, apiAccess: true, webhookAuthConfigured: true,
     applicableStages: ['ms-preparation', 'unused-ms-stage'], applicableCurrencies: ['ms-rub'],
   });
-  assert.equal(result.canEnable, false);
-  assert.ok(result.blockers.some((item) => item.code === 'STAGE_MAPPING_UNCONFIRMED' && item.referenceId === 'unused-ms-stage'));
+  assert.equal(result.canEnable, true);
+  assert.ok(result.warnings.some((item) => item.code === 'UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED'));
 });
 
 test('confirmed defaults allow unused forward stage catalog entries but retain a confirmed PREPARATION create stage', () => {
