@@ -14,7 +14,7 @@ import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
-import { providerResponseFailure } from '../provider-failure';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -617,7 +617,13 @@ async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
   if (!response.ok) {
     const msBase = configuredBase('MOYSKLAD_API_BASE_URL');
     const provider = url.origin === msBase.origin && url.pathname.startsWith(msBase.pathname.replace(/\/?$/, '/')) ? 'MOYSKLAD' : 'BITRIX24';
-    const failure = providerResponseFailure(provider, response.status, response.headers.get('retry-after'));
+    let failure = providerResponseFailure(provider, response.status, response.headers.get('retry-after'));
+    const nativeRetry = response.headers.get('x-lognex-retry-after');
+    if (provider === 'MOYSKLAD' && response.status === 429 && nativeRetry && /^\d+$/.test(nativeRetry) && Number.isSafeInteger(Number(nativeRetry))) {
+      // MySklad's native header is a duration in milliseconds, not seconds.
+      const nativeAt = new Date(Date.now() + Math.min(Number(nativeRetry), 60 * 60_000));
+      if (!failure.retryAfterAt || nativeAt > failure.retryAfterAt) failure = new ProviderFailure(provider, response.status, nativeAt);
+    }
     // Retain the existing credential-free message while preserving Retry-After
     // for the durable event scheduler rather than retrying into a rate limit.
     failure.message = `Provider request failed (${response.status})`;

@@ -53,6 +53,7 @@ let renameNextCreatedDeal = false;
 let nativeTitleUpdates = 0;
 let loseNextTitleUpdateResponse = false;
 let nextRateLimitProvider: 'MOYSKLAD' | 'BITRIX24' | null = null;
+let nextRateLimitHeaders: Record<string, string> = {};
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -351,14 +352,21 @@ test('a portal-generated title is restored once to the native MS order name befo
 test('reverse creation carries native provider Retry-After into durable scheduling without a duplicate write', async () => {
   const previousPositions = orderPositions;
   try {
-    for (const provider of ['MOYSKLAD', 'BITRIX24'] as const) {
+    const scenarios: Array<{ provider: 'MOYSKLAD' | 'BITRIX24'; headers: Record<string, string> }> = [
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': '30000' } },
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': 'invalid', 'Retry-After': '30' } },
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': '30000', 'Retry-After': '5' } },
+      { provider: 'BITRIX24', headers: { 'X-Lognex-Retry-After': '3600000', 'Retry-After': '30' } },
+    ];
+    for (const { provider, headers } of scenarios) {
       const orderId = randomUUID(); activeOrderId = orderId; orderPositions = []; items = []; rows = [];
-      nextRateLimitProvider = provider; dealAdds = 0;
+      nextRateLimitProvider = provider; nextRateLimitHeaders = headers; dealAdds = 0;
       const before = Date.now();
       const error = await service.createAndPair({ moyskladOrderId: orderId, eventId: `rate-limit-${suffix}`, eventConfig: config() }).then(() => null, error => error);
       assert.ok(error instanceof ProviderFailure);
       assert.equal(error.provider, provider); assert.equal(error.status, 429);
       assert.ok(error.retryAfterAt && error.retryAfterAt.getTime() >= before + 29_000);
+      assert.ok(error.retryAfterAt.getTime() < before + 31_000, 'native milliseconds are not interpreted as seconds or accepted for Bitrix');
       assert.equal(retryAtForFailure(error, 1), error.retryAfterAt);
       assert.equal(dealAdds, 0);
       assert.equal((await db.dealOrderReverseCreateOperation.findUnique({ where: { moyskladOrderId: orderId } }))?.bitrix24DealId ?? null, null);
@@ -506,7 +514,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if ((nextRateLimitProvider === 'MOYSKLAD' && pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) ||
       (nextRateLimitProvider === 'BITRIX24' && pathname === '/rest/crm.item.list')) {
     nextRateLimitProvider = null;
-    response.writeHead(429, { 'Retry-After': '30', 'content-type': 'application/json' }); response.end(JSON.stringify({ error: 'RATE_LIMIT' })); return;
+    response.writeHead(429, { ...nextRateLimitHeaders, 'content-type': 'application/json' }); response.end(JSON.stringify({ error: 'RATE_LIMIT' })); return;
   }
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(pathname) && body.useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
