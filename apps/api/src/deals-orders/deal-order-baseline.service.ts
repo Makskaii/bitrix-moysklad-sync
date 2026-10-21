@@ -9,6 +9,7 @@ import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provi
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { DealOrderFieldRuntimeService, RevisionMappingResult } from './deal-order-field-runtime.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
+import { bitrixDocumentTotal, moyskladDocumentTotal } from './document-total-snapshot';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
@@ -210,10 +211,10 @@ function projectApprovedValues(config: VersionedFieldSettingsDto['config'], reco
   const values: Record<string, unknown> = {};
   if (system === 'bitrix24') {
     values['client:companyId'] = approvedValue(record.COMPANY_ID);
-    values['deal-order-total'] = { amount: approvedValue(record.OPPORTUNITY), currencyCode: approvedValue(record.CURRENCY_ID) };
+    values['deal-order-total'] = bitrixDocumentTotal(record);
   } else {
     values['client:agentId'] = approvedValue(agentId(record.agent));
-    values['deal-order-total'] = { amount: approvedValue(record.sum), currencyCode: approvedValue(orderCurrencyCode(record)) };
+    values['deal-order-total'] = moyskladDocumentTotal(record, config);
   }
   const rules = Array.isArray(config.rules) ? config.rules : [];
   for (const rule of rules) {
@@ -230,11 +231,6 @@ function projectApprovedValues(config: VersionedFieldSettingsDto['config'], reco
     else if (system === targetSide) values[`group:${group.id}:target`] = approvedValue(record[group.targetField]);
   }
   return values;
-}
-
-function orderCurrencyCode(record: Record<string, unknown>): unknown {
-  const currency = isRecord(record.currency) ? record.currency : isRecord(record.rate) && isRecord(record.rate.currency) ? record.rate.currency : null;
-  return currency?.isoCode ?? currency?.code ?? null;
 }
 
 function approvedValue(value: unknown): unknown {

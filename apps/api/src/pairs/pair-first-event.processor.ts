@@ -20,6 +20,7 @@ import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-posi
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../deals-orders/deal-order-reverse-create.service';
 import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-total-reconciliation';
+import { bitrixDocumentTotal, moyskladDocumentTotal, DOCUMENT_TOTAL_UNIT } from '../deals-orders/document-total-snapshot';
 import { withDealOrderPairLock } from '../deals-orders/deal-order-pair-lock';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { assertApplyExternalWrite } from '../external-write-guard';
@@ -447,6 +448,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       const stateMs = jsonRecord(syncState?.moyskladValues)['deal-order-total'];
       const stateB24Total = totalValue(stateB24); const stateMsTotal = totalValue(stateMs);
       const baselineB24Total = totalValue(baselineB24); const baselineMsTotal = totalValue(baselineMs);
+      if (!baselineB24Total || !baselineMsTotal) return { status: 'MANUAL_REVIEW' as const, reason: 'DEAL_ORDER_TOTAL_LEGACY_BASELINE_REVIEW_REQUIRED' };
       const prior = stateB24Total && stateMsTotal ? { settingsVersion: syncState!.settingsVersion, bitrix24: stateB24Total, moysklad: stateMsTotal }
         : baselineB24Total && baselineMsTotal ? { settingsVersion: baseline.settingsVersion, bitrix24: baselineB24Total, moysklad: baselineMsTotal } : null;
       const readCurrent = async () => {
@@ -456,8 +458,8 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           this.documentReader!.readMoySkladCustomerOrderForBaseline(input.pair.moyskladId),
         ]);
         return {
-          bitrix24: { amount: b24.OPPORTUNITY, currencyCode: b24.CURRENCY_ID },
-          moysklad: { amount: ms.sum, currencyCode: currencyCodeFromOrder(ms) },
+          bitrix24: bitrixDocumentTotal(b24),
+          moysklad: moyskladDocumentTotal(ms, input.eventConfig.config),
         };
       };
       const initial = await readCurrent();
@@ -490,10 +492,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             const saved = await lease.commit(async (transaction) => {
               const existing = await transaction.entityPairSyncState.findUnique({ where: { pairId: input.pair.id } });
               await transaction.entityPairSyncState.upsert({ where: { pairId: input.pair.id },
-                create: { pairId: input.pair.id, settingsVersion: state.settingsVersion, bitrix24Values: { 'deal-order-total': state.bitrix24 } as Prisma.InputJsonValue, moyskladValues: { 'deal-order-total': state.moysklad } as Prisma.InputJsonValue },
+                create: { pairId: input.pair.id, settingsVersion: state.settingsVersion, bitrix24Values: { 'deal-order-total': { ...state.bitrix24, amountUnit: DOCUMENT_TOTAL_UNIT } } as Prisma.InputJsonValue, moyskladValues: { 'deal-order-total': { ...state.moysklad, amountUnit: DOCUMENT_TOTAL_UNIT } } as Prisma.InputJsonValue },
                 update: { settingsVersion: state.settingsVersion,
-                  bitrix24Values: { ...jsonRecord(existing?.bitrix24Values), 'deal-order-total': state.bitrix24 } as Prisma.InputJsonValue,
-                  moyskladValues: { ...jsonRecord(existing?.moyskladValues), 'deal-order-total': state.moysklad } as Prisma.InputJsonValue } });
+                  bitrix24Values: { ...jsonRecord(existing?.bitrix24Values), 'deal-order-total': { ...state.bitrix24, amountUnit: DOCUMENT_TOTAL_UNIT } } as Prisma.InputJsonValue,
+                  moyskladValues: { ...jsonRecord(existing?.moyskladValues), 'deal-order-total': { ...state.moysklad, amountUnit: DOCUMENT_TOTAL_UNIT } } as Prisma.InputJsonValue } });
             });
             if (!saved.committed) throw new Error('DEAL_ORDER_TOTAL_PAIR_LOCK_LOST');
           },
@@ -693,7 +695,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function jsonRecord(value: unknown): Record<string, unknown> { return isRecord(value) ? value : {}; }
 function totalValue(value: unknown): { amount: unknown; currencyCode: unknown } | null {
-  return isRecord(value) && 'amount' in value && 'currencyCode' in value ? { amount: value.amount, currencyCode: value.currencyCode } : null;
+  return isRecord(value) && value.amountUnit === DOCUMENT_TOTAL_UNIT && 'amount' in value && 'currencyCode' in value ? { amount: value.amount, currencyCode: value.currencyCode } : null;
 }
 function withSlash(url: URL): string { return url.href.endsWith('/') ? url.href : `${url.href}/`; }
 function providerBase(value?: string): URL | null {
@@ -702,11 +704,6 @@ function providerBase(value?: string): URL | null {
     return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password && !url.hash ? url : null;
   } catch { return null; }
 }
-function currencyCodeFromOrder(order: Record<string, unknown>): unknown {
-  const currency = isRecord(order.currency) ? order.currency : isRecord(order.rate) && isRecord(order.rate.currency) ? order.rate.currency : null;
-  return currency?.isoCode ?? currency?.code ?? order.currencyCode ?? null;
-}
-
 async function assertWorkerFenceInTransaction(
   workerLease: EventWorkerLeaseContext | undefined,
   transaction: Parameters<NonNullable<EventWorkerLeaseContext['assertOwnedIn']>>[0],
