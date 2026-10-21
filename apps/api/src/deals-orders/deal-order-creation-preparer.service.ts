@@ -68,6 +68,20 @@ export class DealOrderCreationPreparer {
     }
 
     if (String(deal.ID ?? '') !== input.bitrix24DealId) return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
+    if (readString(deal.ORIGINATOR_ID) === 'MOYSKLAD') {
+      const sourceOrderId = readString(deal.ORIGIN_ID);
+      if (!isUuid(sourceOrderId)) return { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_INVALID' };
+      const reverse = await this.database.dealOrderReverseCreateOperation.findUnique({
+        where: { moyskladOrderId: sourceOrderId }, select: { bitrix24DealId: true, status: true },
+      });
+      if (!reverse || !['WAITING', 'PENDING', 'SUCCEEDED', 'PARTIAL'].includes(reverse.status) ||
+          (reverse.bitrix24DealId && reverse.bitrix24DealId !== input.bitrix24DealId)) {
+        return { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' };
+      }
+      // Provider callbacks can arrive before the CREATE acknowledgement and
+      // pair commit. Never send an imported deal back as another MS order.
+      return { status: 'WAITING', reason: 'REVERSE_DEAL_CREATE_PENDING' };
+    }
     const stageId = readString(deal.STAGE_ID);
     const stage = references.stages.find((candidate) => candidate.bitrix24StageId === stageId);
     if (!stage) return { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' };

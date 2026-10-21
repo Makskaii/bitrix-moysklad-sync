@@ -119,7 +119,7 @@ export class DealOrderReverseCreateService {
     try {
       const dealId = operation.bitrix24DealId ?? await this.createOrRecoverDeal(prepared, leaseToken, input.assertWorkerLease);
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('BITRIX24', dealId);
-      const verified = await this.verifyDeal(dealId, prepared);
+      const verified = await this.verifyDeal(dealId, prepared, leaseToken, input.assertWorkerLease);
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         const createdAt = parseBitrixCreatedAt(verified.createdTime ?? verified.DATE_CREATE);
         if (!createdAt) throw new DealOrderReverseManualReviewError('Controlled target creation timestamp is unavailable');
@@ -325,7 +325,7 @@ export class DealOrderReverseCreateService {
       });
     }
     const dealFields: Row = {
-      title: `Заказ покупателя ${order.name}`,
+      title: order.name,
       categoryId: categoryFromStage(stage.bitrix24StageId),
       stageId: stage.bitrix24StageId,
       currencyId: currency.bitrix24Code,
@@ -368,10 +368,29 @@ export class DealOrderReverseCreateService {
     return creator.createOrRecover(input);
   }
 
-  private async verifyDeal(dealId: string, prepared: Prepared): Promise<Row> {
-    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: 'Y' }, this.providerGate);
-    const item = isRecord(result) && isRecord(result.item) ? result.item : null;
-    if (!item || String(item.id) !== dealId || item.title !== prepared.fields.title || item.originatorId !== 'MOYSKLAD' || item.originId !== prepared.orderId || String(item.UF_CRM_1729757435964 ?? '') !== String(prepared.sourceSnapshot.name)) {
+  private async verifyDeal(dealId: string, prepared: Prepared, leaseToken: string, assertWorkerLease?: () => Promise<void>): Promise<Row> {
+    const read = async () => {
+      const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: 'Y' }, this.providerGate);
+      return isRecord(result) && isRecord(result.item) ? result.item : null;
+    };
+    const hasExactIdentity = (item: Row | null): item is Row => !!item && String(item.id) === dealId &&
+      item.originatorId === 'MOYSKLAD' && item.originId === prepared.orderId &&
+      String(item.UF_CRM_1729757435964 ?? '') === String(prepared.sourceSnapshot.name);
+    let item = await read();
+    if (!hasExactIdentity(item)) {
+      throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
+    }
+    if (item.title !== prepared.fields.title) {
+      // User-approved source-authoritative title after portal creation rules.
+      // This is bounded to the exact journal-owned new deal, never a bulk rename.
+      await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => {
+        await assertWorkerLease?.();
+        await this.assertOperationLease(prepared.orderId, leaseToken);
+        return true;
+      }, undefined, () => b24('crm.item.update', { entityTypeId: 2, id: Number(dealId), fields: { title: prepared.fields.title }, useOriginalUfNames: 'Y' }, this.providerGate));
+      item = await read();
+    }
+    if (!hasExactIdentity(item) || item.title !== prepared.fields.title) {
       throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
     }
     return item;

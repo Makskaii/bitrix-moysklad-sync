@@ -258,9 +258,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
           const inactiveStage = prepared.reason === 'STAGE_NOT_READY';
           const unconfiguredStage = prepared.reason === 'STAGE_NOT_CONFIGURED';
-          await this.finish(event.id, inactiveStage ? 'SUCCEEDED' : unconfiguredStage ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
+          const invalidOrigin = ['REVERSE_DEAL_ORIGIN_INVALID', 'REVERSE_DEAL_ORIGIN_UNRESOLVED'].includes(prepared.reason);
+          await this.finish(event.id, inactiveStage ? 'SUCCEEDED' : unconfiguredStage || invalidOrigin ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
             inactiveStage ? 'DEAL_ORDER_STAGE_NOT_ENABLED' : prepared.reason, workerLease,
-            inactiveStage || unconfiguredStage ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
+            inactiveStage || unconfiguredStage || invalidOrigin ? null : retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
           return null;
         }
         if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {

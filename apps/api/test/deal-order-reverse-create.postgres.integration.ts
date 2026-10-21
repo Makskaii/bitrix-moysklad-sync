@@ -48,6 +48,9 @@ let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
 let expectedClientWorkerLease: { assertOwned(): Promise<void> } | null = null;
 let clientWorkerLeaseChecks = 0;
+let renameNextCreatedDeal = false;
+let nativeTitleUpdates = 0;
+let loseNextTitleUpdateResponse = false;
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -133,7 +136,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(dealAdds, 1, 'deal is never duplicated');
   assert.equal(rowAdds, 3, 'ambiguous row response recovered by durable sort slots, no duplicate row is added');
   assert.equal(rows.length, 3, 'invalid source position is omitted without dropping valid rows');
-  assert.equal(items[0].title, 'Заказ покупателя SO-54');
+  assert.equal(items[0].title, 'SO-54');
   assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
   assert.equal(items[0].originId, ids.order);
   assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 111.11, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
@@ -316,6 +319,33 @@ test('an existing product pair is preserved when the MySklad product name change
   }
 });
 
+test('a portal-generated title is restored once to the native MS order name before pairing', async () => {
+  const previousPositions = orderPositions;
+  const orderId = randomUUID(); activeOrderId = orderId; orderPositions = []; items = []; rows = [];
+  renameNextCreatedDeal = true; nativeTitleUpdates = 0; dealAdds = 0; loseNextTitleUpdateResponse = true;
+  try {
+    const input = { moyskladOrderId: orderId, eventId: `title-${suffix}`, eventConfig: config() };
+    await assert.rejects(service.createAndPair(input), /Provider request failed/);
+    const pending = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: orderId } });
+    assert.equal(pending.status, 'PENDING');
+    assert.ok(pending.bitrix24DealId, 'target ID stays durable after title-update response loss');
+    const result = await service.createAndPair(input);
+    assert.equal(result.status, 'CREATED');
+    assert.equal(items[0].title, 'SO-54');
+    assert.equal(items[0].originId, orderId);
+    assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
+    assert.equal(nativeTitleUpdates, 1);
+    assert.equal(dealAdds, 1);
+    await service.createAndPair({ moyskladOrderId: orderId, eventId: `title-repeat-${suffix}`, eventConfig: config() });
+    assert.equal(nativeTitleUpdates, 1, 'completed repeats do not rename again');
+    assert.equal(dealAdds, 1);
+  } finally {
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    renameNextCreatedDeal = false; loseNextTitleUpdateResponse = false; activeOrderId = ids.order; orderPositions = previousPositions;
+  }
+});
+
 test('missing pinned numbering/runtime references are held for review before any provider write', async () => {
   dealAdds = 0; rowAdds = 0;
   const orderId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -466,11 +496,23 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (pathname === '/rest/crm.item.list') return send(response, { result: { items: items.filter((item) => item.originatorId === body.filter?.originatorId && item.originId === body.filter?.originId) } });
   if (pathname === '/rest/crm.item.add') {
     dealAdds++;
-    const item = { ...body.fields, id: nextDealId++ };
+    const item = { ...body.fields, id: nextDealId++, ...(renameNextCreatedDeal ? { title: 'Synthetic portal-generated company/date title' } : {}) };
+    renameNextCreatedDeal = false;
     items.push(item);
     return send(response, { result: { item } });
   }
   if (pathname === '/rest/crm.item.get') return send(response, { result: { item: items.find((item) => String(item.id) === String(body.id)) } });
+  if (pathname === '/rest/crm.item.update') {
+    assert.equal(body.useOriginalUfNames, 'Y');
+    assert.deepEqual(Object.keys(body.fields), ['title']);
+    const item = items.find(item => String(item.id) === String(body.id));
+    assert.ok(item); Object.assign(item, body.fields); nativeTitleUpdates++;
+    if (loseNextTitleUpdateResponse) {
+      loseNextTitleUpdateResponse = false;
+      response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic title-update response lost after success' })); return;
+    }
+    return send(response, { result: { item } });
+  }
   if (pathname === '/rest/crm.item.productrow.list') {
     if (!body.filter?.['=ownerType'] || !body.filter?.['=ownerId']) {
       response.writeHead(400); response.end(JSON.stringify({ error: 'REQUIRED_ARG_MISSING' })); return;

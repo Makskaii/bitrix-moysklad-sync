@@ -253,6 +253,39 @@ test('confirmed defaults preserve custom forward stages and revalidate the selec
   }
 });
 
+test('actual preparer never sends a journal-owned imported deal back as another MS order before pairing', async () => {
+  const sourceOrder = randomUUID();
+  headerContractDealId = `9038${Date.now()}`;
+  headerContractRequests = [];
+  headerContractOverrides = { ORIGINATOR_ID: 'MOYSKLAD', ORIGIN_ID: sourceOrder };
+  let dependenciesCalled = 0;
+  const preparer = new DealOrderCreationPreparer(database, { async resolveForDocument() { dependenciesCalled++; throw new Error('ECHO_MUST_STOP_BEFORE_DEPENDENCIES'); } } as never);
+  const settings: any = { version: 1, config: { schemaVersion: 1, rules: [], groups: [], references: { units: [], priceTypes: [], dictionaries: [] }, dealOrderRuntime: {
+    nativeOrderNumberingVerified: true, defaultOrganizationId: ids.organization, defaultStoreId: ids.store, defaultEmployeeId: ids.employee,
+    currencies: [{ bitrix24Code: 'RUB', moyskladId: ids.currency }], stages: [{ bitrix24StageId: 'NEW', moyskladId: ids.state, creationEnabled: true }], organizations: [], stores: [], employees: [],
+  } } };
+  const priorPosts = posts;
+  await db.dealOrderReverseCreateOperation.create({ data: { moyskladOrderId: sourceOrder, syncId: randomUUID(), eventId: `reverse-echo-${suffix}`, payload: {}, settingsVersion: 1, status: 'PENDING' } });
+  try {
+    for (const targetId of [null, headerContractDealId]) {
+      await db.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: sourceOrder }, data: { bitrix24DealId: targetId } });
+      assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_CREATE_PENDING' });
+    }
+    await db.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: sourceOrder }, data: { bitrix24DealId: '999' } });
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' });
+    headerContractOverrides.ORIGIN_ID = 'invalid-id';
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_INVALID' });
+    headerContractOverrides.ORIGIN_ID = randomUUID();
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' });
+    assert.equal(dependenciesCalled, 0);
+    assert.equal(posts, priorPosts);
+    assert.equal(headerContractRequests.some(row => row.path.includes('/api/remap/')), false);
+  } finally {
+    await db.dealOrderReverseCreateOperation.delete({ where: { moyskladOrderId: sourceOrder } });
+    headerContractDealId = null; headerContractOverrides = {}; headerContractRequests = [];
+  }
+});
+
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
   posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
   activeOrderId = ids.order;

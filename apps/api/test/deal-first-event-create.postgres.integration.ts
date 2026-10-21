@@ -45,6 +45,8 @@ const sourceCreatedAt = new Map<string, Date>();
 const reverseOrderId = randomUUID();
 let reverseItem: Record<string, unknown> | null = null;
 let reverseAdds = 0;
+const echoDealId = `84${Date.now()}`;
+const echoOrderId = randomUUID();
 
 const fieldSettingsFake = {
   saveAcceptedEvent: async (input: {
@@ -58,9 +60,9 @@ const fieldSettingsFake = {
   }, select: { id: true } }),
   eventConfig: async (id: string) => {
     const event=await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({where:{id}});
-    return event.source==='MOYSKLAD' ? { version:1, createdAt:new Date(), config:{
+    return event.source==='MOYSKLAD' || event.externalEntityId===echoDealId ? { version:1, createdAt:new Date(), config:{
       schemaVersion:1,rules:[],groups:[],references:{units:[],priceTypes:[],dictionaries:[],namedPairs:[{kind:'dealStages',bitrix24Id:'0:PREPARATION',moyskladId:refs.state,status:'confirmed'}]},
-      dealOrderRuntime:{nativeOrderNumberingVerified:true,unmappedReferencePolicy:'confirmed-defaults',stages:[{bitrix24StageId:'PREPARATION',moyskladId:refs.state,creationEnabled:true}],currencies:[{bitrix24Code:'RUB',moyskladId:refs.currency}]},
+      dealOrderRuntime:{nativeOrderNumberingVerified:true,unmappedReferencePolicy:'confirmed-defaults',defaultOrganizationId:refs.organization,defaultStoreId:refs.store,defaultEmployeeId:refs.employee,organizations:[],stores:[],employees:[],stages:[{bitrix24StageId:'PREPARATION',moyskladId:refs.state,creationEnabled:true}],currencies:[{bitrix24Code:'RUB',moyskladId:refs.currency}]},
     }} : {version:1,createdAt:new Date(),config:{}};
   },
 };
@@ -82,6 +84,7 @@ const fieldSettingsFake = {
         assert.ok(workerLease, 'actual public worker must pass its claimed event fence into preparation');
         await workerLease.assertOwned();
         assert.equal((await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({where:{id:input.eventId}})).status,'PROCESSING');
+        if (input.bitrix24DealId === echoDealId) return new DealOrderCreationPreparer(app.get(DatabaseService)).prepare({ ...input, eventConfig: await fieldSettingsFake.eventConfig(input.eventId) } as never, workerLease);
         if (nextPrepareWaiting) {
           nextPrepareWaiting = false;
           return { status: 'WAITING', reason: 'STAGE_NOT_READY' };
@@ -237,6 +240,24 @@ test('public MS UPDATE waits for the already accepted CREATE instead of opening 
   assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: create.id } })).status, 'RETRYABLE_FAILURE');
 });
 
+test('public callback for a newly imported deal waits through the real preparer without echo-order creation', async () => {
+  const database = app.get(DatabaseService);
+  await database.dealOrderReverseCreateOperation.create({ data: { moyskladOrderId: echoOrderId, syncId: randomUUID(), eventId: `echo-origin-${randomUUID()}`, payload: {}, settingsVersion: 1, status: 'PENDING' } });
+  const before = createPosts;
+  try {
+    const acknowledgement = await postDealEvent('ONCRMDEALADD', echoDealId);
+    const event = await waitForEvent(acknowledgement.eventId, 'RETRYABLE_FAILURE');
+    assert.equal(event.lastErrorCategory, 'REVERSE_DEAL_CREATE_PENDING');
+    assert.equal(createPosts, before);
+    assert.equal(await database.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: echoDealId } }), 0);
+    assert.equal((await database.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: echoDealId } })).status, 'WAITING');
+    assert.equal(await database.pairReviewCase.count({ where: { sourceEntityId: echoDealId } }), 0);
+  } finally {
+    await database.dealOrderCreateOperation.deleteMany({ where: { bitrix24DealId: echoDealId } });
+    await database.dealOrderReverseCreateOperation.delete({ where: { moyskladOrderId: echoOrderId } });
+  }
+});
+
 async function postDealEvent(event: string, id: string): Promise<{ eventId: string }> {
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -283,6 +304,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const text = Buffer.concat(chunks).toString('utf8');
   const form = new URLSearchParams(text);
   const url = new URL(request.url ?? '/', providerBase);
+  if (url.pathname === '/rest/crm.deal.get.json' && form.get('id') === echoDealId) return send(response, { result: { ID: echoDealId, ORIGINATOR_ID: 'MOYSKLAD', ORIGIN_ID: echoOrderId } });
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(url.pathname) && JSON.parse(text).useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
   }
