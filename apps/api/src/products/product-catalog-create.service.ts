@@ -28,10 +28,74 @@ export class ProductCatalogManualReviewError extends Error {
   constructor(readonly reason: string) { super(reason); }
 }
 
+export type ProductImportEcho = { status: 'NONE' } | { status: 'WAIT'; moyskladProductId: string; originEventId: string } |
+  { status: 'PAIR'; pairId: string; moyskladProductId: string; originEventId: string };
+
 /** Durable MS→B24 product creation shared by catalog events and deal prerequisites. */
 @Injectable()
 export class ProductCatalogCreateService {
   constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
+
+  /** Read-only provenance check. Never creates a pair or completes the importing
+   * operation; only its original leased worker can do that after prices/readback.
+   */
+  async inspectCreateEcho(input: { targetId: string; kind: 'product' | 'service'; card: Row; receivedAt: Date },
+    exactTargets: (catalogId: string, xmlId: string, kind: 'product' | 'service') => Promise<string[]>): Promise<ProductImportEcho> {
+    const marker = typeof input.card.xmlId === 'string' ? /^MOYSKLAD_(PRODUCT|SERVICE)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(input.card.xmlId) : null;
+    const operations = await this.database.dealOrderReverseProductOperation.findMany({ where: { OR: [
+      { bitrix24ProductId: input.targetId }, ...(marker ? [{ moyskladProductId: marker[2] }] : []),
+    ] }, take: 2 });
+    if (!operations.length && !marker) return { status: 'NONE' };
+    if (operations.length !== 1) throw new ProductCatalogManualReviewError(operations.length ? 'PRODUCT_IMPORT_ECHO_AMBIGUOUS' : 'PRODUCT_IMPORT_ECHO_IDENTITY_UNPROVEN');
+    const operation = operations[0]!;
+    const frozen: Row = isRecord(operation.payload) ? operation.payload as Row : {};
+    const expected = isRecord(frozen.fields) ? frozen.fields : {};
+    const xmlId = `MOYSKLAD_${input.kind.toUpperCase()}_${operation.moyskladProductId}`;
+    const uuid = isRecord(input.card.property108) ? input.card.property108.value : input.card.property108;
+    if (!marker || marker[1].toLowerCase() !== input.kind || marker[2] !== operation.moyskladProductId ||
+      frozen.kind !== input.kind || frozen.xmlId !== xmlId || expected.xmlId !== xmlId || frozen.catalogId !== operation.bitrix24CatalogId ||
+      String(expected.iblockId) !== operation.bitrix24CatalogId || String(input.card.iblockId) !== operation.bitrix24CatalogId ||
+      input.card.xmlId !== xmlId || uuid !== operation.moyskladProductId || (isRecord(expected.property108) ? expected.property108.value : null) !== uuid ||
+      String(input.card.id) !== input.targetId || Number(input.card.type) !== (input.kind === 'service' ? 7 : 1) ||
+      operation.bitrix24ProductId !== null && operation.bitrix24ProductId !== input.targetId ||
+      !operation.attemptedAt || operation.attemptedAt > input.receivedAt || operation.createdAt > input.receivedAt) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    }
+    const origin = await this.database.inboundEvent.findUnique({ where: { id: operation.eventId },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true } });
+    // Document-origin operations are outside this catalog-echo contract.
+    if (origin?.source === 'MOYSKLAD' && origin.externalEntityType === 'customerorder') return { status: 'NONE' };
+    if (!origin || origin.source !== 'MOYSKLAD' || origin.eventType !== 'CREATE' || origin.externalEntityType !== input.kind || origin.externalEntityId !== operation.moyskladProductId) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_ORIGIN_UNPROVEN');
+    }
+    const targets = await exactTargets(operation.bitrix24CatalogId, xmlId, input.kind);
+    if (targets.length !== 1 || targets[0] !== input.targetId) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_AMBIGUOUS');
+    // Provider reads can overlap the original worker's pair commit. Re-read the
+    // operation, origin and pair in ONE snapshot, never mix pre/post commit rows.
+    const stable = await this.database.$transaction(async transaction => {
+      const current = await transaction.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: operation.moyskladProductId } });
+      const currentOrigin = await transaction.inboundEvent.findUnique({ where: { id: operation.eventId }, select: { status: true } });
+      const pairs = await transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', OR: [
+        { bitrix24Id: input.targetId }, { moyskladId: operation.moyskladProductId },
+      ] }, take: 2 });
+      return { current, currentOrigin, pairs };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+    const { current, currentOrigin, pairs } = stable;
+    if (!current || current.syncId !== operation.syncId || JSON.stringify(current.payload) !== JSON.stringify(operation.payload) ||
+        current.bitrix24ProductId !== null && current.bitrix24ProductId !== input.targetId) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    if (pairs.length > 1 || pairs.some(pair => !pair.active || pair.bitrix24Id !== input.targetId || pair.moyskladId !== operation.moyskladProductId || pair.moyskladType !== input.kind)) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_PAIR_CONFLICT');
+    }
+    if (current.status === 'SUCCEEDED') {
+      if (current.bitrix24ProductId !== input.targetId || pairs.length !== 1) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_PAIR_NOT_ACTIVE');
+      return { status: 'PAIR', pairId: pairs[0]!.id, moyskladProductId: operation.moyskladProductId, originEventId: origin.id };
+    }
+    if (current.status !== 'PENDING' || !currentOrigin || !['RECEIVED', 'PROCESSING', 'RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(currentOrigin.status)) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_CREATE_NOT_PENDING');
+    }
+    if (!readbackMatches(input.card, expected, input.kind)) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_CREATE_MISMATCH');
+    return { status: 'WAIT', moyskladProductId: operation.moyskladProductId, originEventId: origin.id };
+  }
 
   async createOrRecover(input: ProductCreateInput): Promise<string> {
     const kind = input.moyskladType ?? 'product';

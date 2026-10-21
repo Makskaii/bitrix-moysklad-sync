@@ -254,6 +254,7 @@ test('controlled product event admits a current synthetic source before allowing
   const event = { id: 'event-1', source: 'BITRIX24', eventType: 'CATALOG.PRODUCT.ON.UPDATE', externalEntityType: 'product', externalEntityId: '101',
     payload: { event: 'CATALOG.PRODUCT.ON.UPDATE', data: { FIELDS: { ID: 101, TYPE: 1 } } }, status: 'RECEIVED', attempts: 0 } as Record<string, unknown>;
   const admissions = new Map<string, any>();
+  const bindings = new Map<string, any>();
   const database: any = {
     $queryRaw: async () => [{ serviceMode: 'on' }],
     inboundEvent: { findUnique: async () => structuredClone(event), updateMany: async ({ data }: any) => { Object.assign(event, data); return { count: 1 }; } },
@@ -265,6 +266,13 @@ test('controlled product event admits a current synthetic source before allowing
       findFirst: async () => null,
       upsert: async ({ where, create }: any) => { if (!admissions.has(where.eventId)) admissions.set(where.eventId, { ...create }); return admissions.get(where.eventId); },
       updateMany: async () => ({ count: 0 }),
+    },
+    // Current admission stores one exclusive binding plus per-event audits.
+    // The previous fixture predated that migration (baseline also failed).
+    controlledTestSourceBinding: {
+      findMany: async ({ where }: any) => [...bindings.values()].filter(row => row.runId === where.runId && row.entity === where.entity),
+      create: async ({ data }: any) => { const row = { id: 'binding-product', ...data }; bindings.set(row.id, row); return row; },
+      findUnique: async ({ where }: any) => bindings.get(where.id) ?? null,
     },
     $transaction: async (callback: (transaction: unknown) => Promise<unknown>) => callback(database),
   };
@@ -290,6 +298,7 @@ test('controlled product event admits a current synthetic source before allowing
     assert.equal((await processor.process('event-1'))?.status, 'SYNCED');
     assert.equal(writes, 1);
     assert.equal(admissions.get('event-1')?.targetNativeId, '101');
+    assert.equal(bindings.size, 1);
   } finally {
     for (const [key, value] of [['CONTROLLED_LIVE_TEST_MODE', previous.mode], ['CONTROLLED_LIVE_TEST_INSTANCE', previous.instance], ['CONTROLLED_LIVE_TEST_MANIFEST', previous.manifest], ['DATABASE_URL', previous.database], ['SYNC_MODE', previous.sync]] as const) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;

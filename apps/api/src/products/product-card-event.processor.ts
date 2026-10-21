@@ -4,10 +4,10 @@ import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { ProductCardHttpApi } from './product-card-api';
 import { ProductCardRuntimeService } from './product-card-runtime.service';
-import { ProductCardPrice, ProductCardSettings, ProductCardSyncResult } from './product-card-sync.service';
+import { ProductCardManualReviewError, ProductCardPrice, ProductCardSettings, ProductCardSyncResult } from './product-card-sync.service';
 import { InboundEventMetadata } from '../event-dispatcher.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
-import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { isRetryableFailure, ProviderFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { ProductCatalogCreateService, ProductCatalogManualReviewError } from './product-catalog-create.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
@@ -21,6 +21,7 @@ import { parseClientMoyskladTimestamp } from '../clients/client-moysklad-date';
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
 const EVENT_BATCH_DELAY_MS = 250;
+const IMPORT_ECHO_WAIT = 'PRODUCT_IMPORT_ECHO_WAITING';
 
 /**
  * Dispatches catalog signal events through the dedicated MySklad-authoritative
@@ -123,7 +124,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<ProductCardSyncResult | null> {
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true, retryAfter: true, processingStartedAt: true },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true, retryAfter: true, processingStartedAt: true, receivedAt: true, lastErrorCategory: true },
     });
     if (!event || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
     if (!isProductEvent(event.source, event.eventType, event.externalEntityType)) return null;
@@ -177,6 +178,52 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true },
       take: 2,
     });
+    if (this.catalogCreate && event.source === 'BITRIX24' && ['CATALOG.PRODUCT.ON.ADD', 'ONCRMPRODUCTADD'].includes(event.eventType ?? '') &&
+      (!matches.length || event.lastErrorCategory === IMPORT_ECHO_WAIT)) {
+      try {
+        const gate = await this.runtime.preflight('BITRIX24', true);
+        if (gate.status !== 'READY') {
+          const result = { ...gate, changedFields: [] as [] };
+          await this.applyResult(event.id, event, result, workerLease); return result;
+        }
+        let kind: 'product' | 'service' = Number(eventFields.TYPE) === 7 ? 'service' : 'product';
+        const readCard = () => this.readUnderMode(() => this.bitrixApi.readBitrix24CreateEchoCard(supported.productId, kind));
+        let card;
+        try { card = await readCard(); }
+        catch (error) {
+          if (![1, 7].includes(Number(eventFields.TYPE)) && (error instanceof ProductCardManualReviewError && error.reason === 'PRODUCT_CARD_TYPE_UNSUPPORTED' || error instanceof ProviderFailure && (error.status === 404 || error.status === 400))) {
+            kind = 'service'; card = await readCard();
+          } else throw error;
+        }
+        const echo = await this.catalogCreate.inspectCreateEcho({ targetId: supported.productId, kind, card, receivedAt: event.receivedAt },
+          (catalogId, xmlId, nativeKind) => this.readUnderMode(() => this.bitrixApi.findBitrix24CreateEchoIds(catalogId, xmlId, nativeKind)));
+        if (echo.status === 'WAIT') {
+          const retryAfter = new Date(Date.now() + 5_000);
+          const parked = await withServiceModeOn(this.database, async transaction => {
+            await assertWorkerLeaseInTransaction(workerLease, transaction);
+            return transaction.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING', attempts: attempt },
+              data: { status: 'RETRYABLE_FAILURE', attempts: event.attempts, lastErrorCategory: IMPORT_ECHO_WAIT, processingStartedAt: null, retryAfter } });
+          });
+          if (!parked.enabled || parked.value?.count !== 1) return null;
+          if (event.lastErrorCategory !== IMPORT_ECHO_WAIT) await writeOperationalLog(this.database, 'EVENT', JSON.stringify({
+            type: 'PRODUCT_IMPORT_ECHO_DEFERRED', eventId: event.id, originEventId: echo.originEventId, moyskladProductId: echo.moyskladProductId, bitrix24ProductId: supported.productId,
+          }), event.id);
+          return { status: 'RETRYABLE_FAILURE', reason: IMPORT_ECHO_WAIT, retryAfter, changedFields: [] };
+        }
+        if (echo.status === 'PAIR') {
+          matches = await this.database.entityPair.findMany({ where: { id: echo.pairId, entityType: 'PRODUCT', active: true },
+            select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true }, take: 2 });
+          await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_IMPORT_ECHO_RESUMED', eventId: event.id,
+            originEventId: echo.originEventId, pairId: echo.pairId, bitrix24ProductId: supported.productId }), event.id);
+        }
+      } catch (error) {
+        const reason = error instanceof ProductCatalogManualReviewError || error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_IMPORT_ECHO_READ_FAILED';
+        const result: ProductCardSyncResult = error instanceof ProductCatalogManualReviewError || error instanceof ProductCardManualReviewError || !isRetryableFailure(error)
+          ? { status: 'MANUAL_REVIEW', reason, changedFields: [] }
+          : { status: 'RETRYABLE_FAILURE', reason, changedFields: [], retryAfter: retryAtForFailure(error, attempt) };
+        await this.applyResult(event.id, event, result, workerLease); return result;
+      }
+    }
     if (!matches.length && event.source === 'BITRIX24' && this.duplicateAliases) {
       const resolution = await this.duplicateAliases.resolveBitrix24Product(supported.productId);
       if (resolution.status === 'PAIR') matches = await this.database.entityPair.findMany({ where: { id: resolution.pair.id, entityType: 'PRODUCT', active: true },

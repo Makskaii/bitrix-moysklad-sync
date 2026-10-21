@@ -27,11 +27,16 @@ const bitrixCatalogRecords = new Map<string, Record<string, unknown>>();
 const moyskladCandidates = new Map<string, Array<{ id: string; created: string | null }>>();
 let nextCardId = 80_000_000 + Math.floor(Math.random() * 10_000_000);
 const oldEnv = new Map<string, string | undefined>();
+const fakeErrors: unknown[] = [];
+let earlyEcho: { sourceId: string; stage: 'ADD' | 'PRICE' } | null = null;
+const echoObservations: Array<{ id: string; target: string; targetSaved: boolean; pairCount: number; waitingAttempts: number }> = [];
+let echoReadFailure: number | null = null;
+let finishImportOnList: { sourceId: string; targetId: string; originId: string } | null = null;
 
 function assertIsolatedTarget(value: string) {
   const target = new URL(value);
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test', '/sync_issue79_product_audit_20261021_test', '/sync_issue79_root_description_20261021_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test', '/sync_issue79_product_audit_20261021_test', '/sync_issue79_root_description_20261021_test', '/sync_issue79_root_product_echo_20261021_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
   const schema = target.searchParams.get('schema') ?? '';
   assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_validation_test' && schema === 'issue79_date_validation', 'requires a dedicated fresh test schema');
 }
@@ -46,7 +51,11 @@ before(async () => {
   process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-b24-event-token';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-only-token';
   process.env.MOYSKLAD_WEBHOOK_SECRET = 'synthetic-product-create-secret';
-  fakeApi = createServer((request, response) => { void reply(request, response); });
+  fakeApi = createServer((request, response) => { void reply(request, response).catch(error => {
+    fakeErrors.push(error);
+    if (!response.headersSent) response.writeHead(500);
+    response.end(JSON.stringify({ error: 'synthetic provider assertion failed' }));
+  }); });
   await new Promise<void>((resolve) => fakeApi!.listen(0, '127.0.0.1', resolve));
   const address = fakeApi.address();
   assert.ok(address && typeof address !== 'string');
@@ -85,6 +94,7 @@ after(async () => {
   for (const [key, value] of oldEnv) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
+  assert.deepEqual(fakeErrors, [], 'fake provider assertions must drain before natural exit');
 });
 
 test('product-create event harness accepts only its dedicated loopback databases and fresh schemas', () => {
@@ -583,6 +593,169 @@ async function sendMoyskladBatch(events: Array<Record<string, unknown>>, audit: 
   });
 }
 
+test('actual public product/service ADD echoes wait before target-save AND pair-commit, then naturally resume without review or duplicate', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const db = app.get(DatabaseService);
+  const version = 1_810_000 + Math.floor(Math.random() * 10_000);
+  const priceType = randomUUID();
+  await db.fieldSettingsVersion.create({ data: { version, config: {
+    schemaVersion: 1, productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name', 'code'] },
+    rules: [{ id: 'echo-name', entity: 'catalog', sourceField: 'name', targetField: 'name',
+      bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } }, moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
+    groups: [], serviceCounterpartyId: null, references: { units: [], priceTypes: [{ bitrix24Id: 2, moyskladId: priceType, status: 'configured' }], dictionaries: [], namedPairs: [] },
+  } } });
+  await db.fieldSettingsState.update({ where: { id: 'global' }, data: { version } });
+  for (const kind of ['product', 'service'] as const) for (const stage of ['ADD', 'PRICE'] as const) {
+    const id = randomUUID();
+    sourceRecords.set(id, { id, meta: { type: kind }, name: `echo-${kind}-${stage}-${id}`, code: `E-${id.slice(0, 8)}`, created: '2026-02-01T00:00:00.000Z',
+      salePrices: [{ value: 1234, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/${randomUUID()}` } },
+        priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }] });
+    earlyEcho = { sourceId: id, stage };
+    const response = await sendCreate(kind, id, `echo-${kind}-${stage}-${id}`);
+    const originEventId = oneEventId(await response.json());
+    await waitForStatus(db, originEventId, 'SUCCEEDED');
+    const observed = echoObservations.at(-1)!;
+    assert.equal(observed.targetSaved, stage === 'PRICE', 'ADD echo is held before provider ADD ACK/target ID save; price echo is held after target save but before pair commit');
+    assert.equal(observed.pairCount, 0);
+    assert.equal(observed.waitingAttempts, 0, 'ordinary import dependency waiting does not spend failure attempts');
+    for (let tick = 0; tick < 400; tick += 1) {
+      const echo = await db.inboundEvent.findUniqueOrThrow({ where: { id: observed.id } });
+      if (echo.status === 'SUCCEEDED') break;
+      assert.notEqual(echo.status, 'MANUAL_REVIEW', echo.lastErrorCategory ?? 'false echo review');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    const echo = await db.inboundEvent.findUniqueOrThrow({ where: { id: observed.id } });
+    assert.equal(echo.status, 'SUCCEEDED');
+    assert.equal(echo.attempts, 1);
+    assert.equal(await db.manualReviewCase.count({ where: { eventId: observed.id } }), 0);
+    assert.equal(await db.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: id, bitrix24Id: observed.target, moyskladType: kind, active: true } }), 1);
+    const journal = await db.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: id } });
+    assert.equal(journal.status, 'SUCCEEDED');
+    assert.equal(journal.bitrix24ProductId, observed.target);
+    assert.equal(priceRows.get(observed.target)?.length, 1);
+    const source = sourceRecords.get(id)!;
+    source.name = `${source.name} REV2`;
+    for (const suffix of ['update', 'repeat']) {
+      const update = await sendUpdate(kind, id, `echo-${id}-${suffix}`);
+      await waitForStatus(db, oneEventId(await update.json()), 'SUCCEEDED');
+    }
+    assert.equal(createdCards.get(observed.target)?.name, source.name);
+    assert.equal([...createdCards.values()].filter(card => card.xmlId === `MOYSKLAD_${kind.toUpperCase()}_${id}`).length, 1);
+    assert.equal(requests.filter(row => row.method === 'POST' && /\/entity\/(product|service)(\?|$)/.test(row.path)).length, 0, 'no reverse provider CREATE');
+    assert.equal(await db.operationalLog.count({ where: { referenceId: observed.id, message: { contains: 'PRODUCT_IMPORT_ECHO_DEFERRED' } } }), 1);
+    assert.equal(await db.operationalLog.count({ where: { referenceId: observed.id, message: { contains: 'PRODUCT_IMPORT_ECHO_RESUMED' } } }), 1);
+  }
+});
+
+async function deliverEarlyEcho(card: Record<string, unknown>, stage: 'ADD' | 'PRICE') {
+  const wanted = earlyEcho;
+  if (!wanted || wanted.stage !== stage || !String(card.xmlId).endsWith(wanted.sourceId)) return;
+  earlyEcho = null;
+  const db = app!.get(DatabaseService);
+  const response = await fetch(`${apiUrl}/webhooks/bitrix24`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMPRODUCTADD', data: { FIELDS: { ID: String(card.id) } }, auth: { application_token: 'synthetic-b24-event-token' } }) });
+  assert.equal(response.status, 200);
+  const id = oneEventId(await response.json());
+  await waitForStatus(db, id, 'RETRYABLE_FAILURE');
+  const waiting = await db.inboundEvent.findUniqueOrThrow({ where: { id } });
+  assert.equal(waiting.lastErrorCategory, 'PRODUCT_IMPORT_ECHO_WAITING');
+  assert.ok(waiting.retryAfter && waiting.retryAfter > new Date());
+  const journal = await db.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: wanted.sourceId } });
+  echoObservations.push({ id, target: String(card.id), targetSaved: journal.bitrix24ProductId !== null,
+    pairCount: await db.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: wanted.sourceId } }), waitingAttempts: waiting.attempts });
+}
+
+test('own import echo provenance rejects forged/ambiguous/conflicting/failed creations and bad auth without provider writes', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const db = app.get(DatabaseService);
+  const fixture = async (scenario: string) => {
+    const id = randomUUID(); const target = String(nextCardId++); const now = new Date(Date.now() - 1_000);
+    const fields = { iblockId: 77, name: `echo-negative-${id}`, xmlId: `MOYSKLAD_PRODUCT_${id}`, active: 'Y', property108: { value: id } };
+    const card: Record<string, unknown> = { ...fields, id: Number(target), type: 1 };
+    const origin = await db.inboundEvent.create({ data: { source: scenario === 'wrong-origin' ? 'BITRIX24' : 'MOYSKLAD', deliveryKey: `echo-fixture-${id}`,
+      eventType: 'CREATE', externalEntityType: 'product', externalEntityId: id, payload: {}, processingStartedAt: new Date(), status: scenario === 'failed-origin' ? 'MANUAL_REVIEW' : 'PROCESSING' } });
+    if (scenario !== 'no-journal') await db.dealOrderReverseProductOperation.create({ data: {
+      moyskladProductId: id, syncId: randomUUID(), eventId: origin.id, settingsVersion: (await db.fieldSettingsState.findUniqueOrThrow({ where: { id: 'global' } })).version,
+      bitrix24CatalogId: '77', createdAt: now, attemptedAt: scenario === 'future-operation' ? new Date(Date.now() + 60_000) : now,
+      status: scenario === 'failed-operation' ? 'FAILED' : scenario === 'succeeded-without-pair' ? 'SUCCEEDED' : 'PENDING',
+      bitrix24ProductId: scenario === 'occupied-target' ? '999999999' : scenario === 'succeeded-without-pair' ? target : null,
+      payload: { kind: scenario === 'wrong-kind' ? 'service' : 'product', catalogId: '77', xmlId: fields.xmlId, fields, prices: [] },
+    } });
+    if (scenario === 'wrong-uuid') card.property108 = { value: randomUUID() };
+    if (scenario === 'wrong-catalog') card.iblockId = 78;
+    if (scenario === 'changed-fields') card.name = 'different native fields';
+    if (scenario === 'duplicate-native') createdCards.set(String(nextCardId++), { ...card, id: nextCardId - 1 });
+    if (scenario === 'inactive-pair') await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: target, moyskladId: id, moyskladType: 'product', active: false, source: 'MANUAL' } });
+    createdCards.set(target, card);
+    return { id, target, origin };
+  };
+  const sendEcho = async (target: string, token = 'synthetic-b24-event-token') => fetch(`${apiUrl}/webhooks/bitrix24`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ event: 'ONCRMPRODUCTADD', data: { FIELDS: { ID: target, TYPE: 1 } }, auth: { application_token: token } }),
+  });
+  for (const scenario of ['no-journal', 'wrong-origin', 'wrong-uuid', 'wrong-catalog', 'changed-fields', 'wrong-kind', 'occupied-target', 'duplicate-native', 'inactive-pair', 'failed-origin', 'failed-operation', 'succeeded-without-pair', 'future-operation']) {
+    const own = await fixture(scenario);
+    const beforePairs = await db.entityPair.count();
+    const beforeAdds = requests.filter(row => /catalog\.(product|price).*(add|update)(\.json)?$/.test(row.path) || row.method === 'PUT').length;
+    const response = await sendEcho(own.target);
+    assert.equal(response.status, 200);
+    const eventId = oneEventId(await response.json());
+    await waitForStatus(db, eventId, 'MANUAL_REVIEW');
+    assert.match((await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).lastErrorCategory ?? '', /^PRODUCT_IMPORT_ECHO_/);
+    assert.equal(await db.entityPair.count(), beforePairs, `${scenario}: cannot seed/repair a pair`);
+    assert.equal(requests.filter(row => /catalog\.(product|price).*(add|update)(\.json)?$/.test(row.path) || row.method === 'PUT').length, beforeAdds, `${scenario}: no provider write`);
+  }
+  const authFixture = await fixture('auth');
+  const beforeAuthEvents = await db.inboundEvent.count(); const calls = requests.length;
+  assert.equal((await sendEcho(authFixture.target, 'not-the-auth-token')).status, 401);
+  assert.equal(await db.inboundEvent.count(), beforeAuthEvents);
+  assert.equal(requests.length, calls);
+
+  const transient = await fixture('transient'); echoReadFailure = 429;
+  const transientResponse = await sendEcho(transient.target); const transientId = oneEventId(await transientResponse.json());
+  await waitForStatus(db, transientId, 'RETRYABLE_FAILURE');
+  const transientEvent = await db.inboundEvent.findUniqueOrThrow({ where: { id: transientId } });
+  assert.equal(transientEvent.lastErrorCategory, 'PRODUCT_IMPORT_ECHO_READ_FAILED');
+  assert.ok(transientEvent.retryAfter && transientEvent.retryAfter > new Date());
+  assert.equal(await db.manualReviewCase.count({ where: { eventId: transientId } }), 0);
+
+  const permanent = await fixture('permanent'); echoReadFailure = 403;
+  const permanentResponse = await sendEcho(permanent.target); const permanentId = oneEventId(await permanentResponse.json());
+  await waitForStatus(db, permanentId, 'MANUAL_REVIEW');
+  assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: permanentId } })).lastErrorCategory, 'PRODUCT_IMPORT_ECHO_READ_FAILED');
+
+  const late = await fixture('late-commit');
+  sourceRecords.set(late.id, { id: late.id, meta: { type: 'product' }, name: createdCards.get(late.target)!.name });
+  finishImportOnList = { sourceId: late.id, targetId: late.target, originId: late.origin.id };
+  const lateResponse = await sendEcho(late.target); const lateId = oneEventId(await lateResponse.json());
+  await waitForStatus(db, lateId, 'SUCCEEDED');
+  assert.equal(await db.manualReviewCase.count({ where: { eventId: lateId } }), 0, 'a commit overlapping the identity read is not mistaken for an inconsistent failed import');
+
+  // Lower-level budget/clock fixture only. The four preceding public scheduled
+  // startup/resume acceptance cases keep their real timers and natural waiting.
+  const processor = app.get(ProductCardEventProcessor);
+  await processor.onModuleDestroy();
+  const prolonged = await fixture('prolonged');
+  const waiting = await db.inboundEvent.create({ data: { source: 'BITRIX24', deliveryKey: `echo-budget-${prolonged.id}`,
+    eventType: 'ONCRMPRODUCTADD', externalEntityType: 'product', externalEntityId: prolonged.target,
+    payload: { event: 'ONCRMPRODUCTADD', data: { FIELDS: { ID: prolonged.target, TYPE: 1 } } },
+    status: 'RETRYABLE_FAILURE', attempts: 7, retryAfter: new Date(0) } });
+  for (let turn = 0; turn < 12; turn += 1) {
+    if (turn) await db.inboundEvent.update({ where: { id: waiting.id }, data: { retryAfter: new Date(0) } }); // only own disposable fixture deadline
+    const result = await processor.process(waiting.id);
+    assert.equal(result?.status, 'RETRYABLE_FAILURE');
+    assert.ok(result && 'reason' in result && result.reason === 'PRODUCT_IMPORT_ECHO_WAITING');
+    const saved = await db.inboundEvent.findUniqueOrThrow({ where: { id: waiting.id } });
+    assert.equal(saved.attempts, 7, 'waiting neither spends a failure attempt nor erases seven prior genuine failures');
+    assert.equal(saved.status, 'RETRYABLE_FAILURE');
+    assert.ok(saved.retryAfter && saved.retryAfter > new Date());
+    const beforeEarly = requests.length;
+    assert.equal(await processor.process(waiting.id), null, 'persisted future deadline prevents another provider read');
+    assert.equal(requests.length, beforeEarly);
+  }
+  assert.equal(await db.manualReviewCase.count({ where: { eventId: waiting.id } }), 0);
+});
+
 const syntheticMoyskladAccountId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 function auditProductEvent(id: string, kind: 'product' | 'service', action: 'CREATE' | 'UPDATE' = 'CREATE', overrides: Record<string, unknown> = {}) {
@@ -644,6 +817,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const pathname = new URL(path, fakeBase).pathname;
   const method = pathname.replace(/\.json$/i, '');
   const parsedPath = new URL(path, fakeBase);
+  if (/catalog\.product(?:\.service)?\.get$/.test(method) && echoReadFailure !== null) {
+    const status = echoReadFailure; echoReadFailure = null;
+    response.writeHead(status, { 'retry-after': '30' }); response.end(JSON.stringify({ error: 'synthetic echo read failure' })); return;
+  }
   if (method.endsWith('catalog.product.get')) {
     const id = new URLSearchParams(body).get('id') ?? '';
     const record = bitrixCatalogRecords.get(id);
@@ -660,6 +837,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const fields=payload.fields;
     const row={id:String(nextCardId++),productId:fields.productId,catalogGroupId:fields.catalogGroupId,price:fields.price,currency:fields.currency};
     const id=String(fields.productId);priceRows.set(id,[...(priceRows.get(id)??[]),row]);
+    await deliverEarlyEcho(createdCards.get(id) ?? {}, 'PRICE');
     response.writeHead(200);response.end(JSON.stringify({result:{price:row}}));return;
   }
   if (method.endsWith('catalog.catalog.get')) {
@@ -693,7 +871,16 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (method.endsWith('catalog.product.list') || method.endsWith('catalog.product.service.list')) {
     const kind = method.includes('.service.') ? 'service' : 'product';
     const payload = parseProviderBody(body) as { filter?: { xmlId?: string }; start?: number };
-    const rows = [...createdCards.values()].filter((card) => card.type === (kind === 'service' ? 7 : 1) && card.xmlId === payload.filter?.xmlId);
+    const xmlId = payload.filter?.xmlId ?? new URLSearchParams(body).get('filter[xmlId]');
+    const rows = [...createdCards.values()].filter((card) => card.type === (kind === 'service' ? 7 : 1) && card.xmlId === xmlId);
+    if (finishImportOnList && xmlId === `MOYSKLAD_PRODUCT_${finishImportOnList.sourceId}`) {
+      const own = finishImportOnList; finishImportOnList = null;
+      await app!.get(DatabaseService).$transaction(async tx => {
+        await tx.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: own.targetId, moyskladId: own.sourceId, moyskladType: 'product', active: true, source: 'AUTO' } });
+        await tx.dealOrderReverseProductOperation.update({ where: { moyskladProductId: own.sourceId }, data: { status: 'SUCCEEDED', bitrix24ProductId: own.targetId } });
+        await tx.inboundEvent.update({ where: { id: own.originId }, data: { status: 'SUCCEEDED' } });
+      });
+    }
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind === 'service' ? 'services' : 'products']: rows.slice(payload.start ?? 0), total: rows.length } })); return;
   }
   if (method.endsWith('catalog.product.add') || method.endsWith('catalog.product.service.add')) {
@@ -702,6 +889,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const id = String(nextCardId++);
     const card = { id: Number(id), type: kind === 'service' ? 7 : 1, ...nativeTextFields(payload.fields) };
     createdCards.set(id, card);
+    await deliverEarlyEcho(card, 'ADD');
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind === 'service' ? 'service' : 'element']: card } })); return;
   }
   if (method.endsWith('catalog.product.update') || method.endsWith('catalog.product.service.update')) {
