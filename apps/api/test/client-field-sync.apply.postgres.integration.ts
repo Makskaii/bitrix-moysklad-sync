@@ -367,15 +367,23 @@ test('new client mappings reconcile from MySklad and old pinned work cannot roll
   assert.equal(moysklad.age, 42);
 
   await database.entityPair.create({ data: { id: contactPairId, entityType: 'CONTACT', bitrix24Id: contactSourceId, moyskladId: contactTargetId, moyskladType: 'contactperson', moyskladParentId: targetId, active: true, source: 'MANUAL' } });
+  bitrixContact.EMAIL=[{VALUE:'before@example.invalid',VALUE_TYPE:'WORK'}];
+  moyskladContact.email='before@example.invalid';
   const withContactName = await saveThroughAdmin({ ...(await settings.active()).config, rules: [
     ...(await settings.active()).config.rules,
-    { id: 'contact-name', entity: 'contacts-companies', sourceField: 'NAME', targetField: 'name', criticality: 'optional',
+    { id: 'contact-name', entity: 'contacts', sourceField: 'NAME', targetField: 'name', criticality: 'optional',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
-  ] });
+  ], groups:[...(await settings.active()).config.groups,{id:'ui-contact-email',entity:'contacts',direction:'BITRIX24_TO_MOYSKLAD',sourceFields:['EMAIL'],targetField:'email',criticality:'optional',transform:{kind:'join-non-empty',separator:'; '}}] });
   const acceptContact = async (key: string) => acceptBitrixWebhook('ONCRMCONTACTUPDATE', contactSourceId, key);
   const contactBaseline = await acceptContact('contact-settings-baseline');
   assert.equal(await processor.process(contactBaseline), 'BASELINE');
+  bitrixContact.EMAIL=[{VALUE:'first@example.invalid',VALUE_TYPE:'WORK'}];
+  assert.equal(await processor.process(await acceptContact('ui-contact-email-first')), 'SYNCED');
+  assert.equal(moyskladContact.email,'first@example.invalid','the real processor applies the UI contacts group to a nested contactperson');
+  bitrixContact.EMAIL=[{VALUE:'second@example.invalid',VALUE_TYPE:'WORK'},{VALUE:'third@example.invalid',VALUE_TYPE:'HOME'}];
+  assert.equal(await processor.process(await acceptContact('ui-contact-email-second')), 'SYNCED');
+  assert.equal(moyskladContact.email,'second@example.invalid; third@example.invalid','repeat updates retain every configured nonempty email without substituting the company email');
   const oldContactEvent = await acceptContact('contact-old-pinned');
   const withContactAge = await saveThroughAdmin({ ...withContactName.config, rules: [
     ...withContactName.config.rules,
@@ -451,6 +459,14 @@ test('field settings reject a forward copy mapping with incompatible types and c
   assert.equal(response.status, 400, body);
   assert.match(body, /exact type and cardinality compatibility/i);
   assert.equal((await settings.active()).version, active.version, 'the rejected incompatible mapping creates no settings version');
+}));
+
+test('UI and legacy contact aliases cannot configure conflicting writes to the same field', async () => serializeApplyTest(async () => {
+  const active=await settings.active();
+  const response=await fetch(`${adminUrl}/api/admin/field-settings`,{method:'PUT',headers:{'content-type':'application/json',authorization:'Bearer synthetic-loopback-token'},body:JSON.stringify({config:{...active.config,groups:[...active.config.groups,{id:'conflicting-legacy-contact-email',entity:'contacts-companies',direction:'BITRIX24_TO_MOYSKLAD',sourceFields:['EMAIL'],targetField:'email',criticality:'optional',transform:{kind:'join-non-empty',separator:' / '}}]}})});
+  assert.equal(response.status,400);
+  assert.match(await response.text(),/Contact mapping aliases cannot write the same target field/);
+  assert.equal((await settings.active()).version,active.version);
 }));
 
 test('child-only settings revisions initialize changed exact requisite fields from MySklad and verify readback', async () => serializeApplyTest(async () => {

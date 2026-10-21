@@ -23,3 +23,10 @@ ambiguity/incomplete-page rejection and native CREATE acknowledgement contract.
 The earlier held contact 227106 is not reset/replayed. Fresh live acceptance must
 use a new owned synthetic contact and verify native child ID, parent, email and
 repeat update without duplicate creation.
+
+The fresh live contact 227114 created one nested native contact, but its configured
+email was absent: the UI stores entity `contacts`, while runtime selected only
+legacy `contacts-companies`. Both supported labels now resolve to CONTACT in
+field selection, transformations, CREATE fields, document dependencies and
+settings-revision projections. They never match COMPANY. Saving conflicting
+writes across the two aliases is rejected. Persisted configuration is not rewritten.

@@ -18,6 +18,7 @@ import { enterControlledLiveEventScope } from '../controlled-live-test-policy';
 import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 import { parseClientMoyskladTimestamp } from './client-moysklad-date';
 import { legacyOwnsContactEvent } from '../contact-event-owner';
+import { sameClientFieldEntity } from '../field-settings/client-field-entity';
 
 const logger = new Logger('ClientSyncProcessor');
 export const CLIENT_SYNC_GATEWAY = Symbol('CLIENT_SYNC_GATEWAY');
@@ -557,8 +558,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }
       const mappingEntity = entity === 'COMPANY' ? 'companies' : 'contacts-companies';
       const rules = Array.isArray(config.config.rules) ? config.config.rules : [];
-      const applicable = rules.filter((rule: any) => rule?.entity === mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
-      const groups = Array.isArray(config.config.groups) ? config.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
+      const applicable = rules.filter((rule: any) => sameClientFieldEntity(rule?.entity, mappingEntity) && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
+      const groups = Array.isArray(config.config.groups) ? config.config.groups.filter((group: any) => sameClientFieldEntity(group?.entity, mappingEntity)) : [];
       let prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
       if (prior) {
         const revision = await this.rebaseClientSettings({ pair, event, eventConfig: config, mappingEntity, bitrixEntity, msType, bitrix, moysklad, state: prior, fence });
@@ -933,8 +934,8 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         let bitrix = await this.gateway.readBitrix('CONTACT', pair.bitrix24Id);
         const mappingEntity = 'contacts-companies';
         const rules = Array.isArray(eventConfig.config.rules) ? eventConfig.config.rules : [];
-        const applicable = rules.filter((rule: any) => rule?.entity === mappingEntity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
-        const groups = Array.isArray(eventConfig.config.groups) ? eventConfig.config.groups.filter((group: any) => group?.entity === mappingEntity) : [];
+        const applicable = rules.filter((rule: any) => sameClientFieldEntity(rule?.entity, mappingEntity) && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string');
+        const groups = Array.isArray(eventConfig.config.groups) ? eventConfig.config.groups.filter((group: any) => sameClientFieldEntity(group?.entity, mappingEntity)) : [];
         let prior = await this.database.entityPairSyncState.findUnique({ where: { pairId: pair.id } });
         if (prior) {
           const revision = await this.rebaseClientSettings({ pair, event, eventConfig, mappingEntity, bitrixEntity: 'CONTACT', msType: pair.moyskladType, bitrix, moysklad: ms, state: prior, fence });
@@ -1312,7 +1313,7 @@ type ClientSettingsProjection = {
 function semanticClientSettings(config: unknown, entity: string): ClientSettingsProjection {
   const source = isRecord(config) ? config : {};
   const rules = (Array.isArray(source.rules) ? source.rules : []).filter((rule): rule is Record<string, any> =>
-    isRecord(rule) && rule.entity === entity && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string' &&
+    isRecord(rule) && sameClientFieldEntity(rule.entity, entity) && typeof rule.sourceField === 'string' && typeof rule.targetField === 'string' &&
     (isRecord(rule.bitrix24ToMoysklad) && rule.bitrix24ToMoysklad.enabled === true || isRecord(rule.moyskladToBitrix24) && rule.moyskladToBitrix24.enabled === true))
     .map((rule) => ({
       entity, sourceField: rule.sourceField, targetField: rule.targetField, criticality: rule.criticality,
@@ -1320,7 +1321,7 @@ function semanticClientSettings(config: unknown, entity: string): ClientSettings
       moyskladToBitrix24: { enabled: rule.moyskladToBitrix24?.enabled === true, transform: rule.moyskladToBitrix24?.transform ?? null },
     })).sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)));
   const groups = (Array.isArray(source.groups) ? source.groups : []).filter((group): group is Record<string, any> =>
-    isRecord(group) && group.entity === entity && typeof group.targetField === 'string' && Array.isArray(group.sourceFields))
+    isRecord(group) && sameClientFieldEntity(group.entity, entity) && typeof group.targetField === 'string' && Array.isArray(group.sourceFields))
     .map((group) => ({ entity, direction: group.direction, sourceFields: group.sourceFields.filter((field: unknown): field is string => typeof field === 'string'),
       targetField: group.targetField, criticality: group.criticality, transform: group.transform ?? null }))
     .sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)));
@@ -1425,7 +1426,7 @@ function buildWrites(config: any, entity: string, direction: 'BITRIX24_TO_MOYSKL
     defaultTarget[destField] = transformed.value;
   }
   for (const group of Array.isArray(config?.groups) ? config.groups : []) {
-    if (group?.entity !== entity || group.direction !== direction || !Array.isArray(group.sourceFields) || typeof group.targetField !== 'string') continue;
+    if (!sameClientFieldEntity(group?.entity, entity) || group.direction !== direction || !Array.isArray(group.sourceFields) || typeof group.targetField !== 'string') continue;
     const sourceFields = group.sourceFields.filter((field: unknown): field is string => typeof field === 'string');
     const changed = sourceFields.some((field: string) => !equal(sourceNow[field], sourcePrior[field]));
     if (!changed) continue;
@@ -1516,7 +1517,7 @@ function configuredCreateFields(config: unknown, entity: string, direction: 'BIT
   if (!isRecord(config)) return output;
   const rules = Array.isArray(config.rules) ? config.rules : [];
   for (const rule of rules) {
-    if (!isRecord(rule) || rule.entity !== entity || typeof rule.sourceField !== 'string' || typeof rule.targetField !== 'string') continue;
+    if (!isRecord(rule) || !sameClientFieldEntity(rule.entity, entity) || typeof rule.sourceField !== 'string' || typeof rule.targetField !== 'string') continue;
     const configKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
     if (!isRecord(rule[configKey]) || rule[configKey].enabled !== true) continue;
     const targetField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.targetField : rule.sourceField;
@@ -1526,7 +1527,7 @@ function configuredCreateFields(config: unknown, entity: string, direction: 'BIT
   }
   const groups = Array.isArray(config.groups) ? config.groups : [];
   for (const group of groups) {
-    if (!isRecord(group) || group.entity !== entity || group.direction !== direction || typeof group.targetField !== 'string') continue;
+    if (!isRecord(group) || !sameClientFieldEntity(group.entity, entity) || group.direction !== direction || typeof group.targetField !== 'string') continue;
     const transformed = settings.transformFieldResult(config, entity, direction, group.targetField, source);
     if (transformed?.status === 'mapped') output[group.targetField] = transformed.value;
     else if (transformed?.status === 'error' && group.criticality === 'critical') throw new Error(`CLIENT_FIELD_TRANSFORM_FAILED:${group.targetField}:${transformed.reason}`);

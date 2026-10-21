@@ -9,6 +9,7 @@ import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 import { validateChildResourceBindings } from '../clients/client-child-resource-sync';
 import { applyFieldTransform, FieldTransform } from './field-transform';
 import { confirmedDealStageReference } from './deal-stage-catalog-key';
+import { sameClientFieldEntity, canonicalClientFieldEntity } from './client-field-entity';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -201,6 +202,18 @@ export class FieldSettingsService {
   }
 
   private async validateConfiguredFields(config: FieldSettingsConfig, bitrixAccessToken: string) {
+    const destinations = new Map<string, string>();
+    const reserve = (entity: string, direction: string, field: string) => {
+      const key = `${canonicalClientFieldEntity(entity)}|${direction}|${field}`;
+      const prior = destinations.get(key);
+      if (prior && prior !== entity) throw new BadRequestException('Contact mapping aliases cannot write the same target field');
+      destinations.set(key, entity);
+    };
+    for (const rule of config.rules) {
+      if (rule.bitrix24ToMoysklad.enabled) reserve(rule.entity, 'BITRIX24_TO_MOYSKLAD', rule.targetField);
+      if (rule.moyskladToBitrix24.enabled) reserve(rule.entity, 'MOYSKLAD_TO_BITRIX24', rule.sourceField);
+    }
+    for (const group of config.groups) reserve(group.entity, group.direction, group.targetField);
     const ruleEntities = [...config.rules, ...config.groups].map((entry) => {
       if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
       return entry.entity;
@@ -375,7 +388,7 @@ export class FieldSettingsService {
     const rules = Array.isArray(config.rules) ? config.rules : [];
     const sourceFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'sourceField' : 'targetField';
     const targetFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'targetField' : 'sourceField';
-    const rule = rules.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate[targetFieldKey] === targetField);
+    const rule = rules.find((candidate) => isRecord(candidate) && sameClientFieldEntity(candidate.entity, entity) && candidate[targetFieldKey] === targetField);
     if (isRecord(rule)) {
       const mapping = rule[ruleDirection];
       if (isRecord(mapping) && mapping.enabled === true && isRecord(mapping.transform)) {
@@ -385,7 +398,7 @@ export class FieldSettingsService {
       }
     }
     const groups = Array.isArray(config.groups) ? config.groups : [];
-    const group = groups.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.direction === direction && candidate.targetField === targetField);
+    const group = groups.find((candidate) => isRecord(candidate) && sameClientFieldEntity(candidate.entity, entity) && candidate.direction === direction && candidate.targetField === targetField);
     if (isRecord(group)) {
       if (!Array.isArray(group.sourceFields) || !isRecord(group.transform) || typeof group.transform.separator !== 'string') {
         return { status: 'error' as const, reason: 'transform is not supported', transform: 'unsupported' };
@@ -1013,7 +1026,7 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
   if (!isRecord(config)) return result;
   const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
   for (const rule of Array.isArray(config.rules) ? config.rules : []) {
-    if (!isRecord(rule) || rule.entity !== entity || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
+    if (!isRecord(rule) || !sameClientFieldEntity(rule.entity, entity) || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
     const mapping = rule[ruleDirection];
     if (!isRecord(mapping) || mapping.enabled !== true || !isRecord(mapping.transform)) continue;
     const sourceField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
@@ -1023,7 +1036,7 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
     result[targetField] = { value: transformed.status === 'mapped' ? transformed.value : null, status: transformed.status, ...(transformed.status === 'error' ? { error: transformed.reason } : {}), ...(transformed.status === 'skip' ? { reason: transformed.reason } : {}), transform: transformed.transform };
   }
   for (const group of Array.isArray(config.groups) ? config.groups : []) {
-    if (!isRecord(group) || group.entity !== entity || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
+    if (!isRecord(group) || !sameClientFieldEntity(group.entity, entity) || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
     const fields = group.sourceFields.filter(isString);
     if (typeof group.transform.separator !== 'string') {
       result[group.targetField] = { value: null, status: 'error', error: 'transform is not supported', transform: String(group.transform.kind) };
