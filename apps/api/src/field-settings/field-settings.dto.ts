@@ -71,6 +71,11 @@ export type DealOrderRuntimeDto = {
   defaultProductGroupId?: string | null;
   currencies: Array<{ bitrix24Code: string; moyskladId: string }>;
   stages: Array<{ bitrix24StageId: string; moyskladId: string; creationEnabled: boolean }>;
+  /** Explicit existing-document transitions; independent from creation eligibility. */
+  stageTransitions?: {
+    bitrix24ToMoysklad: Array<{ bitrix24StageId: string; moyskladId: string }>;
+    moyskladToBitrix24: Array<{ bitrix24StageId: string; moyskladId: string }>;
+  };
   organizations: Array<{ bitrix24Id: string; moyskladId: string }>;
   stores: Array<{ bitrix24Id: string; moyskladId: string }>;
   employees: Array<{ bitrix24Id: string; moyskladId: string }>;

@@ -100,6 +100,16 @@ export class FieldSettingsService {
       if (pair.moyskladId && !targetIds.has(pair.moyskladId)) throw new BadRequestException(`MySklad reference ${pair.moyskladId} no longer exists in ${pair.kind}`);
       if (pair.status === 'confirmed' && !pair.moyskladId) throw new BadRequestException(`Reference ${pair.bitrix24Id} in ${pair.kind} must have a target before it is confirmed`);
     }
+    const transitions = config.dealOrderRuntime?.stageTransitions;
+    if (transitions) {
+      const sources = new Set(namedCatalogs.dealStages.bitrix24.map(item => item.id));
+      const targets = new Set(namedCatalogs.dealStages.moysklad.map(item => item.id));
+      for (const pair of [...transitions.bitrix24ToMoysklad, ...transitions.moyskladToBitrix24]) {
+        const custom = /^C([1-9]\d*):/.exec(pair.bitrix24StageId);
+        const catalogKey = custom ? `${custom[1]}:${pair.bitrix24StageId}` : `0:${pair.bitrix24StageId}`;
+        if (!sources.has(catalogKey) || !targets.has(pair.moyskladId)) throw new BadRequestException('Stage transition references must exist in the current provider catalogs');
+      }
+    }
     }
     const version = await this.database.$transaction(async (transaction) => {
       const states = await transaction.$queryRaw<Array<{ version: number }>>`
@@ -715,6 +725,25 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     if (!isRecord(item) || !isString(item.bitrix24StageId) || !item.bitrix24StageId.trim() || !id(item.moyskladId) || typeof item.creationEnabled !== 'boolean') throw new BadRequestException('Deal stage mapping is invalid');
     return { bitrix24StageId: item.bitrix24StageId.trim(), moyskladId: item.moyskladId as string, creationEnabled: item.creationEnabled };
   });
+  let stageTransitions: NonNullable<FieldSettingsConfigDto['dealOrderRuntime']>['stageTransitions'];
+  if (value.stageTransitions !== undefined) {
+    if (!isRecord(value.stageTransitions)) throw new BadRequestException('Stage transitions must contain both directional maps');
+    const parse = (rows: unknown, source: 'bitrix24StageId' | 'moyskladId') => {
+      if (!Array.isArray(rows)) throw new BadRequestException('Stage transitions must contain both directional maps');
+      const seen = new Set<string>();
+      return rows.map(row => {
+        if (!isRecord(row) || typeof row.bitrix24StageId !== 'string' || !/^(?:C[1-9]\d*:)?[A-Z0-9_]+$/.test(row.bitrix24StageId) || !id(row.moyskladId)) throw new BadRequestException('Stage transition is invalid');
+        const pair = { bitrix24StageId: row.bitrix24StageId, moyskladId: row.moyskladId as string };
+        if (seen.has(pair[source])) throw new BadRequestException('Stage transition source is duplicated in its direction');
+        seen.add(pair[source]);
+        return pair;
+      });
+    };
+    stageTransitions = {
+      bitrix24ToMoysklad: parse(value.stageTransitions.bitrix24ToMoysklad, 'bitrix24StageId'),
+      moyskladToBitrix24: parse(value.stageTransitions.moyskladToBitrix24, 'moyskladId'),
+    };
+  }
   const organizations = pairs(value.organizations, 'Organization');
   const stores = pairs(value.stores, 'Store');
   const employees = pairs(value.employees, 'Employee');
@@ -746,7 +775,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), ...(stageTransitions === undefined ? {} : { stageTransitions }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

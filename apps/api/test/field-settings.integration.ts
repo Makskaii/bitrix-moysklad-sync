@@ -25,6 +25,7 @@ let omitContactNameFieldType = false;
 let fakeMoyskladAttributeType: string | undefined = 'string';
 let fakeMoyskladUnitListAsArray = false;
 let fakeMoyskladPriceListHasMalformedRow = false;
+let fakeMoyskladOrderStates = [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Новая сделка' }];
 const fakeB24UnitIds = [1, 3, 5, 7, 9, 10, 12, 14, 16, 18, 20, 22];
 const fakeB24PriceIds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
 const fakeMsUnitIds = ['250d5161-f815-4524-85b6-fd6afebc1ad6', '8e2eb543-99e9-4077-bc31-93b1359de9c4', '2ec1170c-3f69-4409-87bb-c68e0011b275', '19f1edc0-fc42-4001-94cb-c9ec9c62ec10', '605a1781-b652-11e3-feb0-002590a28eca', 'f5611dc2-1acd-11e7-7a31-d0fd001085d2', '647775b2-3b57-409b-910e-8b17940b279f', 'dfe54549-ec98-4fd7-ad1b-215162a9199a', '7cfd013f-33d0-448a-a4aa-1c8bb2e05417', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
@@ -151,7 +152,7 @@ before(async () => {
         : isUnitList ? fakeMoyskladUnitListAsArray ? rows : { rows, meta: { size: rows.length } }
         : serviceDirectory || paymentDirectory ? { rows: dictionaryRows, meta: { size: dictionaryRows.length } }
         : url.pathname.endsWith('/entity/currency') ? { rows: [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Рубли', code: 'RUB' }], meta: { size: 1 } }
-        : orderStateMetadata ? { states: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Новая сделка' }] }
+        : orderStateMetadata ? { states: fakeMoyskladOrderStates }
         : namedResource ? { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Demo reference', code: 'REF' }], meta: { size: 1 } }
         : url.pathname.endsWith('/metadata/attributes') ? { rows: [{ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', name: 'Preferred contact', ...(fakeMoyskladAttributeType === undefined ? {} : { type: fakeMoyskladAttributeType }), writable: true }] }
         : url.pathname.endsWith('/00000000-0000-4000-8000-000000000005')
@@ -946,4 +947,47 @@ test('accepted events stay pinned across activation and only an explicit one-eve
   const recomputedVersion = await settings.repinEvent(accepted.id);
   assert.equal(recomputedVersion, next.version);
   assert.equal((await settings.eventConfig(accepted.id)).version, next.version);
+});
+
+test('public settings save validates directional stage maps without requiring a bijection or changing creation eligibility', async () => {
+  const previousStatuses = fakeB24DealStatuses;
+  const previousStates = fakeMoyskladOrderStates;
+  const active = await fetch(`${apiUrl}/api/admin/field-settings`).then(response => response.json()) as { config: Record<string, any> };
+  const original = structuredClone(active.config);
+  const save = (config: unknown) => fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }) });
+  try {
+    fakeB24DealStatuses = { ...previousStatuses, DEAL_STAGE: [...previousStatuses.DEAL_STAGE!,
+      { STATUS_ID: 'UC_BBJSFZ', NAME: 'Отменен покупателем' }, { STATUS_ID: 'LOSE', NAME: 'Не успешно' }, { STATUS_ID: 'UC_RH2DBY', NAME: 'Возврат средств' }] };
+    const lower = '703b0c0d-7a39-11e3-076c-002590a28eca';
+    const upper = '296124dc-b504-11ee-0a80-11990013fdf1';
+    const returned = '47deae3c-7a3b-11e3-dde0-002590a28eca';
+    fakeMoyskladOrderStates = [...previousStates, { id: lower, name: 'отменен' }, { id: upper, name: 'Отменен' }, { id: returned, name: 'возврат' }];
+    const config = structuredClone(original);
+    assert.ok(config.dealOrderRuntime);
+    const originalCreation = structuredClone(config.dealOrderRuntime.stages);
+    config.dealOrderRuntime.stageTransitions = {
+      bitrix24ToMoysklad: [{ bitrix24StageId: 'UC_BBJSFZ', moyskladId: lower }, { bitrix24StageId: 'LOSE', moyskladId: lower }, { bitrix24StageId: 'UC_RH2DBY', moyskladId: returned }],
+      moyskladToBitrix24: [{ bitrix24StageId: 'UC_BBJSFZ', moyskladId: lower }, { bitrix24StageId: 'UC_BBJSFZ', moyskladId: upper }, { bitrix24StageId: 'UC_RH2DBY', moyskladId: returned }],
+    };
+    const response = await save(config);
+    assert.equal(response.status, 200, await response.clone().text());
+    const saved = await response.json() as { version: number; config: Record<string, any> };
+    assert.deepEqual(saved.config.dealOrderRuntime.stageTransitions, config.dealOrderRuntime.stageTransitions);
+    assert.deepEqual(saved.config.dealOrderRuntime.stages, originalCreation);
+    for (const kind of ['forward-duplicate', 'reverse-duplicate', 'missing-direction', 'unknown-ms', 'unknown-b24', 'catalog-key-not-runtime-id']) {
+      const bad = structuredClone(config); const transitions = bad.dealOrderRuntime.stageTransitions;
+      if (kind === 'forward-duplicate') transitions.bitrix24ToMoysklad.push({ bitrix24StageId: 'LOSE', moyskladId: upper });
+      if (kind === 'reverse-duplicate') transitions.moyskladToBitrix24.push({ bitrix24StageId: 'LOSE', moyskladId: lower });
+      if (kind === 'missing-direction') delete transitions.moyskladToBitrix24;
+      if (kind === 'unknown-ms') transitions.moyskladToBitrix24[0].moyskladId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      if (kind === 'unknown-b24') transitions.bitrix24ToMoysklad[0].bitrix24StageId = 'UNKNOWN';
+      if (kind === 'catalog-key-not-runtime-id') transitions.bitrix24ToMoysklad[0].bitrix24StageId = '0:LOSE';
+      assert.equal((await save(bad)).status, 400, kind);
+    }
+    const final = await fetch(`${apiUrl}/api/admin/field-settings`).then(response => response.json()) as { version: number };
+    assert.equal(final.version, saved.version, 'rejected maps do not activate settings versions');
+  } finally {
+    fakeB24DealStatuses = previousStatuses; fakeMoyskladOrderStates = previousStates;
+    assert.equal((await save(original)).status, 200);
+  }
 });

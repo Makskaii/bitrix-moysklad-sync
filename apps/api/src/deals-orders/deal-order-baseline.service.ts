@@ -7,9 +7,10 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
-import { DealOrderFieldRuntimeService, RevisionMappingResult } from './deal-order-field-runtime.service';
+import { DealOrderFieldRuntimeService, RevisionMappingResult, readConfiguredStage } from './deal-order-field-runtime.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
 import { bitrixDocumentTotal, moyskladDocumentTotal } from './document-total-snapshot';
+import { configuredStagePairs } from './deal-order-stage-mappings';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
@@ -209,6 +210,11 @@ export class DealOrderBaselineService {
 
 function projectApprovedValues(config: VersionedFieldSettingsDto['config'], record: Record<string, unknown>, system: 'bitrix24' | 'moysklad') {
   const values: Record<string, unknown> = {};
+  const stages = configuredStagePairs(config);
+  if (stages?.length) {
+    const stage = readConfiguredStage(record, stages, system === 'bitrix24' ? 'BITRIX24' : 'MOYSKLAD');
+    if (stage) values['native:stage'] = stage;
+  }
   if (system === 'bitrix24') {
     values['client:companyId'] = approvedValue(record.COMPANY_ID);
     values['deal-order-total'] = bitrixDocumentTotal(record);
