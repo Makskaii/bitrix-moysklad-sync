@@ -8,6 +8,7 @@ import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
 import { ProductCatalogManualReviewError } from '../src/products/product-catalog-create.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../src/deals-orders/deal-order-reverse-create.service';
+import { ProviderFailure, retryAtForFailure } from '../src/provider-failure';
 
 process.env.SYNC_MODE ??= 'apply';
 const db = new PrismaClient();
@@ -51,6 +52,7 @@ let clientWorkerLeaseChecks = 0;
 let renameNextCreatedDeal = false;
 let nativeTitleUpdates = 0;
 let loseNextTitleUpdateResponse = false;
+let nextRateLimitProvider: 'MOYSKLAD' | 'BITRIX24' | null = null;
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -346,6 +348,25 @@ test('a portal-generated title is restored once to the native MS order name befo
   }
 });
 
+test('reverse creation carries native provider Retry-After into durable scheduling without a duplicate write', async () => {
+  const previousPositions = orderPositions;
+  try {
+    for (const provider of ['MOYSKLAD', 'BITRIX24'] as const) {
+      const orderId = randomUUID(); activeOrderId = orderId; orderPositions = []; items = []; rows = [];
+      nextRateLimitProvider = provider; dealAdds = 0;
+      const before = Date.now();
+      const error = await service.createAndPair({ moyskladOrderId: orderId, eventId: `rate-limit-${suffix}`, eventConfig: config() }).then(() => null, error => error);
+      assert.ok(error instanceof ProviderFailure);
+      assert.equal(error.provider, provider); assert.equal(error.status, 429);
+      assert.ok(error.retryAfterAt && error.retryAfterAt.getTime() >= before + 29_000);
+      assert.equal(retryAtForFailure(error, 1), error.retryAfterAt);
+      assert.equal(dealAdds, 0);
+      assert.equal((await db.dealOrderReverseCreateOperation.findUnique({ where: { moyskladOrderId: orderId } }))?.bitrix24DealId ?? null, null);
+      await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    }
+  } finally { nextRateLimitProvider = null; activeOrderId = ids.order; orderPositions = previousPositions; }
+});
+
 test('missing pinned numbering/runtime references are held for review before any provider write', async () => {
   dealAdds = 0; rowAdds = 0;
   const orderId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -482,6 +503,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const bodyText = Buffer.concat(chunks).toString('utf8');
   const body = bodyText ? JSON.parse(bodyText) as Record<string, any> : {};
   const pathname = new URL(request.url ?? '/', base).pathname;
+  if ((nextRateLimitProvider === 'MOYSKLAD' && pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) ||
+      (nextRateLimitProvider === 'BITRIX24' && pathname === '/rest/crm.item.list')) {
+    nextRateLimitProvider = null;
+    response.writeHead(429, { 'Retry-After': '30', 'content-type': 'application/json' }); response.end(JSON.stringify({ error: 'RATE_LIMIT' })); return;
+  }
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(pathname) && body.useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
   }

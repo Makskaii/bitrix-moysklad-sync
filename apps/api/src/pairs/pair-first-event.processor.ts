@@ -278,7 +278,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
         await this.finish(event.id, 'RETRYABLE_FAILURE', 'CUSTOMER_ORDER_CREATE_RETRY', workerLease,
           retryAtForFailure(error, event.attempts + 1));
-        logger.warn(JSON.stringify({ eventId: event.id, reason }));
+        logger.warn(JSON.stringify({ eventId: event.id, reason, ...(error instanceof ProviderFailure ? { provider: error.provider, status: error.status } : {}) }));
         return null;
       }
     }
@@ -304,7 +304,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           await this.finish(event.id, 'RETRYABLE_FAILURE', 'REVERSE_DEAL_CREATE_RETRY', workerLease,
             retryAtForFailure(error, event.attempts + 1));
         }
-        logger.warn(JSON.stringify({ eventId: event.id, reason }));
+        logger.warn(JSON.stringify({ eventId: event.id, reason, ...(error instanceof ProviderFailure ? { provider: error.provider, status: error.status } : {}) }));
         return null;
       }
     }

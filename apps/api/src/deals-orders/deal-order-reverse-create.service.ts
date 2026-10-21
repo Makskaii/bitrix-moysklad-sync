@@ -14,6 +14,7 @@ import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
+import { providerResponseFailure } from '../provider-failure';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -613,7 +614,15 @@ function hasUniqueConfirmedStagePair(
 }
 async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
   const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(12_000) });
-  if (!response.ok) throw new Error(`Provider request failed (${response.status})`);
+  if (!response.ok) {
+    const msBase = configuredBase('MOYSKLAD_API_BASE_URL');
+    const provider = url.origin === msBase.origin && url.pathname.startsWith(msBase.pathname.replace(/\/?$/, '/')) ? 'MOYSKLAD' : 'BITRIX24';
+    const failure = providerResponseFailure(provider, response.status, response.headers.get('retry-after'));
+    // Retain the existing credential-free message while preserving Retry-After
+    // for the durable event scheduler rather than retrying into a rate limit.
+    failure.message = `Provider request failed (${response.status})`;
+    throw failure;
+  }
   const body: unknown = await response.json().catch(() => null);
   if (isRecord(body) && body.errors) throw new Error('Provider returned an error response');
   return body;
