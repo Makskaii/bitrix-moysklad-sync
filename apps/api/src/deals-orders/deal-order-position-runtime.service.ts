@@ -472,14 +472,15 @@ export class DealOrderPositionRuntimeService {
         const created = await runMutation('bitrix24ToMoysklad', () => this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
           method: 'POST', headers: msHeaders(), body: JSON.stringify(payload),
         }));
-        if (!isRecord(created) || !isUuid(created.id)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
+        const createdId = positionIdFromCreateResponse(created);
+        if (!createdId) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
         const savedPositionId = await this.database.dealOrderPositionAddOperation.updateMany({
-          where: { id: operation.id, leaseToken }, data: { moyskladPositionId: created.id },
+          where: { id: operation.id, leaseToken }, data: { moyskladPositionId: createdId },
         });
         if (savedPositionId.count !== 1) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_LEASE_LOST_AFTER_PROVIDER_SUCCESS' };
-        const readback = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(created.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(readback) || readback.id !== created.id || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
-        return await this.persistAddedRow(pairId, row, created.id, payload, operation.id, leaseToken, assertOwner);
+        const readback = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(createdId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(readback) || readback.id !== createdId || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
+        return await this.persistAddedRow(pairId, row, createdId, payload, operation.id, leaseToken, assertOwner);
       } catch (error) {
         throwIfServiceModeNotOn(error);
         await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operation.id, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'ADD_OUTCOME_UNKNOWN' } }).catch(() => undefined);
@@ -514,6 +515,12 @@ export class DealOrderPositionRuntimeService {
     await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operationId, leaseToken }, data: { status: 'UNCERTAIN', lastErrorCategory: reason, leaseToken: null, leaseUntil: null } });
     return { status: 'MANUAL_REVIEW', reason };
   }
+}
+
+/** A single-row positions POST can acknowledge with either an object or [object]. */
+export function positionIdFromCreateResponse(value: unknown): string | null {
+  const row = Array.isArray(value) ? value.length === 1 ? value[0] : null : value;
+  return isRecord(row) && !('errors' in row) && !('error' in row) && isUuid(row.id) ? row.id : null;
 }
 
 export function classifyPositionAddRecovery(attempted: boolean, matchingUnlinkedCount: number): string | null {
