@@ -120,6 +120,17 @@ test('truncated successful product response is a retryable uncertain outcome', a
   );
 });
 
+test('description write boundary sends plain supported text and rejects unsupported letters before a provider call', async () => {
+  const api = new ProductCardHttpApi();
+  await api.updateBitrix24('101', { detailText: 'Ё 😀 <b>literal</b>\nTAIL' });
+  const request = new URLSearchParams(requests.at(-1)!.body);
+  assert.equal(request.get('fields[detailText]'), 'Ё  <b>literal</b>\nTAIL');
+  assert.equal(request.get('fields[detailTextType]'), 'text');
+  const before = requests.length;
+  await assert.rejects(api.updateBitrix24('101', { detailText: 'A𠀀B' }), /PRODUCT_DESCRIPTION_UNSUPPORTED_CHARACTER/);
+  assert.equal(requests.length, before);
+});
+
 test('catalog services use service-specific provider endpoints and retain their native kind', async () => {
   const api = new ProductCardHttpApi();
   const bitrix = await api.readBitrix24('102', 'service');

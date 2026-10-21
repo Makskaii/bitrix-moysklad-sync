@@ -1,5 +1,6 @@
 import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { applyFieldTransform, type FieldTransform } from '../field-settings/field-transform';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
 
 export type ProductCardPair = {
   id: string;
@@ -100,8 +101,22 @@ export class ProductCardSyncService {
         this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product'),
         this.state.read(pair.id),
       ]);
+      if (rules.description?.moyskladToBitrix24) {
+        // Compare the same approved projection that CREATE/UPDATE writes. Raw
+        // source fields remain intact; null/empty are one optional empty text.
+        bitrix24 = { ...bitrix24, detailText: bitrix24.detailText ?? '' };
+        moysklad = { ...moysklad, detailText: bitrixProductDescription(moysklad.detailText ?? '') };
+        if (previous) previous = { ...previous,
+          bitrix24Values: { ...previous.bitrix24Values, description: previous.bitrix24Values.description ?? '' },
+          moyskladValues: { ...previous.moyskladValues,
+            ...(typeof previous.moyskladValues.description === 'string'
+              ? { description: bitrixProductDescription(previous.moyskladValues.description) }
+              : { description: previous.moyskladValues.description ?? '' }) },
+        };
+      }
     } catch (error) {
       if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
+      if (error instanceof ProductDescriptionEncodingError) return review(error.reason);
       return error instanceof ProductCardManualReviewError ? review(error.reason) : isRetryableFailure(error)
         ? retry('PRODUCT_CARD_READ_FAILED', [], retryAtForFailure(error, input.attempt ?? 1)) : review('PRODUCT_PROVIDER_REJECTED');
     }
@@ -300,7 +315,7 @@ export class ProductCardSyncService {
       ? await this.api.readBitrix24(pair.bitrix24Id, pair.moyskladType === 'service' ? 'service' : 'product')
       : await this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product');
     if (field === 'name') return snapshot.name;
-    if (field === 'description') return snapshot.detailText;
+    if (field === 'description') return snapshot.detailText ?? '';
     if (field === 'code') return snapshot.code;
     if (field === 'unit') return snapshot.unitId;
     if (field.startsWith('field:') && direction.bitrix24Field) return snapshot.fields?.[direction.bitrix24Field];

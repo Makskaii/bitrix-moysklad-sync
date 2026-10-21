@@ -3,6 +3,7 @@ import { assertApplyExternalWrite } from '../external-write-guard';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProductCardApi, ProductCardManualReviewError, ProductCardSnapshot } from './product-card-sync.service';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const EXACT_NAME_CANDIDATE_LIMIT = 25;
@@ -218,6 +219,13 @@ export class ProductCardHttpApi implements ProductCardApi {
   async updateBitrix24(id: string, fields: Record<string, unknown>, kind: 'product' | 'service' = 'product'): Promise<void> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
     if (Object.keys(fields).some((key) => key === 'measure' ? !isSafeUnitValue(fields[key]) : !isSafeCatalogScalarField(key, fields[key]))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (typeof fields.detailText === 'string' || fields.detailText === null) {
+      try { fields = { ...fields, detailText: bitrixProductDescription(fields.detailText ?? ''), detailTextType: 'text' }; }
+      catch (error) {
+        if (error instanceof ProductDescriptionEncodingError) throw new ProductCardManualReviewError(error.reason);
+        throw error;
+      }
+    }
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: kind, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('BITRIX24', 'PRODUCT_UPDATE');
     await this.bitrixCall(kind === 'service' ? 'catalog.product.service.update' : 'catalog.product.update', { id, fields });

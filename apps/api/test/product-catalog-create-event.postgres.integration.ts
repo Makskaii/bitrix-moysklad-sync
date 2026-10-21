@@ -31,7 +31,7 @@ const oldEnv = new Map<string, string | undefined>();
 function assertIsolatedTarget(value: string) {
   const target = new URL(value);
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(target.hostname), 'refusing to run product-create event integration against a non-local database');
-  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test', '/sync_issue79_product_audit_20261021_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
+  assert.ok(['/aerosystems_offline_acceptance_test', '/sync_issue79_integration_create_event_test', '/sync_issue79_date_validation_test', '/sync_issue79_product_audit_20261021_test', '/sync_issue79_root_description_20261021_test'].includes(target.pathname), 'requires an explicitly allowlisted disposable database');
   const schema = target.searchParams.get('schema') ?? '';
   assert.ok(/^issue61_create_event_[a-z0-9_]+$/.test(schema) || target.pathname === '/sync_issue79_date_validation_test' && schema === 'issue79_date_validation', 'requires a dedicated fresh test schema');
 }
@@ -487,6 +487,95 @@ async function sendCreate(kind: 'product' | 'service', id: string, requestId: st
   });
 }
 
+test('actual public product CREATE/UPDATE complete with approved emoji projection, price, UUID and one durable pair', { skip: !databaseUrl }, async () => {
+  assert.ok(app);
+  const database = app.get(DatabaseService);
+  const version = 1_710_000 + Math.floor(Math.random() * 10_000);
+  const priceType = randomUUID();
+  const rule = (sourceField: string, targetField: string) => ({ id: sourceField, entity: 'catalog', sourceField, targetField,
+    bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
+    moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } });
+  await database.fieldSettingsVersion.create({ data: { version, config: {
+    schemaVersion: 1, productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name', 'description'] },
+    rules: [rule('name', 'name'), rule('detailText', 'description')], groups: [], serviceCounterpartyId: null,
+    references: { units: [], priceTypes: [{ bitrix24Id: 2, moyskladId: priceType, status: 'configured' }], dictionaries: [], namedPairs: [] },
+  } } });
+  await database.fieldSettingsState.update({ where: { id: 'global' }, data: { version } });
+  const cases = [
+    ['😀тест Ё & <b>literal</b>\nEND', 'тест Ё & <b>literal</b>\nEND'],
+    ['тест 😀 Ё & <b>literal</b>\nEND', 'тест  Ё & <b>literal</b>\nEND'],
+    ['тест Ё & <b>literal</b>\nEND😀', 'тест Ё & <b>literal</b>\nEND'],
+    ['тест Ё © ♥ <b>literal</b>\nEND', 'тест Ё © ♥ <b>literal</b>\nEND'],
+    ['😀👨‍👩‍👧‍👦', ''],
+  ];
+  for (const [raw, projected] of cases) {
+    const id = randomUUID();
+    const source = { id, meta: { type: 'product' }, name: `description-${id}`, description: raw,
+      created: '2026-02-01T00:00:00.000Z', salePrices: [{ value: 1234, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/${randomUUID()}` } },
+        priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }] };
+    sourceRecords.set(id, source);
+    const deliver = async (action: 'CREATE' | 'UPDATE', suffix: string) => {
+      const response = await (action === 'CREATE' ? sendCreate : sendUpdate)('product', id, `text-${id}-${suffix}`);
+      assert.equal(response.status, 200);
+      const eventId = oneEventId(await response.json());
+      await waitForStatus(database, eventId, 'SUCCEEDED');
+    };
+    await deliver('CREATE', 'create');
+    const pair = await database.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: id, active: true } });
+    const card = createdCards.get(pair.bitrix24Id)!;
+    assert.equal(card.detailText ?? '', projected);
+    if (projected) assert.equal(card.detailTextType, 'text');
+    assert.equal((card.property108 as { value: string }).value, id);
+    assert.equal(priceRows.get(pair.bitrix24Id)?.[0].price, 12.34);
+    const operation = await database.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: id } });
+    assert.equal(operation.status, 'SUCCEEDED');
+    assert.equal((operation.payload as any).fields.detailText ?? '', projected, 'journal freezes the approved projection, not a lossy native prefix');
+    await deliver('UPDATE', 'baseline');
+    source.description = `REV2 ${raw} TAIL😀`;
+    await deliver('UPDATE', 'changed');
+    assert.equal(card.detailText, `REV2 ${projected} TAIL`);
+    assert.equal(card.detailTextType, 'text');
+    assert.equal(source.description, `REV2 ${raw} TAIL😀`, 'MySklad source is never changed');
+    const writes = requests.filter(row => /catalog\.product\.(add|update)(\.json)?$/.test(row.path)).length;
+    await deliver('UPDATE', 'repeat');
+    assert.equal(requests.filter(row => /catalog\.product\.(add|update)(\.json)?$/.test(row.path)).length, writes, 'repeat is a stable no-op');
+    assert.equal(await database.entityPair.count({ where: { entityType: 'PRODUCT', moyskladId: id } }), 1);
+    assert.equal([...createdCards.values()].filter(value => value.xmlId === `MOYSKLAD_PRODUCT_${id}`).length, 1);
+    source.description = '😀';
+    await deliver('UPDATE', 'emoji-only');
+    assert.equal(card.detailText ?? '', '', 'emoji-only update clears the optional description instead of retaining stale text');
+    await deliver('UPDATE', 'empty-repeat');
+  }
+  const id = randomUUID();
+  sourceRecords.set(id, { id, meta: { type: 'product' }, name: `unsupported-${id}`, description: 'A𠀀B', created: '2026-02-01T00:00:00.000Z' });
+  const before = createdCards.size;
+  const rejected = await sendCreate('product', id, `text-${id}-unsupported`);
+  const eventId = oneEventId(await rejected.json());
+  await waitForStatus(database, eventId, 'MANUAL_REVIEW');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).lastErrorCategory, 'PRODUCT_DESCRIPTION_UNSUPPORTED_CHARACTER');
+  assert.equal(createdCards.size, before, 'unsupported non-emoji text stops BEFORE any partial provider CREATE');
+  assert.equal(await database.dealOrderReverseProductOperation.count({ where: { moyskladProductId: id } }), 0);
+  const heldId = randomUUID();
+  const heldTarget = String(nextCardId++);
+  const frozenFields = { iblockId: 77, active: 'Y', name: `held-${heldId}`, xmlId: `MOYSKLAD_PRODUCT_${heldId}`,
+    property108: { value: heldId }, detailText: 'old 😀 tail', detailTextType: 'text' };
+  sourceRecords.set(heldId, { id: heldId, meta: { type: 'product' }, name: frozenFields.name, description: frozenFields.detailText, created: '2026-02-01T00:00:00.000Z' });
+  createdCards.set(heldTarget, { id: Number(heldTarget), type: 1, ...frozenFields, detailText: 'old ' });
+  await database.dealOrderReverseProductOperation.create({ data: { moyskladProductId: heldId, syncId: randomUUID(), eventId: `old-${heldId}`, settingsVersion: version,
+    bitrix24CatalogId: '77', payload: { fields: frozenFields, xmlId: frozenFields.xmlId, catalogId: '77', prices: [], kind: 'product' } } });
+  const heldBefore = await database.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: heldId } });
+  const heldResponse = await sendCreate('product', heldId, `text-${heldId}-held`);
+  const heldEvent = oneEventId(await heldResponse.json());
+  await waitForStatus(database, heldEvent, 'MANUAL_REVIEW');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: heldEvent } })).lastErrorCategory, 'PRODUCT_CREATE_RECOVERY_MISMATCH');
+  const heldAfter = await database.dealOrderReverseProductOperation.findUniqueOrThrow({ where: { moyskladProductId: heldId } });
+  assert.deepEqual(heldAfter.payload, heldBefore.payload, 'old raw frozen journal is NOT silently rewritten to fit a partial native card');
+  assert.equal(heldAfter.bitrix24ProductId, null);
+  assert.equal(await database.entityPair.count({ where: { moyskladId: heldId } }), 0);
+  assert.equal(createdCards.get(heldTarget)?.detailText, 'old ');
+  assert.equal(documentWriteAttempts, 0);
+});
+
 async function sendMoyskladBatch(events: Array<Record<string, unknown>>, audit: Record<string, unknown> | undefined, requestId: string) {
   return fetch(`${apiUrl}/webhooks/moysklad/synthetic-product-create-secret?requestId=${encodeURIComponent(requestId)}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -597,7 +686,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (method.endsWith('catalog.product.getFieldsByFilter') || method.endsWith('catalog.product.service.getFieldsByFilter')) {
     const kind = method.includes('.service.') ? 'service' : 'product';
-    const definitions = Object.fromEntries(['name', 'code', 'detailText'].map((key) => [key, { type: 'string', isReadOnly: false }]));
+    const definitions = Object.fromEntries(['name', 'code', 'detailText', 'detailTextType'].map((key) => [key, { type: 'string', isReadOnly: false }]));
     Object.assign(definitions, { property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } });
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind]: definitions } })); return;
   }
@@ -611,7 +700,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const kind = method.includes('.service.') ? 'service' : 'product';
     const payload = parseProviderBody(body) as { fields: Record<string, unknown> };
     const id = String(nextCardId++);
-    const card = { id: Number(id), type: kind === 'service' ? 7 : 1, ...payload.fields };
+    const card = { id: Number(id), type: kind === 'service' ? 7 : 1, ...nativeTextFields(payload.fields) };
     createdCards.set(id, card);
     response.writeHead(200); response.end(JSON.stringify({ result: { [kind === 'service' ? 'service' : 'element']: card } })); return;
   }
@@ -627,7 +716,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }));
     const card = createdCards.get(String(id));
     if (!card || card.type !== (kind === 'service' ? 7 : 1)) { response.writeHead(404); response.end(JSON.stringify({ error: 'not found' })); return; }
-    Object.assign(card, fields);
+    Object.assign(card, nativeTextFields(fields));
     response.writeHead(200); response.end(JSON.stringify({ result: true })); return;
   }
   if (method.endsWith('catalog.price.update')) {
@@ -657,6 +746,13 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     response.writeHead(200); response.end(JSON.stringify({ result: { prices: structuredClone(prices), total: prices.length } })); return;
   }
   response.writeHead(404); response.end(JSON.stringify({ error: 'unexpected fake API call' }));
+}
+
+// Reproduces the actual portal: a raw supplementary character truncates the
+// ordinary field. This runs on BOTH real CREATE and UPDATE adapter paths.
+function nativeTextFields(fields: Record<string, unknown>) {
+  if (typeof fields.detailText !== 'string') return fields;
+  return { ...fields, detailText: fields.detailText.split(/[\u{10000}-\u{10ffff}]/u)[0] };
 }
 
 function parseProviderBody(body: string): Record<string, unknown> {

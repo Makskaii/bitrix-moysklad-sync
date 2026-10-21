@@ -8,6 +8,7 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { SyncModeService } from '../sync-mode.service';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
 
 type Row = Record<string, any>;
 type ProductCreateInput = {
@@ -57,6 +58,17 @@ export class ProductCatalogCreateService {
     for (const rule of configuredCatalogCreateRules(input.eventConfig.config.rules, input.product)) {
       if (['name', 'iblockId', 'active', 'xmlId', 'property108', 'measure', 'detailPicture', 'previewPicture', 'iblockSection', 'iblockSectionId'].includes(rule.bitrix24Field)) continue;
       fields[rule.bitrix24Field] = rule.value;
+    }
+    if (typeof fields.detailText === 'string') {
+      try { fields.detailText = bitrixProductDescription(fields.detailText); }
+      catch (error) {
+        if (error instanceof ProductDescriptionEncodingError) throw new ProductCatalogManualReviewError(error.reason);
+        throw error;
+      }
+      // An emoji-only optional description is absent; identity/prices/pair
+      // creation still complete. Freeze only the approved provider projection.
+      if (fields.detailText === '') delete fields.detailText;
+      else fields.detailTextType = 'text';
     }
     await assertCatalogCreateFieldsWritable(catalogId, kind, fields);
     const prices = input.prices ?? [];

@@ -584,6 +584,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       name: { type: 'string', isReadOnly: false },
       code: { type: 'string', isReadOnly: false },
       detailText: { type: 'string', isReadOnly: false },
+      detailTextType: { type: 'string', isReadOnly: false },
       measure: { type: 'integer', isReadOnly: false },
       property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false },
     } } });
