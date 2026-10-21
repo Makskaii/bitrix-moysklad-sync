@@ -112,7 +112,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(products[0].name, 'MS product name');
   assert.equal(products[0].code, 'MS-SKU-54');
   assert.equal(products[0].detailText, 'MS product description');
-  assert.equal(products[0].measure, 796);
+  assert.equal(products[0].measure, 9, 'Bitrix catalog product measure uses the catalog measure ID');
   assert.equal(products[0].xmlId, `MOYSKLAD_PRODUCT_${ids.product}`);
   assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '903');
   assert.equal(dealAdds, 1, 'deal is never duplicated');
@@ -123,6 +123,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(items[0].originId, ids.order);
   assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 133.33, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
   assert.deepEqual([rows[0].discountRate, rows[0].taxRate, rows[0].taxIncluded], [10, 20, 'Y']);
+  assert.deepEqual(rows.map((row) => row.measureCode), [796, 796, 796], 'product-row MEASURE_CODE uses the saved catalog code, not its catalog ID');
   assert.equal(rows.some((row) => Number(row.productId) !== 903), false);
   const savedPair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', moyskladId: ids.order, active: true } });
   assert.equal(savedPair.bitrix24Id, '801');
@@ -274,7 +275,7 @@ test('an existing product pair is preserved when the MySklad product name change
   await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
   const productPair = await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: '904', moyskladId: ids.product, source: 'MANUAL' } });
   pairIds.push(productPair.id);
-  items = []; rows = []; products = [{ id: 904, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'Existing Bitrix product name', measure: 796 }];
+  items = []; rows = []; products = [{ id: 904, iblockId: 42, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'Existing Bitrix product name', measure: 9 }];
   nextDealId = 802;
   productAdds = 0; dealAdds = 0; rowAdds = 0; msProductWrites = 0; loseProductCreateResponse = false; loseSecondRowResponse = false;
   orderPositions = [position('rename-1', 1)];
@@ -331,7 +332,7 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
   await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
   await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
   dealAdds = 0; rowAdds = 0; productAdds = 0; items = []; rows = [];
-  const candidate = { id: 905, iblockId: 42, type: 1, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 796 };
+  const candidate = { id: 905, iblockId: 42, type: 1, xmlId: `MOYSKLAD_PRODUCT_${ids.product}`, name: 'MS product name', code: 'MS-SKU-54', detailText: 'MS product description', measure: 9 };
   products = [candidate, { ...candidate, id: 906 }];
   orderPositions = [position('ambiguous-1', 1)];
   await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof ProductCatalogManualReviewError);
@@ -342,7 +343,7 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
 function config(): any {
   return { version: 4, createdAt: new Date(0).toISOString(), config: {
     schemaVersion: 1, rules: [], groups: [], serviceCounterpartyId: null,
-    references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] },
+    references: { units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] },
     dealOrderRuntime: {
       nativeOrderNumberingVerified: true,
       bitrix24ProductCatalogId: '42',

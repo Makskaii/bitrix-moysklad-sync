@@ -258,7 +258,7 @@ export class DealOrderReverseCreateService {
         }
         const uomId = isRecord(product.uom) ? readId(product.uom.id) : null;
         const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === uomId);
-        if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1) {
+        if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1 || !numericBitrixMeasureCode(unit[0]?.bitrix24Code)) {
           await skip(id, 'UNIT_UNMAPPED');
           continue;
         }
@@ -272,6 +272,7 @@ export class DealOrderReverseCreateService {
         resolvedProducts.set(assortmentId, mappedProduct);
       }
       const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === mappedProduct!.uomId);
+      const measureCode = unit.length === 1 ? numericBitrixMeasureCode(unit[0]?.bitrix24Code) : null;
       const price = typeof position.price === 'number' && Number.isFinite(position.price) && position.price >= 0 ? position.price / 100 : null;
       const quantity = typeof position.quantity === 'number' && Number.isFinite(position.quantity) && position.quantity > 0 ? position.quantity : null;
       const discount = typeof position.discount === 'number' && Number.isFinite(position.discount) && position.discount >= 0 && position.discount <= 100 ? position.discount : null;
@@ -282,14 +283,13 @@ export class DealOrderReverseCreateService {
         price: typeof position.price === 'number' ? position.price : null, discount, vat, vatEnabled, vatIncluded,
       });
       const rowKey = `${input.moyskladOrderId}:${id}`;
-      if (unit.length !== 1 || price === null || quantity === null || discount === null || !bitrixMoney || (vatEnabled && (vat === null || typeof vatIncluded !== 'boolean'))) {
+      if (unit.length !== 1 || measureCode === null || price === null || quantity === null || discount === null || !bitrixMoney || (vatEnabled && (vat === null || typeof vatIncluded !== 'boolean'))) {
         const reason = unit.length !== 1 ? 'UNIT_UNMAPPED' : price === null ? 'DOCUMENT_PRICE_MISSING' : quantity === null ? 'QUANTITY_INVALID' : discount === null ? 'DISCOUNT_MAPPING_UNSUPPORTED' : 'VAT_MAPPING_UNSUPPORTED';
         await skip(id, reason);
         continue;
       }
       if (seenPair.has(rowKey)) throw new Error('Customer-order position was duplicated');
       seenPair.add(rowKey);
-      const measureCode = unit[0].bitrix24Id;
       rows.push({
         msPositionId: id,
         snapshot: position,
@@ -530,6 +530,11 @@ async function b24FindOriginDeals(orderId: string, gate: ProviderGate = requestJ
 }
 function sameRow(actual: Row, expected: PreparedRow['fields'], dealId: string): boolean {
   return Number(actual.ownerId) === Number(dealId) && actual.ownerType === 'D' && Number(actual.productId) === expected.productId && Number(actual.measureCode) === expected.measureCode && Number(actual.sort) === expected.sort && Number(actual.quantity) === expected.quantity && Number(actual.price) === expected.price;
+}
+function numericBitrixMeasureCode(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^[1-9]\d{0,19}$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 function categoryFromStage(stageId: string): number {
   const prefix = stageId.match(/^C(\d+):/);
