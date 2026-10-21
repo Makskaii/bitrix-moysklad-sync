@@ -8,6 +8,7 @@ import { DealOrderPreparedInput } from './deal-order-create-operation.service';
 import { bitrixMoneyToMoySklad } from './deal-order-money';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 
 const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
   UF_CRM_1770062820: 'attributes.4a432000-0785-11f1-0a80-1b1000018578',
@@ -213,6 +214,15 @@ export class DealOrderCreationPreparer {
       }
 
       let targetProductId: string | null = null;
+      try {
+        await ensureDocumentProductIdentity(this.database, {
+          bitrix24ProductId: productId, eventId: input.eventId,
+          bitrix24CatalogId: input.eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? input.eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
+        });
+      } catch (error) {
+        if (error instanceof DocumentProductIdentityError) return { status: 'WAITING', reason: error.reason };
+        throw error;
+      }
       const productPairs = await this.database.entityPair.findMany({
         where: { entityType: 'PRODUCT', bitrix24Id: productId, active: true },
         select: { moyskladId: true },

@@ -10,6 +10,7 @@ import { bitrixMoneyToMoySklad, moySkladMoneyToBitrix } from './deal-order-money
 import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } from '../sync-mode.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from './deal-order-reverse-create.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type Result = { status: 'SYNCED'; rowValuesChanged?: boolean } | { status: 'PARTIAL'; reason: 'DEAL_ORDER_POSITION_ROWS_SKIPPED'; skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }> } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
@@ -104,6 +105,8 @@ export class DealOrderPositionRuntimeService {
     linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
     linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
     const productIds = [...new Set(b24Rows.map((row) => String(row.productId)))];
+    const identityFailure = await this.ensureProductIdentities(productIds, input.eventId, input.eventConfig);
+    if (identityFailure) return identityFailure;
     const productPairs = await this.database.entityPair.findMany({
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },
@@ -284,6 +287,19 @@ export class DealOrderPositionRuntimeService {
   }
 
   /** Bootstrap only when unique, confirmed product identity produces a one-to-one row relation on both sides. */
+  private async ensureProductIdentities(productIds: string[], eventId: string, eventConfig: VersionedFieldSettingsDto): Promise<Result | null> {
+    try {
+      for (const productId of productIds) await ensureDocumentProductIdentity(this.database, {
+        bitrix24ProductId: productId, eventId,
+        bitrix24CatalogId: eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
+      });
+      return null;
+    } catch (error) {
+      if (error instanceof DocumentProductIdentityError) return { status: 'MANUAL_REVIEW', reason: error.reason };
+      throw error;
+    }
+  }
+
   private async bootstrapHistoricalLinks(
     pairId: string,
     orderId: string,
@@ -306,6 +322,8 @@ export class DealOrderPositionRuntimeService {
     if ([...productCounts.values()].some((count) => count !== 1)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
 
     const productIds = [...productCounts.keys()];
+    const identityFailure = await this.ensureProductIdentities(productIds, eventId, eventConfig);
+    if (identityFailure) return identityFailure;
     const productPairs = await this.database.entityPair.findMany({
       where: { entityType: 'PRODUCT', active: true, bitrix24Id: { in: productIds } },
       select: { bitrix24Id: true, moyskladId: true },

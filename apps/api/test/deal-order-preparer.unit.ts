@@ -206,7 +206,7 @@ function reset() {
 
 async function findMany(args: { where: { entityType: string; bitrix24Id: string }; take: number }) {
   const id = args.where.entityType === 'COMPANY' ? uuids.company : productPairExists ? uuids.product : null;
-  return id ? [{ moyskladId: id }] : [];
+  return id ? [{ moyskladId: id, bitrix24Id: args.where.bitrix24Id, active: true, lifecycleStatus: 'ACTIVE', moyskladType: 'product' }] : [];
 }
 
 async function fakeFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
