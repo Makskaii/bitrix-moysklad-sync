@@ -344,9 +344,9 @@ test('deal-order admission requires an exact source ID while target-null creatio
     const admission = new ControlledLiveTestAdmissionService(fakeDatabase as any);
     const source = { entity: 'deal-order', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-test-100', currentNativeId: 'b24-test-100', currentName: sourceName, sourceCreatedAt: new Date() };
     const updateEvent = { sourceSystem: 'BITRIX24' as const, eventType: 'ONCRMDEALUPDATE', externalEntityType: 'deal', sourceNativeId: source.sourceNativeId };
-    assert.equal(admission.allowsIncomingEvent(updateEvent), true);
-    assert.equal(admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: 'b24-foreign-900' }), false);
-    assert.equal(admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: null }), false);
+    assert.equal(await admission.allowsIncomingEvent(updateEvent), true);
+    assert.equal(await admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: 'b24-foreign-900' }), false);
+    assert.equal(await admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: null }), false);
     await admission.admit('evt-exact-source', source);
     await assert.rejects(admission.admit('evt-foreign-source', { ...source, sourceNativeId: 'b24-foreign-900', currentNativeId: 'b24-foreign-900' }), /SOURCE_NOT_ADMITTED/);
 

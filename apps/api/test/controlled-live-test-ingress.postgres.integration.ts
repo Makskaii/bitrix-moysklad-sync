@@ -14,8 +14,8 @@ import { SyncModeService } from '../src/sync-mode.service';
 import { ControlledLiveTestAdmissionService } from '../src/controlled-live-test-admission.service';
 import { setVerifiedControlledLiveProviderNamespace } from '../src/controlled-live-test-namespace';
 
-const databaseName = 'sync_issue79_scoped_ingress_route_20261020_test';
-const schemaName = 'issue79_scoped_ingress_route_20261020_test';
+const databaseName = 'sync_issue79_scoped_ingress_reverse_20261021_test';
+const schemaName = 'issue79_scoped_ingress_reverse_20261021_test';
 const providerNamespace = {
   bitrix24PortalOrigin: 'https://test.bitrix.example',
   bitrix24UserId: '3664',
@@ -66,6 +66,11 @@ test('controlled live ingress enforces exact manifest gates through public route
         entity: 'deal-order', direction: 'BOTH', name: `тест ${runId} pair`, syntheticOnly: true,
         sourceSystem: 'BITRIX24', sourceNativeId: 'b24-deal-pg-exact', targetSystem: 'MOYSKLAD', targetNativeId: 'ms-order-pg-exact',
         createdAfterUtc: '2026-10-20T00:00:00Z', allowedActions: ['UPDATE'],
+      },
+      {
+        entity: 'deal-order', direction: 'BOTH', name: `тест ${runId} dynamically bound pair`, syntheticOnly: true,
+        sourceSystem: 'BITRIX24', sourceNativeId: 'b24-deal-pg-dynamic', targetSystem: 'MOYSKLAD', targetNativeId: null,
+        createdAfterUtc: '2026-10-20T00:00:00Z', allowedActions: ['CREATE', 'UPDATE'],
       },
       {
         entity: 'client:COMPANY', direction: 'MOYSKLAD_TO_BITRIX24', name: `тест ${runId} company collision`, syntheticOnly: true,
@@ -206,6 +211,81 @@ test('controlled live ingress enforces exact manifest gates through public route
     assert.equal((await reverseWrongId.json() as { accepted: boolean }).accepted, false);
     assert.equal(await database.inboundEvent.count(), beforeCount + 3);
     assert.deepEqual(enqueued, [productAck.eventId, mixedAck.eventId, bitrixAck.eventId]);
+    assert.deepEqual(providerCalls, []);
+
+    const dynamicName = `тест ${runId} dynamically bound pair`;
+    const beforeDynamicCreateCount = await database.inboundEvent.count();
+    const beforeDynamicCreateQueue = enqueued.length;
+    const unknownDynamicCreate = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ event: 'ONCRMDEALADD', 'auth[application_token]': 'postgres-ingress-test-token', 'data[FIELDS][ID]': 'b24-deal-pg-unmanifested' }),
+    });
+    assert.equal(unknownDynamicCreate.status, 200);
+    assert.equal((await unknownDynamicCreate.json() as { accepted: boolean }).accepted, false,
+      'a null target does not make an unknown source eligible for admission');
+    assert.equal(await database.inboundEvent.count(), beforeDynamicCreateCount);
+    assert.equal(enqueued.length, beforeDynamicCreateQueue);
+
+    const dynamicCreate = await fetch(`${apiUrl}/webhooks/bitrix24`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ event: 'ONCRMDEALADD', 'auth[application_token]': 'postgres-ingress-test-token', 'data[FIELDS][ID]': 'b24-deal-pg-dynamic' }),
+    });
+    assert.equal(dynamicCreate.status, 200);
+    const dynamicCreateAck = await dynamicCreate.json() as { accepted: boolean; eventId: string };
+    assert.equal(dynamicCreateAck.accepted, true, 'an exact manifested source may enter before its create target exists');
+    await waitFor(() => enqueued.includes(dynamicCreateAck.eventId));
+    const dynamicAdmission = app.get(ControlledLiveTestAdmissionService);
+    const createdAt = new Date();
+    await dynamicAdmission.admit(dynamicCreateAck.eventId, {
+      entity: 'deal-order', sourceSystem: 'BITRIX24', sourceNativeId: 'b24-deal-pg-dynamic',
+      currentNativeId: 'b24-deal-pg-dynamic', currentName: dynamicName, sourceCreatedAt: createdAt,
+    });
+    await dynamicAdmission.runForEvent(dynamicCreateAck.eventId, async () => {
+      await dynamicAdmission.assertCreateReserved(dynamicCreateAck.eventId, 'deal-order', 'MOYSKLAD');
+      await dynamicAdmission.bindCreatedTarget(dynamicCreateAck.eventId, 'ms-order-pg-dynamic', 'ms-order-pg-dynamic', dynamicName, new Date());
+    });
+
+    const boundEventCount = await database.inboundEvent.count();
+    const boundQueueCount = enqueued.length;
+    const wrongDynamicReverse = await fetch(`${apiUrl}/webhooks/moysklad/postgres-ingress-test-secret?requestId=${runId}-dynamic-wrong`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { href: 'https://online.moysklad.ru/api/remap/1.2/entity/customerorder/ms-order-pg-foreign' } }] }),
+    });
+    assert.equal(wrongDynamicReverse.status, 200);
+    assert.equal((await wrongDynamicReverse.json() as { accepted: boolean }).accepted, false,
+      'an unknown reverse ID remains rejected before persistence and dispatch');
+    assert.equal(await database.inboundEvent.count(), boundEventCount);
+    assert.equal(enqueued.length, boundQueueCount);
+
+    const boundAdmission = await database.controlledTestAdmission.findUniqueOrThrow({ where: { eventId: dynamicCreateAck.eventId } });
+    const boundBinding = await database.controlledTestSourceBinding.findUniqueOrThrow({ where: { id: boundAdmission.bindingId } });
+    await database.controlledTestSourceBinding.update({
+      where: { id: boundBinding.id }, data: { moyskladAccountId: '22222222-2222-4222-8222-222222222222' },
+    });
+    const wrongNamespaceReverse = await fetch(`${apiUrl}/webhooks/moysklad/postgres-ingress-test-secret?requestId=${runId}-dynamic-namespace`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { href: 'https://online.moysklad.ru/api/remap/1.2/entity/customerorder/ms-order-pg-dynamic' } }] }),
+    });
+    assert.equal(wrongNamespaceReverse.status, 200);
+    assert.equal((await wrongNamespaceReverse.json() as { accepted: boolean }).accepted, false,
+      'a reverse ID bound under a different provider namespace remains rejected');
+    assert.equal(await database.inboundEvent.count(), boundEventCount);
+    assert.equal(enqueued.length, boundQueueCount);
+    await database.controlledTestSourceBinding.update({
+      where: { id: boundBinding.id }, data: { moyskladAccountId: providerNamespace.moyskladAccountId },
+    });
+
+    const dynamicReverse = await fetch(`${apiUrl}/webhooks/moysklad/postgres-ingress-test-secret?requestId=${runId}-dynamic-exact`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [{ action: 'UPDATE', meta: { href: 'https://online.moysklad.ru/api/remap/1.2/entity/customerorder/ms-order-pg-dynamic' } }] }),
+    });
+    assert.equal(dynamicReverse.status, 200);
+    const dynamicReverseAck = await dynamicReverse.json() as { accepted: boolean; eventId: string; rejectedCount: number };
+    assert.equal(dynamicReverseAck.accepted, true, 'the public reverse webhook accepts the exact readback-bound target');
+    assert.equal(dynamicReverseAck.rejectedCount, 0);
+    assert.equal((await database.inboundEvent.findUniqueOrThrow({ where: { id: dynamicReverseAck.eventId } })).externalEntityId, 'ms-order-pg-dynamic');
+    await waitFor(() => enqueued.includes(dynamicReverseAck.eventId));
+    assert.deepEqual(enqueued.slice(boundQueueCount), [dynamicReverseAck.eventId]);
     assert.deepEqual(providerCalls, []);
   } finally {
     await app?.close();
