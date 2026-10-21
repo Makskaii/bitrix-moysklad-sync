@@ -54,6 +54,7 @@ const bitrixInvoices = new Map<string, InvoiceRecord>();
 const moyskladInvoices = new Map<string, InvoiceRecord>();
 const deals = new Map<string, InvoiceRecord>();
 const orders = new Map<string, InvoiceRecord>();
+const invoiceRows = new Map<string, InvoiceRecord[]>();
 
 before(async () => {
   const connection = new URL(process.env.INVOICE_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '');
@@ -204,6 +205,37 @@ test('invoice processor creates one independently paired invoiceout, then update
   const replay = await createEvent(`replay-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
   assert.equal((await processor.process(replay.id))?.status, 'SUCCEEDED');
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
+});
+
+test('invoice creation copies its own goods and prices, with organization and agent from the paired order', async () => {
+  const sourceId = String(++invoiceCounter);
+  const productId = `55${Date.now()}`;
+  const targetId = 'd813b5d2-5939-11ee-0a80-1143000e2d5c';
+  await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: targetId, moyskladType: 'product', source: 'MANUAL' } });
+  bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice own goods', parentId2: Number(dealId), createdTime: createdAfterBoundary, opportunity: 342, currencyId: 'RUB' });
+  invoiceRows.set(sourceId, [{ id: 321, ownerType: 'SI', ownerId: Number(sourceId), productId: Number(productId), quantity: 2, price: 171,
+    priceNetto: 140.16393443, priceBrutto: 171, taxRate: 22, taxIncluded: 'Y', discountTypeId: 2, discountRate: 0, discountSum: 0 }]);
+  try {
+    const event = await createEvent(`own-goods-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    const target = moyskladInvoices.get(pair.moyskladId)!;
+    assert.deepEqual(target.positions, [{ quantity: 2, price: 17100, discount: 0, vat: 22, assortment: { meta: {
+      href: `${base}api/remap/1.2/entity/product/${targetId}`, type: 'product', mediaType: 'application/json' } } }]);
+    assert.equal(target.vatIncluded, true);
+    assert.equal((target.organization as any).meta.type, 'organization');
+    assert.equal((target.agent as any).meta.type, 'counterparty');
+    const mismatchedId = String(++invoiceCounter);
+    bitrixInvoices.set(mismatchedId, { ...bitrixInvoices.get(sourceId), id: mismatchedId, opportunity: 999 });
+    invoiceRows.set(mismatchedId, invoiceRows.get(sourceId)!.map((row) => ({ ...row, ownerId: Number(mismatchedId) })));
+    const beforeWrites = moyskladWrites;
+    const bad = await createEvent(`wrong-total-${mismatchedId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', mismatchedId);
+    assert.equal((await processor.process(bad.id))?.status, 'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: bad.id } })).lastErrorCategory, 'INVOICE_SOURCE_TOTAL_MISMATCH');
+    assert.equal(moyskladWrites, beforeWrites);
+  } finally {
+    await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', bitrix24Id: productId } });
+  }
 });
 
 test('controlled invoice processor admits a synthetic source, creates and binds its target, then resumes an exact BOTH echo', async () => {
@@ -767,13 +799,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (method === 'crm.item.get.json') {
       const id = form.get('id') ?? '';
       const item = bitrixInvoices.get(id);
-      return send(response, item ? { result: { item: { id, ...item } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, item ? 200 : 400);
+      return send(response, item ? { result: { item: { id, opportunity: 0, currencyId: 'RUB', ...item } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, item ? 200 : 400);
+    }
+    if (method === 'crm.item.productrow.list.json') {
+      assert.equal(form.get('filter[=ownerType]'), 'SI');
+      return send(response, { result: { productRows: invoiceRows.get(form.get('filter[=ownerId]') ?? '') ?? [] } });
     }
     if (method === 'crm.item.fields.json') return send(response, { result: { fields: { title: { type: 'string', title: 'Title', isReadOnly: false }, code: { type: 'string', title: 'Code', isReadOnly: false } } } });
     if (method === 'crm.deal.get.json') {
       const id = form.get('id') ?? '';
       const deal = deals.get(id);
-      return send(response, deal ? { result: { deal } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, deal ? 200 : 400);
+      return send(response, deal ? { result: { deal: { CURRENCY_ID: 'RUB', ...deal } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, deal ? 200 : 400);
     }
     if (method === 'crm.item.add.json') {
       const id = String(++invoiceCounter);
@@ -836,7 +872,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       return send(response, invoice ?? {}, invoice ? 200 : 404);
     }
     const order = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/customerorder\/([0-9a-f-]{36})$/i)?.[1];
-    if (order && request.method === 'GET') return send(response, orders.get(order) ?? { id: order, meta: { type: 'customerorder' }, created: createdAfterBoundary });
+    if (order && request.method === 'GET') return send(response, {
+      organization: { meta: { href: `${base}api/remap/1.2/entity/organization/02ada5df-d515-11e2-3c12-7054d21a8d1e`, type: 'organization' } },
+      agent: { meta: { href: `${base}api/remap/1.2/entity/counterparty/b0b309ee-13e3-11e9-9109-f8fc0001f188`, type: 'counterparty' } },
+      ...(orders.get(order) ?? { id: order, meta: { type: 'customerorder' }, created: createdAfterBoundary }),
+    });
   }
   return send(response, { error: 'NOT_FOUND', path: url.pathname }, 404);
 }

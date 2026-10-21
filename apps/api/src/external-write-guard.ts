@@ -133,7 +133,11 @@ function mutationEntity(provider: string, path: string, bodyText: string): strin
     const method = path.split('/').pop()?.replace(/\.json$/i, '').toLowerCase() ?? '';
     if (method.startsWith('crm.company.')) return 'client:COMPANY';
     if (method.startsWith('crm.contact.')) return 'client:CONTACT';
-    if (method.startsWith('crm.deal.') || method.startsWith('crm.item.productrow.')) return 'deal-order';
+    if (method.startsWith('crm.item.productrow.')) {
+      const form = new URLSearchParams(bodyText);
+      return form.get('filter[=ownerType]') === 'SI' ? 'invoice' : 'deal-order';
+    }
+    if (method.startsWith('crm.deal.')) return 'deal-order';
     if (method.startsWith('crm.product.') || method.startsWith('catalog.price.')) return 'catalog-product';
     if (method.startsWith('catalog.product.service.')) return 'catalog-service';
     if (method.startsWith('catalog.product.')) return 'catalog-product';
@@ -197,7 +201,7 @@ function extractMutationTarget(provider: string, path: string, bodyText: string)
     // must still be rejected before network by the manifest policy.
     const owners = form.getAll('filter[=ownerId]');
     const types = form.getAll('filter[=ownerType]');
-    if (owners.length === 1 && /^\d{1,20}$/.test(owners[0]) && types.length === 1 && types[0] === 'D'
+    if (owners.length === 1 && /^\d{1,20}$/.test(owners[0]) && types.length === 1 && ['D', 'SI'].includes(types[0])
       && [...form.keys()].every((key) => ['filter[=ownerId]', 'filter[=ownerType]', 'start'].includes(key))) return owners[0];
     return null;
   }

@@ -28,6 +28,16 @@ export class InvoiceHttpApi {
     return { ...item, ...(proposed ?? {}) };
   }
 
+  async readBitrix24ProductRowsPage(id: string, start: number): Promise<{ rows: InvoiceRecord[]; next: number | null }> {
+    if (!/^\d{1,20}$/.test(id) || !Number.isSafeInteger(start) || start < 0) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    const page = record(await this.bitrixCall('crm.item.productrow.list', { filter: { '=ownerType': 'SI', '=ownerId': id }, start }, true));
+    const result = record(page.result);
+    if (!Array.isArray(result.productRows) || result.productRows.some((row) => !isRecord(row) || row.ownerType !== 'SI' || String(row.ownerId) !== id)) throw new Error('INVOICE_ROWS_RESPONSE_INVALID');
+    const next = page.next === undefined ? null : page.next;
+    if (next !== null && (typeof next !== 'number' || !Number.isSafeInteger(next) || next <= start)) throw new Error('INVOICE_ROWS_PAGINATION_INVALID');
+    return { rows: result.productRows as InvoiceRecord[], next: next as number | null };
+  }
+
   async findMoyskladByExternalCode(externalCode: string): Promise<InvoiceRecord[]> {
     const url = new URL('entity/invoiceout', ensureSlash(requiredEnv('MOYSKLAD_API_BASE_URL')));
     url.searchParams.set('filter', `externalCode=${externalCode}`);
@@ -102,7 +112,7 @@ export class InvoiceHttpApi {
     return order;
   }
 
-  private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async bitrixCall(method: string, params: Record<string, unknown>, envelope = false): Promise<unknown> {
     if (/\.(?:add|update)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', /\.add$/i.test(method) ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', /\.add$/i.test(method) ? null : scalarId(params.id), 'invoice');
     const base = requiredEnv('BITRIX24_REST_BASE_URL');
     const url = new URL(`${method}.json`, ensureSlash(base));
@@ -113,7 +123,7 @@ export class InvoiceHttpApi {
     if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
     if (!isRecord(payload) || 'error' in payload || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
-    return payload.result;
+    return envelope ? payload : payload.result;
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'POST' | 'PUT', body?: InvoiceRecord): Promise<unknown> {
