@@ -115,6 +115,8 @@ test('field settings select, save, and reload field pairs while preview stays re
   const autoMatches = page.getByLabel('Несохранённые предложения');
   await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Найдено: 1');
   await expect(autoMatches.getByLabel('Стандартные поля')).toContainText('Конфликты: 1');
+  await expect(autoMatches.getByLabel('Стандартные поля').getByText('EMAIL', { exact: true })).toHaveCount(0);
+  await expect(autoMatches.getByLabel('Стандартные поля').getByText('email', { exact: true })).toHaveCount(0);
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Найдено: 1');
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Конфликты: 2');
   await expect(autoMatches.getByLabel('Пользовательские поля')).toContainText('Без пары: 2');

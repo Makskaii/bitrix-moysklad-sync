@@ -779,16 +779,27 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       }
     }
     const bitrixWrites: Record<string, unknown> = {};
-    const sourceFields = new Set<string>();
+    const moyskladWrites: Record<string, unknown> = {};
+    const bitrixSourceFields = new Set<string>();
+    const moyskladSourceFields = new Set<string>();
     const skipped: string[] = [];
     let mappingError: string | null = null;
 
     for (const rule of changedRules) {
-      sourceFields.add(rule.targetField);
       if (!rule.moyskladToBitrix24.enabled) {
-        mappingError = 'CLIENT_SETTINGS_REVISION_REVERSE_MAPPING_REQUIRED';
+        const newlyAdded = isNewClientRule(oldSettings.config, input.eventConfig.config, input.mappingEntity, rule.sourceField, rule.targetField);
+        if (!newlyAdded || rule.criticality !== 'optional' || !rule.bitrix24ToMoysklad.enabled) {
+          mappingError = 'CLIENT_SETTINGS_REVISION_REVERSE_MAPPING_REQUIRED';
+          continue;
+        }
+        bitrixSourceFields.add(rule.sourceField);
+        const transformed = this.settings.transformFieldResult(input.eventConfig.config, input.mappingEntity, 'BITRIX24_TO_MOYSKLAD', rule.targetField, input.bitrix);
+        if (transformed?.status === 'mapped') moyskladWrites[rule.targetField] = transformed.value;
+        else if (transformed?.status === 'error') mappingError = `CLIENT_SETTINGS_REVISION_TRANSFORM_FAILED:${rule.sourceField}`;
+        else skipped.push(`${rule.sourceField} → ${rule.targetField}:${transformed?.status === 'skip' ? transformed.reason : 'forward transform unavailable'}`);
         continue;
       }
+      moyskladSourceFields.add(rule.targetField);
       const transformed = this.settings.transformFieldResult(input.eventConfig.config, input.mappingEntity, 'MOYSKLAD_TO_BITRIX24', rule.sourceField, input.moysklad);
       if (transformed?.status === 'mapped') bitrixWrites[rule.sourceField] = transformed.value;
       else if (transformed?.status === 'error' && rule.criticality === 'critical') mappingError = `CLIENT_SETTINGS_REVISION_TRANSFORM_FAILED:${rule.sourceField}`;
@@ -799,7 +810,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         mappingError = 'CLIENT_SETTINGS_REVISION_GROUP_REVERSE_MAPPING_REQUIRED';
         continue;
       }
-      for (const field of group.sourceFields) sourceFields.add(field);
+      for (const field of group.sourceFields) moyskladSourceFields.add(field);
       const transformed = this.settings.transformFieldResult(input.eventConfig.config, input.mappingEntity, group.direction, group.targetField, input.moysklad);
       if (transformed?.status === 'mapped') bitrixWrites[group.targetField] = transformed.value;
       else if (transformed?.status === 'error' && group.criticality === 'critical') mappingError = `CLIENT_SETTINGS_REVISION_GROUP_TRANSFORM_FAILED:${group.targetField}`;
@@ -812,25 +823,34 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
 
     let verifiedBitrix = input.bitrix;
     let verifiedMoysklad = input.moysklad;
-    if (Object.keys(bitrixWrites).length) {
+    if (Object.keys(bitrixWrites).length || Object.keys(moyskladWrites).length) {
       try {
         const [beforeBitrix, beforeMoysklad] = await Promise.all([
           this.gateway!.readBitrix(input.bitrixEntity, input.pair.bitrix24Id),
           this.gateway!.readMoysklad(input.msType, input.pair.moyskladId, input.pair.moyskladParentId),
         ]);
-        if ([...sourceFields].some((field) => !equal(beforeMoysklad[field], input.moysklad[field])) ||
-            Object.keys(bitrixWrites).some((field) => !equal(beforeBitrix[field], input.bitrix[field]))) {
+        if ([...moyskladSourceFields].some((field) => !equal(beforeMoysklad[field], input.moysklad[field])) ||
+            [...bitrixSourceFields].some((field) => !equal(beforeBitrix[field], input.bitrix[field])) ||
+            Object.keys(bitrixWrites).some((field) => !equal(beforeBitrix[field], input.bitrix[field])) ||
+            Object.keys(moyskladWrites).some((field) => !equal(beforeMoysklad[field], input.moysklad[field]))) {
           return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_SOURCE_CHANGED' };
         }
-        await input.fence?.assertOwned();
-        await this.gateway!.updateBitrix(input.bitrixEntity, input.pair.bitrix24Id, bitrixWrites, input.event.id);
+        if (Object.keys(moyskladWrites).length) {
+          await input.fence?.assertOwned();
+          await this.gateway!.updateMoysklad(input.msType, input.pair.moyskladId, input.pair.moyskladParentId, moyskladWrites, input.event.id);
+        }
+        if (Object.keys(bitrixWrites).length) {
+          await input.fence?.assertOwned();
+          await this.gateway!.updateBitrix(input.bitrixEntity, input.pair.bitrix24Id, bitrixWrites, input.event.id);
+        }
         [verifiedBitrix, verifiedMoysklad] = await Promise.all([
           this.gateway!.readBitrix(input.bitrixEntity, input.pair.bitrix24Id),
           this.gateway!.readMoysklad(input.msType, input.pair.moyskladId, input.pair.moyskladParentId),
         ]);
       } catch { return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_READBACK_FAILED' }; }
-      if (!matchesWrittenFields(bitrixWrites, verifiedBitrix) ||
-          [...sourceFields].some((field) => !equal(verifiedMoysklad[field], input.moysklad[field]))) {
+      if (!matchesWrittenFields(bitrixWrites, verifiedBitrix) || !matchesWrittenFields(moyskladWrites, verifiedMoysklad) ||
+          [...moyskladSourceFields].some((field) => !equal(verifiedMoysklad[field], input.moysklad[field])) ||
+          [...bitrixSourceFields].some((field) => !equal(verifiedBitrix[field], input.bitrix[field]))) {
         return { status: 'RETRY', reason: 'CLIENT_SETTINGS_REVISION_READBACK_MISMATCH' };
       }
     }
@@ -860,7 +880,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
           status: 'COMPLETE', currentBaseline: { settingsVersion: input.eventConfig.version, bitrix24Values, moyskladValues, childResourceState: revisedChildState } as Prisma.InputJsonValue,
           errorCategory: skipped.length ? 'OPTIONAL_MAPPING_SKIPPED' : null,
         } });
-        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client mapping settings advanced from ${baseline.settingsVersion} to ${input.eventConfig.version}; MySklad-authoritative initial values verified for pair ${input.pair.id}.${skipped.length ? ` Optional mappings skipped: ${skipped.join('; ')}.` : ''}`, referenceId: input.event.id } });
+        await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client mapping settings advanced from ${baseline.settingsVersion} to ${input.eventConfig.version}; configured-direction initial values verified for pair ${input.pair.id}.${skipped.length ? ` Optional mappings skipped: ${skipped.join('; ')}.` : ''}`, referenceId: input.event.id } });
         return nextState;
       });
       return { status: 'READY', state: committed, rebased: true };
@@ -1312,6 +1332,14 @@ function semanticClientSettings(config: unknown, entity: string): ClientSettings
     } : binding).sort((left, right) => stableClientJson(left).localeCompare(stableClientJson(right)))
     : [];
   return { rules, groups, childResourceBindings };
+}
+
+function isNewClientRule(previousConfig: unknown, nextConfig: unknown, entity: string, sourceField: string, targetField: string): boolean {
+  const nextRules = isRecord(nextConfig) && Array.isArray(nextConfig.rules) ? nextConfig.rules : [];
+  const nextRule = nextRules.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.sourceField === sourceField && candidate.targetField === targetField);
+  if (!isRecord(nextRule) || typeof nextRule.id !== 'string') return false;
+  const previousRules = isRecord(previousConfig) && Array.isArray(previousConfig.rules) ? previousConfig.rules : [];
+  return !previousRules.some((candidate) => isRecord(candidate) && candidate.id === nextRule.id);
 }
 
 function unchangedClientFields(oldProjection: ClientSettingsProjection, newProjection: ClientSettingsProjection, side: 'BITRIX24' | 'MOYSKLAD'): Set<string> {
