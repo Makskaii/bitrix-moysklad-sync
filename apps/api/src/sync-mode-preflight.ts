@@ -94,20 +94,35 @@ export function evaluateEnablePreflight(input: EnablePreflightInput): EnablePref
       if (!availableCurrencies.length) blockers.push(finding('DEAL_CURRENCIES_UNAVAILABLE', 'API не вернул применимые валюты для проверки подтверждённых пар.'));
 
       if (input.direction === 'moyskladToBitrix24') {
-        for (const stageId of availableStages) {
-          const runtimeMapped = array(object(runtime)?.stages).map(object).some((stage) =>
-            String(stage?.moyskladId) === stageId && nonEmpty(stage?.bitrix24StageId) && nonEmpty(stage?.moyskladId));
-          if (!confirmed('dealStages', stageId) || !runtimeMapped) {
-            blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Для стадии сделки нет подтверждённой пары в активной версии настроек МойСклад.', stageId));
+        // Enable the configured scope; unused catalog entries remain guarded per record.
+        const selectedStages = array(object(runtime)?.stages).map(object);
+        const selectedCurrencies = array(object(runtime)?.currencies).map(object);
+        if (!selectedStages.length) blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Не выбрана ни одна подтверждённая стадия заказа.'));
+        if (!selectedCurrencies.length) blockers.push(finding('CURRENCY_MAPPING_UNCONFIRMED', 'Не выбрана ни одна подтверждённая валюта заказа.'));
+        const seenStages = new Set<string>();
+        for (const stage of selectedStages) {
+          const sourceId = nonEmpty(stage?.moyskladId) ? String(stage!.moyskladId) : '';
+          const targetId = nonEmpty(stage?.bitrix24StageId) ? bitrixStageCatalogId(String(stage!.bitrix24StageId)) : '';
+          const matches = namedPairs.map(object).filter((pair) => pair?.kind === 'dealStages' && pair.moyskladId === sourceId);
+          if (!sourceId || !targetId || availableStages.filter(id => id === sourceId).length !== 1 || seenStages.has(sourceId) ||
+              matches.length !== 1 || matches[0]?.status !== 'confirmed' || matches[0]?.bitrix24Id !== targetId) {
+            blockers.push(finding('STAGE_MAPPING_UNCONFIRMED', 'Выбранная стадия заказа отсутствует, неоднозначна или не подтверждена.', sourceId || undefined));
           }
+          seenStages.add(sourceId);
         }
-        for (const currencyId of availableCurrencies) {
-          const runtimeMapped = array(object(runtime)?.currencies).map(object).some((currency) =>
-            String(currency?.moyskladId) === currencyId && nonEmpty(currency?.bitrix24Code) && nonEmpty(currency?.moyskladId));
-          if (!confirmed('currencies', currencyId) || !runtimeMapped) {
-            blockers.push(finding('CURRENCY_MAPPING_UNCONFIRMED', 'Для валюты нет подтверждённой пары в активной версии настроек МойСклад.', currencyId));
+        const seenCurrencies = new Set<string>();
+        for (const currency of selectedCurrencies) {
+          const sourceId = nonEmpty(currency?.moyskladId) ? String(currency!.moyskladId) : '';
+          const targetId = nonEmpty(currency?.bitrix24Code) ? String(currency!.bitrix24Code) : '';
+          const matches = namedPairs.map(object).filter((pair) => pair?.kind === 'currencies' && pair.moyskladId === sourceId);
+          if (!sourceId || !targetId || availableCurrencies.filter(id => id === sourceId).length !== 1 || seenCurrencies.has(sourceId) ||
+              matches.length !== 1 || matches[0]?.status !== 'confirmed' || matches[0]?.bitrix24Id !== targetId) {
+            blockers.push(finding('CURRENCY_MAPPING_UNCONFIRMED', 'Выбранная валюта заказа отсутствует, неоднозначна или не подтверждена.', sourceId || undefined));
           }
+          seenCurrencies.add(sourceId);
         }
+        if (availableStages.some(id => !seenStages.has(id))) warnings.push(finding('UNUSED_PROVIDER_DEAL_STAGE_UNMAPPED', 'Ненастроенные стадии проверяются отдельно при обработке заказа.'));
+        if (availableCurrencies.some(id => !seenCurrencies.has(id))) warnings.push(finding('UNUSED_PROVIDER_CURRENCY_UNMAPPED', 'Ненастроенные валюты проверяются отдельно при обработке заказа.'));
       } else {
       const runtimeStages = array(object(runtime)?.stages);
       const stageChecks = runtimeStages.length
