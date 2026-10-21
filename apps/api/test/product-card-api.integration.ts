@@ -32,13 +32,13 @@ before(async () => {
       if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'GET') return response.end(JSON.stringify({
         id: productId, meta: { type: 'product' }, name: 'Starter', description: 'Plain detail', weight: 2.5, updated: '2026-10-07 10:00:00.000',
         uom: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/uom/abcdefab-cdef-abcd-efab-cdefabcdefab' } },
-        salePrices: [{ value: 12.5,
+        salePrices: [{ value: 1250,
           currency: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' } },
           priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/service/' + serviceId && request.method === 'GET') return response.end(JSON.stringify({
         id: serviceId, meta: { type: 'service' }, name: 'Setup', description: 'Install', updated: '2026-10-07 10:00:00.000',
-        salePrices: [{ value: 100, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
+        salePrices: [{ value: 10000, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' && request.method === 'GET') return response.end(JSON.stringify({ id: 'abcdefab-cdef-abcd-efab-cdefabcdefad', isoCode: 'RUB' }));
       if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'PUT' && malformedNextProductWriteResponse) {
@@ -89,6 +89,7 @@ test('product API adapter reads only addressed cards and issues partial field an
   assert.equal(ms.unitId, 'abcdefab-cdef-abcd-efab-cdefabcdefab');
   assert.equal(ms.prices[0].typeId, 'abcdefab-cdef-abcd-efab-cdefabcdefac');
   assert.equal(ms.prices[0].currency, 'RUB');
+  assert.equal(ms.prices[0].value, 12.5, '1250 Remap minor units are the same 12.50 RUB as Bitrix catalog.price');
   assert.equal((ms.prices[0].currencyRef?.meta as { type: string }).type, 'currency');
 
   await api.updateBitrix24('101', { name: 'Renamed' });
@@ -123,6 +124,7 @@ test('catalog services use service-specific provider endpoints and retain their 
   assert.deepEqual(bitrix.prices, [{ priceId: '52', typeId: '3', value: 100, currency: 'RUB' }]);
   const moysklad = await api.readMoysklad(serviceId, 'service');
   assert.equal(moysklad.name, 'Setup');
+  assert.equal(moysklad.prices[0].value, 100, 'service salePrices use the same native minor-unit contract');
   await api.updateBitrix24('102', { name: 'Setup v2' }, 'service');
   await api.updateBitrix24Price('52', 125, 'RUB');
   await api.updateMoysklad(serviceId, { name: 'Setup v2' }, 'service');

@@ -101,20 +101,23 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
   requests.length = 0;
   const database = app.get(DatabaseService);
   const settingsVersion = 910_000 + Math.floor(Math.random() * 80_000);
+  const priceType = randomUUID();
+  const currencyId = randomUUID();
   const config = {
     schemaVersion: 1,
     productCatalogRuntime: { bitrix24CatalogId: '77', moyskladFields: ['name', 'code', 'description'] },
     rules: [{ id: 'catalog-name', entity: 'catalog', sourceField: 'name', targetField: 'name',
       bitrix24ToMoysklad: { enabled: false, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } }],
-    groups: [], references: { units: [], priceTypes: [], dictionaries: [], namedPairs: [] }, serviceCounterpartyId: null,
+    groups: [], references: { units: [], priceTypes: [{ bitrix24Id: 2, moyskladId: priceType, status: 'configured' }], dictionaries: [], namedPairs: [] }, serviceCounterpartyId: null,
   };
   await database.fieldSettingsVersion.create({ data: { version: settingsVersion, config } });
   await database.fieldSettingsState.upsert({ where: { id: 'global' }, create: { id: 'global', version: settingsVersion }, update: { version: settingsVersion } });
 
   for (const kind of ['product', 'service'] as const) {
     const id = randomUUID();
-    sourceRecords.set(id, { id, meta: { type: kind }, name: `${kind}-after-boundary`, code: `${kind}-code`, description: `${kind} description`, created: '2026-02-01T00:00:00.000Z', updated: '2026-10-18T00:00:00.000Z' });
+    sourceRecords.set(id, { id, meta: { type: kind }, name: `${kind}-after-boundary`, code: `${kind}-code`, description: `${kind} description`, created: '2026-02-01T00:00:00.000Z', updated: '2026-10-18T00:00:00.000Z',
+      salePrices: [{ value: 23700, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/${currencyId}` } }, priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }] });
     const first = await sendCreate(kind, id, `post-boundary-${kind}-1`);
     assert.equal(first.status, 200);
     const firstId = oneEventId(await first.json());
@@ -128,6 +131,8 @@ test('post-boundary product and service CREATE intake creates/readbacks one card
     assert.equal(operation.bitrix24ProductId, pair.bitrix24Id);
     assert.equal(createdCards.get(pair.bitrix24Id)?.xmlId, `MOYSKLAD_${kind.toUpperCase()}_${id}`);
     assert.equal((createdCards.get(pair.bitrix24Id)?.property108 as { value: string }).value, id);
+    assert.equal(priceRows.get(pair.bitrix24Id)?.length, 1);
+    assert.equal(priceRows.get(pair.bitrix24Id)?.[0].price, 237, 'CREATE copies 23700 kopecks as 237 RUB, never 23700 RUB');
 
     const addsBeforeRepeat = requests.filter(({ path }) => isCreatePath(path, kind)).length;
     const repeated = await sendCreate(kind, id, `post-boundary-${kind}-2`);
@@ -317,7 +322,7 @@ test('public Bitrix24 catalog webhook persists earliest-date, deterministic ties
     moyskladCandidates.set(name, rows.map(({ id, createdAt }) => ({ id, created: createdAt })));
     for (const { id, createdAt } of rows) sourceRecords.set(id, {
       id, meta: { type: 'product' }, name, created: createdAt, updated: '2026-10-18T00:00:00.000Z', vatEnabled: true, vatIncluded: false, vat: 20,
-      salePrices: [{ value: 25, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/12345678-1234-1234-1234-123456789abc` } }, priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }],
+      salePrices: [{ value: 2500, currency: { isoCode: 'RUB', meta: { href: `${fakeBase}ms/api/remap/1.2/entity/currency/12345678-1234-1234-1234-123456789abc` } }, priceType: { meta: { href: `${fakeBase}ms/api/remap/1.2/context/companysettings/pricetype/${priceType}` } } }],
     });
   }
   const freshB24Id = () => String(8_000_000_000_000_000 + Math.floor(Math.random() * 500_000_000_000_000));
@@ -407,8 +412,8 @@ test('MySklad product UPDATE applies confirmed price and UOM mappings through th
     created: '2026-02-01T00:00:00.000Z', updated: '2026-10-18T00:00:00.000Z',
     uom: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/uom/${oldUnitId}` } },
     salePrices: [
-      { value: 10, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
-      { value: 777, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
+      { value: 1000, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
+      { value: 77700, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
     ],
   });
   const config = {
@@ -442,8 +447,8 @@ test('MySklad product UPDATE applies confirmed price and UOM mappings through th
     const source = sourceRecords.get(productId)!;
     source.uom = { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/uom/${newUnitId}` } };
     source.salePrices = [
-      { value: 18.25, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
-      { value: 777, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
+      { value: 1825, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${configuredPriceType}` } } },
+      { value: 77700, currency: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}` }, isoCode: 'RUB' }, priceType: { meta: { href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${unconfiguredPriceType}` } } },
     ];
     const updateResponse = await sendUpdate('product', productId, 'catalog-price-uom-update');
     assert.equal(updateResponse.status, 200);
@@ -453,6 +458,11 @@ test('MySklad product UPDATE applies confirmed price and UOM mappings through th
     assert.equal(productCard.measure, 4, 'configured MySklad UOM mapping is written to the existing B24 catalog card');
     assert.equal(priceRows.get(bitrix24Id)?.find((row) => row.id === b24PriceId)?.price, 18.25, 'configured sale price updates the exact existing B24 catalog price row');
     assert.equal(priceRows.get(bitrix24Id)?.find((row) => row.id === unrelatedPrice.id)?.price, 777, 'unconfigured price type remains untouched');
+    (source.salePrices as Array<{ value: number }>)[0].value = 0;
+    const zeroResponse = await sendUpdate('product', productId, 'catalog-price-zero');
+    assert.equal(zeroResponse.status, 200);
+    await waitForStatus(database, oneEventId(await zeroResponse.json()), 'SUCCEEDED');
+    assert.equal(priceRows.get(bitrix24Id)?.find((row) => row.id === b24PriceId)?.price, 0, 'zero is copied without inventing a replacement price');
     const providerCalls = requests.map(({ path }) => path);
     assert.ok(providerCalls.some((path) => path.includes('catalog.price.update.json')), 'the configured price is written through Bitrix catalog.price.update');
     assert.ok(providerCalls.some((path) => path.includes('catalog.product.update.json')), 'the configured UOM is written through Bitrix catalog.product.update');
@@ -551,9 +561,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (record) { response.writeHead(200); response.end(JSON.stringify({ result: { product: record } })); return; }
   }
   if (method.endsWith('catalog.price.list')) {
-    const id = new URLSearchParams(body).get('filter[productId]') ?? '';
-    const prices = priceRows.get(id) ?? [];
+    const payload = parseProviderBody(body) as { filter?: { productId?: number; catalogGroupId?: number } };
+    const id = String(payload.filter?.productId ?? new URLSearchParams(body).get('filter[productId]') ?? '');
+    const prices = (priceRows.get(id) ?? []).filter(row=>payload.filter?.catalogGroupId===undefined||row.catalogGroupId===payload.filter.catalogGroupId);
     response.writeHead(200); response.end(JSON.stringify({ result: { prices, total: prices.length } })); return;
+  }
+  if (method.endsWith('catalog.price.add')) {
+    const payload = parseProviderBody(body) as { fields: { productId: number; catalogGroupId: number; price: number; currency: string } };
+    const fields=payload.fields;
+    const row={id:String(nextCardId++),productId:fields.productId,catalogGroupId:fields.catalogGroupId,price:fields.price,currency:fields.currency};
+    const id=String(fields.productId);priceRows.set(id,[...(priceRows.get(id)??[]),row]);
+    response.writeHead(200);response.end(JSON.stringify({result:{price:row}}));return;
   }
   if (method.endsWith('catalog.catalog.get')) {
     response.writeHead(200); response.end(JSON.stringify({ result: { catalog: { vatId: 2 } } })); return;

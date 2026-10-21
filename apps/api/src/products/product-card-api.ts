@@ -157,7 +157,9 @@ export class ProductCardHttpApi implements ProductCardApi {
     const prices = Array.isArray(product.salePrices) ? await Promise.all(product.salePrices.filter(isRecord).map(async (price) => {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
       const typeId = idFromHref(typeMeta.href);
-      const value = finiteNumber(price.value);
+      // Remap salePrices.value is in minor units; catalog.price uses major units.
+      const nativeMinorValue = finiteNumber(price.value);
+      const value = nativeMinorValue === null || nativeMinorValue < 0 ? null : nativeMinorValue / 100;
       if (!typeId || value === null) throw new Error('PRODUCT_PRICE_READ_INVALID');
       const rawCurrency = isRecord(price.currency) ? price.currency : undefined;
       const currencyId = isRecord(rawCurrency?.meta) ? idFromHref(rawCurrency.meta.href) : null;
@@ -189,7 +191,8 @@ export class ProductCardHttpApi implements ProductCardApi {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
       const typeId = idFromHref(typeMeta.href);
       const current = typeId ? values.prices.find((entry) => entry.typeId === typeId) : undefined;
-      const value = finiteNumber(price.value);
+      const nativeMinorValue = finiteNumber(price.value);
+      const value = nativeMinorValue === null || nativeMinorValue < 0 ? null : nativeMinorValue / 100;
       if (!typeId || value === null) return null;
       return {
         priceId: typeId, typeId, value,

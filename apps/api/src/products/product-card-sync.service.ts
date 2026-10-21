@@ -13,6 +13,7 @@ export type ProductCardPair = {
   createdAt: Date;
 };
 
+/** Snapshots use major currency units on both sides, not native Remap kopecks. */
 export type ProductCardPrice = { priceId: string; typeId: string; value: number; currency: string; currencyRef?: Record<string, unknown> };
 export type ProductCardSnapshot = {
   name: string | null;
@@ -195,9 +196,9 @@ export class ProductCardSyncService {
       if (verified) {
         try {
           setState(next, direction, 'BITRIX24', direction.bitrix24Key,
-            direction.target === 'BITRIX24' ? normalizeDirectionState(direction.field, direction.value) : readField(bitrix24, direction.field, direction));
+            direction.target === 'BITRIX24' ? normalizeDirectionState(direction.field, direction.value) : readField(bitrix24, direction.field, direction, 'BITRIX24'));
           setState(next, direction, 'MOYSKLAD', direction.moyskladKey,
-            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction));
+            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction, 'MOYSKLAD'));
           await this.state.write(pair.id, settingsVersion, next);
           changedFields.push(direction.field);
         } catch (error) {
@@ -277,7 +278,7 @@ export class ProductCardSyncService {
           // Remap exposes salePrices as an embedded collection. Re-read before
           // writing and include every current entry, preserving unpaired types.
           salePrices: moysklad.prices.map((price) => ({
-            value: price.typeId === direction.moyskladKey ? direction.value : price.value,
+            value: Number(price.typeId === direction.moyskladKey ? direction.value : price.value) * 100,
             ...(price.currencyRef ? { currency: price.currencyRef } : {}),
             priceType: { meta: {
               href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${price.typeId}`,
@@ -554,11 +555,15 @@ function setState(state: ProductCardSyncState, direction: Direction, side: Side,
   }
 }
 
-function readField(snapshot: ProductCardSnapshot, field: string, direction?: Direction): unknown {
+function readField(snapshot: ProductCardSnapshot, field: string, direction?: Direction, side?: Side): unknown {
   if (field === 'name') return snapshot.name;
   if (field === 'description') return snapshot.detailText;
   if (field === 'code') return snapshot.code;
   if (field === 'unit') return snapshot.unitId;
+  if (field.startsWith('price:')) {
+    const typeId = side === 'BITRIX24' ? direction?.bitrix24Key : direction?.moyskladKey;
+    return snapshot.prices.find((price) => price.typeId === typeId)?.value;
+  }
   if (field.startsWith('field:')) return direction?.moyskladField ? snapshot.fields?.[direction.moyskladField] : undefined;
   return undefined;
 }
