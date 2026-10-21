@@ -14,11 +14,11 @@ const db = new PrismaClient();
 const database = new DatabaseService();
 const portMarker = 'issue54_reverse_test';
 const ids = {
-  order: '11111111-1111-4111-8111-111111111111',
-  company: '22222222-2222-4222-8222-222222222222',
-  product: '33333333-3333-4333-8333-333333333333',
+  order: '11111111-1111-11f1-0a80-111111111111',
+  company: '22222222-2222-11f1-0a80-222222222222',
+  product: '33333333-3333-11f1-0a80-333333333333',
   state: '44444444-4444-4444-8444-444444444444',
-  currency: '55555555-5555-4555-8555-555555555555',
+  currency: '55555555-5555-11e2-4ba4-555555555555',
   unit: '66666666-6666-4666-8666-666666666666',
   preparationState: '77777777-7777-4777-8777-777777777777',
   unmappedState: '88888888-8888-4888-8888-888888888888',
@@ -46,6 +46,8 @@ let pauseModeAck: Promise<void> | null = null;
 const suffix = randomUUID();
 let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
+let expectedClientWorkerLease: { assertOwned(): Promise<void> } | null = null;
+let clientWorkerLeaseChecks = 0;
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -70,7 +72,14 @@ before(async () => {
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-only';
   process.env.BITRIX24_API_TOKEN = 'synthetic-test-only';
   service = new DealOrderReverseCreateService(database, new SyncModeService(database), {
-    async resolveForDocument() { return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' }; },
+    async resolveForDocument(_input: unknown, workerLease: unknown) {
+      if (expectedClientWorkerLease) {
+        assert.equal(workerLease, expectedClientWorkerLease, 'claimed worker context must reach the client dependency');
+        await expectedClientWorkerLease.assertOwned();
+        clientWorkerLeaseChecks++;
+      }
+      return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' };
+    },
     async scheduleOptionalContactRetry() {}, async verifyServiceCounterparty() { return true; },
   } as never);
 });
@@ -177,8 +186,11 @@ test('existing paired order receives addressed MS-only positions without replaci
   const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '880', moyskladId: orderId, source: 'MANUAL' } });
   pairIds.push(dealPair.id);
   try {
-    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true };
+    expectedClientWorkerLease = { assertOwned: async () => {} };
+    clientWorkerLeaseChecks = 0;
+    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true, workerLease: expectedClientWorkerLease };
     await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    assert.equal(clientWorkerLeaseChecks, 1);
     assert.equal(rows.length, 3, 'provider applied the row before its response was lost');
     const first = await service.addPositionsToExistingPair(input);
     assert.deepEqual(first, { status: 'ROWS_ADDED' });
@@ -193,6 +205,7 @@ test('existing paired order receives addressed MS-only positions without replaci
     assert.equal(rows.length, 3, 'repeat is idempotent');
     assert.equal(rowAdds, 2);
   } finally {
+    expectedClientWorkerLease = null;
     await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
     await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
     await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
@@ -443,6 +456,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
   if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
+    assert.equal(new URL(request.url ?? '/', base).searchParams.get('expand'), 'assortment');
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
     return send(response, { rows: orderPositions.slice(offset, offset + 100) });
   }
@@ -455,8 +469,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (pathname === '/rest/crm.item.get') return send(response, { result: { item: items.find((item) => String(item.id) === String(body.id)) } });
   if (pathname === '/rest/crm.item.productrow.list') {
+    if (!body.filter?.['=ownerType'] || !body.filter?.['=ownerId']) {
+      response.writeHead(400); response.end(JSON.stringify({ error: 'REQUIRED_ARG_MISSING' })); return;
+    }
+    assert.equal(body.filter['=ownerType'], 'D');
+    assert.equal(body.select, undefined);
     const start = Number(body.start ?? 0);
-    return send(response, { result: { productRows: rows.slice(start, start + 50) } });
+    const owned = rows.filter((row) => Number(row.ownerId) === Number(body.filter['=ownerId']));
+    return send(response, { result: { productRows: owned.slice(start, start + 50) }, total: owned.length, ...(start + 50 < owned.length ? { next: start + 50 } : {}) });
   }
   if (pathname === '/rest/crm.item.productrow.add') {
     rowAdds++;
