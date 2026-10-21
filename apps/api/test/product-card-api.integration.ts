@@ -7,7 +7,7 @@ import { isRetryableFailure, ProviderFailure } from '../src/provider-failure';
 let server: Server;
 let base = '';
 const saved = new Map<string, string | undefined>();
-const requests: Array<{ method: string; path: string; body: string }> = [];
+const requests: Array<{ method: string; path: string; body: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
 let malformedNextProductWriteResponse = false;
 let failNextProductWriteRetryAfter: string | null = null;
 const productId = '12345678-1234-1234-1234-123456789abc';
@@ -20,7 +20,10 @@ before(async () => {
     request.on('data', (chunk: Buffer) => chunks.push(chunk));
     request.on('end', () => {
       const body = Buffer.concat(chunks).toString('utf8');
-      requests.push({ method: request.method ?? '', path: request.url ?? '', body });
+      requests.push({
+        method: request.method ?? '', path: request.url ?? '', body,
+        accept: request.headers.accept, acceptEncoding: request.headers['accept-encoding'],
+      });
       response.setHeader('content-type', 'application/json');
       if (request.url === '/rest/catalog.product.get.json') return response.end(JSON.stringify({ result: { product: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' } } }));
       if (request.url === '/rest/catalog.product.service.get.json') return response.end(JSON.stringify({ result: { service: { id: 102, type: 7, name: 'Setup', detailText: 'Install', dateModify: '2026-10-07T10:00:00Z' } } }));
@@ -80,6 +83,9 @@ test('product API adapter reads only addressed cards and issues partial field an
     name: 'Starter', code: 'S-1', detailText: 'HTML detail', unitId: '3', fields: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' }, prices: [{ priceId: '51', typeId: '2', value: 12.5, currency: 'RUB' }], updatedAt: '2026-10-07T10:00:00Z', createdAt: null,
   });
   const ms = await api.readMoysklad(productId);
+  const moyskladProductRead = requests.find((request) => request.path === `/api/remap/1.2/entity/product/${productId}` && request.method === 'GET');
+  assert.equal(moyskladProductRead?.accept, 'application/json;charset=utf-8');
+  assert.equal(moyskladProductRead?.acceptEncoding, 'gzip');
   assert.equal(ms.unitId, 'abcdefab-cdef-abcd-efab-cdefabcdefab');
   assert.equal(ms.prices[0].typeId, 'abcdefab-cdef-abcd-efab-cdefabcdefac');
   assert.equal(ms.prices[0].currency, 'RUB');

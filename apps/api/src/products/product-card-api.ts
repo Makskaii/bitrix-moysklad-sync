@@ -257,7 +257,7 @@ export class ProductCardHttpApi implements ProductCardApi {
     const url = new URL(path, ensureSlash(base));
     const response = await fetch(url, {
       method,
-      headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+      headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
       redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
