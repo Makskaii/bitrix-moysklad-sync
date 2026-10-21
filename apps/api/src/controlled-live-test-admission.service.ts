@@ -51,8 +51,10 @@ export class ControlledLiveTestAdmissionService {
       if (candidate.sourceSystem === source.sourceSystem &&
           candidate.sourceNativeId === source.sourceNativeId) return { record: candidate, reversed: false };
       if (candidate.direction === 'BOTH' && candidate.targetSystem === source.sourceSystem) {
-        const prior = priorBindings.find((row: any) => bindingMatchesManifestPair(row, candidate));
-        if (prior && candidate.targetNativeId === source.sourceNativeId) return { record: candidate, reversed: true };
+        const prior = priorBindings.find((row: any) => bindingMatchesManifestPair(row, candidate, this.manifest.runId));
+        const targetField = candidate.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+        const expectedTargetId = candidate.targetNativeId ?? prior?.[targetField];
+        if (prior && expectedTargetId === source.sourceNativeId) return { record: candidate, reversed: true };
       }
       return null;
     }).filter((item: any) => item !== null);
@@ -417,10 +419,16 @@ function canonicalProviderIds(record: any): { bitrix24NativeId: string | null; m
   };
 }
 
-function bindingMatchesManifestPair(binding: any, record: any): boolean {
+function bindingMatchesManifestPair(binding: any, record: any, runId: string): boolean {
   const pair = canonicalProviderIds(record);
-  return binding.entity === record.entity && binding.bitrix24NativeId === pair.bitrix24NativeId &&
-    binding.moyskladNativeId === pair.moyskladNativeId && binding.sourceName === record.name;
+  const sourceField = record.sourceSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetField = record.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetMatches = pair[targetField] === null
+    ? typeof binding[targetField] === 'string' && binding[targetField].length > 0 &&
+      typeof binding.createReservedByEventId === 'string' && binding.createReservedByEventId.length > 0
+    : binding[targetField] === pair[targetField];
+  return binding.runId === runId && binding.entity === record.entity &&
+    binding[sourceField] === record.sourceNativeId && targetMatches && binding.sourceName === record.name;
 }
 
 function bindingMatchesExpected(binding: any, runId: string, record: any,

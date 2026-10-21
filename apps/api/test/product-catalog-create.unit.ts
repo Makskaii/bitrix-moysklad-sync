@@ -53,8 +53,8 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     const method = url.slice(url.lastIndexOf('/') + 1);
     calls.push(method);
     const request = JSON.parse(String(init?.body)) as { fields?: Record<string, unknown> };
-    if (method === 'catalog.product.getFieldsByFilter') return Response.json({ result: { product: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, weight: { type: 'double', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false } } } });
-    if (method === 'catalog.product.service.getFieldsByFilter') return Response.json({ result: { service: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false } } } });
+    if (method === 'catalog.product.getFieldsByFilter') return Response.json({ result: { product: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, weight: { type: 'double', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false }, property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } } } });
+    if (method === 'catalog.product.service.getFieldsByFilter') return Response.json({ result: { service: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false }, property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } } } });
     if (method === 'catalog.product.list') return Response.json({ result: { products: [...cards.values()].filter((card) => card.xmlId === (request as any).filter?.xmlId), total: cards.size }, total: cards.size });
     if (method === 'catalog.product.add') {
       const id = '821';
