@@ -48,6 +48,8 @@ let failNextInvoiceCreate = false;
 let failNextMoyskladUpdate = false;
 let failNextBitrixUpdateField: string | null = null;
 let reparentOnNextMoyskladWrite = false;
+let failPositionReadAfterWrite = false;
+let failNextPositionRead = false;
 let moyskladWrites = 0;
 let processorStarted = false;
 const bitrixInvoices = new Map<string, InvoiceRecord>();
@@ -207,10 +209,11 @@ test('invoice processor creates one independently paired invoiceout, then update
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
 });
 
-test('invoice creation copies its own goods and prices, with organization and agent from the paired order', async () => {
+test('invoice goods create/update/add/recovery keep native row IDs and stop unsafe total, deletion, or target conflicts', async () => {
   const sourceId = String(++invoiceCounter);
   const productId = `55${Date.now()}`;
   const targetId = 'd813b5d2-5939-11ee-0a80-1143000e2d5c';
+  const secondProductId = `56${Date.now()}`;
   await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: targetId, moyskladType: 'product', source: 'MANUAL' } });
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice own goods', parentId2: Number(dealId), createdTime: createdAfterBoundary, opportunity: 342, currencyId: 'RUB' });
   invoiceRows.set(sourceId, [{ id: 321, ownerType: 'SI', ownerId: Number(sourceId), productId: Number(productId), quantity: 2, price: 171,
@@ -220,11 +223,55 @@ test('invoice creation copies its own goods and prices, with organization and ag
     assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
     const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
     const target = moyskladInvoices.get(pair.moyskladId)!;
-    assert.deepEqual(target.positions, [{ quantity: 2, price: 17100, discount: 0, vat: 22, assortment: { meta: {
+    assert.deepEqual((target.positions as InvoiceRecord[]).map(({id,...value})=>value), [{ quantity: 2, price: 17100, discount: 0, vat: 22, assortment: { meta: {
       href: `${base}api/remap/1.2/entity/product/${targetId}`, type: 'product', mediaType: 'application/json' } } }]);
     assert.equal(target.vatIncluded, true);
     assert.equal((target.organization as any).meta.type, 'organization');
     assert.equal((target.agent as any).meta.type, 'counterparty');
+    const originalRowId=(target.positions as InvoiceRecord[])[0]!.id;
+    const sourceRow=invoiceRows.get(sourceId)![0]!;
+    Object.assign(sourceRow,{quantity:3,price:150,priceBrutto:150,priceNetto:122.95081967});
+    bitrixInvoices.get(sourceId)!.opportunity=450;
+    let writes=moyskladWrites;
+    const update=await createEvent(`goods-update-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(update.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes+1);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.price,15000);
+    assert.equal(invoiceSum(target),45000);
+    const secondTargetId=randomUUID();
+    await db.entityPair.create({data:{entityType:'PRODUCT',bitrix24Id:secondProductId,moyskladId:secondTargetId,moyskladType:'product',source:'MANUAL'}});
+    invoiceRows.get(sourceId)!.push({...sourceRow,id:322,productId:Number(secondProductId),quantity:1,price:80,priceBrutto:80,priceNetto:65.57377049});
+    bitrixInvoices.get(sourceId)!.opportunity=530;
+    const add=await createEvent(`goods-add-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(add.id))?.status,'SUCCEEDED');
+    assert.equal((target.positions as InvoiceRecord[]).length,2);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    writes=moyskladWrites;
+    const repeat=await createEvent(`goods-repeat-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(repeat.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes);
+    Object.assign(sourceRow,{quantity:4});bitrixInvoices.get(sourceId)!.opportunity=680;
+    failPositionReadAfterWrite=true;
+    const recover=await createEvent(`goods-readback-retry-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(recover.id))?.status,'RETRYABLE_FAILURE');
+    writes=moyskladWrites;
+    await db.inboundEvent.update({where:{id:recover.id},data:{retryAfter:new Date(Date.now()-1)}});
+    assert.equal((await processor.process(recover.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes,'provider success before failed readback must not issue a duplicate row write');
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    const secondRow=invoiceRows.get(sourceId)!.pop()!;bitrixInvoices.get(sourceId)!.opportunity=600;
+    const removed=await createEvent(`goods-removed-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(removed.id))?.status,'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({where:{id:removed.id}})).lastErrorCategory,'INVOICE_GOODS_SOURCE_ROW_REMOVED');
+    assert.equal((target.positions as InvoiceRecord[]).length,2);
+    assert.equal(moyskladWrites,writes);
+    invoiceRows.get(sourceId)!.push(secondRow);bitrixInvoices.get(sourceId)!.opportunity=680;
+    (target.positions as InvoiceRecord[])[0]!.price=15100;
+    const conflict=await createEvent(`goods-ms-change-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(conflict.id))?.status,'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({where:{id:conflict.id}})).lastErrorCategory,'INVOICE_GOODS_TARGET_CHANGED');
+    assert.equal(moyskladWrites,writes);
     const mismatchedId = String(++invoiceCounter);
     bitrixInvoices.set(mismatchedId, { ...bitrixInvoices.get(sourceId), id: mismatchedId, opportunity: 999 });
     invoiceRows.set(mismatchedId, invoiceRows.get(sourceId)!.map((row) => ({ ...row, ownerId: Number(mismatchedId) })));
@@ -234,7 +281,7 @@ test('invoice creation copies its own goods and prices, with organization and ag
     assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: bad.id } })).lastErrorCategory, 'INVOICE_SOURCE_TOTAL_MISMATCH');
     assert.equal(moyskladWrites, beforeWrites);
   } finally {
-    await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', bitrix24Id: productId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', bitrix24Id: {in:[productId,secondProductId]} } });
   }
 });
 
@@ -851,14 +898,37 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       moyskladWrites++;
       const body = JSON.parse(raw) as InvoiceRecord;
       const id = randomUUID();
-      const invoice = { ...body, id, created: createdAfterBoundary, meta: { type: 'invoiceout' } };
+      const positions = Array.isArray(body.positions) ? body.positions.map((row:any)=>({...row,id:randomUUID()})) : [];
+      const invoice = { ...body, positions, id, created: createdAfterBoundary, meta: { type: 'invoiceout' } };
       moyskladInvoices.set(id, invoice);
       return send(response, { id, meta: { type: 'invoiceout' } });
     }
     const invoiceId = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/invoiceout\/([0-9a-f-]{36})$/i)?.[1];
     if (invoiceId && request.method === 'GET') {
       const invoice = moyskladInvoices.get(invoiceId);
-      return send(response, invoice ?? { errors: [{ error: 'not found' }] }, invoice ? 200 : 404);
+      return send(response, invoice ? {...invoice,sum:invoiceSum(invoice)} : { errors: [{ error: 'not found' }] }, invoice ? 200 : 404);
+    }
+    const positionPath = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/invoiceout\/([0-9a-f-]{36})\/positions(?:\/([0-9a-f-]{36}))?$/i);
+    if(positionPath) {
+      const invoice = moyskladInvoices.get(positionPath[1]!);
+      if(!invoice) return send(response,{},404);
+      const rows=Array.isArray(invoice.positions)?invoice.positions as InvoiceRecord[]:[];
+      if(request.method==='GET') {
+        if(failNextPositionRead) {failNextPositionRead=false;return send(response,{errors:[{code:1000}]},503);}
+        return send(response,{meta:{size:rows.length},rows});
+      }
+      if(request.method==='POST') {
+        moyskladWrites++;
+        const row={...JSON.parse(raw),id:randomUUID()};rows.push(row);invoice.positions=rows;
+        return send(response,row);
+      }
+      if(request.method==='PUT') {
+        const row=rows.find(r=>r.id===positionPath[2]);
+        if(!row) return send(response,{},404);
+        moyskladWrites++;Object.assign(row,JSON.parse(raw));
+        if(failPositionReadAfterWrite) {failPositionReadAfterWrite=false;failNextPositionRead=true;}
+        return send(response,row);
+      }
     }
     if (invoiceId && request.method === 'PUT') {
       if (failNextMoyskladUpdate) { failNextMoyskladUpdate = false; return send(response, { errors: [{ error: 'temporary' }] }, 503); }
@@ -884,6 +954,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
 function send(response: ServerResponse, value: unknown, status = 200) {
   response.writeHead(status, { 'content-type': 'application/json' });
   response.end(JSON.stringify(value));
+}
+
+function invoiceSum(invoice:InvoiceRecord):number {
+  const rows=Array.isArray(invoice.positions)?invoice.positions as InvoiceRecord[]:[];
+  return rows.reduce((sum,row)=>sum+Math.round(Number(row.price)*Number(row.quantity)*(1-Number(row.discount??0)/100)*(invoice.vatEnabled===true&&invoice.vatIncluded!==true?1+Number(row.vat??0)/100:1)),0);
 }
 
 function restoreEnv(name: string, value: string | undefined) {

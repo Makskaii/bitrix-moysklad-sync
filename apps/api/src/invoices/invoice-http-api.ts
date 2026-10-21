@@ -78,6 +78,28 @@ export class InvoiceHttpApi {
     await this.moyskladRequest(`entity/invoiceout/${encodeURIComponent(id)}`, 'PUT', body);
   }
 
+  async readMoyskladPositionsPage(id: string, offset: number): Promise<{ rows: InvoiceRecord[]; next: number | null }> {
+    if (!isUuid(id) || !Number.isSafeInteger(offset) || offset < 0) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    const root = record(await this.moyskladRequest(`entity/invoiceout/${id}/positions?limit=1000&offset=${offset}`, 'GET'));
+    const size = record(root.meta).size;
+    if (!Array.isArray(root.rows) || root.rows.some((row) => !isRecord(row)) || typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0 || offset + root.rows.length > size || root.rows.length === 0 && size > offset) throw new Error('INVOICE_ROWS_RESPONSE_INVALID');
+    return { rows: root.rows as InvoiceRecord[], next: offset + root.rows.length < size ? offset + root.rows.length : null };
+  }
+
+  async updateMoyskladPosition(id: string, positionId: string, fields: InvoiceRecord): Promise<void> {
+    if (!isUuid(id) || !isUuid(positionId)) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    assertApplyExternalWrite('MOYSKLAD','INVOICE_POSITION_UPDATE',id,'invoice');
+    await this.moyskladRequest(`entity/invoiceout/${id}/positions/${positionId}`,'PUT',fields);
+  }
+
+  async addMoyskladPosition(id: string, fields: InvoiceRecord): Promise<string> {
+    if (!isUuid(id)) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    assertApplyExternalWrite('MOYSKLAD','INVOICE_CHILD_CREATE',id,'invoice');
+    const row = record(await this.moyskladRequest(`entity/invoiceout/${id}/positions`,'POST',fields));
+    if (typeof row.id !== 'string' || !isUuid(row.id)) throw new Error('INVOICE_POSITION_CREATE_RESPONSE_INVALID');
+    return row.id;
+  }
+
   async createBitrix24(sourceId: string, dealId: string, fields: InvoiceRecord): Promise<string> {
     const body = { ...fields, parentId2: Number(dealId), originatorId: 'MOYSKLAD', originId: sourceId };
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'crm_dynamic_31', entityId: `origin:${sourceId}`, operation: 'CREATE', fields: body })) return `dry:${sourceId}`;
@@ -131,7 +153,10 @@ export class InvoiceHttpApi {
   }
 
   private async moyskladRequestUrl(url: URL, method: 'GET' | 'POST' | 'PUT', body?: InvoiceRecord): Promise<unknown> {
-    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', method === 'POST' ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', method === 'POST' ? null : url.pathname.split('/').at(-1), 'invoice');
+    if (method !== 'GET') {
+      const position = /\/entity\/invoiceout\/([0-9a-f-]{36})\/positions(?:\/[0-9a-f-]{36})?$/.exec(url.pathname);
+      assertApplyExternalWrite('MOYSKLAD', position ? method === 'POST' ? 'INVOICE_CHILD_CREATE' : 'INVOICE_POSITION_UPDATE' : method === 'POST' ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', position ? position[1] : method === 'POST' ? null : url.pathname.split('/').at(-1), 'invoice');
+    }
     const token = requiredEnv('MOYSKLAD_API_TOKEN');
     const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .catch(() => { throw new ProviderFailure('MOYSKLAD', null); });

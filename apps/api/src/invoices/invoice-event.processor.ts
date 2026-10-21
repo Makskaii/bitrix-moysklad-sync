@@ -17,6 +17,7 @@ import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admi
 import { InvoicePairLease, withInvoicePairLock } from './invoice-pair-lock';
 import { serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 import { bitrixMoneyToMoySklad } from '../deals-orders/deal-order-money';
+import { invoiceGoodsValue, InvoiceGoodsReview, InvoiceGoodsRow, InvoiceGoodsState, planInvoiceGoods, sameGoods } from './invoice-goods-plan';
 
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
@@ -200,10 +201,13 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
           }
           const pair = await this.persistPair(source, sourceId, created.partnerId, order.pair.moyskladId, event.id, lease);
           if (!pair) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_PERSIST_FAILED', retryAtForFailure(new Error('INVOICE_PAIR_PERSIST_FAILED'), event.attempts + 1), lease);
-          const baselineLock = await withInvoicePairLock(this.database, pair.id, event.id, async (pairLease) => {
+          const initialize = () => withInvoicePairLock(this.database, pair.id, event.id, async (pairLease) => {
             await this.initializeBaseline(pair.id, event.id, settings, rules, groups, bitrix, moysklad, pairLease);
+            if (source === 'BITRIX24') await this.synchronizeInvoiceGoods(pair, order.pair, settings, lease, pairLease);
             return true;
           });
+          const baselineLock = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+            ? await this.controlledAdmission.runForEvent(event.id, initialize) : await initialize();
           if (!baselineLock) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
           return this.finish(event, 'SUCCEEDED', 'INVOICE_CREATED_AND_PAIRED', null, lease);
         });
@@ -219,12 +223,13 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         const baselineResult = await this.ensureBaseline(invoicePair.pair, order.pair, event.id, settings, rules, groups, bitrix, moysklad, lease, pairLease);
         if (baselineResult.status === 'SUPERSEDED') return { status: 'UNCHANGED', reason: 'SETTINGS_PIN_SUPERSEDED', retryAfter: null } as const;
         if (baselineResult.status !== 'READY') return baselineResult;
-        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline: baselineResult.baseline, bitrix: baselineResult.bitrix, moysklad: baselineResult.moysklad, lease, pairLease });
+        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventSource: source, eventConfig: settings, rules, groups, baseline: baselineResult.baseline, bitrix: baselineResult.bitrix, moysklad: baselineResult.moysklad, lease, pairLease });
         return this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? this.controlledAdmission.runForEvent(event.id, sync) : sync();
       }));
       if (!result) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
+      if (error instanceof InvoiceGoodsReview) return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
       if (error instanceof Error && /^INVOICE_(?:PRODUCT_|SOURCE_TOTAL_|ORDER_CURRENCY_|ORDER_CONTEXT_|ROWS_)/.test(error.message)) {
         return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
       }
@@ -293,9 +298,9 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         return { status: 'CREATED', partnerId: recoveredId };
       }
       await input.lease.assertOwned();
-      const document = await this.prepareMoyskladCreation(input.sourceId, input.sourceRecord, input.dealId, input.orderId, fields);
+      const prepared = await this.prepareMoyskladCreation(input.sourceId, input.sourceRecord, input.dealId, input.orderId, fields);
       await input.lease.assertOwned();
-      const partnerId = await this.api.createMoysklad(input.sourceId, input.orderId, document);
+      const partnerId = await this.api.createMoysklad(input.sourceId, input.orderId, prepared.document);
       if (partnerId.startsWith('dry:')) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_DRY_CREATE_READBACK_UNAVAILABLE' };
       this.controlledAdmission?.allowTargetReadback('MOYSKLAD', partnerId);
       const verified = await this.api.readMoysklad(partnerId);
@@ -331,7 +336,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   /** Invoice goods are authoritative on the invoice, not inherited wholesale from its order. */
-  private async prepareMoyskladCreation(sourceId: string, source: InvoiceRecord, dealId: string, orderId: string, fields: InvoiceRecord): Promise<InvoiceRecord> {
+  private async prepareMoyskladCreation(sourceId: string, source: InvoiceRecord, dealId: string, orderId: string, fields: InvoiceRecord): Promise<{ document: InvoiceRecord; rows: InvoiceGoodsRow[] }> {
     const order = await this.api.readCustomerOrder(orderId);
     const deal = await this.api.readDeal(dealId);
     if (typeof source.currencyId !== 'string' || source.currencyId !== deal.CURRENCY_ID) throw new Error('INVOICE_ORDER_CURRENCY_MISMATCH');
@@ -344,6 +349,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       return { meta: { href, type: kind, mediaType: 'application/json' } };
     };
     const positions: InvoiceRecord[] = [];
+    const sourceRows: InvoiceGoodsRow[] = [];
     const seen = new Set<string>();
     let start: number | null = 0;
     let totalMinor = 0;
@@ -365,16 +371,76 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         vatMode = mode;
         totalMinor += Math.round(Number(row.price) * quantity * 100);
         const product = pairs[0]!;
-        positions.push({ quantity, price: money.price, discount: money.discount, vat: money.vat,
-          assortment: { meta: { href: new URL(`entity/${product.moyskladType}/${product.moyskladId}`, base).href, type: product.moyskladType, mediaType: 'application/json' } } });
+        const position = { quantity, price: money.price, discount: money.discount, vat: money.vat,
+          assortment: { meta: { href: new URL(`entity/${product.moyskladType}/${product.moyskladId}`, base).href, type: product.moyskladType, mediaType: 'application/json' } } };
+        positions.push(position);
+        sourceRows.push({ id, value: invoiceGoodsValue(position, base.href) });
       }
       start = page.next;
       if (positions.length > 10000) throw new Error('INVOICE_PRODUCT_ROW_LIMIT');
     }
     const amount = Number(source.opportunity);
     if (!Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(totalMinor) || Math.round(amount * 100) !== totalMinor) throw new Error('INVOICE_SOURCE_TOTAL_MISMATCH');
-    return { ...fields, organization: relation(order.organization, 'organization'), agent: relation(order.agent, 'counterparty'),
-      ...(order.rate ? { rate: order.rate } : {}), positions, vatEnabled: vatMode?.enabled ?? false, vatIncluded: vatMode?.included ?? false };
+    return { document: { ...fields, organization: relation(order.organization, 'organization'), agent: relation(order.agent, 'counterparty'),
+      ...(order.rate ? { rate: order.rate } : {}), positions, vatEnabled: vatMode?.enabled ?? false, vatIncluded: vatMode?.included ?? false }, rows: sourceRows };
+  }
+
+  private async synchronizeInvoiceGoods(pair: {id:string;bitrix24Id:string;moyskladId:string}, order: {bitrix24Id:string;moyskladId:string}, settings: VersionedFieldSettingsDto, lease: EventWorkerLeaseContext, pairLease: InvoicePairLease): Promise<void> {
+    const read = async () => {
+      await lease.assertOwned();
+      const source = await this.api.readBitrix24(pair.bitrix24Id);
+      const prepared = await this.prepareMoyskladCreation(pair.bitrix24Id,source,order.bitrix24Id,order.moyskladId,{});
+      const target = await this.api.readMoysklad(pair.moyskladId);
+      if (!invoicePairLinksMatchOrder(source,target,order)) throw new InvoiceGoodsReview('INVOICE_GOODS_ORDER_LINK_CHANGED');
+      const rows: InvoiceGoodsRow[] = [];
+      let next: number | null = 0, pages = 0;
+      while(next !== null) {
+        if (++pages > 200) throw new InvoiceGoodsReview('INVOICE_GOODS_ROW_LIMIT');
+        const page = await this.api.readMoyskladPositionsPage(pair.moyskladId,next);
+        for(const row of page.rows) {
+          if(typeof row.id !== 'string' || !isMoyskladId(row.id)) throw new InvoiceGoodsReview('INVOICE_GOODS_TARGET_ROW_ID_INVALID');
+          rows.push({id:row.id,value:invoiceGoodsValue(row,process.env.MOYSKLAD_API_BASE_URL!)});
+        }
+        next=page.next;
+      }
+      return { source:prepared.rows,target:rows,sourceMode:{vatEnabled:prepared.document.vatEnabled===true,vatIncluded:prepared.document.vatIncluded===true},
+        targetMode:{vatEnabled:target.vatEnabled===true,vatIncluded:target.vatIncluded===true},expectedMinor:Math.round(Number(source.opportunity)*100),actualMinor:target.sum };
+    };
+    let current = await read();
+    const saved = await this.database.entityPairSyncState.findUnique({where:{pairId:pair.id}});
+    const children = jsonRecord(saved?.childResourceState);
+    let state = children.invoiceGoods === undefined ? null : children.invoiceGoods as unknown as InvoiceGoodsState;
+    const plan = planInvoiceGoods(current.source,current.target,state,current.sourceMode,current.targetMode);
+    state=plan.state;
+    const checkpoint = async () => {
+      const result = await pairLease.commit(async transaction => {
+        const latest = await transaction.entityPairSyncState.findUniqueOrThrow({where:{pairId:pair.id}});
+        await transaction.entityPairSyncState.update({where:{pairId:pair.id},data:{childResourceState:{...jsonRecord(latest.childResourceState),invoiceGoods:state} as unknown as Prisma.InputJsonValue}});
+      });
+      if(!result.committed) throw new Error('INVOICE_GOODS_PAIR_LOCK_LOST');
+    };
+    await checkpoint();
+    for(const action of plan.actions) {
+      if(process.env.SYNC_MODE !== 'apply') throw new InvoiceGoodsReview('INVOICE_GOODS_DRY_MUTATION_NOT_SUPPORTED');
+      const verified=await read();
+      if(stableJson(verified)!==stableJson(current)) throw new Error('INVOICE_GOODS_CHANGED_BEFORE_WRITE');
+      await this.assertWriteAllowed('BITRIX24_TO_MOYSKLAD',pair.id,lease);
+      if(!await pairLease.assertOwned()) throw new Error('INVOICE_GOODS_PAIR_LOCK_LOST');
+      const value=action.source.value;
+      const body={quantity:value.quantity,price:value.price,discount:value.discount,vat:value.vat,assortment:{meta:{
+        href:new URL(`entity/${value.productType}/${value.productId}`,process.env.MOYSKLAD_API_BASE_URL!.replace(/\/?$/,'/')).href,type:value.productType,mediaType:'application/json'}}};
+      const targetId=action.kind==='update' ? action.targetId : await this.api.addMoyskladPosition(pair.moyskladId,body);
+      if(action.kind==='update') await this.api.updateMoyskladPosition(pair.moyskladId,targetId,body);
+      const after=await read();
+      const row=after.target.find(candidate=>candidate.id===targetId);
+      if(!row || !sameGoods(row.value,value)) throw new Error('INVOICE_GOODS_READBACK_MISMATCH');
+      const binding=state.rows.find(candidate=>candidate.sourceId===action.source.id);
+      if(binding) { binding.source=value;binding.target=row.value; }
+      else state.rows.push({sourceId:action.source.id,targetId,source:value,target:row.value});
+      await checkpoint();
+      current=after;
+    }
+    if(!Number.isSafeInteger(current.actualMinor) || current.actualMinor!==current.expectedMinor) throw new InvoiceGoodsReview('INVOICE_GOODS_TOTAL_READBACK_MISMATCH');
   }
 
   private async bindControlledInvoiceTarget(eventId: string, provider: Source, nativeId: string, record: InvoiceRecord): Promise<void> {
@@ -588,10 +654,11 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   private async syncFields(input: {
-    pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventConfig: VersionedFieldSettingsDto;
+    pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventSource: Source; eventConfig: VersionedFieldSettingsDto;
     rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext; pairLease: InvoicePairLease;
   }): Promise<{ status: ProcessStatus; reason?: string; retryAfter?: Date }> {
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
+    if(input.eventSource==='BITRIX24' && directions?.bitrix24ToMoysklad) await this.synchronizeInvoiceGoods(input.pair,input.order,input.eventConfig,input.lease,input.pairLease);
     const baselineB24 = jsonRecord(input.baseline.bitrix24Values);
     const baselineMs = jsonRecord(input.baseline.moyskladValues);
     for (const rule of input.rules) {
