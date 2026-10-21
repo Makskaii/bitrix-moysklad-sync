@@ -6,8 +6,9 @@ Implemented/pushed and deployed `34b273a46aee029ab0757fceb03f1d489c68d8f8`.
 Main service is ACTIVE, semantic ON, PID1258143, exact process entrypoint and
 cwd `/opt/bitrix-moysklad-sync-releases/issue79-34b273a-20261021-stage`.
 Final independent native API/SQL readbacks completed at 18:57 UTC /21:57 MSK.
-This closes the implementation/live evidence for **point 3 only**, pending the
-separate checker's acceptance. Points 4–7 were not implemented.
+The independent checker accepted **point 3** after its own readonly native
+readbacks of all four cases and confirmation of the direct human emoji policy.
+Points 4–7 were not implemented by this fix; only point4 was subsequently assigned.
 
 The user explicitly allowed safe HTML or omission of emoji. Root selected and
 announced the simpler omission policy: descriptions remain **plain text**.
