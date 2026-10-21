@@ -350,7 +350,7 @@ export class DealOrderReverseCreateService {
     let dealId = items.length === 1 ? readNumericId(items[0].id) : null;
     if (items.length === 1 && (items[0].originId !== prepared.orderId || items[0].originatorId !== 'MOYSKLAD')) throw new DealOrderReverseManualReviewError('Bitrix24 deal recovery identity is ambiguous');
     if (!dealId) {
-      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true }, this.providerGate));
+      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: 'Y' }, this.providerGate));
       const item = isRecord(created) && isRecord(created.item) ? created.item : null;
       dealId = item ? readNumericId(item.id) : null;
       if (!dealId) throw new Error('Bitrix24 deal create response did not include a numeric ID');
@@ -369,7 +369,7 @@ export class DealOrderReverseCreateService {
   }
 
   private async verifyDeal(dealId: string, prepared: Prepared): Promise<Row> {
-    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: true }, this.providerGate);
+    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: 'Y' }, this.providerGate);
     const item = isRecord(result) && isRecord(result.item) ? result.item : null;
     if (!item || String(item.id) !== dealId || item.title !== prepared.fields.title || item.originatorId !== 'MOYSKLAD' || item.originId !== prepared.orderId || String(item.UF_CRM_1729757435964 ?? '') !== String(prepared.sourceSnapshot.name)) {
       throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');

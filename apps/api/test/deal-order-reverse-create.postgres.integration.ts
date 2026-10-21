@@ -452,6 +452,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const bodyText = Buffer.concat(chunks).toString('utf8');
   const body = bodyText ? JSON.parse(bodyText) as Record<string, any> : {};
   const pathname = new URL(request.url ?? '/', base).pathname;
+  if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(pathname) && body.useOriginalUfNames !== 'Y') {
+    response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
+  }
   const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/product\/([0-9a-f-]+)$/i);
   if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
   if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });

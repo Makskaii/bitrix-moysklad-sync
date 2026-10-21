@@ -283,6 +283,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const text = Buffer.concat(chunks).toString('utf8');
   const form = new URLSearchParams(text);
   const url = new URL(request.url ?? '/', providerBase);
+  if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(url.pathname) && JSON.parse(text).useOriginalUfNames !== 'Y') {
+    response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
+  }
   if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}`)return send(response,{id:reverseOrderId,name:'SYNTHETIC-REVERSE',sum:0,agent:{id:company.moyskladId,meta:{type:'counterparty'}},state:{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc'},rate:{currency:{id:refs.currency}}});
   if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}/positions`)return send(response,{rows:[],meta:{size:0,offset:0,limit:1000}});
   if(url.pathname==='/rest/crm.item.list')return send(response,{result:{items:reverseItem?[reverseItem]:[]}});
