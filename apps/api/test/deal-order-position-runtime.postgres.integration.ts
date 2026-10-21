@@ -176,6 +176,20 @@ test('all Bitrix24 and MySklad pages are read before addressed reconciliation', 
   assert.equal(msRows[50].quantity, 77);
 });
 
+test('historical row bootstrap resolves MEASURE_CODE through the saved catalog code without changing the mapping', async () => {
+  const one = await seed(uniqueDealId());
+  await db.dealOrderPositionPair.deleteMany({ where: { pairId: one.pair.id } });
+  b24Rows = [{ id: '306', productId: 904, measureCode: 796, quantity: 2, price: 5, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
+  msRows = [msPosition(one.positionId, 2, 500)];
+
+  const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'event-unit-code-bootstrap', eventConfig: config() });
+
+  assert.deepEqual(result, { status: 'SYNCED' });
+  const link = await db.dealOrderPositionPair.findUniqueOrThrow({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '306' } } });
+  assert.equal(link.moyskladPositionId, one.positionId);
+  assert.equal(b24Rows[0]?.measureCode, 796);
+});
+
 test('new MySklad position ID is journaled before readback and retry resumes without a duplicate POST', async () => {
   const one = await seed('98105');
   const addedRow = { id: '302', productId: 904, measureCode: 796, quantity: 4, price: 0, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null };
@@ -291,7 +305,7 @@ async function seed(dealId: string) {
   await db.dealOrderPositionPair.create({ data: { pairId: pair.id, bitrix24ProductRowId: '301', moyskladPositionId: positionId, bitrix24Values: sourceValues(b24Rows[0]), moyskladValues: targetValues(msRows[0]) } });
   return { pair, positionId };
 }
-function config(): any { return { version: 2, createdAt: new Date(0).toISOString(), config: { schemaVersion: 1, rules: [], groups: [], references: { units: [{ bitrix24Id: 796, bitrix24Code: '796', moyskladId: unitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] } }, references: { units: [], priceTypes: [], dictionaries: [] } }; }
+function config(): any { return { version: 2, createdAt: new Date(0).toISOString(), config: { schemaVersion: 1, rules: [], groups: [], references: { units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: unitId, moyskladCode: '796', status: 'configured' }], priceTypes: [], dictionaries: [] } }, references: { units: [], priceTypes: [], dictionaries: [] } }; }
 function msPosition(id: string, quantity: number, price: number) { return { id, assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${productId}` } }, quantity, price, discount: 0, vat: 0, vatEnabled: false }; }
 function confirmed(pair: any): any { return { id: pair.id, entityType: 'DEAL', bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId, status: 'CONFIRMED', source: 'PERSISTED' }; }
 function uniqueDealId(): string { return String(980_000_000 + Math.floor(Math.random() * 19_000_000)); }

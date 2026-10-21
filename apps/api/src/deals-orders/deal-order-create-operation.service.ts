@@ -29,7 +29,7 @@ export type DealOrderPreparedInput = {
   sourceRowValues: Array<Record<string, unknown>>;
   sourceMeasureCodes: number[];
   skippedRows?: Array<{ sourceRowId: string; reason: string }>;
-  unitMappings: Array<{ bitrix24Id: number; moyskladId: string | null; status: 'configured' | 'unmapped' }>;
+  unitMappings: Array<{ bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; status: 'configured' | 'unmapped' }>;
   payload: {
     agent: Reference;
     organization: Reference;
@@ -287,7 +287,10 @@ export class DealOrderCreateOperationService {
       if (!/^\d{1,20}$/.test(sourceProductId) || !Number.isInteger(sourceMeasureCode) || sourceMeasureCode < 1) {
         throw new Error('Prepared customer-order product or unit identity is invalid');
       }
-      const mappedUnit = input.unitMappings.find((unit) => unit.bitrix24Id === sourceMeasureCode && unit.status === 'configured' && unit.moyskladId);
+      const unitCandidates = input.unitMappings.filter((unit) => unit.bitrix24Code === String(sourceMeasureCode));
+      const mappedUnit = unitCandidates.length === 1 && unitCandidates[0]?.status === 'configured' && unitCandidates[0].moyskladId
+        ? unitCandidates[0]
+        : null;
       if (!mappedUnit?.moyskladId) throw new Error(`Customer-order unit ${sourceMeasureCode} is not mapped`);
       const targetId = referenceId(positions[index].assortment.meta.href);
       const productPair = await this.database.entityPair.findFirst({

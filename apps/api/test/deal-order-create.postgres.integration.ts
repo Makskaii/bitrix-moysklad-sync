@@ -161,7 +161,7 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
     if (result.status === 'READY') {
       assert.deepEqual(result.input.sourceRowIds, ['301'], 'measureCode 796 must resolve the saved catalog row id 9/code 796 mapping');
       assert.deepEqual(result.input.sourceMeasureCodes, [796]);
-      assert.deepEqual(result.input.unitMappings, [{ bitrix24Id: 9, moyskladId: ids.unit, status: 'configured' }], 'resolution must not rewrite the saved mapping');
+      assert.deepEqual(result.input.unitMappings, [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }], 'resolution must preserve the saved catalog id/code mapping');
       assert.equal(result.input.payload.positions.length, 1);
       assert.equal(result.input.payload.positions[0]?.quantity, 1);
       assert.equal(result.input.payload.positions[0]?.price, 1000);
@@ -239,7 +239,7 @@ function preparedInput(bitrix24DealId = '901'): any {
     bitrix24DealId, bitrix24CompanyId: '902', bitrix24ContactId: null, confirmedCustomerPairIds: [companyPairId],
     eventId: `b24-event-${suffix}`, settingsVersion: 4, sourceProductIds: ['904'], sourceRowIds: ['301'],
     sourceRowValues: [{ id: '301', productId: 904, quantity: 2, price: 0, measureCode: 796 }], sourceMeasureCodes: [796],
-    unitMappings: [{ bitrix24Id: 796, moyskladId: ids.unit, status: 'configured' }],
+    unitMappings: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }],
     payload: {
       agent: ref('counterparty', ids.company), organization: ref('organization', ids.organization), store: ref('store', ids.store),
       state: { meta: { type: 'state', href: `${base}api/remap/1.2/entity/customerorder/metadata/states/${ids.state}` } },

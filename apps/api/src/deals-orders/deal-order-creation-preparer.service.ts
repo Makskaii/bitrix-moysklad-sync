@@ -268,7 +268,7 @@ export class DealOrderCreationPreparer {
       sourceRowValues,
       sourceMeasureCodes,
       skippedRows,
-      unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, moyskladId: unit.moyskladId, status: unit.status })),
+      unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, bitrix24Code: unit.bitrix24Code, moyskladId: unit.moyskladId, status: unit.status })),
       payload: {
         agent: { meta: { type: 'counterparty', href: msHref(msBase, `entity/counterparty/${agentCounterpartyId}`) } },
         organization: { meta: { type: 'organization', href: msHref(msBase, `entity/organization/${targetOrganizationId}`) } },

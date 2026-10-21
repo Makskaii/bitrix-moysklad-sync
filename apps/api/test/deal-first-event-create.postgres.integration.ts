@@ -212,7 +212,7 @@ function preparedOrder(dealId: string, eventId: string) {
     confirmedCustomerPairIds: [companyPairId], eventId, settingsVersion: 1,
     sourceProductIds: [product.bitrix24Id], sourceRowIds: ['301'],
     sourceRowValues: [{ id: '301', productId: Number(product.bitrix24Id), quantity: 2, price: 12500, measureCode: 796 }],
-    sourceMeasureCodes: [796], unitMappings: [{ bitrix24Id: 796, moyskladId: refs.unit, status: 'configured' as const }],
+    sourceMeasureCodes: [796], unitMappings: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: refs.unit, status: 'configured' as const }],
     payload: {
       agent: ref('counterparty', company.moyskladId), organization: ref('organization', refs.organization),
       store: ref('store', refs.store), state: { meta: { type: 'state', href: `${base}entity/customerorder/metadata/states/${refs.state}` } },

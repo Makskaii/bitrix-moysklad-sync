@@ -158,7 +158,7 @@ export class DealOrderPositionRuntimeService {
         await skipRow('BITRIX24', link.bitrix24ProductRowId, 'DEAL_ORDER_POSITION_IDENTITY_CHANGED');
         continue;
       }
-      const mappedUnit = input.eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      const mappedUnit = findConfiguredUnitByCode(input.eventConfig.config.references.units, source.measureCode);
       const linkedProducts = productPairs.filter((candidate) => candidate.bitrix24Id === String(source.productId));
       const targetProductId = assortmentId(target.assortment);
       if (!mappedUnit?.moyskladId || linkedProducts.length !== 1 || linkedProducts[0].moyskladId !== targetProductId) {
@@ -339,7 +339,7 @@ export class DealOrderPositionRuntimeService {
       const target = msRows.find((candidate) => candidate.assortment && assortmentId(candidate.assortment) === targetProductId);
       if (!target || !targetProductId || linkedTargets.has(target.id)) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
       const desired = sourceValues(source);
-      const mappedUnit = eventConfig.config.references.units.find((unit) => unit.bitrix24Id === source.measureCode && unit.status === 'configured' && unit.moyskladId);
+      const mappedUnit = findConfiguredUnitByCode(eventConfig.config.references.units, source.measureCode);
       if (!desired || !mappedUnit?.moyskladId || !isUuid(mappedUnit.moyskladId) ||
           !isRecord(target.assortment) || !isRecord(target.assortment.meta) || target.assortment.meta.type !== 'product' || !Number.isFinite(target.quantity) || target.quantity <= 0 ||
           !Number.isFinite(target.price) || target.price < 0 || (target.discount ?? 0) !== 0 || (target.vatEnabled ?? false) || (target.vat ?? 0) !== 0) {
@@ -374,7 +374,7 @@ export class DealOrderPositionRuntimeService {
       const desired = sourceValues(row);
       const productId = String(row.productId ?? '');
       const measureCode = row.measureCode;
-      const unit = units.find((candidate) => candidate.bitrix24Id === measureCode && candidate.status === 'configured' && candidate.moyskladId);
+      const unit = findConfiguredUnitByCode(units, measureCode);
       if (!desired || !/^\d{1,20}$/.test(rowId) || !/^\d{1,20}$/.test(productId) || !Number.isInteger(measureCode) || !unit?.moyskladId) {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
         continue;
@@ -509,6 +509,12 @@ function sourceValues(row: Row): { quantity: number; price: number; discount: nu
   if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0) return null;
   const money = bitrixMoneyToMoySklad(row);
   return money ? { quantity, price: money.price, discount: money.discount, vat: money.vat, vatEnabled: money.vatEnabled, vatIncluded: money.vatIncluded } : null;
+}
+
+function findConfiguredUnitByCode<T extends { bitrix24Code: string; status: string; moyskladId: string | null }>(units: readonly T[], measureCode: unknown): T | null {
+  if (typeof measureCode !== 'number' || !Number.isInteger(measureCode) || measureCode < 1) return null;
+  const candidates = units.filter((unit) => unit.bitrix24Code === String(measureCode));
+  return candidates.length === 1 && candidates[0]?.status === 'configured' && candidates[0].moyskladId ? candidates[0] : null;
 }
 
 function sameProductAndUnit(source: Row, old: unknown): boolean {
