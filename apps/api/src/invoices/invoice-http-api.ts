@@ -169,6 +169,16 @@ export class InvoiceHttpApi {
     }
     if (response.status === 204) return {};
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    // The positions collection can acknowledge a single add with a one-row
+    // collection response. Normalize only this endpoint; generic entity reads
+    // and writes must keep their object-only contract.
+    if (method === 'POST' && /\/entity\/invoiceout\/[0-9a-f-]{36}\/positions$/.test(url.pathname) && Array.isArray(payload)) {
+      if (payload.length !== 1 || !isRecord(payload[0]) || typeof payload[0].id !== 'string' || !isUuid(payload[0].id) || 'errors' in payload[0]) {
+        throw new ProviderFailure('MOYSKLAD', null);
+      }
+      logger.log(JSON.stringify({ provider: 'MOYSKLAD', operation: 'INVOICE_POSITION_CREATE', status: response.status, responseShape: 'single-row-array' }));
+      return payload[0];
+    }
     if (!isRecord(payload)) throw new ProviderFailure('MOYSKLAD', 400);
     return payload;
   }

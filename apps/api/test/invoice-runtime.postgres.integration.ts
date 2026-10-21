@@ -920,7 +920,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       if(request.method==='POST') {
         moyskladWrites++;
         const row={...JSON.parse(raw),id:randomUUID()};rows.push(row);invoice.positions=rows;
-        return send(response,row);
+        return send(response,[row]);
       }
       if(request.method==='PUT') {
         const row=rows.find(r=>r.id===positionPath[2]);

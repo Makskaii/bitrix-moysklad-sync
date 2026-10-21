@@ -93,3 +93,34 @@ test('invoice updates omit payments and reflected payment/shipment totals', asyn
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name]; else process.env[name] = value;
 }
+
+test('invoice position add normalizes only an exact one-row collection acknowledgement', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldMode = process.env.SYNC_MODE;
+  const oldBase = process.env.MOYSKLAD_API_BASE_URL;
+  const oldToken = process.env.MOYSKLAD_API_TOKEN;
+  const positionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  process.env.SYNC_MODE = 'apply';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://ms-fixture.invalid/api/remap/1.2';
+  process.env.MOYSKLAD_API_TOKEN = 'fixture-only-token';
+  let responseBody: unknown = [{ id: positionId, quantity: 1, price: 10000 }];
+  globalThis.fetch = async (input, init) => {
+    assert.equal(new URL(String(input)).pathname, `/api/remap/1.2/entity/invoiceout/${invoiceId}/positions`);
+    assert.equal(init?.method, 'POST');
+    return Response.json(responseBody);
+  };
+  try {
+    assert.equal(await new InvoiceHttpApi().addMoyskladPosition(invoiceId, { quantity: 1, price: 10000 }), positionId);
+    for (const invalid of [[], [{ id: positionId }, { id: orderId }], [{ id: 'not-native-id' }], [{ id: positionId, errors: [{ code: 1 }] }]]) {
+      responseBody = invalid;
+      await assert.rejects(new InvoiceHttpApi().addMoyskladPosition(invoiceId, { quantity: 1, price: 10000 }));
+    }
+    globalThis.fetch = async () => Response.json([{ id: invoiceId }]);
+    await assert.rejects(new InvoiceHttpApi().createMoysklad('91', orderId, {}), 'entity create must not accept arrays');
+  } finally {
+    globalThis.fetch = oldFetch;
+    restoreEnv('SYNC_MODE', oldMode);
+    restoreEnv('MOYSKLAD_API_BASE_URL', oldBase);
+    restoreEnv('MOYSKLAD_API_TOKEN', oldToken);
+  }
+});
