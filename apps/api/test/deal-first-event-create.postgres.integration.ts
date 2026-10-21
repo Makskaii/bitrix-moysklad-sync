@@ -13,6 +13,7 @@ import { DatabaseRecoveryService } from '../src/database-recovery.service';
 import { DryRunDocumentReader } from '../src/dry-run-document-reader';
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
+import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../src/event-worker-lease.service';
 import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
 import { EntityPairService } from '../src/pairs/entity-pair.service';
 import { PairResolutionProvider } from '../src/pairs/pair-resolution.provider';
@@ -57,7 +58,7 @@ const fieldSettingsFake = {
 @Module({
   controllers: [EventsController],
   providers: [
-    DatabaseService, EventIntakeService, SyncModeService, EntityPairService,
+    DatabaseService, EventIntakeService, SyncModeService, EntityPairService, EventWorkerLeaseService,
     PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor,
     { provide: FieldSettingsService, useValue: fieldSettingsFake },
     {
@@ -67,7 +68,10 @@ const fieldSettingsFake = {
     { provide: DryRunDocumentReader, useValue: { readDealOrderCreationTimestamp: async (_source: string, id: string) => sourceCreatedAt.get(id) ?? new Date() } },
     {
       provide: DealOrderCreationPreparer,
-      useValue: { prepare: async (input: { bitrix24DealId: string; eventId: string }) => {
+      useValue: { prepare: async (input: { bitrix24DealId: string; eventId: string }, workerLease?: EventWorkerLeaseContext) => {
+        assert.ok(workerLease, 'actual public worker must pass its claimed event fence into preparation');
+        await workerLease.assertOwned();
+        assert.equal((await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({where:{id:input.eventId}})).status,'PROCESSING');
         if (nextPrepareWaiting) {
           nextPrepareWaiting = false;
           return { status: 'WAITING', reason: 'STAGE_NOT_READY' };
