@@ -46,6 +46,8 @@ let pauseModeAck: Promise<void> | null = null;
 const suffix = randomUUID();
 let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
+let expectedClientWorkerLease: { assertOwned(): Promise<void> } | null = null;
+let clientWorkerLeaseChecks = 0;
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -70,7 +72,14 @@ before(async () => {
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-only';
   process.env.BITRIX24_API_TOKEN = 'synthetic-test-only';
   service = new DealOrderReverseCreateService(database, new SyncModeService(database), {
-    async resolveForDocument() { return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' }; },
+    async resolveForDocument(_input: unknown, workerLease: unknown) {
+      if (expectedClientWorkerLease) {
+        assert.equal(workerLease, expectedClientWorkerLease, 'claimed worker context must reach the client dependency');
+        await expectedClientWorkerLease.assertOwned();
+        clientWorkerLeaseChecks++;
+      }
+      return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' };
+    },
     async scheduleOptionalContactRetry() {}, async verifyServiceCounterparty() { return true; },
   } as never);
 });
@@ -177,8 +186,11 @@ test('existing paired order receives addressed MS-only positions without replaci
   const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '880', moyskladId: orderId, source: 'MANUAL' } });
   pairIds.push(dealPair.id);
   try {
-    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true };
+    expectedClientWorkerLease = { assertOwned: async () => {} };
+    clientWorkerLeaseChecks = 0;
+    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true, workerLease: expectedClientWorkerLease };
     await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    assert.equal(clientWorkerLeaseChecks, 1);
     assert.equal(rows.length, 3, 'provider applied the row before its response was lost');
     const first = await service.addPositionsToExistingPair(input);
     assert.deepEqual(first, { status: 'ROWS_ADDED' });
@@ -193,6 +205,7 @@ test('existing paired order receives addressed MS-only positions without replaci
     assert.equal(rows.length, 3, 'repeat is idempotent');
     assert.equal(rowAdds, 2);
   } finally {
+    expectedClientWorkerLease = null;
     await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
     await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
     await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });

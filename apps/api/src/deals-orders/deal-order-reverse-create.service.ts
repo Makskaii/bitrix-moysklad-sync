@@ -13,6 +13,7 @@ import { ProductCatalogCreateService } from '../products/product-catalog-create.
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -58,7 +59,7 @@ export class DealOrderReverseCreateService {
 
   private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
-  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
+  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; workerLease?: EventWorkerLeaseContext; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
     if (!isUuid(input.moyskladOrderId)) throw new Error('Customer-order identity is invalid');
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) {
       throw new Error('Reverse deal creation is disabled');
@@ -136,7 +137,7 @@ export class DealOrderReverseCreateService {
   /** Add only explicitly unlinked MS positions to the existing Bitrix24 deal.
    * The parent operation is a durable row-add journal; no document create or
    * replacement-pair path is invoked. */
-  async addPositionsToExistingPair(input: { pairId: string; bitrix24DealId: string; moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds: string[]; assertPairLease: () => Promise<boolean> }): Promise<{ status: 'ROWS_ADDED' | 'PARTIAL'; skippedRows?: Array<{ sourceRowId: string; reason: string }> }> {
+  async addPositionsToExistingPair(input: { pairId: string; bitrix24DealId: string; moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds: string[]; assertPairLease: () => Promise<boolean>; workerLease?: EventWorkerLeaseContext }): Promise<{ status: 'ROWS_ADDED' | 'PARTIAL'; skippedRows?: Array<{ sourceRowId: string; reason: string }> }> {
     if (!input.positionIds.length) return { status: 'ROWS_ADDED' };
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) throw new Error('Reverse row addition is disabled');
     const pair = await this.database.entityPair.findFirst({ where: { id: input.pairId, entityType: 'DEAL', active: true, bitrix24Id: input.bitrix24DealId, moyskladId: input.moyskladOrderId }, select: { id: true } });
@@ -155,7 +156,7 @@ export class DealOrderReverseCreateService {
     } else {
       const existingB24Rows = await b24AllRows(input.bitrix24DealId, this.providerGate);
       const nextSort = existingB24Rows.reduce((highest, row) => Math.max(highest, Number(row.sort) || 0), 0) + 1;
-      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, writePair: { id: pair.id, entityType: 'DEAL' } });
+      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, workerLease: input.workerLease, writePair: { id: pair.id, entityType: 'DEAL' } });
       frozen = { ...prepared, rows: prepared.rows.map((row, index) => ({ ...row, fields: { ...row.fields, sort: nextSort + index } })), skippedRows: prepared.skippedRows.filter((row) => input.positionIds.includes(row.sourceRowId)) };
     }
     const existingLinks = await this.database.dealOrderPositionPair.findMany({ where: { pairId: input.pairId }, select: { moyskladPositionId: true } });
@@ -220,7 +221,7 @@ export class DealOrderReverseCreateService {
     }
   }
 
-  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
+  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; workerLease?: EventWorkerLeaseContext; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
     const config = input.eventConfig.config.dealOrderRuntime;
     if (!config || !config.nativeOrderNumberingVerified) throw new DealOrderReverseManualReviewError('Deal-order runtime settings or native numbering confirmation are missing');
       const order = await msGet(`entity/customerorder/${input.moyskladOrderId}?expand=agent,state,rate.currency`, this.providerGate);
@@ -245,7 +246,7 @@ export class DealOrderReverseCreateService {
     let companyId: string | null = null;
     const configuredServiceId = input.eventConfig.config.serviceCounterpartyId;
     if (order.agent.id !== configuredServiceId) {
-      const client = await this.clients?.resolveForDocument({ eventId: input.eventId, sourceSystem: 'MOYSKLAD', entity: 'COMPANY', sourceId: order.agent.id });
+      const client = await this.clients?.resolveForDocument({ eventId: input.eventId, sourceSystem: 'MOYSKLAD', entity: 'COMPANY', sourceId: order.agent.id }, input.workerLease);
       if (!client || client.status === 'REVIEW') throw new DealOrderReverseManualReviewError('Customer-order counterparty pair is not confirmed');
       if (client.status !== 'RESOLVED') throw new Error('Customer-order counterparty pair resolution is retryable');
       companyPairId = client.pair.id;

@@ -12,6 +12,7 @@ import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
+import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type Result = { status: 'SYNCED'; rowValuesChanged?: boolean } | { status: 'PARTIAL'; reason: 'DEAL_ORDER_POSITION_ROWS_SKIPPED'; skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }> } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
@@ -35,14 +36,14 @@ export class DealOrderPositionRuntimeService {
 
   private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
-  async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
+  async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto; workerLease?: EventWorkerLeaseContext }): Promise<Result> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
     if (process.env.SYNC_MODE !== 'apply') return { status: 'MANUAL_REVIEW', reason: 'SYNC_MODE_NOT_APPLY' };
     return await withDealOrderPairLock(this.database, input.pair.id, input.eventId, (lease) => this.processLocked(input, lease)) ??
       { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_BUSY' };
   }
 
-  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, lease: DealOrderPairLease): Promise<Result> {
+  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto; workerLease?: EventWorkerLeaseContext }, lease: DealOrderPairLease): Promise<Result> {
     const assertOwner = lease.assertOwner;
     const runMutation = (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => this.mode.runDealOrderExternalWrite(direction, assertOwner, { id: input.pair.id, entityType: 'DEAL' }, mutation);
     const pair = await this.database.entityPair.findFirst({
@@ -88,7 +89,7 @@ export class DealOrderPositionRuntimeService {
       if (!(directionSetting?.moyskladToBitrix24 ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
       try {
         const added = await this.reverseCreate.addPositionsToExistingPair({ pairId: pair.id, bitrix24DealId: pair.bitrix24Id, moyskladOrderId: pair.moyskladId,
-          eventId: input.eventId, eventConfig: input.eventConfig, positionIds: unlinkedTargets.map((position) => position.id), assertPairLease: assertOwner });
+          eventId: input.eventId, eventConfig: input.eventConfig, positionIds: unlinkedTargets.map((position) => position.id), assertPairLease: assertOwner, workerLease: input.workerLease });
         for (const skipped of added.skippedRows ?? []) skippedRows.push({ sourceSystem: 'MOYSKLAD', sourceRowId: skipped.sourceRowId, reason: skipped.reason });
       } catch (error) {
         if (error instanceof DealOrderReverseManualReviewError) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_REVERSE_POSITION_REVIEW' };

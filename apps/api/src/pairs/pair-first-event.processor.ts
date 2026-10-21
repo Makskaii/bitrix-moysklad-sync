@@ -282,7 +282,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       try {
         const eventConfig = await this.fieldSettings.eventConfig(event.id);
-        const reverseInput = { moyskladOrderId: input.externalId, eventId: event.id, eventConfig, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined,
+        const reverseInput = { moyskladOrderId: input.externalId, eventId: event.id, eventConfig, workerLease, assertWorkerLease: workerLease ? async () => { await workerLease.assertOwned(); } : undefined,
           ...(this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? { controlledSyntheticName: (await this.controlledAdmission.scopeForEvent(event.id)).admittedSourceName } : {}) };
         const reverseResult = await this.reverseCreate.createAndPair(reverseInput);
         partialDealOrderCreation = reverseResult.status === 'PARTIAL';
@@ -390,7 +390,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
             const holdReason = headerHoldReason(headerResult as string);
             const clientHoldReason = clientHoldReasonFor(clientResult as string);
             const positions = process.env.SYNC_MODE === 'apply' && this.positionRuntime
-              ? await this.positionRuntime.process({ pair: result.pair, eventId: event.id, eventConfig })
+              ? await this.positionRuntime.process({ pair: result.pair, eventId: event.id, eventConfig, workerLease })
               : { status: 'SYNCED' as const };
             const partialPositionRows = positions.status === 'PARTIAL';
             const fields = process.env.SYNC_MODE === 'apply' && this.fieldRuntime
