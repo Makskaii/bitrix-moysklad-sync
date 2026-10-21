@@ -580,6 +580,42 @@ test('durable admissions preserve non-client manifest entities across current re
   }
 });
 
+test('deal product-row list accepts only exact manifested owner equality filters before network', async () => {
+  const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, b24: process.env.BITRIX24_REST_BASE_URL, ms: process.env.MOYSKLAD_API_BASE_URL };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled';
+  process.env.BITRIX24_REST_BASE_URL = 'https://guarded-bitrix.invalid/rest/';
+  process.env.MOYSKLAD_API_BASE_URL = 'https://guarded-ms.invalid/api/';
+  globalThis.fetch = (async () => { calls++; return new Response('{}'); }) as typeof fetch;
+  const record = { ...manifest.records[0], entity: 'deal-order', sourceNativeId: '138060', targetNativeId: null };
+  setControlledLiveTestWriteCheck(createControlledLiveTestPolicy({ ...manifest, records: [record] }, testDatabaseUrl));
+  const request = (body: URLSearchParams) => fetch('https://guarded-bitrix.invalid/rest/crm.item.productrow.list', {method:'POST', body});
+  const valid = () => new URLSearchParams({'filter[=ownerId]':'138060','filter[=ownerType]':'D',start:'0'});
+  try {
+    installControlledLiveFetchGuard(manifest.providerNamespace);
+    await withControlledLiveEventScope({...scope, entity:'deal-order', sourceNativeId:'138060', targetNativeId:null}, async () => {
+      await request(valid());
+      const foreign = valid(); foreign.set('filter[=ownerId]', '138062');
+      await assert.rejects(request(foreign), /READ_ID_NOT_APPROVED/);
+      const wrongType = valid(); wrongType.set('filter[=ownerType]', 'I');
+      await assert.rejects(request(wrongType), /READ_SCOPE_INVALID/);
+      const duplicate = valid(); duplicate.append('filter[=ownerId]', '138062');
+      await assert.rejects(request(duplicate), /READ_SCOPE_INVALID/);
+      const broad = valid(); broad.set('filter[LOGIC]', 'OR');
+      await assert.rejects(request(broad), /READ_SCOPE_INVALID/);
+      await assert.rejects(request(new URLSearchParams({start:'0'})), /READ_SCOPE_INVALID/);
+    });
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    setControlledLiveTestWriteCheck(null);
+    for (const [key,value] of Object.entries({CONTROLLED_LIVE_TEST_MODE:previous.mode,BITRIX24_REST_BASE_URL:previous.b24,MOYSKLAD_API_BASE_URL:previous.ms})) {
+      if(value === undefined) delete process.env[key]; else process.env[key]=value;
+    }
+  }
+});
+
 test('final fetch guard catches exact provider mutation IDs and refuses unclassified external writes', async () => {
   const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, b24: process.env.BITRIX24_REST_BASE_URL, ms: process.env.MOYSKLAD_API_BASE_URL };
   const originalFetch = globalThis.fetch;

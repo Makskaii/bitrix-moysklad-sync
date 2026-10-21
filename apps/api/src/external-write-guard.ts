@@ -186,6 +186,16 @@ function extractMutationTarget(provider: string, path: string, bodyText: string)
     }
   }
   if (/\.(?:add|create)$/i.test(method)) return null;
+  if (/^crm\.item\.productrow\.list$/i.test(method)) {
+    // The document reader scopes this list by its owning DEAL, not a row ID.
+    // Accept only its exact-equality form; an unfiltered/foreign/ambiguous list
+    // must still be rejected before network by the manifest policy.
+    const owners = form.getAll('filter[=ownerId]');
+    const types = form.getAll('filter[=ownerType]');
+    if (owners.length === 1 && /^\d{1,20}$/.test(owners[0]) && types.length === 1 && types[0] === 'D'
+      && [...form.keys()].every((key) => ['filter[=ownerId]', 'filter[=ownerType]', 'start'].includes(key))) return owners[0];
+    return null;
+  }
   if (/^crm\.item\.productrow\./i.test(method)) {
     for (const key of ['ownerId', 'fields[ownerId]']) {
       const value = form.get(key);
