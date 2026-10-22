@@ -51,8 +51,10 @@ No genuine production comment has been posted, and live acceptance is NOT RUN.
 This requires migration/client/build and explicit coordinated deployment before
 it is usable. Main's current urgent rollout must not be held up by this feature.
 
-Handoff is explicitly ON HOLD until the user says the main coordinator has
-finished. Do not message/reactivate it or autonomously deploy these changes.
+The earlier handoff hold was released by the human on 22 October ("пусть
+приступает к слиянию"). Root integrated exactly the two handed-off commits;
+see `integration-defaults-timeline-2026-10-22.md` for independent verification.
+This authorizes local integration/checks, not automatic production deployment.
 
 ## References
 
