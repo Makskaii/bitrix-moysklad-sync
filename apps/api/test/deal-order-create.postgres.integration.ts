@@ -221,7 +221,7 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
 test('confirmed defaults preserve custom forward stages and revalidate the selected store through PostgreSQL gates', async () => {
   headerContractDealId = `9037${Date.now()}`;
   headerContractRequests = [];
-  headerContractOverrides = { STAGE_ID: 'C2:PREPARATION', UF_CRM_1732004209: '98765', ASSIGNED_BY_ID: '98766' };
+  headerContractOverrides = { STAGE_ID: 'C2:PREPARATION', UF_CRM_1732004209: '98765', ASSIGNED_BY_ID: '98766', UF_CRM_1776347243: '98767', CURRENCY_ID: 'USD' };
   const resolver = { async resolveForDocument() {
     return { status: 'RESOLVED', pair: { id: companyPairId, entityType: 'COMPANY', bitrix24Id: '902', moyskladId: ids.company }, companyPair: { id: companyPairId, bitrix24Id: '902', moyskladId: ids.company } };
   } };
@@ -243,10 +243,15 @@ test('confirmed defaults preserve custom forward stages and revalidate the selec
     assert.equal(result.status, 'READY');
     if (result.status === 'READY') {
       assert.equal(result.input.payload.store.meta.href, `${base}api/remap/1.2/entity/store/${ids.store}`);
+      assert.equal(result.input.payload.organization.meta.href, `${base}api/remap/1.2/entity/organization/${ids.organization}`);
+      assert.equal(result.input.payload.rate.currency.meta.href, `${base}api/remap/1.2/entity/currency/${ids.currency}`);
       assert.equal(result.input.payload.positions.length, 1);
+      assert.equal(result.input.payload.positions[0]?.price, 1000, 'user-approved RUB fallback never converts numeric prices');
     }
     assert.ok(headerContractRequests.some((row) => row.path.endsWith(`/store/${ids.store}`)), 'fallback store is read from the provider, not just trusted from config');
     assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED' } } }));
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_CURRENCY_RUB_APPLIED' } } }));
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_ORGANIZATION_DEFAULT_APPLIED' } } }));
     missingHeaderStore = true;
     const missing = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `missing-default-${suffix}`, eventConfig: settings });
     assert.equal(missing.status, 'WAITING');

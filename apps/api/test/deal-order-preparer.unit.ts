@@ -257,24 +257,28 @@ test('confirmed defaults preserve explicitly configured creation-enabled custom 
   assert.equal(result.status, 'READY');
 });
 
-test('confirmed defaults never guess an unknown currency or explicit organization', async () => {
+test('confirmed defaults use RUB without FX and the default organization for unmapped source values', async () => {
   reset();
   rows = [productRow(10, 1)];
   const settings = eventConfig();
   settings.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
   deal.CURRENCY_ID = 'USD';
-  assert.deepEqual(
-    await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-currency', eventConfig: settings }),
-    { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' },
-  );
+  const currencyResult = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-currency', eventConfig: settings });
+  assert.equal(currencyResult.status, 'READY');
+  if (currencyResult.status === 'READY') {
+    assert.equal(currencyResult.input.payload.rate.currency.meta.href, msRef('currency', uuids.currency));
+    assert.equal(currencyResult.input.payload.positions[0]?.price, 1000);
+  }
 
   reset();
   rows = [productRow(10, 1)];
   deal.UF_CRM_1776347243 = '1234';
-  assert.deepEqual(
-    await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-organization', eventConfig: settings }),
-    { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' },
-  );
+  const organizationResult = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-organization', eventConfig: settings });
+  assert.equal(organizationResult.status, 'READY');
+  if (organizationResult.status === 'READY') assert.equal(organizationResult.input.payload.organization.meta.href, msRef('organization', uuids.organization));
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'hold';
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-organization-held', eventConfig: settings }),
+    { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' });
 });
 
 test('runtime policy parsing defaults to hold and rejects unknown policy values', () => {

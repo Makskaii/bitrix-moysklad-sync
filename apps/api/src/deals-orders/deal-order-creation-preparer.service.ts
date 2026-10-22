@@ -98,7 +98,11 @@ export class DealOrderCreationPreparer {
     if (rows.length > 1000) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
 
     const currencyCode = readString(deal.CURRENCY_ID);
-    const currency = references.currencies.find((candidate) => candidate.bitrix24Code === currencyCode);
+    const mappedCurrency = references.currencies.find((candidate) => candidate.bitrix24Code === currencyCode);
+    const currencyFallbackUsed = !mappedCurrency && references.unmappedReferencePolicy === 'confirmed-defaults';
+    // Explicit user policy: an unmapped currency is RUB without FX conversion.
+    // A counterparty price type is not currency evidence.
+    const currency = mappedCurrency ?? (currencyFallbackUsed ? references.currencies.find((candidate) => candidate.bitrix24Code === 'RUB') : undefined);
     if (!currency) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
     const rawStoreSource = deal.UF_CRM_1732004209;
     const storeSource = readOptionalId(deal.UF_CRM_1732004209);
@@ -108,9 +112,11 @@ export class DealOrderCreationPreparer {
     if (storeSource && !mappedStoreId && !storeFallbackUsed) return { status: 'WAITING', reason: 'STORE_MAPPING_UNCONFIRMED' };
     const targetStoreId = mappedStoreId ?? references.defaultStoreId;
     const organizationSource = readOptionalId(deal.UF_CRM_1776347243);
-    const targetOrganizationId = organizationSource
+    const mappedOrganizationId = organizationSource
       ? references.organizations.find((candidate) => candidate.bitrix24Id === organizationSource)?.moyskladId
       : references.defaultOrganizationId;
+    const organizationFallbackUsed = !!organizationSource && !mappedOrganizationId && references.unmappedReferencePolicy === 'confirmed-defaults';
+    const targetOrganizationId = mappedOrganizationId ?? (organizationFallbackUsed ? references.defaultOrganizationId : undefined);
     if (!targetStoreId || !targetOrganizationId) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
     const rawAssignedBy = deal.ASSIGNED_BY_ID;
     const assignedBy = readOptionalId(rawAssignedBy);
@@ -326,6 +332,8 @@ export class DealOrderCreationPreparer {
       },
     };
     if (storeFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad store; reason=UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED', input.eventId);
+    if (currencyFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured RUB currency without converting numeric prices; reason=UNMAPPED_SOURCE_CURRENCY_RUB_APPLIED', input.eventId);
+    if (organizationFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad organization; reason=UNMAPPED_SOURCE_ORGANIZATION_DEFAULT_APPLIED', input.eventId);
     if (employeeFallbackUsed) {
       await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad responsible; reason=UNMAPPED_SOURCE_EMPLOYEE_DEFAULT_APPLIED', input.eventId);
       await writeOperationalLog(this.database, 'ADMIN', 'Deal order used configured default MySklad responsible', input.eventId);
