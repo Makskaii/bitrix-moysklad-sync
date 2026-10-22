@@ -870,9 +870,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (method.endsWith('catalog.product.list') || method.endsWith('catalog.product.service.list')) {
     const kind = method.includes('.service.') ? 'service' : 'product';
-    const payload = parseProviderBody(body) as { filter?: { xmlId?: string }; start?: number };
+    const payload = parseProviderBody(body) as { filter?: { xmlId?: string; property108?: string }; start?: number };
     const xmlId = payload.filter?.xmlId ?? new URLSearchParams(body).get('filter[xmlId]');
-    const rows = [...createdCards.values()].filter((card) => card.type === (kind === 'service' ? 7 : 1) && card.xmlId === xmlId);
+    const rows = [...createdCards.values()].filter((card: any) => card.type === (kind === 'service' ? 7 : 1) &&
+      (payload.filter?.property108 ? card.property108?.value === payload.filter.property108 : card.xmlId === xmlId));
     if (finishImportOnList && xmlId === `MOYSKLAD_PRODUCT_${finishImportOnList.sourceId}`) {
       const own = finishImportOnList; finishImportOnList = null;
       await app!.get(DatabaseService).$transaction(async tx => {
