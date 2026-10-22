@@ -86,7 +86,10 @@ export class MoyskladRequestScheduler {
     const delay = Math.max(this.nextStart, this.blockedUntil) - Date.now();
     if (delay > 0) {
       this.timer = setTimeout(() => { this.timer = undefined; this.pump(); }, delay);
-      this.timer.unref(); return;
+      // Pending work must keep a finite CLI/preflight process alive too. Abort
+      // removes waiters and clears this timer, so a long server cooldown cannot
+      // outlive the request's bounded deadline.
+      return;
     }
     const entry = this.queue.shift()!;
     this.nextStart = Date.now() + this.interval;

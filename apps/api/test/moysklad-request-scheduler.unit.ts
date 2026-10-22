@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert';
 import { before, after, test } from 'node:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { MoyskladRequestScheduler } from '../src/moysklad-request-scheduler';
 import { installControlledLiveFetchGuard, setControlledLiveTestWriteCheck } from '../src/external-write-guard';
 
@@ -179,6 +180,15 @@ test('queued transport retains the event scope and the actual controlled guard s
     globalThis.fetch = previousFetch; setControlledLiveTestWriteCheck(null);
     for (const [key, value] of saved) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   }
+});
+
+test('standalone CLI does not silently exit zero while its final queued request is pending', () => {
+  const script = `const {MoyskladRequestScheduler}=require(${JSON.stringify(require.resolve('../src/moysklad-request-scheduler'))});
+    const s=new MoyskladRequestScheduler(async()=>new Response('{}'),new URL('https://api.moysklad.ru/api/remap/1.2/'),{intervalMs:40});
+    Promise.all([1,2].map(async()=>{await(await s.fetch('https://api.moysklad.ru/api/remap/1.2/entity/store/test')).json()})).then(()=>console.log('BOTH_REQUESTS_COMPLETED'));`;
+  const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5_000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /BOTH_REQUESTS_COMPLETED/);
 });
 
 test('actual HTTP burst reproduces 429 unpaced and passes with the shared scheduler', async () => {
