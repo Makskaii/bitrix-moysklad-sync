@@ -15,6 +15,7 @@ import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provi
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DealOrderCreationPreparer } from '../deals-orders/deal-order-creation-preparer.service';
+import { DealTimelineNoticeService } from '../deals-orders/deal-timeline-notice.service';
 import { DealOrderCreateOperationService } from '../deals-orders/deal-order-create-operation.service';
 import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
@@ -71,6 +72,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     @Optional() private readonly totalRuntime?: DealOrderTotalReconciliationHandler,
     @Optional() private readonly dryWrites?: DryRunWriteJournal,
     @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService,
+    @Optional() private readonly timelineNotices?: DealTimelineNoticeService,
   ) {
     this.documentReader = documentReader ? serviceModeBoundProvider(database, documentReader) : undefined;
   }
@@ -317,6 +319,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           const inactiveStage = prepared.reason === 'STAGE_NOT_READY';
           const unconfiguredStage = prepared.reason === 'STAGE_NOT_CONFIGURED';
           const invalidOrigin = ['REVERSE_DEAL_ORIGIN_INVALID', 'REVERSE_DEAL_ORIGIN_UNRESOLVED'].includes(prepared.reason);
+          if (!inactiveStage) await this.timelineNotices?.enqueue({ bitrix24DealId: input.externalId, kind: 'ERROR', reason: prepared.reason });
           await this.finish(event.id, inactiveStage ? 'SUCCEEDED' : unconfiguredStage || invalidOrigin ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE',
             inactiveStage ? 'DEAL_ORDER_STAGE_NOT_ENABLED' : prepared.reason, workerLease,
             inactiveStage || unconfiguredStage || invalidOrigin ? null : prepared.retryAfter ?? retryAtForFailure(new Error(prepared.reason), event.attempts + 1));
@@ -328,6 +331,9 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         }
         await workerLease?.assertOwned();
         const creation = await this.createOperation.createAndPair(prepared.input, workerLease ? async () => { await workerLease.assertOwned(); return true; } : undefined);
+        if (creation.status !== 'ALREADY_PAIRED') await this.timelineNotices?.enqueue({
+          bitrix24DealId: input.externalId, kind: 'CREATED', moyskladOrderId: creation.moyskladOrderId,
+        });
         partialDealOrderCreation = creation.status === 'PARTIAL';
         result = await this.resolver.resolve(input);
       } catch (error) {
@@ -681,6 +687,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         externalEntityId: event.externalEntityId, reason, fieldTitle: 'Товары UUID', diagnostic,
       }, update: { reason, diagnostic } });
       await transaction.operationalLog.create({ data: { category: 'ERROR', referenceId: eventId, message: `${reason}: ${userAction}` } });
+      await this.timelineNotices?.errorForEvent(eventId, reason, transaction);
     });
   }
 
@@ -700,19 +707,27 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
   private async finish(eventId: string, status: string, reason: string | null, workerLease?: EventWorkerLeaseContext, retryAfter?: Date | null) {
     await this.database.$transaction(async (transaction) => {
       await assertWorkerFenceInTransaction(workerLease, transaction);
-      await transaction.inboundEvent.updateMany({
+      const updated = await transaction.inboundEvent.updateMany({
         where: { id: eventId, status: 'PROCESSING' },
         data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter: retryAfter ?? null },
       });
+      if (updated.count && ['RETRYABLE_FAILURE', 'MANUAL_REVIEW'].includes(status)) {
+        await this.timelineNotices?.errorForEvent(eventId, reason, transaction);
+      }
     });
   }
 
   private async finishBeforeClaim(
     event: { id: string; status: string }, status: string, reason: string, retryAfter?: Date | null,
   ) {
-    await this.database.inboundEvent.updateMany({
-      where: { id: event.id, status: event.status },
-      data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter: retryAfter ?? null },
+    await this.database.$transaction(async (tx) => {
+      const updated = await tx.inboundEvent.updateMany({
+        where: { id: event.id, status: event.status },
+        data: { status, lastErrorCategory: reason, processingStartedAt: null, retryAfter: retryAfter ?? null },
+      });
+      if (updated.count && ['RETRYABLE_FAILURE', 'MANUAL_REVIEW'].includes(status)) {
+        await this.timelineNotices?.errorForEvent(event.id, reason, tx);
+      }
     });
     await writeOperationalLog(this.database, status === 'SKIPPED_PRE_LAUNCH' ? 'EVENT' : 'ERROR', reason, event.id);
   }

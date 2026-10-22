@@ -32,6 +32,7 @@ import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.ser
 import { DryRunDocumentReader } from './dry-run-document-reader';
 import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
 import { DealOrderCreationPreparer } from './deals-orders/deal-order-creation-preparer.service';
+import { DealTimelineNoticeService } from './deals-orders/deal-timeline-notice.service';
 import { DealOrderCreateOperationService } from './deals-orders/deal-order-create-operation.service';
 import { DealOrderPositionRuntimeService } from './deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from './deals-orders/deal-order-field-runtime.service';
@@ -93,7 +94,7 @@ class AppController {
     WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
-    DryRunWriteJournal,
+    DryRunWriteJournal, DealTimelineNoticeService,
     { provide: InvoiceHttpApi, useFactory: (dry: DryRunWriteJournal) => new InvoiceHttpApi(dry), inject: [DryRunWriteJournal] }, InvoiceEventProcessor,
     { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCatalogCreateService, ProductCardRuntimeService, ProductDuplicateAliasService, ProductCardEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,

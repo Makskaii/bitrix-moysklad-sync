@@ -13,6 +13,7 @@ import { DatabaseRecoveryService } from '../src/database-recovery.service';
 import { DryRunDocumentReader } from '../src/dry-run-document-reader';
 import { FieldSettingsService } from '../src/field-settings/field-settings.service';
 import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
+import { DealTimelineNoticeService } from '../src/deals-orders/deal-timeline-notice.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../src/event-worker-lease.service';
 import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
 import { EntityPairService } from '../src/pairs/entity-pair.service';
@@ -38,6 +39,7 @@ let companyPairId = '';
 let productPairId = '';
 let createPosts = 0;
 let nextPrepareWaiting = false;
+let nextPrepareReview = false;
 let b24OrderNumber: string | null = null;
 let b24DealTitle: string | null = 'Original source title';
 let orderPayload: Record<string, any> | null = null;
@@ -78,6 +80,13 @@ const fieldSettingsFake = {
   controllers: [EventsController],
   providers: [
     DatabaseService, EventIntakeService, SyncModeService, EntityPairService, EventWorkerLeaseService,
+    { provide: DealTimelineNoticeService, inject: [DatabaseService], useFactory: (db: DatabaseService) => {
+      const notices = new DealTimelineNoticeService(db);
+      // This public-worker test verifies durable enqueue. Delivery has its own
+      // real-PG HTTP stub suite; do not start another background worker here.
+      notices.onApplicationBootstrap = () => {};
+      return notices;
+    } },
     PairResolutionProvider, { provide: PAIR_RESOLVER, useExisting: PairResolutionProvider }, PairFirstEventProcessor,
     { provide: FieldSettingsService, useValue: fieldSettingsFake },
     {
@@ -99,6 +108,7 @@ const fieldSettingsFake = {
           nextPrepareWaiting = false;
           return { status: 'WAITING', reason: 'STAGE_NOT_READY' };
         }
+        if (nextPrepareReview) { nextPrepareReview = false; return { status: 'MANUAL_REVIEW', reason: 'PRODUCT_UUID_INVALID', userAction: 'Исправьте UUID' }; }
         return { status: 'READY', input: preparedOrder(input.bitrix24DealId, input.eventId) };
       } },
     },
@@ -179,10 +189,26 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   const pair = await app.get(DatabaseService).entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: dealId, active: true } });
   assert.equal(pair.moyskladId, refs.order);
   assert.equal(await app.get(DatabaseService).dealOrderPositionPair.count({ where: { pairId: pair.id } }), 1);
+  assert.equal(await app.get(DatabaseService).dealTimelineNotice.count({ where: { bitrix24DealId: dealId, kind: 'CREATED', moyskladOrderId: refs.order } }), 1);
 
   const retry = await postDealEvent('ONCRMDEALUPDATE', dealId);
   await waitForEvent(retry.eventId, 'SUCCEEDED');
   assert.equal(createPosts, 1, 'a later event for the already-paired source must not create a duplicate order');
+  assert.equal(await app.get(DatabaseService).dealTimelineNotice.count({ where: { bitrix24DealId: dealId, kind: 'CREATED' } }), 1);
+});
+
+test('public invalid-product event atomically queues a human-readable error without attempting CREATE', async () => {
+  const dealId = `83${Date.now()}90`;
+  sourceCreatedAt.set(dealId, new Date());
+  const previousPosts = createPosts;
+  nextPrepareReview = true;
+  const event = await postDealEvent('ONCRMDEALUPDATE', dealId);
+  const held = await waitForEvent(event.eventId, 'MANUAL_REVIEW');
+  assert.equal(held.lastErrorCategory, 'PRODUCT_UUID_INVALID');
+  assert.equal(createPosts, previousPosts);
+  const notice = await app.get(DatabaseService).dealTimelineNotice.findFirstOrThrow({ where: { bitrix24DealId: dealId } });
+  assert.equal(notice.reason, 'PRODUCT_UUID_INVALID');
+  assert.equal(notice.status, 'PENDING');
 });
 
 test('public authenticated MS CREATE reaches real reverse creation and default stage through the production resolver',async()=>{
