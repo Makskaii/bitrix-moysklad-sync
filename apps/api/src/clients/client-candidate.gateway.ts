@@ -281,6 +281,10 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
         try { return { count: await this.usageCount(candidate.id, entity, system, candidate.type, candidate.parentId), unavailable: false }; }
         catch (error) {
           if (isSystemwideMetricUnavailable(error)) return { count: null, unavailable: true };
+          // A transient provider outage is not missing identity evidence. Let
+          // the owning event's durable retry honor backoff instead of holding
+          // the customer for manual resolution (or immediately retrying 429).
+          if (error instanceof ProviderFailure && error.retryable) throw error;
           if (attempt === 2) return { count: null, unavailable: false };
           await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 100 : 250));
         }

@@ -20,7 +20,7 @@ function candidate(id: string, filledFields = 1): Record<string, unknown> {
   return { id, inn: '7700000000', name: 'Example LLC', phone: '+7 (999) 000-11-22', created: filledFields > 1 ? '2024-01-02T00:00:00.000Z' : '2024-01-01T00:00:00.000Z', ...(filledFields > 2 ? { email: 'info@example.test', address: { city: 'Moscow' } } : {}), companyType: 'legal' };
 }
 
-test('production candidate gateway returns partial usage evidence so resolver holds ambiguous rankings', async () => {
+test('production candidate gateway propagates transient usage failures for durable automatic retry', async () => {
   process.env.MOYSKLAD_API_BASE_URL = 'https://candidate.fake/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-candidate-token';
   const ids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
@@ -34,10 +34,24 @@ test('production candidate gateway returns partial usage evidence so resolver ho
     throw new Error(`Unexpected fake API request ${url.pathname}`);
   };
   const gateway = new HttpClientCandidateGateway(fakeDb, fetcher);
-  const candidates = await gateway.companyByInn('7700000000');
-  assert.deepEqual(candidates.map((row) => [row.usageCount, row.usageMetricUnavailable]), [[6, false], [null, false]]);
-  const result = await new ClientRuntimeResolver(gateway).resolve({ id: 'b24', entity: 'COMPANY', name: 'Example LLC', inn: '7700000000' });
-  assert.deepEqual(result, { action: 'MANUAL_REVIEW', reason: 'INCOMPLETE_USAGE_METRICS', candidates: ids });
+  await assert.rejects(new ClientRuntimeResolver(gateway).resolve({ id: 'b24', entity: 'COMPANY', name: 'Example LLC', inn: '7700000000' }),
+    (error: unknown) => error instanceof ProviderFailure && error.status === 503 && error.retryable);
+});
+
+test('usage HTTP429 preserves Retry-After and does not retry immediately or invent zero usage', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://candidate.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-candidate-token';
+  let usageReads = 0;
+  const before = Date.now();
+  const gateway = new HttpClientCandidateGateway(fakeDb, async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/entity/counterparty')) return response({ rows: [candidate('one')], meta: { size: 1 } });
+    usageReads++;
+    return new Response('{}', { status: 429, headers: { 'retry-after': '30' } });
+  });
+  await assert.rejects(gateway.companyByInn('7700000000'), (error: unknown) => error instanceof ProviderFailure
+    && error.status === 429 && error.retryable && !!error.retryAfterAt && error.retryAfterAt.getTime() >= before + 30_000);
+  assert.equal(usageReads, 1);
 });
 
 test('systemwide metric endpoint unavailability is explicit and permits deterministic equal-usage ranking', async () => {
@@ -90,7 +104,7 @@ test('client create failure retains safe provider status and operation without r
     && !error.message.includes('do-not-expose-this-response'));
 });
 
-test('temporary usage failures retry before evidence is classified as incomplete', async () => {
+test('subsequent durable attempt can obtain usage after temporary failures without a manual hold', async () => {
   process.env.MOYSKLAD_API_BASE_URL = 'https://candidate.fake/api/remap/1.2/';
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-candidate-token';
   let attempts = 0;
@@ -103,7 +117,10 @@ test('temporary usage failures retry before evidence is classified as incomplete
     }
     throw new Error(`Unexpected fake API request ${url.pathname}`);
   };
-  const [resolved] = await new HttpClientCandidateGateway(fakeDb, fetcher).companyByInn('7700000000');
+  const gateway = new HttpClientCandidateGateway(fakeDb, fetcher);
+  await assert.rejects(gateway.companyByInn('7700000000'), ProviderFailure);
+  await assert.rejects(gateway.companyByInn('7700000000'), ProviderFailure);
+  const [resolved] = await gateway.companyByInn('7700000000');
   assert.equal(attempts, 3);
   assert.equal(resolved?.usageCount, 9);
   assert.equal(resolved?.usageMetricUnavailable, false);
