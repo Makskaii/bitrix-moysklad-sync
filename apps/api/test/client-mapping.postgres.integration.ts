@@ -108,6 +108,9 @@ before(async () => {
   dryTarget.searchParams.set('schema', 'dry_client53_test');
   process.env.DRY_DATABASE_URL = dryTarget.toString();
   database = new DatabaseService();
+  // These public runtime cases intend ON; a fresh migrated database must not
+  // depend on a prior test run having initialized the authoritative mode row.
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on', offSince: null } });
   await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeCompanyId } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeContactId } });
