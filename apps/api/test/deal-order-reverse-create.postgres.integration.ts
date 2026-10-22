@@ -487,6 +487,33 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
   assert.equal(dealAdds, 0);
 });
 
+test('reverse order reuses a legacy UUID card before creating rows, without creating or rewriting the product', async () => {
+  activeOrderId = ids.order; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: ids.order } });
+  await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: ids.product } });
+  await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
+  await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false; items = []; rows = [];
+  const legacy = { id: 49006, iblockId: 42, type: 1, active: 'Y', xmlId: 'legacy-external-code', property108: { value: ids.product }, name: 'Existing catalogue title', measure: 9 };
+  products = [legacy]; orderPositions = [position('legacy-uuid-row', 2)];
+  const input = { moyskladOrderId: ids.order, eventId: `event-${suffix}-legacy-uuid`, eventConfig: config() };
+  await service.createAndPair(input);
+  assert.equal(productAdds, 0);
+  assert.equal(msProductWrites, 0);
+  assert.deepEqual(products, [legacy], 'linking a prerequisite must not replace a working catalogue card');
+  assert.equal(dealAdds, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].productId, 49006);
+  assert.equal(rows[0].quantity, 2);
+  assert.equal(rows[0].price, 123.45);
+  assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '49006');
+  await service.createAndPair(input);
+  assert.equal(dealAdds, 1);
+  assert.equal(productAdds, 0);
+  assert.equal(rowAdds, 1);
+});
+
 function config(): any {
   return { version: 4, createdAt: new Date(0).toISOString(), config: {
     schemaVersion: 1, rules: [], groups: [], serviceCounterpartyId: null,
@@ -574,7 +601,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { result: { productRow: added } });
   }
   if (pathname === '/rest/catalog.product.list') {
-    const found = products.filter((product) => product.xmlId === body.filter?.xmlId && String(product.iblockId) === String(body.filter?.iblockId));
+    const found = products.filter((product: any) => (body.filter?.property108 ? product.property108?.value === body.filter.property108 : product.xmlId === body.filter?.xmlId) && String(product.iblockId) === String(body.filter?.iblockId));
     return send(response, { result: { products: found }, total: found.length });
   }
   if (pathname === '/rest/catalog.product.getFieldsByFilter') {

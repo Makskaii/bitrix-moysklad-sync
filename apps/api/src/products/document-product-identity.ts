@@ -89,6 +89,10 @@ export async function ensureDocumentProductIdentity(database: DatabaseService, i
       fail('PRODUCT_UUID_PAIR_CONFLICT');
     }
     if (await transaction.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId } })) fail('PRODUCT_UUID_ALIAS_CONFLICT');
+    // Reverse creation/reuse has already reserved this MS identity. Do not
+    // race it by binding a different legacy card from a forward document.
+    const reverseOperation = await transaction.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: identity }, select: { status: true, bitrix24ProductId: true } });
+    if (reverseOperation && (reverseOperation.status !== 'SUCCEEDED' || reverseOperation.bitrix24ProductId !== productId)) fail('PRODUCT_UUID_PAIR_CONFLICT');
     await transaction.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: identity, moyskladType: 'product', source: 'AUTO', reason: 'BITRIX_PROPERTY108_EXACT_MOYSKLAD_ID' } });
     await transaction.operationalLog.create({ data: { category: 'EVENT', message: `Product identity linked from property108; bitrix24Id=${productId}; moyskladId=${identity}`, referenceId: input.eventId } });
   });

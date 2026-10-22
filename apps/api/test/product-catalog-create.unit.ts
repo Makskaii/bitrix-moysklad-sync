@@ -19,7 +19,7 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     create: async ({ data }: { data: Record<string, any> }) => {
       const value = { ...data, status: 'PENDING', bitrix24ProductId: null, leaseToken: null, leaseUntil: null };
       operations.set(data.moyskladProductId, value);
-      return value;
+      return { ...value };
     },
     updateMany: async ({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => {
       const operation = operations.get(where.moyskladProductId);
@@ -36,10 +36,11 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
       create: async ({ data }: { data: Record<string, unknown> }) => pairs.push(data),
     },
     $transaction: async (fn: (tx: any) => Promise<unknown>) => fn({
-      $queryRaw: async () => [{ locked: 1 }],
+      $queryRaw: async () => [{ locked: 1, serviceMode: 'on' }],
+      productDuplicateAlias: { findUnique: async () => null },
       entityPair: {
-        findMany: async ({ where }: { where: Record<string, unknown> }) => pairs.filter((pair) => pair.entityType === where.entityType && pair.active && (pair.bitrix24Id === where.bitrix24Id || pair.moyskladId === where.moyskladId)),
-        create: async ({ data }: { data: Record<string, unknown> }) => pairs.push({ active: true, ...data }),
+        findMany: async ({ where }: { where: Record<string, unknown> }) => pairs.filter((pair) => pair.entityType === where.entityType && (pair.bitrix24Id === where.bitrix24Id || pair.moyskladId === where.moyskladId)),
+        create: async ({ data }: { data: Record<string, unknown> }) => pairs.push({ active: true, lifecycleStatus: 'ACTIVE', ...data }),
       },
       dealOrderReverseProductOperation: {
         updateMany: async ({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => operationModel.updateMany({ where, data }),
@@ -55,7 +56,12 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     const request = JSON.parse(String(init?.body)) as { fields?: Record<string, unknown> };
     if (method === 'catalog.product.getFieldsByFilter') return Response.json({ result: { product: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, detailTextType: { type: 'string', isReadOnly: false }, weight: { type: 'double', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false }, property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } } } });
     if (method === 'catalog.product.service.getFieldsByFilter') return Response.json({ result: { service: { name: { type: 'string', isReadOnly: false }, code: { type: 'string', isReadOnly: false }, detailText: { type: 'string', isReadOnly: false }, detailTextType: { type: 'string', isReadOnly: false }, iblockId: { type: 'integer', isReadOnly: false }, property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false } } } });
-    if (method === 'catalog.product.list') return Response.json({ result: { products: [...cards.values()].filter((card) => card.xmlId === (request as any).filter?.xmlId), total: cards.size }, total: cards.size });
+    if (method === 'catalog.product.list') {
+      const filter = (request as any).filter;
+      const products = [...cards.values()].filter((card: any) => card.type === 1 && String(card.iblockId) === String(filter.iblockId) &&
+        (filter.property108 ? card.property108?.value === filter.property108 : card.xmlId === filter.xmlId));
+      return Response.json({ result: { products, total: products.length }, total: products.length });
+    }
     if (method === 'catalog.product.add') {
       const id = '821';
       const card = { id: Number(id), type: 1, ...request.fields };
@@ -67,7 +73,9 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
       return Response.json({ result: { element: card } });
     }
     if (method === 'catalog.product.service.list') {
-      const services = [...cards.values()].filter((card) => card.xmlId === (request as any).filter?.xmlId && card.type === 7);
+      const filter = (request as any).filter;
+      const services = [...cards.values()].filter((card: any) => card.type === 7 && String(card.iblockId) === String(filter.iblockId) &&
+        (filter.property108 ? card.property108?.value === filter.property108 : card.xmlId === filter.xmlId));
       return Response.json({ result: { services, total: services.length }, total: services.length });
     }
     if (method === 'catalog.product.service.add') {
@@ -107,7 +115,7 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     assert.equal(await service.createOrRecover(input), '821', 'retry recovers the already-created card by its stable XML ID');
     assert.equal(await service.createOrRecover(input), '821');
     assert.equal(cards.size, 1);
-    assert.deepEqual(pairs[0], { active: true, entityType: 'PRODUCT', bitrix24Id: '821', moyskladId: input.productId, moyskladType: 'product', source: 'AUTO' });
+    assert.deepEqual(pairs[0], { active: true, lifecycleStatus: 'ACTIVE', entityType: 'PRODUCT', bitrix24Id: '821', moyskladId: input.productId, moyskladType: 'product', source: 'AUTO' });
     assert.equal(calls.filter((name) => name === 'catalog.product.add').length, 1);
     assert.equal(operations.get(input.productId)?.status, 'SUCCEEDED');
     assert.equal((cards.get('821') as any).name, 'Rotor');
@@ -133,7 +141,7 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     await assert.rejects(() => service.createOrRecover(serviceInput), /BITRIX24_PRODUCT_API_503/);
     assert.equal(await service.createOrRecover(serviceInput), '822');
     assert.equal(await service.createOrRecover(serviceInput), '822');
-    assert.deepEqual(pairs[1], { active: true, entityType: 'PRODUCT', bitrix24Id: '822', moyskladId: serviceInput.productId, moyskladType: 'service', source: 'AUTO' });
+    assert.deepEqual(pairs[1], { active: true, lifecycleStatus: 'ACTIVE', entityType: 'PRODUCT', bitrix24Id: '822', moyskladId: serviceInput.productId, moyskladType: 'service', source: 'AUTO' });
     assert.equal(calls.filter((name) => name === 'catalog.product.service.add').length, 1);
     assert.equal(calls.filter((name) => name === 'catalog.price.add').length, 1, 'retry reads the applied service price and does not duplicate it');
     assert.deepEqual(prices, [{ id: 1, productId: 822, catalogGroupId: 2, price: 42, currency: 'RUB' }]);
@@ -152,6 +160,32 @@ test('new MySklad product creates one Bitrix24 card, durable hardpair, and repea
     );
     assert.equal(calls.filter((name) => name === 'catalog.product.service.add').length, 1);
     assert.equal(operations.has(unsupportedServiceWeight.productId), false, 'schema rejection precedes durable create journal and provider write');
+
+    for (const kind of ['product', 'service'] as const) {
+      const id = kind === 'product' ? '42345678-1234-1234-1234-123456789abc' : '52345678-1234-1234-1234-123456789abc';
+      const targetId = kind === 'product' ? '49006' : '49007';
+      const legacy = { id: Number(targetId), iblockId: 12, type: kind === 'product' ? 1 : 7, active: 'Y', xmlId: 'legacy-external-code', property108: { value: id }, name: 'Keep existing title', detailText: 'Keep description' };
+      cards.set(targetId, legacy);
+      const reuse = { ...input, productId: id, moyskladType: kind, product: { ...input.product, id, meta: { type: kind } }, eventConfig: { ...input.eventConfig, config: { ...input.eventConfig.config, rules: [] } }, prices: [{ catalogGroupId: 2, value: 999, currency: 'RUB' }] };
+      const writesBefore = calls.filter(name => /\.(add|update|delete)$/.test(name)).length;
+      assert.equal(await service.createOrRecover(reuse), targetId);
+      assert.equal(await service.createOrRecover(reuse), targetId);
+      assert.equal(calls.filter(name => /\.(add|update|delete)$/.test(name)).length, writesBefore, 'UUID reuse performs zero provider writes, including prices');
+      assert.deepEqual(cards.get(targetId), legacy);
+      assert.equal(pairs.filter(pair => pair.moyskladId === id).length, 1);
+      assert.equal((operations.get(id)?.payload as any).reusedIdentity.id, targetId);
+    }
+    const conflictId = '62345678-1234-1234-1234-123456789abc';
+    for (const target of ['49008', '49009']) cards.set(target, { id: Number(target), iblockId: 12, type: 1, active: 'Y', xmlId: target, property108: { value: conflictId } });
+    const conflictInput = { ...input, productId: conflictId, product: { ...input.product, id: conflictId } };
+    const writesBeforeConflict = calls.filter(name => /\.(add|update|delete)$/.test(name)).length;
+    await assert.rejects(() => service.createOrRecover(conflictInput), /PRODUCT_UUID_AMBIGUOUS/);
+    assert.equal(calls.filter(name => /\.(add|update|delete)$/.test(name)).length, writesBeforeConflict);
+    assert.equal(pairs.some(pair => pair.moyskladId === conflictId), false);
+
+    const inactiveId = '72345678-1234-1234-1234-123456789abc';
+    cards.set('49010', { id: 49010, iblockId: 12, type: 1, active: 'N', property108: { value: inactiveId } });
+    await assert.rejects(() => service.createOrRecover({ ...input, productId: inactiveId, product: { ...input.product, id: inactiveId } }), /PRODUCT_UUID_EXISTING_CARD_INVALID/);
   } finally {
     globalThis.fetch = oldFetch;
     if (oldBase === undefined) delete process.env.BITRIX24_REST_BASE_URL;
