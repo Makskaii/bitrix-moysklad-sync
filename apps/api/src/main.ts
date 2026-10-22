@@ -52,6 +52,7 @@ import { CLIENT_DEPENDENCY_RESOLVER } from './clients/client-dependency-resolver
 import { ClientChildResourceSync } from './clients/client-child-resource-sync';
 import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from './event-dispatcher.service';
 import { EventWorkerLeaseService } from './event-worker-lease.service';
+import { installMoyskladRequestScheduler } from './moysklad-request-scheduler';
 import { ProductCardEventProcessor } from './products/product-card-event.processor';
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
@@ -125,6 +126,7 @@ async function bootstrap() {
       allowLoopbackHttp: process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled',
     });
   }
+  installMoyskladRequestScheduler();
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
   await app.get(DatabaseRecoveryService).initialize();
