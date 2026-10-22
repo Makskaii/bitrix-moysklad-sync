@@ -37,6 +37,7 @@ const CLIENT_EVENT_LEASE_MS = 60_000;
 @Injectable()
 export class ClientSyncProcessor implements ClientDependencyResolver {
   private readonly active = new Set<string>();
+  private recoveryCursor: string | null = null;
   private readonly gateway?: ClientSyncGateway;
   private readonly candidateGateway?: WritableClientCandidateGateway;
   private readonly childResources?: ClientChildResourceSync;
@@ -76,6 +77,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       const pending = await transaction.inboundEvent.findMany({
       where: {
         AND: [
+          ...(this.recoveryCursor ? [{ id: { gt: this.recoveryCursor } }] : []),
           { OR: [
             { source: 'BITRIX24', eventType: { in: ['ONCRMCOMPANYADD', 'ONCRMCOMPANYUPDATE', 'ONCRMCONTACTADD', 'ONCRMCONTACTUPDATE'] } },
             { source: 'MOYSKLAD', eventType: { in: ['CREATE', 'UPDATE'] }, externalEntityType: { in: ['counterparty', 'contactperson'] } },
@@ -88,12 +90,14 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
         ],
       },
       select: { id: true, status: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
+      orderBy: { id: 'asc' },
       take: 100,
       });
       return { now, pending };
     });
     if (!scan.enabled) return;
     const { now, pending } = scan.value;
+    this.recoveryCursor = pending.length === 100 ? pending[99]!.id : null;
     for (const event of pending) {
       if (await legacyOwnsContactEvent(this.database, event)) continue;
       if (event.status === 'RETRYABLE_FAILURE') {
@@ -398,7 +402,7 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
 
   async process(eventId: string): Promise<'IGNORED' | 'REVIEW' | 'BASELINE' | 'UNCHANGED' | 'SYNCED' | 'RETRY'> {
     const run = async () => this.workerLease
-      ? await this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease)) ?? 'IGNORED'
+      ? await this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease), 'clients') ?? 'IGNORED'
       : this.processWithLease(eventId);
     return this.controlledAdmission ? this.controlledAdmission.runForEvent(eventId, run) : run();
   }

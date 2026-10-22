@@ -73,7 +73,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   async process(eventId: string) {
-    return this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease));
+    return this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease), 'invoices');
   }
 
   private requestRecoveryScan() {

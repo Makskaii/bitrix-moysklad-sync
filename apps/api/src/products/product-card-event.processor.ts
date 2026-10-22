@@ -31,6 +31,7 @@ const IMPORT_ECHO_WAIT = 'PRODUCT_IMPORT_ECHO_WAITING';
 export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
+  private recoveryCursor: string | null = null;
   private readonly active = new Set<string>();
 
   constructor(
@@ -93,6 +94,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         return transaction.inboundEvent.findMany({
         where: {
           AND: [
+            ...(this.recoveryCursor ? [{ id: { gt: this.recoveryCursor } }] : []),
             { OR: [
               { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.ADD', 'CATALOG.PRODUCT.ON.UPDATE', 'ONCRMPRODUCTADD', 'ONCRMPRODUCTUPDATE', 'ONCRMPRODUCTDELETE', 'CATALOG.PRICE.ON.ADD', 'CATALOG.PRICE.ON.UPDATE', 'CATALOG.PRICE.ON.DELETE'] } },
               { source: 'MOYSKLAD', eventType: { in: ['CREATE', 'UPDATE'] }, externalEntityType: { in: ['product', 'service'] } },
@@ -106,10 +108,12 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
           ],
         },
         select: { id: true },
+        orderBy: { id: 'asc' },
         take: 100,
       });
       });
       if (!pending.enabled) return;
+      this.recoveryCursor = pending.value.length === 100 ? pending.value[99]!.id : null;
       for (const event of pending.value ?? []) this.enqueue(event.id);
     } catch {
       // A later timer tick retries database discovery without blocking startup.
@@ -117,7 +121,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   async process(eventId: string): Promise<ProductCardSyncResult | null> {
-    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
+    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease), 'products');
     return this.processWithLease(eventId);
   }
 

@@ -50,6 +50,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
   private readonly documentReader?: DryRunDocumentReader;
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
+  private recoveryCursor: string | null = null;
 
   constructor(
     private readonly database: DatabaseService,
@@ -106,6 +107,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         return transaction.inboundEvent.findMany({
         where: {
           AND: [
+            ...(this.recoveryCursor ? [{ id: { gt: this.recoveryCursor } }] : []),
             { OR: [
               { source: 'BITRIX24', eventType: { startsWith: 'ONCRMDEAL' } },
               { source: 'MOYSKLAD', externalEntityType: 'customerorder', eventType: { in: ['CREATE', 'UPDATE', 'DELETE'] } },
@@ -118,10 +120,12 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
           ],
         },
         select: { id: true },
+        orderBy: { id: 'asc' },
         take: 100,
         });
       });
       if (!scan.enabled) return;
+      this.recoveryCursor = scan.value.length === 100 ? scan.value[99]!.id : null;
       for (const event of scan.value) this.enqueue(event.id);
     } catch {
       // Pending rows remain durable; the next scan retries discovery.
@@ -150,7 +154,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       }
       return this.controlledAdmission.runForEvent(eventId, () => this.processWithLease(eventId, workerLease));
     };
-    if (this.workerLease) return this.workerLease.run(eventId, execute);
+    if (this.workerLease) return this.workerLease.run(eventId, execute, 'deals-orders');
     return execute();
   }
 

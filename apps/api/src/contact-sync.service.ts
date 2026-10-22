@@ -38,6 +38,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
   private readonly activeEntities = new Set<string>();
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
+  private recoveryCursor: string | null = null;
 
   constructor(
     private readonly database: DatabaseService,
@@ -78,6 +79,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
       const scan = await withServiceModeOn(this.database, async (tx) => tx.inboundEvent.findMany({
         where: {
           AND: [
+            ...(this.recoveryCursor ? [{ id: { gt: this.recoveryCursor } }] : []),
             { OR: [
               { source: 'BITRIX24', eventType: { startsWith: 'ONCRMCONTACT' } },
               { source: 'MOYSKLAD', eventType: 'UPDATE', externalEntityType: 'counterparty' },
@@ -96,8 +98,10 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
           ],
         },
         select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true },
+        orderBy: { id: 'asc' }, take: 100,
       }));
       if (!scan.enabled) return;
+      this.recoveryCursor = scan.value.length === 100 ? scan.value[99]!.id : null;
       for (const event of scan.value) {
         if (await clientOwnsContactEvent(this.database, event)) continue;
         this.enqueue(event.id);
@@ -112,7 +116,7 @@ export class ContactSyncProcessor implements OnApplicationBootstrap, OnModuleDes
     // avoids acquiring it during stable OFF, while durable event/entity claims are
     // independently serialized with OFF inside withServiceModeOn below.
     if (!await this.isApplyEnabled()) return;
-    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
+    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease), 'legacy-contacts');
     return this.processWithLease(eventId);
   }
 
