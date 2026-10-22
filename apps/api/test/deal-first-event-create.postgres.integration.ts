@@ -48,6 +48,12 @@ let reverseItem: Record<string, unknown> | null = null;
 let reverseAdds = 0;
 const echoDealId = `84${Date.now()}`;
 const echoOrderId = randomUUID();
+const extraOrders = new Map<string, Record<string, any>>();
+let forwardNativeId = refs.order;
+let forwardReadBarrier: { started(): void; wait: Promise<void> } | null = null;
+let failForwardReadOnce = false;
+let failNativeReadOnce = false;
+let beforeReverseAdd: (() => Promise<void>) | null = null;
 
 const fieldSettingsFake = {
   saveAcceptedEvent: async (input: {
@@ -78,7 +84,10 @@ const fieldSettingsFake = {
       provide: DatabaseRecoveryService,
       useValue: { assertReady: async () => true, launchBoundary: async () => new Date('2026-10-20T14:00:00.000Z') },
     },
-    { provide: DryRunDocumentReader, useValue: { readDealOrderCreationTimestamp: async (_source: string, id: string) => sourceCreatedAt.get(id) ?? new Date() } },
+    { provide: DryRunDocumentReader, useValue: {
+      readDealOrderCreationTimestamp: async (_source: string, id: string) => sourceCreatedAt.get(id) ?? new Date(),
+      readMoySkladCustomerOrderForBaseline: (id: string) => new DryRunDocumentReader().readMoySkladCustomerOrderForBaseline(id),
+    } },
     {
       provide: DealOrderCreationPreparer,
       useValue: { prepare: async (input: { bitrix24DealId: string; eventId: string }, workerLease?: EventWorkerLeaseContext) => {
@@ -260,6 +269,131 @@ test('public callback for a newly imported deal waits through the real preparer 
   }
 });
 
+test('own saved forward target defers concurrent genuine CREATE/UPDATE without reverse creation, false review or failure-budget consumption', async () => {
+  const db = app.get(DatabaseService), id = randomUUID(), sourceId = `83${Date.now()}71`, before = reverseAdds;
+  await forwardJournal(sourceId, id);
+  const ids = await Promise.all(['CREATE','UPDATE','CREATE','UPDATE'].map(action => postMs(action, id)));
+  for (const eventId of ids) {
+    const event = await waitForEvent(eventId, 'RETRYABLE_FAILURE');
+    assert.equal(event.lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING'); assert.equal(event.attempts, 0); assert.ok(event.retryAfter);
+  }
+  const eventId = ids[0];
+  await db.inboundEvent.update({ where: { id: eventId }, data: { attempts: 7 } });
+  await app.get(PairFirstEventProcessor).process(eventId);
+  assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).attempts, 7, 'future deadline prevents a claim');
+  for (let poll = 0; poll < 12; poll++) {
+    await db.inboundEvent.update({ where: { id: eventId }, data: { retryAfter: null } });
+    await app.get(PairFirstEventProcessor).process(eventId);
+  }
+  assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: eventId } })).attempts, 7, 'wait restores only its own claim, preserving seven actual failures');
+  assert.equal(await db.operationalLog.count({ where: { referenceId: eventId, message: { contains: 'FORWARD_ORDER_ECHO_DEFERRED' } } }), 1);
+  assert.equal(reverseAdds, before);
+  assert.equal(await db.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: id } }), 0);
+  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', moyskladId: id } }), 0);
+  assert.equal(await db.pairReviewCase.count({ where: { sourceSystem: 'MOYSKLAD', sourceEntityId: id } }), 0);
+});
+
+test('actual public forward create, delayed source read failure and cold restart resume original pair; pending native callbacks never reverse-create', async () => {
+  const db = app.get(DatabaseService), sourceId = `83${Date.now()}72`, id = randomUUID(), before = reverseAdds, beforePosts = createPosts;
+  forwardNativeId = id; b24OrderNumber = null; b24DealTitle = 'Original forward title';
+  let started!: () => void, release!: () => void;
+  const observed = new Promise<void>(resolve => { started = resolve; }), wait = new Promise<void>(resolve => { release = resolve; });
+  forwardReadBarrier = { started, wait }; failForwardReadOnce = true;
+  try {
+    const forward = await postDealEvent('ONCRMDEALUPDATE', sourceId);
+    await observed;
+    const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: sourceId } });
+    assert.equal(pending.moyskladOrderId, id); assert.equal(pending.status, 'PENDING');
+    const callbacks = await Promise.all(['CREATE','UPDATE'].map(action => postMs(action, id)));
+    for (const callback of callbacks) assert.equal((await waitForEvent(callback, 'RETRYABLE_FAILURE')).lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING');
+    assert.equal(reverseAdds, before);
+    release(); await waitForEvent(forward.eventId, 'RETRYABLE_FAILURE');
+    await app.close();
+    app = await NestFactory.create(DealFirstEventCreatePostgresModule, { logger: false }); await app.listen(0, '127.0.0.1'); apiUrl = await app.getUrl();
+    const restarted = app.get(DatabaseService);
+    await restarted.inboundEvent.update({ where: { id: forward.eventId }, data: { retryAfter: null } });
+    await app.get(PairFirstEventProcessor).process(forward.eventId); await waitForEvent(forward.eventId, 'SUCCEEDED');
+    for (const callback of callbacks) {
+      await restarted.inboundEvent.update({ where: { id: callback }, data: { retryAfter: null } });
+      await app.get(PairFirstEventProcessor).process(callback); await waitForEvent(callback, 'SUCCEEDED');
+    }
+    const pair = await restarted.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', moyskladId: id } });
+    assert.equal(pair.bitrix24Id, sourceId); assert.equal(createPosts, beforePosts + 1); assert.equal(reverseAdds, before);
+    assert.equal(await restarted.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: id } }), 0);
+    assert.equal(await restarted.pairReviewCase.count({ where: { sourceEntityId: id } }), 0);
+    assert.equal(b24DealTitle, 'SO-TEST-1');
+  } finally { release(); forwardReadBarrier = null; failForwardReadOnce = false; forwardNativeId = refs.order; }
+});
+
+test('native syncId proves an attempted forward origin before target-ID save; a temporary native read failure cannot create or poison a reverse pair', async () => {
+  const db = app.get(DatabaseService), sourceId = `83${Date.now()}73`, id = randomUUID(), before = reverseAdds;
+  const syncId = randomUUID(); const input = preparedOrder(sourceId, 'lost-response-original');
+  await db.dealOrderCreateOperation.create({ data: { bitrix24DealId: sourceId, syncId, payload: input.payload, confirmedCustomerPairIds: [companyPairId], settingsVersion: 1, status: 'PENDING', attemptedAt: new Date() } });
+  extraOrders.set(id, nativeOrder(id, { ...input.payload, syncId }));
+  failNativeReadOnce = true;
+  const failed = await postMs('UPDATE', id); const failedEvent = await waitForEvent(failed, 'RETRYABLE_FAILURE');
+  assert.equal(failedEvent.lastErrorCategory, 'FORWARD_ORDER_ORIGIN_READ_FAILED');
+  const waiting = await postMs('CREATE', id); assert.equal((await waitForEvent(waiting, 'RETRYABLE_FAILURE')).lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING');
+  assert.equal(reverseAdds, before); assert.equal(await db.pairReviewCase.count({ where: { sourceEntityId: id } }), 0);
+  await app.get(DealOrderCreateOperationService).createAndPair(input);
+  for (const eventId of [failed, waiting]) {
+    await db.inboundEvent.update({ where: { id: eventId }, data: { retryAfter: null } });
+    await app.get(PairFirstEventProcessor).process(eventId); await waitForEvent(eventId, 'SUCCEEDED');
+  }
+  assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', moyskladId: id } })).bitrix24Id, sourceId);
+  assert.equal(reverseAdds, before); assert.equal([...extraOrders.values()].filter(order => order.syncId === syncId).length, 1);
+});
+
+test('reverse mutation gate rechecks a forward target saved after resolution/preparation, before any Bitrix ADD', async () => {
+  const db = app.get(DatabaseService), id = randomUUID(), sourceId = `83${Date.now()}74`, before = reverseAdds;
+  extraOrders.set(id, nativeOrder(id));
+  beforeReverseAdd = async () => { await forwardJournal(sourceId, id); };
+  try {
+    const event = await waitForEvent(await postMs('CREATE', id), 'RETRYABLE_FAILURE');
+    assert.equal(event.lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING'); assert.equal(event.attempts, 0);
+    assert.equal(reverseAdds, before); assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', moyskladId: id } }), 0);
+    const journal = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: id } });
+    assert.equal(journal.status, 'WAITING'); assert.equal(journal.bitrix24DealId, null);
+    assert.equal(journal.lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING');
+  } finally { beforeReverseAdd = null; }
+});
+
+test('a native marker matching an unattempted reservation is not proof of our CREATE; a genuine external order still creates one deal', async () => {
+  const db = app.get(DatabaseService), id = randomUUID(), sourceId = `83${Date.now()}75`, syncId = randomUUID(), before = reverseAdds;
+  await db.dealOrderCreateOperation.create({ data: { bitrix24DealId: sourceId, syncId, payload: {}, settingsVersion: 1, status: 'WAITING' } });
+  extraOrders.set(id, nativeOrder(id, { syncId, description: 'FORWARD_CREATED_MARKER_ONLY' }));
+  const event = await postMs('CREATE', id); await waitForEvent(event, 'SUCCEEDED');
+  assert.equal(reverseAdds, before + 1);
+  assert.ok(await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: id } }));
+});
+
+test('OFF fences an already received native echo without claims, reverse writes or journal changes', async () => {
+  const db = app.get(DatabaseService), id = randomUUID(), sourceId = `83${Date.now()}76`, before = reverseAdds;
+  const origin = await forwardJournal(sourceId, id);
+  await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+  const event = await db.inboundEvent.create({ data: { source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'customerorder', externalEntityId: id, deliveryKey: randomUUID(), payload: {}, status: 'RECEIVED' } });
+  createdEventIds.push(event.id);
+  try {
+    await app.get(PairFirstEventProcessor).process(event.id);
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } })).attempts, 0);
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } })).status, 'RECEIVED');
+    assert.equal(reverseAdds, before); assert.deepEqual(await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: sourceId } }), origin);
+  } finally { await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on', offSince: null } }); }
+});
+
+async function forwardJournal(sourceId: string, target: string) {
+  return app.get(DatabaseService).dealOrderCreateOperation.create({ data: { bitrix24DealId: sourceId, syncId: randomUUID(), payload: {}, settingsVersion: 1, status: 'PENDING', moyskladOrderId: target, attemptedAt: new Date() } });
+}
+async function postMs(action: string, id: string): Promise<string> {
+  const response = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-first-create?requestId=${randomUUID()}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ events: [{ action, accountId: '11111111-1111-4111-8111-111111111111', meta: { type: 'customerorder', href: `${providerBase}api/remap/1.2/entity/customerorder/${id}` } }] }) });
+  assert.equal(response.status, 200); const body = await response.json() as { eventId: string }; createdEventIds.push(body.eventId); return body.eventId;
+}
+function nativeOrder(id: string, payload: Record<string, any> = {}): Record<string, any> {
+  return { id, name: 'SO-TEST-1', meta: { type: 'customerorder' }, sum: 0,
+    agent: { id: company.moyskladId, meta: { type: 'counterparty' } }, state: { id: refs.state }, rate: { currency: { id: refs.currency } },
+    ...payload, positions: { rows: (payload.positions ?? []).map((p: any) => ({ ...p, id: refs.position })) } };
+}
+
 async function postDealEvent(event: string, id: string): Promise<{ eventId: string }> {
   const response = await fetch(`${apiUrl}/webhooks/bitrix24`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -306,13 +440,23 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const text = Buffer.concat(chunks).toString('utf8');
   const form = new URLSearchParams(text);
   const url = new URL(request.url ?? '/', providerBase);
+  const extraId = url.pathname.match(/\/entity\/customerorder\/([0-9a-f-]{36})(\/positions)?$/)?.[1];
+  if (extraId && extraOrders.has(extraId)) {
+    if (failNativeReadOnce) { failNativeReadOnce = false; response.writeHead(503); response.end('temporary'); return; }
+    const order = extraOrders.get(extraId)!;
+    return send(response, url.pathname.endsWith('/positions') ? { rows: order.positions.rows, meta: { size: order.positions.rows.length, offset: 0, limit: 1000 } } : order);
+  }
   if (url.pathname === '/rest/crm.deal.get.json' && form.get('id') === echoDealId) return send(response, { result: { ID: echoDealId, ORIGINATOR_ID: 'MOYSKLAD', ORIGIN_ID: echoOrderId } });
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(url.pathname) && JSON.parse(text).useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
   }
   if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}`)return send(response,{id:reverseOrderId,name:'SYNTHETIC-REVERSE',sum:0,agent:{id:company.moyskladId,meta:{type:'counterparty'}},state:{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc'},rate:{currency:{id:refs.currency}}});
   if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}/positions`)return send(response,{rows:[],meta:{size:0,offset:0,limit:1000}});
-  if(url.pathname==='/rest/crm.item.list')return send(response,{result:{items:reverseItem?[reverseItem]:[]}});
+  if(url.pathname==='/rest/crm.item.list'){
+    if (beforeReverseAdd) { const hook = beforeReverseAdd; beforeReverseAdd = null; await hook(); }
+    const requested = JSON.parse(text).filter?.originId;
+    return send(response,{result:{items:reverseItem && reverseItem.originId === requested ? [reverseItem]:[]}});
+  }
   if(url.pathname==='/rest/crm.item.add'){
     reverseAdds++;reverseItem={...JSON.parse(text).fields,id:`83${Date.now()}99`};
     return send(response,{result:{item:reverseItem}});
@@ -329,14 +473,21 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (url.pathname === '/api/remap/1.2/entity/customerorder' && request.method === 'POST') {
     createPosts++;
     orderPayload = JSON.parse(text) as Record<string, any>;
-    return send(response, { id: refs.order, name: 'SO-TEST-1', meta: { type: 'customerorder' } });
+    const recovered = [...extraOrders.values()].find(order => order.syncId === orderPayload?.syncId);
+    const id = recovered?.id ?? forwardNativeId;
+    if (id !== refs.order) extraOrders.set(id, nativeOrder(id, orderPayload));
+    return send(response, { id, name: 'SO-TEST-1', meta: { type: 'customerorder' } });
   }
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${refs.order}`) {
     const positions = orderPayload?.positions as Array<Record<string, any>> | undefined;
     return send(response, { id: refs.order, name: 'SO-TEST-1', meta: { type: 'customerorder' },
       positions: { rows: (positions ?? []).map((position) => ({ ...position, id: refs.position })) } });
   }
-  if (url.pathname === '/rest/crm.deal.get.json') return send(response, { result: { ID: form.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
+  if (url.pathname === '/rest/crm.deal.get.json') {
+    if (forwardReadBarrier) { const barrier = forwardReadBarrier; forwardReadBarrier = null; barrier.started(); await barrier.wait; }
+    if (failForwardReadOnce) { failForwardReadOnce = false; response.writeHead(503); response.end('{}'); return; }
+    return send(response, { result: { ID: form.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
+  }
   if (url.pathname === '/rest/crm.deal.update.json') {
     b24OrderNumber = form.get('fields[UF_CRM_1729757435964]');
     b24DealTitle = form.get('fields[TITLE]');

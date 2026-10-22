@@ -15,6 +15,7 @@ import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admi
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { assertNoForwardOrderOwner, ForwardOrderPairPendingError } from './forward-order-origin';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
@@ -71,6 +72,7 @@ export class DealOrderReverseCreateService {
     if ((operation?.status === 'SUCCEEDED' || operation?.status === 'PARTIAL') && operation.bitrix24DealId) return { status: operation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: operation.bitrix24DealId, skippedRows: readSkippedRows(operation.skippedRows) };
     const existingPair = await this.database.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: input.moyskladOrderId, active: true }, select: { bitrix24Id: true } });
     if (existingPair) return { status: 'ALREADY_PAIRED', bitrix24DealId: existingPair.bitrix24Id };
+    await assertNoForwardOrderOwner(this.database, input.moyskladOrderId);
     if (!operation || operation.status === 'WAITING') {
       const prepared = await this.prepare(input);
       if (input.controlledSyntheticName && this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
@@ -130,7 +132,15 @@ export class DealOrderReverseCreateService {
       return await this.persistPair(prepared, dealId, leaseToken);
     } catch (error) {
       if (error instanceof ServiceModeNotOnError) throw error;
-      await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'REVERSE_CREATE_RETRYABLE' } }).catch(() => undefined);
+      // Only a NEW, previously unattempted journal blocked before its first
+      // B24 ADD can be returned to preparation. Never reset an older uncertain
+      // reverse write. This also avoids poisoning future paired row additions
+      // with a stale, never-sent reverse-document payload.
+      const waitingForForward = error instanceof ForwardOrderPairPendingError && !operation.attemptedAt && !operation.bitrix24DealId;
+      await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: {
+        leaseToken: null, leaseUntil: null, lastErrorCategory: waitingForForward ? 'FORWARD_ORDER_PAIR_PENDING' : 'REVERSE_CREATE_RETRYABLE',
+        ...(waitingForForward ? { status: 'WAITING' } : {}),
+      } }).catch(() => undefined);
       throw error;
     }
   }
@@ -229,6 +239,7 @@ export class DealOrderReverseCreateService {
     if (!isRecord(order) || order.id !== input.moyskladOrderId || !isRecord(order.agent) || !isRecord(order.agent.meta) || !isUuid(order.agent.id) || !isRecord(order.state) || !isUuid(order.state.id) || !isRecord(order.rate) || !isRecord(order.rate.currency) || !isUuid(order.rate.currency.id) || typeof order.name !== 'string' || !order.name.trim()) {
       throw new DealOrderReverseManualReviewError('Customer-order header is incomplete');
     }
+    if (!input.writePair) await assertNoForwardOrderOwner(this.database, input.moyskladOrderId, order.syncId);
     const stageResolution = resolveReverseOrderStage({
       sourceStageId: order.state.id,
       stages: config.stages,
@@ -351,7 +362,11 @@ export class DealOrderReverseCreateService {
     let dealId = items.length === 1 ? readNumericId(items[0].id) : null;
     if (items.length === 1 && (items[0].originId !== prepared.orderId || items[0].originatorId !== 'MOYSKLAD')) throw new DealOrderReverseManualReviewError('Bitrix24 deal recovery identity is ambiguous');
     if (!dealId) {
-      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: 'Y' }, this.providerGate));
+      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => {
+        await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken);
+        await assertNoForwardOrderOwner(this.database, prepared.orderId, prepared.sourceSnapshot.syncId);
+        return true;
+      }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: 'Y' }, this.providerGate));
       const item = isRecord(created) && isRecord(created.item) ? created.item : null;
       dealId = item ? readNumericId(item.id) : null;
       if (!dealId) throw new Error('Bitrix24 deal create response did not include a numeric ID');

@@ -4,6 +4,7 @@ import { DatabaseService } from '../database.service';
 import { EntityType, isEntityType, PairResolutionInput, PairResolutionReason, PairResolutionResult, PairResolver } from './pair-resolver';
 import { isUniqueConstraintError } from './pair-db-errors';
 import { lockEntityPairState } from './pair-db-lock';
+import { forwardOrderOwnership } from '../deals-orders/forward-order-origin';
 
 @Injectable()
 export class PairResolutionProvider implements PairResolver {
@@ -60,6 +61,19 @@ export class PairResolutionProvider implements PairResolver {
         },
       });
       return manualReviewResult(input, review.id, 'PAIR_INACTIVE');
+    }
+
+    // An MS CREATE/UPDATE may arrive after our forward POST but before its
+    // pair commits. It must wait for that source deal, never reverse-create.
+    if (input.entityType === 'DEAL' && input.sourceSystem === 'MOYSKLAD' && ['CREATE', 'UPDATE'].includes(input.eventType ?? '')) {
+      const ownership = await forwardOrderOwnership(transaction, input.externalId);
+      if (ownership === 'PENDING') return { status: 'unavailable', reason: 'FORWARD_ORDER_PAIR_PENDING' };
+      if (ownership === 'CONFLICT') {
+        const review = await transaction.pairReviewCase.create({ data: {
+          entityType: 'DEAL', sourceSystem: 'MOYSKLAD', sourceEntityId: input.externalId, eventId: input.eventId, reason: 'PAIR_ALREADY_ASSIGNED',
+        } });
+        return manualReviewResult(input, review.id, 'PAIR_ALREADY_ASSIGNED');
+      }
     }
 
     // MS may deliver the automatic UPDATE immediately after CREATE. A faster

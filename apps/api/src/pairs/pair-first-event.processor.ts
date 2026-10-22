@@ -27,6 +27,7 @@ import { assertApplyExternalWrite } from '../external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
 import { productIdentityUserAction } from '../products/document-product-identity';
+import { ForwardOrderPairPendingError, ForwardOrderOwnershipConflictError, forwardOrderOwnership } from '../deals-orders/forward-order-origin';
 
 const logger = new Logger('PairFirstEventProcessor');
 const EVENT_LEASE_MS = 60_000;
@@ -168,7 +169,7 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<PairFirstResult | null> {
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true, attempts: true, processingStartedAt: true, retryAfter: true, lastErrorCategory: true },
     });
     if (!event || !event.externalEntityId || !isDealOrderEvent(event) || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
     const mode = await withServiceModeOn(this.database, async () => true);
@@ -231,12 +232,46 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
     };
 
     let result: PairResolutionResult;
+    // A native UPDATE can arrive even before CREATE and before its POST
+    // response is saved locally. Probe only while an attempted unbound forward
+    // journal exists, and trust only its exact native syncId. No marker bypass.
+    if (input.sourceSystem === 'MOYSKLAD' && ['CREATE', 'UPDATE'].includes(input.eventType ?? '')) {
+      try {
+        const paired = await this.database.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: input.externalId, active: true }, select: { id: true } });
+        const unbound = !paired && await this.database.dealOrderCreateOperation.findFirst({
+          where: { status: 'PENDING', attemptedAt: { not: null }, moyskladOrderId: null }, select: { bitrix24DealId: true },
+        });
+        if (unbound) {
+          if (!this.documentReader) throw new ProviderFailure('MOYSKLAD', null);
+          const native = await this.documentReader.readMoySkladCustomerOrderForBaseline(input.externalId);
+          if (native.id !== input.externalId) throw new ProviderFailure('MOYSKLAD', null);
+          const ownership = await forwardOrderOwnership(this.database, input.externalId, native.syncId);
+          if (ownership === 'PENDING') {
+            await this.deferForForwardOrderPair(event.id, workerLease, event.lastErrorCategory);
+            return { status: 'unavailable', reason: 'FORWARD_ORDER_PAIR_PENDING' };
+          }
+          if (ownership === 'CONFLICT') {
+            await this.finish(event.id, 'MANUAL_REVIEW', 'FORWARD_ORDER_OWNERSHIP_CONFLICT', workerLease);
+            return null;
+          }
+        }
+      } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
+        await this.finish(event.id, isRetryableFailure(error) ? 'RETRYABLE_FAILURE' : 'MANUAL_REVIEW', 'FORWARD_ORDER_ORIGIN_READ_FAILED', workerLease,
+          isRetryableFailure(error) ? retryAtForFailure(error, event.attempts + 1) : null);
+        return null;
+      }
+    }
     try {
       result = await this.resolver.resolve(input);
     } catch {
       result = { status: 'unavailable', reason: 'PAIR_STORE_UNAVAILABLE' };
     }
 
+    if (result.status === 'unavailable' && result.reason === 'FORWARD_ORDER_PAIR_PENDING') {
+      await this.deferForForwardOrderPair(event.id, workerLease, event.lastErrorCategory);
+      return result;
+    }
     if (result.status === 'unavailable' && result.reason === 'PAIR_CREATE_PENDING') {
       await this.finish(event.id, 'RETRYABLE_FAILURE', 'PAIR_CREATE_PENDING', workerLease,
         retryAtForFailure(new Error('PAIR_CREATE_PENDING'), event.attempts + 1));
@@ -317,7 +352,9 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         if (error instanceof ServiceModeNotOnError) return null;
         if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
         const reason = error instanceof Error ? error.message : 'REVERSE_DEAL_CREATE_FAILED';
-        if (error instanceof DealOrderReverseManualReviewError) {
+        if (error instanceof ForwardOrderPairPendingError) {
+          await this.deferForForwardOrderPair(event.id, workerLease, event.lastErrorCategory);
+        } else if (error instanceof DealOrderReverseManualReviewError || error instanceof ForwardOrderOwnershipConflictError) {
           await this.finish(event.id, 'MANUAL_REVIEW', 'REVERSE_DEAL_CREATE_REVIEW', workerLease);
         } else {
           await this.finish(event.id, 'RETRYABLE_FAILURE', 'REVERSE_DEAL_CREATE_RETRY', workerLease,
@@ -640,6 +677,19 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         externalEntityId: event.externalEntityId, reason, fieldTitle: 'Товары UUID', diagnostic,
       }, update: { reason, diagnostic } });
       await transaction.operationalLog.create({ data: { category: 'ERROR', referenceId: eventId, message: `${reason}: ${userAction}` } });
+    });
+  }
+
+  private async deferForForwardOrderPair(eventId: string, workerLease?: EventWorkerLeaseContext, previousReason?: string | null) {
+    await withServiceModeOn(this.database, async (transaction) => {
+      await assertWorkerFenceInTransaction(workerLease, transaction);
+      const deferred = await transaction.inboundEvent.updateMany({ where: { id: eventId, status: 'PROCESSING', attempts: { gt: 0 } }, data: {
+        status: 'RETRYABLE_FAILURE', lastErrorCategory: 'FORWARD_ORDER_PAIR_PENDING', processingStartedAt: null,
+        retryAfter: new Date(Date.now() + 5_000), attempts: { decrement: 1 },
+      } });
+      if (deferred.count === 1 && previousReason !== 'FORWARD_ORDER_PAIR_PENDING') await transaction.operationalLog.create({ data: {
+        category: 'EVENT', referenceId: eventId, message: JSON.stringify({ type: 'FORWARD_ORDER_ECHO_DEFERRED', eventId, reason: 'FORWARD_ORDER_PAIR_PENDING' }),
+      } });
     });
   }
 

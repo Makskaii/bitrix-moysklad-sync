@@ -43,7 +43,7 @@ export type PairResolutionResult =
       sourceEntityId: string;
       reviewCaseId: string;
     }
-  | { status: 'unavailable'; reason: 'PAIR_STORE_UNAVAILABLE' | 'ENTITY_TYPE_UNSUPPORTED' | 'PAIR_CREATE_PENDING' };
+  | { status: 'unavailable'; reason: 'PAIR_STORE_UNAVAILABLE' | 'ENTITY_TYPE_UNSUPPORTED' | 'PAIR_CREATE_PENDING' | 'FORWARD_ORDER_PAIR_PENDING' };
 
 export interface PairResolver {
   resolve(input: PairResolutionInput): Promise<PairResolutionResult>;
