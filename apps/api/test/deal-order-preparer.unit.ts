@@ -66,6 +66,28 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
 });
 
+test('assembly handoff needs explicit creation admission; a transition mapping alone does not create orders', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.STAGE_ID = 'UC_DZSNZ0';
+  const config = eventConfig();
+  config.config.dealOrderRuntime!.stageTransitions = {
+    bitrix24ToMoysklad: [{ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state }],
+    moyskladToBitrix24: [{ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state }],
+  };
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'assembly-before', eventConfig: config }),
+    { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' });
+  const originalStages = structuredClone(config.config.dealOrderRuntime!.stages);
+  config.config.dealOrderRuntime!.stages.push({ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state, creationEnabled: true });
+  const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'assembly-after', eventConfig: config });
+  assert.equal(result.status, 'READY');
+  if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 1);
+  assert.deepEqual(config.config.dealOrderRuntime!.stages.slice(0, -1), originalStages);
+  deal.STAGE_ID = 'UC_G3M2W5';
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'another-stage', eventConfig: config }),
+    { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' });
+});
+
 test('claimed deal worker lease is forwarded unchanged to client dependencies, never replaced by a RECEIVED assumption', async()=>{
   reset(); rows=[productRow(10,1)];
   let asserted=0;
