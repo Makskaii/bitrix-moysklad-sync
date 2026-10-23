@@ -5,12 +5,15 @@ import { EventIntakeDisabledError, FieldSettingsService } from '../src/field-set
 import { ReadOnlyFieldDataProvider } from '../src/field-settings/read-only-field-data.provider';
 import { EntityPairService } from '../src/pairs/entity-pair.service';
 
-function fixture(options: { renewed?: number; mode?: string; token?: string; expiresAt?: Date } = {}) {
+function fixture(options: { renewed?: number; mode?: string; token?: string; expiresAt?: Date; initFailOnce?: boolean } = {}) {
   const calls: string[] = [];
+  let initializationCount = 0;
+  let guardReadCount = 0;
   const transaction = {
     $queryRaw: async () => {
       calls.push('read-guard');
-      return calls.filter((call) => call === 'read-guard').length === 1
+      guardReadCount += 1;
+      return guardReadCount === 1
         ? [{ serviceMode: options.mode ?? 'on', nightlyLeaseToken: options.token ?? 'lease-1', nightlyLeaseExpiresAt: options.expiresAt ?? new Date(Date.now() + 60_000) }]
         : [{ version: 7 }];
     },
@@ -21,23 +24,42 @@ function fixture(options: { renewed?: number; mode?: string; token?: string; exp
     $executeRaw: async () => { calls.push('renew'); return options.renewed ?? 1; },
     $transaction: async (run: (client: typeof transaction) => Promise<unknown>) => {
       calls.push('begin');
+      guardReadCount = 0;
       return run(transaction);
     },
   };
   const service = new FieldSettingsService(database as unknown as DatabaseService, {} as ReadOnlyFieldDataProvider, {} as EntityPairService);
-  (service as unknown as { ensureInitialized: () => Promise<void> }).ensureInitialized = async () => {};
+  (service as unknown as { ensureInitialized: () => Promise<void> }).ensureInitialized = async () => {
+    initializationCount += 1;
+    if (options.initFailOnce && initializationCount === 1) throw new Error('Synthetic initialization failure');
+  };
   const accept = () => service.saveAcceptedEvent({
     source: 'BITRIX24', deliveryKey: 'nightly-test', eventType: 'ONCRMCOMPANYUPDATE',
     externalEntityId: '42', externalEntityType: 'company', payload: {}, directionDisabled: false,
     requireServiceNotOff: true, nightlyLeaseToken: 'lease-1',
   });
-  return { calls, accept };
+  return { calls, accept, initializationCount: () => initializationCount };
 }
 
 test('nightly lease renews before the short durable enqueue transaction', async () => {
   const { calls, accept } = fixture();
   assert.equal((await accept()).id, 'event-1');
   assert.deepEqual(calls, ['renew', 'begin', 'read-guard', 'upsert', 'read-guard', 'pin']);
+});
+
+test('event intake performs the historical settings backfill only once per service instance', async () => {
+  const { accept, initializationCount } = fixture();
+  await accept();
+  await accept();
+  assert.equal(initializationCount(), 1);
+});
+
+test('failed initial backfill can be retried without accepting a partial event', async () => {
+  const { accept, initializationCount, calls } = fixture({ initFailOnce: true });
+  await assert.rejects(accept(), /Synthetic initialization failure/);
+  assert.equal(calls.includes('upsert'), false);
+  await accept();
+  assert.equal(initializationCount(), 2);
 });
 
 test('lost or expired lease and OFF mode reject before an event is accepted', async () => {

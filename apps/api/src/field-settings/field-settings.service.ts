@@ -21,6 +21,8 @@ export class EventIntakeDisabledError extends Error {
 
 @Injectable()
 export class FieldSettingsService {
+  private acceptanceInitialization: Promise<void> | null = null;
+
   constructor(
     private readonly database: DatabaseService,
     private readonly readOnlyData: ReadOnlyFieldDataProvider,
@@ -328,7 +330,15 @@ export class FieldSettingsService {
     requireServiceNotOff?: boolean;
     nightlyLeaseToken?: string;
   }) {
-    await this.ensureInitialized();
+    // Initial backfill scans historical events. Do it once per process, not
+    // once for every webhook/nightly row; each accepted row is pinned below.
+    if (!this.acceptanceInitialization) {
+      this.acceptanceInitialization = this.ensureInitialized().catch((error) => {
+        this.acceptanceInitialization = null;
+        throw error;
+      });
+    }
+    await this.acceptanceInitialization;
     // A nightly page can enqueue dozens of events. Renew the lease in its own
     // short statement, rather than holding SyncSetting's write lock for the
     // lifetime of each event/settings-pin transaction. The transaction still
