@@ -34,4 +34,5 @@ test('settings revision copies native warehouse and refuses foreign reference UR
  msStore=store;b24Store='';const prior:any={version:0,config:{...config.config,rules:[]}};
  assert.equal((await service.reconcileRevisionMappings({pair,eventId:'warehouse-rebase',oldConfig:prior,newConfig:config,assertLease:async()=>true})).status,'verified');assert.equal(b24Store,'8682');assert.equal(writes,3);
  assert.equal(readDealOrderRuleField({store:{meta:{href:'https://foreign.invalid/entity/store/'+store,type:'store'}}},rule,'MOYSKLAD').supported,false);
+ assert.deepEqual(readDealOrderRuleField({UF_CRM_1732004209:8682},rule,'BITRIX24'),{supported:true,value:'8682'});
 });

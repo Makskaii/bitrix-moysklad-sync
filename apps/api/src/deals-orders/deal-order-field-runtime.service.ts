@@ -515,6 +515,12 @@ export function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'B
   { supported: true; value: string | number | boolean | null } | { supported: false } {
   const field = side === 'BITRIX24' ? rule.sourceField : rule.targetField;
   if (isReverseWarehouseRule(rule) && side === 'MOYSKLAD') return readNativeWarehouse(record.store);
+  if (isReverseWarehouseRule(rule) && side === 'BITRIX24') {
+    const value = record[field];
+    if (value === undefined || value === null || value === '') return { supported: true, value: null };
+    if ((typeof value === 'string' || typeof value === 'number') && /^\d{1,20}$/.test(String(value))) return { supported: true, value: String(value) };
+    return { supported: false };
+  }
   const scalar = readScalarField(record, field, side === 'BITRIX24' ? 'bitrix24' : 'moysklad');
   if (!scalar.supported || !isPlannedDeliveryDateMapping(rule.sourceField, rule.targetField)) return scalar;
   const normalized = normalizePlannedDeliveryDate(scalar.value, side);
