@@ -624,6 +624,25 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       throw error;
     }
     await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}/contactpersons', 'GET', response.status, response.ok);
+    if (response.status === 404) {
+      await response.body?.cancel().catch(() => undefined);
+      // A stale active pair must not stop all other parents. Confirm that the
+      // parent itself is absent; a missing nested endpoint alone is ambiguous.
+      await this.waitForNightlyRequestSlot();
+      const parent = await fetch(new URL(`entity/counterparty/${encodeURIComponent(parentId)}`, base.endsWith('/') ? base : `${base}/`), {
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
+        redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}', 'GET', parent.status, parent.ok);
+      if (parent.status === 404) {
+        const missing: unknown = await parent.json();
+        if (isRecord(missing) && Array.isArray(missing.errors) && missing.errors.some(error => isRecord(error) && error.code === 1021)) {
+          await writeOperationalLog(this.database, 'EVENT', 'Nightly MOYSKLAD contactpersons PARENT_NOT_FOUND; existing pairs preserved.', 'nightly');
+          return { rows: [], size: 0 };
+        }
+      }
+      await parent.body?.cancel().catch(() => undefined);
+    }
     if (!response.ok) throw providerFeedError(response);
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) ||

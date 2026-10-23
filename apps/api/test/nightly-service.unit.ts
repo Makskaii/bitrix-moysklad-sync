@@ -27,6 +27,9 @@ class NightlyStore {
   productCatalogConfigured = false;
   moyskladTotal = 0;
   moyskladEntityIds: Record<string, string[]> = {};
+  contactParents: string[] = [];
+  contactParentStatus = 404;
+  contactParentErrorCode = 1021;
   failBitrix = false;
   pairLifecycleStatus = 'ACTIVE';
   pairEntityType = 'CONTACT';
@@ -109,6 +112,7 @@ class NightlyStore {
   };
   readonly entityPair = {
     findMany: async ({ where }: { where: Record<string, any> }) => {
+      if (where.entityType === 'COMPANY') return this.contactParents.map(moyskladId => ({ moyskladId }));
       const ids: string[] = where.bitrix24Id?.in ?? where.moyskladId?.in ?? [];
       return ids.includes('contact-1') ? [{ entityType: 'CONTACT', bitrix24Id: 'contact-1', moyskladId: 'ms-contact-1', moyskladType: 'counterparty' }] : [];
     },
@@ -177,6 +181,8 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
     const headers=new Headers(init?.headers);
     assert.equal(headers.get('accept'),'application/json;charset=utf-8');
     assert.equal(headers.get('accept-encoding'),'gzip');
+    if (requestUrl.pathname.endsWith('/counterparty/missing-parent/contactpersons')) return Response.json({ errors: [{ code: 1021 }] }, { status: 404 });
+    if (requestUrl.pathname.endsWith('/counterparty/missing-parent')) return Response.json({ errors: [{ code: store.contactParentErrorCode }] }, { status: store.contactParentStatus });
     store.moyskladWindows.push(requestUrl.searchParams.get('filter') ?? '');
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
     const entity = requestUrl.pathname.split('/').filter(Boolean).at(-1) ?? 'counterparty';
@@ -573,6 +579,22 @@ test('nightly Bitrix24 updated feeds enqueue unpaired deals and type-31 invoices
     assert.equal(harness.store.dispatched.length, 2);
   } finally {
     harness.close();
+  }
+});
+
+test('nightly continues past a parent confirmed absent without treating ambiguous nested 404 as an empty collection', async () => {
+  for (const [status, code, expected] of [[404, 1021, 'awaiting_processing'], [200, 1021, 'failed'], [403, 1000, 'failed'], [404, 9999, 'failed']] as const) {
+    const harness = await createHarness('on');
+    harness.store.contactParents = ['missing-parent', 'present-parent'];
+    harness.store.contactParentStatus = status;
+    harness.store.contactParentErrorCode = code;
+    try {
+      harness.service.onApplicationBootstrap();
+      await settleUntil(() => ['awaiting_processing', 'failed'].includes(harness.store.state.nightlyStatus));
+      assert.equal(harness.store.state.nightlyStatus, expected);
+      assert.equal(harness.store.providerCalls.some(url => url.includes('/counterparty/present-parent/contactpersons')), expected === 'awaiting_processing');
+      assert.equal(harness.store.accepted.some(event => event.externalEntityType === 'contactperson'), false);
+    } finally { harness.close(); }
   }
 });
 
