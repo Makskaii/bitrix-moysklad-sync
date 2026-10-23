@@ -88,7 +88,7 @@ export class DealOrderFieldRuntimeService {
       const currentB24 = readDealOrderRuleField(bitrix24, rule, 'BITRIX24');
       const currentMs = readDealOrderRuleField(moysklad, rule, 'MOYSKLAD');
       if (!currentB24.supported || !currentMs.supported) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_FIELD_SHAPE_UNSUPPORTED' };
-      const transformed = applyFieldTransform(rule.moyskladToBitrix24.transform, currentMs.value);
+      const transformed = transformWarehouseOrField(input.newConfig, rule, 'MOYSKLAD_TO_BITRIX24', currentMs.value);
       if (transformed.status === 'skip') return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_SOURCE_VALUE_MISSING' };
       if (transformed.status === 'error' || !isFieldScalar(transformed.value)) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_TRANSFORM_INVALID' };
       if (isExactOptionalStringMapping(rule.sourceField, rule.targetField) && (!isOptionalString(currentMs.value) || !isOptionalString(transformed.value))) {
@@ -240,12 +240,13 @@ export class DealOrderFieldRuntimeService {
       const b24Changed = !sameJson(b24Current.value, previousB24);
       const msChanged = !sameJson(msCurrent.value, previousMs);
       const paidSumAuthority = isReadOnlyPaidSumRule(rule);
+      const warehouseAuthority = isReverseWarehouseRule(rule);
       if (paidSumAuthority && (!isFiniteNumber(msCurrent.value) || !(b24Current.value === null || isFiniteNumber(b24Current.value)))) {
         heldRules++;
         this.logHeld(input.eventId, pair.id, rule.id, 'READ_ONLY_PAID_SUM_VALUE_INVALID');
         continue;
       }
-      let direction: Direction | 'ECHO' = paidSumAuthority
+      let direction: Direction | 'ECHO' = warehouseAuthority ? 'MOYSKLAD_TO_BITRIX24' : paidSumAuthority
         ? (b24Changed || msChanged ? 'MOYSKLAD_TO_BITRIX24' : 'ECHO')
         : b24Changed && msChanged
         ? 'MOYSKLAD_TO_BITRIX24'
@@ -266,7 +267,10 @@ export class DealOrderFieldRuntimeService {
         continue;
       }
       const sourceValue = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current.value : msCurrent.value;
-      const transformResult = applyFieldTransform(mapping.transform, sourceValue);
+      const transformResult = transformWarehouseOrField(input.eventConfig, rule, direction, sourceValue);
+      if (transformResult.status === 'mapped' && transformResult.transform === 'warehouse-confirmed-default') {
+        await writeOperationalLog(this.database, 'EVENT', 'Warehouse source is not mapped; used the explicitly configured default warehouse.', input.eventId);
+      }
       if (transformResult.status === 'skip') {
         logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, ruleId: rule.id, reason: `FIELD_VALUE_SKIPPED:${transformResult.reason}` }));
         continue;
@@ -507,13 +511,44 @@ function readScalarField(record: RecordValue, field: string, system: 'bitrix24' 
   return { supported: false };
 }
 
-function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'BITRIX24' | 'MOYSKLAD'):
+export function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'BITRIX24' | 'MOYSKLAD'):
   { supported: true; value: string | number | boolean | null } | { supported: false } {
   const field = side === 'BITRIX24' ? rule.sourceField : rule.targetField;
+  if (isReverseWarehouseRule(rule) && side === 'MOYSKLAD') return readNativeWarehouse(record.store);
   const scalar = readScalarField(record, field, side === 'BITRIX24' ? 'bitrix24' : 'moysklad');
   if (!scalar.supported || !isPlannedDeliveryDateMapping(rule.sourceField, rule.targetField)) return scalar;
   const normalized = normalizePlannedDeliveryDate(scalar.value, side);
   return normalized.supported ? normalized : { supported: false };
+}
+
+export function isReverseWarehouseRule(rule: Rule): boolean {
+  return rule.entity === 'deals-orders' && rule.sourceField === 'UF_CRM_1732004209' && rule.targetField === 'store' &&
+    !rule.bitrix24ToMoysklad.enabled && rule.moyskladToBitrix24.enabled && rule.moyskladToBitrix24.transform.kind === 'reference-map' &&
+    rule.moyskladToBitrix24.transform.resource === 'store';
+}
+export function transformWarehouseOrField(config: VersionedFieldSettingsDto, rule: Rule, direction: Direction, value: unknown): ReturnType<typeof applyFieldTransform> {
+  const transform = direction === 'MOYSKLAD_TO_BITRIX24' ? rule.moyskladToBitrix24.transform : rule.bitrix24ToMoysklad.transform;
+  const result = applyFieldTransform(transform, value);
+  if (!isReverseWarehouseRule(rule) || direction !== 'MOYSKLAD_TO_BITRIX24') return result;
+  const runtime = config.config.dealOrderRuntime;
+  if (result.status === 'mapped') {
+    const known = runtime?.stores.filter(row => row.moyskladId === value && row.bitrix24Id === String(result.value));
+    return known?.length === 1 ? result : { status: 'error', reason: 'Warehouse mapping must match a configured native store pair', transform: 'reference-map' };
+  }
+  // Empty or malformed references are not evidence for choosing another store.
+  if (result.status !== 'error' || typeof value !== 'string' || !isNativeStageId(value) || runtime?.unmappedReferencePolicy !== 'confirmed-defaults') return result;
+  const defaults = runtime.stores.filter(row => row.moyskladId === runtime.defaultStoreId);
+  if (defaults.length !== 1 || !/^\d+$/.test(defaults[0].bitrix24Id)) return result;
+  return { status: 'mapped', value: defaults[0].bitrix24Id, transform: 'warehouse-confirmed-default' };
+}
+function readNativeWarehouse(value: unknown): { supported: true; value: string | null } | { supported: false } {
+  if (value === undefined || value === null) return { supported: true, value: null };
+  if (!isRecord(value) || !isRecord(value.meta) || value.meta.type !== 'store' || typeof value.meta.href !== 'string') return { supported: false };
+  try {
+    const base = externalBase(process.env.MOYSKLAD_API_BASE_URL), url = new URL(value.meta.href), id = url.pathname.split('/').at(-1) ?? '';
+    if (!isNativeStageId(id) || url.href !== new URL(`entity/store/${id}`, base).href) return { supported: false };
+    return { supported: true, value: id };
+  } catch { return { supported: false }; }
 }
 
 async function writeMoySkladAttribute(orderId: string, targetField: string, value: string | number | boolean | null, sourceField: string) {

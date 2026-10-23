@@ -7,7 +7,7 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
-import { DealOrderFieldRuntimeService, RevisionMappingResult, readConfiguredStage } from './deal-order-field-runtime.service';
+import { DealOrderFieldRuntimeService, RevisionMappingResult, readConfiguredStage, isReverseWarehouseRule, readDealOrderRuleField } from './deal-order-field-runtime.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
 import { bitrixDocumentTotal, moyskladDocumentTotal } from './document-total-snapshot';
 import { configuredStagePairs } from './deal-order-stage-mappings';
@@ -226,7 +226,8 @@ function projectApprovedValues(config: VersionedFieldSettingsDto['config'], reco
   for (const rule of rules) {
     if (rule.entity !== 'deals-orders' || (!rule.bitrix24ToMoysklad.enabled && !rule.moyskladToBitrix24.enabled)) continue;
     const field = system === 'bitrix24' ? rule.sourceField : rule.targetField;
-    values[`rule:${rule.id}`] = approvedValue(record[field]);
+    const warehouse = isReverseWarehouseRule(rule) ? readDealOrderRuleField(record, rule, system === 'bitrix24' ? 'BITRIX24' : 'MOYSKLAD') : null;
+    values[`rule:${rule.id}`] = warehouse?.supported ? warehouse.value : approvedValue(record[field]);
   }
   const groups = Array.isArray(config.groups) ? config.groups : [];
   for (const group of groups) {
