@@ -128,7 +128,10 @@ export class SyncModeService {
       });
       await tx.syncModeTransition.create({ data: { fromMode: current.serviceMode, toMode: mode, transitionedAt } });
       return { mode: setting.serviceMode as ServiceMode };
-    });
+    // Existing in-flight provider requests hold a shared mode lock for at most
+    // 15 seconds. Allow this exclusive transition to wait for that bounded
+    // request; Prisma's five-second default can otherwise reject a safe PAUSE.
+    }, { timeout: 20_000 });
   }
 
   async readEntitySettings() {

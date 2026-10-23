@@ -12,6 +12,7 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
     resumeStatus: 'idle',
   };
   const transitions: Array<Record<string, unknown>> = [];
+  const transactionOptions: unknown[] = [];
   const transaction = {
     $queryRaw: async () => [],
     syncModeTransition: {
@@ -30,7 +31,10 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
     syncSetting: {
       upsert: async () => ({ ...state }),
     },
-    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>) => work(transaction),
+    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>, options: unknown) => {
+      transactionOptions.push(options);
+      return work(transaction);
+    },
   };
   const service = new SyncModeService(database as never);
 
@@ -49,6 +53,7 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
   assert.equal(state.resumeFrom, null);
   assert.equal(state.resumeThrough, null);
   assert.equal(state.lastInactiveAt, lastInactiveAt);
+  assert.deepEqual(transactionOptions, [{ timeout: 20_000 }, { timeout: 20_000 }]);
 });
 
 test('test ON, pause, and resume never establish or move the separately confirmed launch boundary', async () => {
