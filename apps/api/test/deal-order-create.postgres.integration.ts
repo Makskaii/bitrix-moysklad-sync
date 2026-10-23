@@ -144,7 +144,11 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
     createdAt: new Date(0),
     config: {
       schemaVersion: 1,
-      rules: [],
+      rules: [{
+        id: 'test-reverse-warehouse', entity: 'deals-orders', sourceField: 'UF_CRM_1732004209', targetField: 'store', criticality: 'optional',
+        bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'reference-map', resource: 'store', pairs: [{ source: ids.store, target: '8682' }] } },
+      }],
       groups: [],
       references: {
         units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }],

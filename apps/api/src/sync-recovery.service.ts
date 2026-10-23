@@ -220,12 +220,12 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       if (current.nightlyStatus === 'failed' && current.nightlyRetryAfter && current.nightlyRetryAfter > now) return;
       const lease = await this.database.$executeRaw`
         UPDATE "SyncSetting"
-        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds',
+        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds',
             "nightlyStatus" = 'running', "nightlyRetryAfter" = NULL, "nightlyError" = NULL,
             "nightlyAttempts" = "nightlyAttempts" + 1, "updatedAt" = NOW()
         WHERE "id" = 'global' AND "nightlyScheduledDate" IS NOT DISTINCT FROM ${current.nightlyScheduledDate}
           AND "nightlyStatus" IN ('pending', 'running', 'failed')
-          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= NOW())
+          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= (NOW() AT TIME ZONE 'UTC'))
       `;
       if (lease !== 1) return;
       let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
@@ -303,6 +303,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
 
   private async runBitrixFeed(initial: NonNullable<Awaited<ReturnType<DatabaseService['syncSetting']['findUnique']>>>, leaseToken: string) {
     let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? initial;
+    let phase = 'read';
     if (setting.nightlyBitrixStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
@@ -315,6 +316,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           ? await this.readBitrixProductPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedLastId)
           : await this.readBitrixPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedEntityTypeId, queriedLastId);
         await this.renewNightlyLease(leaseToken);
+        phase = 'enqueue';
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
         if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
@@ -342,14 +344,16 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         });
         if (result.count !== 1) throw new Error('Nightly lease or Bitrix cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        phase = 'read';
       }
     } catch (error) {
-      await this.markProviderFailed('BITRIX24', error, leaseToken);
+      await this.markProviderFailed('BITRIX24', error, leaseToken, phase);
     }
   }
 
   private async runMoyskladFeed(initial: NonNullable<Awaited<ReturnType<DatabaseService['syncSetting']['findUnique']>>>, leaseToken: string) {
     let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? initial;
+    let phase = 'read';
     if (setting.nightlyMoyskladStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
@@ -361,6 +365,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         await this.renewNightlyLease(leaseToken);
         const page = await this.readMoyskladUpdatedPage(queriedEntity, setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
         await this.renewNightlyLease(leaseToken);
+        phase = 'enqueue';
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
         if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
@@ -379,6 +384,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         });
         if (result.count !== 1) throw new Error('Nightly lease or MoySklad cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        phase = 'read';
       }
       await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, nightlyJobKey(setting), leaseToken);
       if (await this.nightlyIsPaused()) return;
@@ -390,7 +396,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       });
       if (completed.count !== 1) throw new Error('Nightly lease was lost before MoySklad feed completion');
     } catch (error) {
-      await this.markProviderFailed('MOYSKLAD', error, leaseToken);
+      await this.markProviderFailed('MOYSKLAD', error, leaseToken, phase);
     }
   }
 
@@ -657,7 +663,12 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (failures.length) throw new Error(`Could not durably queue ${failures.length} changed MoySklad contact-person event(s)`);
   }
 
-  private async markProviderFailed(provider: 'BITRIX24' | 'MOYSKLAD', error: unknown, leaseToken: string) {
+  private async markProviderFailed(provider: 'BITRIX24' | 'MOYSKLAD', error: unknown, leaseToken: string, phase: string) {
+    const diagnostic = error instanceof UnsupportedPaginationError ? 'PAGINATION'
+      : error instanceof ProviderFeedError ? 'PROVIDER_HTTP'
+        : isRecord(error) && typeof error.code === 'string' && /^P\d{4}$/.test(error.code) ? error.code
+          : 'INTERNAL';
+    await writeOperationalLog(this.database, 'ERROR', `Nightly ${provider} ${phase} ${diagnostic}`, 'nightly');
     const current = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { nightlyAttempts: true } });
     await this.database.syncSetting.updateMany({
       where: { id: 'global', nightlyLeaseToken: leaseToken },
@@ -687,8 +698,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
 
   private async renewNightlyLease(leaseToken: string) {
     const renewed = await this.database.$executeRaw`
-      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds', "updatedAt" = NOW()
-      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > NOW()
+      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds', "updatedAt" = NOW()
+      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
     `;
     if (renewed !== 1) throw new Error('Nightly run lease was lost');
   }

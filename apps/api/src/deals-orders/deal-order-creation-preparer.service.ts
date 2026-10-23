@@ -348,7 +348,10 @@ function prepareMappedAttributes(
   base: URL,
 ): { attributes: Array<{ meta: { href: string; type: 'attributemetadata'; mediaType: 'application/json' }; value: unknown }>; nativeFields: Record<string, unknown>; skippedOptionalRules: string[] } | null {
   if (config.groups.some((group) => group.entity === 'deals-orders')) return null;
-  const activeRules = config.rules.filter((rule) => rule.entity === 'deals-orders' && (rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled));
+  // Order creation sends only forward fields. Reverse-only mappings remain
+  // available to the existing-pair field runtime, not to this MS payload.
+  const activeRules = config.rules.filter((rule) => rule.entity === 'deals-orders' &&
+    (rule.bitrix24ToMoysklad.enabled || isQ26PaidSumRule(rule)));
   const targets = new Set<string>();
   const attributes: Array<{ meta: { href: string; type: 'attributemetadata'; mediaType: 'application/json' }; value: unknown }> = [];
   const nativeFields: Record<string, unknown> = {};

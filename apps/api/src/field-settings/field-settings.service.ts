@@ -341,8 +341,8 @@ export class FieldSettingsService {
         }
         if (input.nightlyLeaseToken) {
           const renewed = await transaction.$executeRaw`
-            UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds'
-            WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken} AND "nightlyLeaseExpiresAt" > NOW()
+            UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
+            WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken} AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
           `;
           if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
         }
