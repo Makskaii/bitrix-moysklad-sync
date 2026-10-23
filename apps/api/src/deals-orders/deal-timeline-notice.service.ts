@@ -42,7 +42,7 @@ export class DealTimelineNoticeService implements OnApplicationBootstrap, OnModu
   }
 
   async errorForEvent(eventId: string, reason: string | null, tx: Prisma.TransactionClient) {
-    if (!reason || ['STAGE_NOT_READY', 'FORWARD_ORDER_ECHO_DEFERRED'].includes(reason)) return;
+    if (!reason || ['STAGE_NOT_READY', 'FORWARD_ORDER_ECHO_DEFERRED', 'CLIENT_ENTITY_LOCK_BUSY'].includes(reason)) return;
     const event = await tx.inboundEvent.findUnique({ where: { id: eventId }, select: { source: true, externalEntityType: true, externalEntityId: true } });
     if (!event?.externalEntityId) return;
     let dealId = event.source === 'BITRIX24' && event.externalEntityType === 'deal' ? event.externalEntityId : null;
