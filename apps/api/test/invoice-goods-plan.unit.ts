@@ -29,6 +29,7 @@ test('invoice goods values reject foreign native references and unsafe money',()
   const base='https://api.moysklad.ru/api/remap/1.2/';
   const native={quantity:1,price:41800,discount:0,vat:0,assortment:{meta:{href:base+'entity/product/'+value.productId,type:'product'}}};
   assert.deepEqual(invoiceGoodsValue(native,base),value);
-  assert.throws(()=>invoiceGoodsValue({...native,price:41800.5},base),/VALUE_INVALID/);
+  assert.equal(invoiceGoodsValue({...native,price:41800.5},base).price,41800.5);
+  assert.throws(()=>invoiceGoodsValue({...native,price:Infinity},base),/VALUE_INVALID/);
   assert.throws(()=>invoiceGoodsValue({...native,assortment:{meta:{...native.assortment.meta,href:native.assortment.meta.href.replace('api.moysklad.ru','foreign.invalid')}}},base),/VALUE_INVALID/);
 });

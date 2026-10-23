@@ -7,6 +7,7 @@ import { SyncModeService } from '../sync-mode.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
+import { isMoySkladPositionPrice } from './deal-order-money';
 
 type CustomerOrderPosition = {
   assortment: { meta: { type: string; href: string } };
@@ -443,7 +444,7 @@ function validatePreparedOrder(input: DealOrderPreparedInput) {
         position.assortment.meta.type !== 'product' ||
         !isUuidFromHref(position.assortment.meta.href, base, String(position.assortment.meta.type)) ||
         typeof position.quantity !== 'number' || !Number.isFinite(position.quantity) || position.quantity <= 0 ||
-        typeof position.price !== 'number' || !Number.isSafeInteger(position.price) || position.price < 0 ||
+        !isMoySkladPositionPrice(position.price) ||
         typeof position.discount !== 'number' || !Number.isFinite(position.discount) ||
         typeof position.vat !== 'number' || !Number.isInteger(position.vat) ||
         typeof position.vatEnabled !== 'boolean') {

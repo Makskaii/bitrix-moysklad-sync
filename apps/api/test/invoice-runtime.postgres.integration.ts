@@ -296,6 +296,24 @@ test('invoice processor creates one independently paired invoiceout, then update
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
 });
 
+test('invoice native fractional pre-discount price creates and updates the same invoice without double discount', async () => {
+  const sourceId=String(++invoiceCounter),productId=`57${Date.now()}`,targetId=randomUUID();
+  await db.entityPair.create({data:{entityType:'PRODUCT',bitrix24Id:productId,moyskladId:targetId,moyskladType:'product',source:'MANUAL'}});
+  bitrixInvoices.set(sourceId,{id:sourceId,title:'Invoice fractional discount',parentId2:Number(dealId),createdTime:createdAfterBoundary,opportunity:100,currencyId:'RUB'});
+  const row={id:343,ownerType:'SI',ownerId:Number(sourceId),productId:Number(productId),quantity:1,price:100,priceNetto:111.11111111,priceBrutto:111.11111111,discountTypeId:2,discountRate:10,discountSum:11.11111111,taxRate:0,taxIncluded:'N'};
+  invoiceRows.set(sourceId,[row]);
+  const event=await createEvent(`fraction-discount-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+  assert.equal((await processor.process(event.id))?.status,'SUCCEEDED');
+  const pair=await db.entityPair.findFirstOrThrow({where:{entityType:'INVOICE',bitrix24Id:sourceId}});
+  const target=moyskladInvoices.get(pair.moyskladId)!;
+  const position=(target.positions as InvoiceRecord[])[0]!;const positionId=position.id;
+  assert.equal(position.price,11111.111111);assert.equal(position.discount,10);assert.equal(invoiceSum(target),10000);
+  row.quantity=10;bitrixInvoices.get(sourceId)!.opportunity=1000;
+  const update=await createEvent(`fraction-discount-update-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+  assert.equal((await processor.process(update.id))?.status,'SUCCEEDED');
+  assert.equal((target.positions as InvoiceRecord[])[0]!.id,positionId);assert.equal(invoiceSum(target),100000);
+});
+
 test('invoice goods create/update/add/recovery keep native row IDs and stop unsafe total, deletion, or target conflicts', async () => {
   const sourceId = String(++invoiceCounter);
   const productId = `55${Date.now()}`;

@@ -44,3 +44,14 @@ test('native picker inclusive price is copied despite sub-cent net price; incons
   assert.equal(bitrixMoneyToMoySklad({...row,taxRate:undefined}),null);
   assert.deepEqual(bitrixMoneyToMoySklad({...row,price:153.9,discountRate:10}),{price:17100,discount:10,vat:22,vatEnabled:true,vatIncluded:true});
 });
+
+test('native fractional pre-discount amounts preserve the actual sale and percentage without a second discount',()=>{
+  const row={price:100,priceNetto:111.11111111,priceBrutto:111.11111111,discountTypeId:2,discountRate:10,discountSum:11.11111111,taxRate:0,taxIncluded:'N'};
+  const converted=bitrixMoneyToMoySklad(row);
+  assert.deepEqual(converted,{price:11111.111111,discount:10,vat:0,vatEnabled:true,vatIncluded:false});
+  assert.equal(moySkladMoneyToBitrix(converted!)?.price,100);
+  assert.equal(bitrixMoneyToMoySklad({...row,price:99}),null);
+  assert.equal(bitrixMoneyToMoySklad({...row,priceNetto:NaN}),null);
+  assert.equal(bitrixMoneyToMoySklad({...row,price:100.001}),null);
+  assert.equal(Math.round(converted!.price*(1-converted!.discount/100)*10),100000);
+});

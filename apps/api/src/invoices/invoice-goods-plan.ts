@@ -1,3 +1,4 @@
+import { isMoySkladPositionPrice } from '../deals-orders/deal-order-money';
 export type InvoiceGoodsValue = { productType: string; productId: string; quantity: number; price: number; discount: number; vat: number };
 export type InvoiceGoodsRow = { id: string; value: InvoiceGoodsValue };
 export type InvoiceGoodsBinding = { sourceId: string; targetId: string; source: InvoiceGoodsValue; target: InvoiceGoodsValue };
@@ -46,7 +47,7 @@ export function invoiceGoodsValue(value: Record<string, unknown>, base: string):
   const id = href.split('/').at(-1) ?? '';
   if (!['product','service'].includes(String(meta.type)) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) || href !== new URL(`entity/${meta.type}/${id}`, base.replace(/\/?$/,'/')).href ||
       typeof value.quantity !== 'number' || !Number.isFinite(value.quantity) || value.quantity <= 0 ||
-      typeof value.price !== 'number' || !Number.isSafeInteger(value.price) || value.price < 0 ||
+      !isMoySkladPositionPrice(value.price) ||
       typeof value.discount !== 'number' || !Number.isFinite(value.discount) || value.discount < 0 || value.discount > 100 ||
       typeof value.vat !== 'number' || !Number.isFinite(value.vat) || value.vat < 0 || value.vat > 100) throw new InvoiceGoodsReview('INVOICE_GOODS_VALUE_INVALID');
   return {productType:String(meta.type),productId:id,quantity:value.quantity,price:value.price,discount:value.discount,vat:value.vat};
