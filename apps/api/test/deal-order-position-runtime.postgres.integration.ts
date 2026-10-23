@@ -26,6 +26,7 @@ let positionAdds = 0;
 let failPositionReadId: string | null = null;
 let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MALFORMED_JSON' | 'INVALID_SHAPE' | 'INVALID_UOM' | 'UNAUTHORIZED' = 'NORMAL';
 let productReadCalls = 0;
+let productReadKind: 'product' | 'service' = 'product';
 let addAck: (row: Record<string, unknown>) => unknown = row => row;
 let failFirstAddedRead = true;
 
@@ -353,6 +354,50 @@ test('invalid product responses and non-transient 4xx are held without skipping,
   }
 });
 
+test('paired service rows use the service endpoint and explicitly approved reverse UOM on update and bootstrap', async () => {
+  productReadKind = 'service';
+  await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: 'service' } });
+  try {
+    const one = await seed(uniqueDealId());
+    msRows[0].assortment = { meta: { type: 'service', href: `${base}api/remap/1.2/entity/service/${productId}` } };
+    await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { moyskladValues: targetValues(msRows[0]) } });
+    const settings = config();
+    settings.config.references.units[0].moyskladId = 'aaaaaaaa-1111-4111-8111-111111111111';
+    settings.config.references.units[0].reverseMoyskladIds = [unitId];
+    msRows[0].quantity = 3;
+    calls = [];
+    assert.equal((await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-update', eventConfig: settings })).status, 'SYNCED');
+    assert.equal(b24Rows[0].quantity, 3);
+    assert.ok(calls.some(call => call.path.includes('/entity/service/')));
+    assert.ok(!calls.some(call => call.path.includes('/entity/product/')));
+    await db.dealOrderPositionPair.deleteMany({ where: { pairId: one.pair.id } });
+    assert.equal((await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-bootstrap', eventConfig: settings })).status, 'SYNCED');
+    assert.equal(await db.dealOrderPositionPair.count({ where: { pairId: one.pair.id } }), 1);
+  } finally {
+    productReadKind = 'product';
+    await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: null } });
+  }
+});
+
+test('forward row addition retains a saved service identity instead of constructing a product reference', async () => {
+  productReadKind = 'service';
+  await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: 'service' } });
+  try {
+    const one = await seed(uniqueDealId());
+    msRows[0].assortment = { meta: { type: 'service', href: `${base}api/remap/1.2/entity/service/${productId}` } };
+    await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { moyskladValues: targetValues(msRows[0]) } });
+    b24Rows.push({ ...b24Rows[0], id: '302', quantity: 1 });
+    failFirstAddedRead = false;
+    const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-add', eventConfig: config() });
+    assert.equal(result.status, 'SYNCED');
+    assert.equal((msRows[1].assortment as any).meta.type, 'service');
+    assert.ok((msRows[1].assortment as any).meta.href.includes('/entity/service/'));
+  } finally {
+    productReadKind = 'product';
+    await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: null } });
+  }
+});
+
 async function seed(dealId: string) {
   addAck = row => row;
   failFirstAddedRead = true;
@@ -393,7 +438,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     return send(response, { result: true });
   }
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}` && request.method === 'GET') return send(response, { id: activeOrderId, vatIncluded });
-  if (url.pathname === '/api/remap/1.2/entity/product/' + productId) {
+  if (url.pathname === '/api/remap/1.2/entity/' + productReadKind + '/' + productId) {
     productReadCalls += 1;
     if (productReadCalls > 1 && productReadBehavior === 'NOT_FOUND') return send(response, {}, 404);
     if (productReadCalls > 1 && productReadBehavior === 'SERVER_ERROR') return send(response, {}, 500);
@@ -403,7 +448,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_SHAPE') return send(response, { id: productId, meta: { type: 'service' }, uom: { id: unitId } });
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_UOM') return send(response, { id: productId, meta: { type: 'product' }, uom: { id: 796 } });
     if (productReadCalls > 1 && productReadBehavior === 'UNAUTHORIZED') return send(response, {}, 401);
-    return send(response, { id: productId, meta: { type: 'product' }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${unitId}`} } });
+    return send(response, { id: productId, meta: { type: productReadKind }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${unitId}`} } });
   }
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);

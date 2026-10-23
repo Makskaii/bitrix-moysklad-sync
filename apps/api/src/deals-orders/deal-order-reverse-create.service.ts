@@ -281,6 +281,14 @@ export class DealOrderReverseCreateService {
       const id = readId(position.id)!;
       if (input.positionIds && !input.positionIds.has(id)) continue;
       const assortment = isRecord(position.assortment) ? position.assortment : {};
+      const nativeKind = isRecord(assortment.meta) ? assortment.meta.type : undefined;
+      // Old normalized fixtures omit meta.type; real native services must never
+      // be addressed through the product endpoint (which returns a permanent404).
+      const kind = nativeKind === undefined ? 'product' : nativeKind;
+      if (kind !== 'product' && kind !== 'service') {
+        await skip(id, 'ASSORTMENT_TYPE_UNSUPPORTED');
+        continue;
+      }
       const assortmentId = readId(assortment.id);
       if (!assortmentId || !isUuid(assortmentId)) {
         await skip(id, 'PRODUCT_ID_MISSING');
@@ -288,13 +296,14 @@ export class DealOrderReverseCreateService {
       }
       let mappedProduct = resolvedProducts.get(assortmentId);
       if (!mappedProduct) {
-        let productPairs = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, moyskladId: assortmentId }, select: { bitrix24Id: true, moyskladId: true }, take: 2 });
+        let productPairs = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, moyskladId: assortmentId }, select: { bitrix24Id: true, moyskladId: true, moyskladType: true }, take: 2 });
         if (productPairs.length > 1) throw new DealOrderReverseManualReviewError(`MySklad product ${assortmentId} has ambiguous active Bitrix24 pairs`);
+        if (productPairs[0]?.moyskladType && productPairs[0].moyskladType !== kind) throw new DealOrderReverseManualReviewError('MySklad assortment kind conflicts with the saved product pair');
         if (!productPairs.length && !config.bitrix24ProductCatalogId) {
           throw new DealOrderReverseManualReviewError('A confirmed Bitrix24 product catalog is required to create a missing product pair');
         }
-        const product = await msGet(`entity/product/${encodeURIComponent(assortmentId)}`, this.providerGate);
-        if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== 'product') {
+        const product = await msGet(`entity/${kind}/${encodeURIComponent(assortmentId)}`, this.providerGate);
+        if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== kind) {
           throw new DealOrderReverseManualReviewError(`MySklad assortment ${assortmentId} is not a readable product`);
         }
         const uomId = moyskladUomReferenceId(product.uom, configuredBase('MOYSKLAD_API_BASE_URL'));
@@ -305,8 +314,7 @@ export class DealOrderReverseCreateService {
         }
         let bitrix24Id = productPairs[0]?.bitrix24Id;
         if (!bitrix24Id) {
-          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined), writePair: input.writePair });
-          productPairs = [{ bitrix24Id, moyskladId: assortmentId }];
+          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, moyskladType: kind, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined), writePair: input.writePair });
         }
         if (!/^\d{1,20}$/.test(bitrix24Id)) throw new DealOrderReverseManualReviewError(`MySklad product ${assortmentId} has an invalid Bitrix24 pair`);
         mappedProduct = { bitrix24Id, uomId: uomId! };
@@ -380,7 +388,7 @@ export class DealOrderReverseCreateService {
   /** Create only the missing Bitrix24 prerequisite product, using an explicitly
    * confirmed catalog/unit and a stable external key. MySklad product records
    * are read-only in this path. */
-  private async createOrRecoverProductPair(input: { productId: string; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean>; writePair?: { id: string; entityType: string } }): Promise<string> {
+  private async createOrRecoverProductPair(input: { productId: string; moyskladType?: 'product' | 'service'; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean>; writePair?: { id: string; entityType: string } }): Promise<string> {
     const creator = this.productCatalogCreate ?? new ProductCatalogCreateService(this.database, this.mode);
     return creator.createOrRecover(input);
   }

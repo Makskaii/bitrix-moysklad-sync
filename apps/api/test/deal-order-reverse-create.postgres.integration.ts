@@ -557,6 +557,36 @@ test('reverse-only UOM alternative retains a real order position without changin
   }
 });
 
+test('a mixed product/service order reads native service resource and creates one deal with both rows', async () => {
+  const orderId = randomUUID(), serviceId = randomUUID();
+  activeOrderId = orderId; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  items = []; rows = []; products = [];
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false;
+  orderPositions = [position('mixed-product', 2), { ...position('mixed-service', 1), assortment: { id: serviceId, meta: { type: 'service' } } }];
+  try {
+    const input = { moyskladOrderId: orderId, eventId: `event-${suffix}-mixed`, eventConfig: config() };
+    const result = await service.createAndPair(input);
+    assert.equal(result.status, 'CREATED');
+    assert.equal(rows.length, 2);
+    const servicePair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: serviceId, active: true } });
+    assert.equal(servicePair.moyskladType, 'service');
+    assert.equal(rows[1].productId, Number(servicePair.bitrix24Id));
+    assert.equal(products.filter(product => product.type === 7).length, 1);
+    await service.createAndPair(input);
+    assert.equal(dealAdds, 1);
+    assert.equal(rows.length, 2);
+    assert.equal(msProductWrites, 0);
+  } finally {
+    const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: serviceId } });
+    await db.entityPair.deleteMany({ where: { OR: [{ entityType: 'DEAL', moyskladId: orderId }, { entityType: 'PRODUCT', moyskladId: serviceId }] } });
+    activeOrderId = ids.order;
+  }
+});
+
 function position(id: string, quantity: number): Record<string, unknown> {
   return { id, quantity, price: 12345, discount: 0, vat: 0, vatEnabled: false, assortment: { id: ids.product, uom: { id: ids.unit } } };
 }
@@ -574,8 +604,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(pathname) && body.useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
   }
-  const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/product\/([0-9a-f-]+)$/i);
-  if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
+  const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/(product|service)\/([0-9a-f-]+)$/i);
+  if (productRead) return send(response, { id: productRead[2], meta: { type: productRead[1] }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
   if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
     assert.equal(new URL(request.url ?? '/', base).searchParams.get('expand'), 'assortment');
@@ -628,14 +658,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     return send(response, { result: { productRow: added } });
   }
-  if (pathname === '/rest/catalog.product.list') {
+  if (['/rest/catalog.product.list', '/rest/catalog.product.service.list'].includes(pathname)) {
     const found = products.filter((product: any) => (body.filter?.property108 ? product.property108?.value === body.filter.property108 : product.xmlId === body.filter?.xmlId) && String(product.iblockId) === String(body.filter?.iblockId));
-    return send(response, { result: { products: found }, total: found.length });
+    return send(response, { result: { [pathname.includes('.service.') ? 'services' : 'products']: found }, total: found.length });
   }
-  if (pathname === '/rest/catalog.product.getFieldsByFilter') {
+  if (['/rest/catalog.product.getFieldsByFilter','/rest/catalog.product.service.getFieldsByFilter'].includes(pathname)) {
     // ProductCatalogCreateService checks writable fields before catalog.product.add.
     // Mirror the Bitrix response envelope consumed by that production caller.
-    return send(response, { result: { product: {
+    return send(response, { result: { [pathname.includes('.service.') ? 'service' : 'product']: {
       name: { type: 'string', isReadOnly: false },
       code: { type: 'string', isReadOnly: false },
       detailText: { type: 'string', isReadOnly: false },
@@ -644,12 +674,13 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false },
     } } });
   }
-  if (pathname === '/rest/catalog.product.add') {
+  if (['/rest/catalog.product.add','/rest/catalog.product.service.add'].includes(pathname)) {
     productAdds++;
-    const created = { ...body.fields, type: 1, id: String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
+    const isService = pathname.includes('.service.');
+    const created = { ...body.fields, type: isService ? 7 : 1, id: isService ? 990 : String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
     products.push(created);
     if (loseProductCreateResponse) { loseProductCreateResponse = false; response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic product create response loss' })); return; }
-    return send(response, { result: { element: created } });
+    return send(response, { result: { [isService ? 'service' : 'element']: created } });
   }
   response.writeHead(404); response.end(JSON.stringify({ error: `unexpected ${request.method} ${pathname}` }));
 }
