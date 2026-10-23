@@ -7,7 +7,7 @@ import { isRetryableFailure, ProviderFailure } from '../src/provider-failure';
 let server: Server;
 let base = '';
 const saved = new Map<string, string | undefined>();
-const requests: Array<{ method: string; path: string; body: string }> = [];
+const requests: Array<{ method: string; path: string; body: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
 let malformedNextProductWriteResponse = false;
 let failNextProductWriteRetryAfter: string | null = null;
 const productId = '12345678-1234-1234-1234-123456789abc';
@@ -20,7 +20,10 @@ before(async () => {
     request.on('data', (chunk: Buffer) => chunks.push(chunk));
     request.on('end', () => {
       const body = Buffer.concat(chunks).toString('utf8');
-      requests.push({ method: request.method ?? '', path: request.url ?? '', body });
+      requests.push({
+        method: request.method ?? '', path: request.url ?? '', body,
+        accept: request.headers.accept, acceptEncoding: request.headers['accept-encoding'],
+      });
       response.setHeader('content-type', 'application/json');
       if (request.url === '/rest/catalog.product.get.json') return response.end(JSON.stringify({ result: { product: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' } } }));
       if (request.url === '/rest/catalog.product.service.get.json') return response.end(JSON.stringify({ result: { service: { id: 102, type: 7, name: 'Setup', detailText: 'Install', dateModify: '2026-10-07T10:00:00Z' } } }));
@@ -29,13 +32,14 @@ before(async () => {
       if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'GET') return response.end(JSON.stringify({
         id: productId, meta: { type: 'product' }, name: 'Starter', description: 'Plain detail', weight: 2.5, updated: '2026-10-07 10:00:00.000',
         uom: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/uom/abcdefab-cdef-abcd-efab-cdefabcdefab' } },
-        salePrices: [{ value: 12.5,
+        salePrices: [{ value: 1250,
           currency: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' } },
-          priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
+          priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } },
+          { value: 0, currency: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' } }, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/bbcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/service/' + serviceId && request.method === 'GET') return response.end(JSON.stringify({
         id: serviceId, meta: { type: 'service' }, name: 'Setup', description: 'Install', updated: '2026-10-07 10:00:00.000',
-        salePrices: [{ value: 100, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
+        salePrices: [{ value: 10000, priceType: { meta: { href: 'https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/abcdefab-cdef-abcd-efab-cdefabcdefac' } } }],
       }));
       if (request.url === '/api/remap/1.2/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad' && request.method === 'GET') return response.end(JSON.stringify({ id: 'abcdefab-cdef-abcd-efab-cdefabcdefad', isoCode: 'RUB' }));
       if (request.url === '/api/remap/1.2/entity/product/' + productId && request.method === 'PUT' && malformedNextProductWriteResponse) {
@@ -80,9 +84,15 @@ test('product API adapter reads only addressed cards and issues partial field an
     name: 'Starter', code: 'S-1', detailText: 'HTML detail', unitId: '3', fields: { id: 101, type: 1, name: 'Starter', code: 'S-1', detailText: 'HTML detail', measure: 3, weight: 2.5, dateModify: '2026-10-07T10:00:00Z' }, prices: [{ priceId: '51', typeId: '2', value: 12.5, currency: 'RUB' }], updatedAt: '2026-10-07T10:00:00Z', createdAt: null,
   });
   const ms = await api.readMoysklad(productId);
+  const moyskladProductRead = requests.find((request) => request.path === `/api/remap/1.2/entity/product/${productId}` && request.method === 'GET');
+  assert.equal(moyskladProductRead?.accept, 'application/json;charset=utf-8');
+  assert.equal(moyskladProductRead?.acceptEncoding, 'gzip');
   assert.equal(ms.unitId, 'abcdefab-cdef-abcd-efab-cdefabcdefab');
   assert.equal(ms.prices[0].typeId, 'abcdefab-cdef-abcd-efab-cdefabcdefac');
   assert.equal(ms.prices[0].currency, 'RUB');
+  assert.equal(ms.prices[0].value, 12.5, '1250 Remap minor units are the same 12.50 RUB as Bitrix catalog.price');
+  assert.equal(ms.prices[1].value, 0);
+  assert.equal(requests.filter(request=>request.path.endsWith('/entity/currency/abcdefab-cdef-abcd-efab-cdefabcdefad')).length,1,'one snapshot reads each selected currency only once despite multiple price types');
   assert.equal((ms.prices[0].currencyRef?.meta as { type: string }).type, 'currency');
 
   await api.updateBitrix24('101', { name: 'Renamed' });
@@ -110,6 +120,17 @@ test('truncated successful product response is a retryable uncertain outcome', a
   );
 });
 
+test('description write boundary sends plain supported text and rejects unsupported letters before a provider call', async () => {
+  const api = new ProductCardHttpApi();
+  await api.updateBitrix24('101', { detailText: 'Ё 😀 <b>literal</b>\nTAIL' });
+  const request = new URLSearchParams(requests.at(-1)!.body);
+  assert.equal(request.get('fields[detailText]'), 'Ё  <b>literal</b>\nTAIL');
+  assert.equal(request.get('fields[detailTextType]'), 'text');
+  const before = requests.length;
+  await assert.rejects(api.updateBitrix24('101', { detailText: 'A𠀀B' }), /PRODUCT_DESCRIPTION_UNSUPPORTED_CHARACTER/);
+  assert.equal(requests.length, before);
+});
+
 test('catalog services use service-specific provider endpoints and retain their native kind', async () => {
   const api = new ProductCardHttpApi();
   const bitrix = await api.readBitrix24('102', 'service');
@@ -117,6 +138,7 @@ test('catalog services use service-specific provider endpoints and retain their 
   assert.deepEqual(bitrix.prices, [{ priceId: '52', typeId: '3', value: 100, currency: 'RUB' }]);
   const moysklad = await api.readMoysklad(serviceId, 'service');
   assert.equal(moysklad.name, 'Setup');
+  assert.equal(moysklad.prices[0].value, 100, 'service salePrices use the same native minor-unit contract');
   await api.updateBitrix24('102', { name: 'Setup v2' }, 'service');
   await api.updateBitrix24Price('52', 125, 'RUB');
   await api.updateMoysklad(serviceId, { name: 'Setup v2' }, 'service');

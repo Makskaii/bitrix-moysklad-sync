@@ -48,12 +48,17 @@ let failNextInvoiceCreate = false;
 let failNextMoyskladUpdate = false;
 let failNextBitrixUpdateField: string | null = null;
 let reparentOnNextMoyskladWrite = false;
+let failPositionReadAfterWrite = false;
+let failNextPositionRead = false;
 let moyskladWrites = 0;
 let processorStarted = false;
 const bitrixInvoices = new Map<string, InvoiceRecord>();
 const moyskladInvoices = new Map<string, InvoiceRecord>();
 const deals = new Map<string, InvoiceRecord>();
 const orders = new Map<string, InvoiceRecord>();
+const invoiceRows = new Map<string, InvoiceRecord[]>();
+const invoiceReadCounts = new Map<string, number>();
+const invoiceReadFaults = new Map<string, { status: number; remaining: number; retryAfter?: string }>();
 
 before(async () => {
   const connection = new URL(process.env.INVOICE_TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '');
@@ -188,6 +193,91 @@ test('admin HTTP V1→V2 invoice settings save is applied by the inbound webhook
   }
 });
 
+test('two public invoice events persist a bounded non-failing wait across restart, then create one invoice with its own goods', async () => {
+  const savedEnv = Object.fromEntries(['ADMIN_PREVIEW', 'BITRIX24_EVENT_APPLICATION_TOKEN'].map(key => [key, process.env[key]]));
+  const sourceId = String(++invoiceCounter), nextDeal = `${Date.now()}93`, nextOrder = randomUUID();
+  const productId = `57${Date.now()}`, targetProduct = 'd813b5d2-5939-11ee-0a80-1143000e2d5c';
+  const productPair = await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: targetProduct, moyskladType: 'product', source: 'MANUAL' } });
+  deals.set(nextDeal, { ID: nextDeal, DATE_CREATE: createdAfterBoundary });
+  bitrixInvoices.set(sourceId, { id: sourceId, title: 'HTTP waiting invoice own goods', parentId2: Number(nextDeal), createdTime: createdAfterBoundary, opportunity: 24.68, currencyId: 'RUB' });
+  invoiceRows.set(sourceId, [{ id: 941, ownerType: 'SI', ownerId: Number(sourceId), productId: Number(productId), quantity: 2, price: 12.34, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: 0, taxIncluded: 'Y' }]);
+  const events: string[] = [];
+  let app: INestApplication | undefined;
+  const close = async () => { if (app) { (app.getHttpServer() as Server).closeAllConnections(); await app.close(); app = undefined; } };
+  const open = async () => { app = await NestFactory.create(LocalAdminPreviewModule.register(), { logger: false }); await app.listen(0, '127.0.0.1'); };
+  try {
+    process.env.ADMIN_PREVIEW = '1'; process.env.BITRIX24_EVENT_APPLICATION_TOKEN = 'synthetic-invoice-wait-http-token';
+    await open();
+    for (const event of ['ONCRMDYNAMICITEMADD', 'ONCRMDYNAMICITEMUPDATE']) {
+      const response = await fetch(`${await app!.getUrl()}/webhooks/bitrix24`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ event, data: { FIELDS: { ID: sourceId, ENTITY_TYPE_ID: 31 } }, auth: { application_token: 'synthetic-invoice-wait-http-token' } }) });
+      assert.ok([200, 201].includes(response.status));
+      const ack = await response.json() as { eventId: string }; events.push(ack.eventId);
+      await app!.get(EventDispatcherService).dispatch(ack.eventId);
+      const waiting = await waitForEventStatus(ack.eventId, 'WAITING_FOR_ORDER');
+      assert.equal(waiting.attempts, 0); assert.ok(waiting.retryAfter && waiting.retryAfter.getTime() > Date.now() + 25_000);
+    }
+    const reads = invoiceReadCounts.get(sourceId);
+    for (const id of events) assert.equal(await app!.get(InvoiceEventProcessor).process(id), null, 'direct redispatch cannot bypass the persisted deadline');
+    await new Promise(resolve => setTimeout(resolve, 1_200));
+    assert.equal(invoiceReadCounts.get(sourceId), reads, 'public recovery scanner must not poll the providers early');
+    await close(); await open();
+    await new Promise(resolve => setTimeout(resolve, 1_200));
+    assert.equal(invoiceReadCounts.get(sourceId), reads, 'restart must honor the same persisted deadline');
+    for (const id of events) assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id } })).attempts, 0);
+    assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 0);
+    orders.set(nextOrder, { id: nextOrder, meta: { type: 'customerorder' }, created: createdAfterBoundary });
+    await db.entityPair.create({ data: { id: `invoice55-${suffix}-public-wait-order`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
+    // Only the isolated fixture's deadline advances. Counters/statuses/leases are not reset.
+    await db.inboundEvent.updateMany({ where: { id: { in: events }, status: 'WAITING_FOR_ORDER' }, data: { retryAfter: new Date(0) } });
+    for (const id of events) { const done = await waitForEventStatus(id, 'SUCCEEDED'); assert.ok(done.attempts <= 2); }
+    const pairs = await db.entityPair.findMany({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    assert.equal(pairs.length, 1); assert.equal(pairs[0]!.moyskladParentId, nextOrder);
+    const targets = [...moyskladInvoices.values()].filter(row => row.externalCode === sourceId);
+    assert.equal(targets.length, 1); assert.equal(invoiceSum(targets[0]!), 2468);
+    const goods = targets[0]!.positions as InvoiceRecord[];
+    assert.equal(goods.length, 1); assert.equal(goods[0]!.quantity, 2); assert.equal(goods[0]!.price, 1234);
+    assert.equal(((targets[0]!.customerOrder as any).meta.href), `${base}api/remap/1.2/entity/customerorder/${nextOrder}`);
+  } finally {
+    await close();
+    await db.inboundEvent.deleteMany({ where: { id: { in: events } } });
+    await db.entityPair.deleteMany({ where: { OR: [{ entityType: 'INVOICE', bitrix24Id: sourceId }, { entityType: 'DEAL', bitrix24Id: nextDeal }, { id: productPair.id }] } });
+    for (const [id, row] of moyskladInvoices) if (row.externalCode === sourceId) moyskladInvoices.delete(id);
+    bitrixInvoices.delete(sourceId); invoiceRows.delete(sourceId); moyskladWrites = 0;
+    restoreEnv('ADMIN_PREVIEW', savedEnv.ADMIN_PREVIEW); restoreEnv('BITRIX24_EVENT_APPLICATION_TOKEN', savedEnv.BITRIX24_EVENT_APPLICATION_TOKEN);
+  }
+});
+
+test('dependency waits preserve earlier real failures, while 429/503 retain backoff and the eighth failure limit', async () => {
+  const sourceId = String(++invoiceCounter), nextDeal = `${Date.now()}94`;
+  deals.set(nextDeal, { ID: nextDeal, DATE_CREATE: createdAfterBoundary });
+  bitrixInvoices.set(sourceId, { id: sourceId, title: 'Wait with actual failures', parentId2: Number(nextDeal), createdTime: createdAfterBoundary });
+  const event = await createEvent(`wait-with-failures-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMADD', 'invoice', sourceId);
+  invoiceReadFaults.set(sourceId, { status: 429, remaining: 1, retryAfter: '12' });
+  assert.equal((await processor.process(event.id))?.status, 'RETRYABLE_FAILURE');
+  const rateLimited = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+  assert.equal(rateLimited.attempts, 1); assert.ok(rateLimited.retryAfter && rateLimited.retryAfter.getTime() > Date.now() + 10_000);
+  const reads = invoiceReadCounts.get(sourceId);
+  assert.equal(await processor.process(event.id), null); assert.equal(invoiceReadCounts.get(sourceId), reads);
+  for (let poll = 0; poll < 12; poll++) {
+    await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
+    assert.equal((await processor.process(event.id))?.status, 'WAITING_FOR_ORDER');
+    const waiting = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+    assert.equal(waiting.attempts, 1, 'normal waits neither spend nor erase real failures');
+    assert.ok(waiting.retryAfter && waiting.retryAfter.getTime() > Date.now() + 25_000);
+  }
+  invoiceReadFaults.set(sourceId, { status: 503, remaining: 10 });
+  for (let failure = 2; failure <= 8; failure++) {
+    await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
+    const result = await processor.process(event.id), saved = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
+    assert.equal(saved.attempts, failure);
+    assert.equal(result?.status, failure === 8 ? 'MANUAL_REVIEW' : 'RETRYABLE_FAILURE');
+    if (failure < 8) assert.ok(saved.retryAfter && saved.retryAfter.getTime() > Date.now());
+    else assert.equal(saved.lastErrorCategory, 'INVOICE_RETRY_LIMIT_EXCEEDED');
+  }
+  assert.equal(await processor.process(event.id), null, 'terminal failure is not retried');
+  invoiceReadFaults.delete(sourceId);
+});
+
 test('invoice processor creates one independently paired invoiceout, then update replay echoes without another write', async () => {
   const sourceId = String(++invoiceCounter);
   bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice Alpha', parentId2: Number(dealId), createdTime: createdAfterBoundary });
@@ -204,6 +294,100 @@ test('invoice processor creates one independently paired invoiceout, then update
   const replay = await createEvent(`replay-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
   assert.equal((await processor.process(replay.id))?.status, 'SUCCEEDED');
   assert.equal(moyskladWrites, 1, 'a duplicate/update event must not create or echo-write a second invoice');
+});
+
+test('invoice native fractional pre-discount price creates and updates the same invoice without double discount', async () => {
+  const sourceId=String(++invoiceCounter),productId=`57${Date.now()}`,targetId=randomUUID();
+  await db.entityPair.create({data:{entityType:'PRODUCT',bitrix24Id:productId,moyskladId:targetId,moyskladType:'product',source:'MANUAL'}});
+  bitrixInvoices.set(sourceId,{id:sourceId,title:'Invoice fractional discount',parentId2:Number(dealId),createdTime:createdAfterBoundary,opportunity:100,currencyId:'RUB'});
+  const row={id:343,ownerType:'SI',ownerId:Number(sourceId),productId:Number(productId),quantity:1,price:100,priceNetto:111.11111111,priceBrutto:111.11111111,discountTypeId:2,discountRate:10,discountSum:11.11111111,taxRate:0,taxIncluded:'N'};
+  invoiceRows.set(sourceId,[row]);
+  const event=await createEvent(`fraction-discount-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+  assert.equal((await processor.process(event.id))?.status,'SUCCEEDED');
+  const pair=await db.entityPair.findFirstOrThrow({where:{entityType:'INVOICE',bitrix24Id:sourceId}});
+  const target=moyskladInvoices.get(pair.moyskladId)!;
+  const position=(target.positions as InvoiceRecord[])[0]!;const positionId=position.id;
+  assert.equal(position.price,11111.111111);assert.equal(position.discount,10);assert.equal(invoiceSum(target),10000);
+  row.quantity=10;bitrixInvoices.get(sourceId)!.opportunity=1000;
+  const update=await createEvent(`fraction-discount-update-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+  assert.equal((await processor.process(update.id))?.status,'SUCCEEDED');
+  assert.equal((target.positions as InvoiceRecord[])[0]!.id,positionId);assert.equal(invoiceSum(target),100000);
+});
+
+test('invoice goods create/update/add/recovery keep native row IDs and stop unsafe total, deletion, or target conflicts', async () => {
+  const sourceId = String(++invoiceCounter);
+  const productId = `55${Date.now()}`;
+  const targetId = 'd813b5d2-5939-11ee-0a80-1143000e2d5c';
+  const secondProductId = `56${Date.now()}`;
+  await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: productId, moyskladId: targetId, moyskladType: 'product', source: 'MANUAL' } });
+  bitrixInvoices.set(sourceId, { id: sourceId, title: 'Invoice own goods', parentId2: Number(dealId), createdTime: createdAfterBoundary, opportunity: 342, currencyId: 'RUB' });
+  invoiceRows.set(sourceId, [{ id: 321, ownerType: 'SI', ownerId: Number(sourceId), productId: Number(productId), quantity: 2, price: 171,
+    priceNetto: 140.16393443, priceBrutto: 171, taxRate: 22, taxIncluded: 'Y', discountTypeId: 2, discountRate: 0, discountSum: 0 }]);
+  try {
+    const event = await createEvent(`own-goods-${sourceId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', sourceId);
+    assert.equal((await processor.process(event.id))?.status, 'SUCCEEDED');
+    const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } });
+    const target = moyskladInvoices.get(pair.moyskladId)!;
+    assert.deepEqual((target.positions as InvoiceRecord[]).map(({id,...value})=>value), [{ quantity: 2, price: 17100, discount: 0, vat: 22, assortment: { meta: {
+      href: `${base}api/remap/1.2/entity/product/${targetId}`, type: 'product', mediaType: 'application/json' } } }]);
+    assert.equal(target.vatIncluded, true);
+    assert.equal((target.organization as any).meta.type, 'organization');
+    assert.equal((target.agent as any).meta.type, 'counterparty');
+    const originalRowId=(target.positions as InvoiceRecord[])[0]!.id;
+    const sourceRow=invoiceRows.get(sourceId)![0]!;
+    Object.assign(sourceRow,{quantity:3,price:150,priceBrutto:150,priceNetto:122.95081967});
+    bitrixInvoices.get(sourceId)!.opportunity=450;
+    let writes=moyskladWrites;
+    const update=await createEvent(`goods-update-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(update.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes+1);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.price,15000);
+    assert.equal(invoiceSum(target),45000);
+    const secondTargetId=randomUUID();
+    await db.entityPair.create({data:{entityType:'PRODUCT',bitrix24Id:secondProductId,moyskladId:secondTargetId,moyskladType:'product',source:'MANUAL'}});
+    invoiceRows.get(sourceId)!.push({...sourceRow,id:322,productId:Number(secondProductId),quantity:1,price:80,priceBrutto:80,priceNetto:65.57377049});
+    bitrixInvoices.get(sourceId)!.opportunity=530;
+    const add=await createEvent(`goods-add-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(add.id))?.status,'SUCCEEDED');
+    assert.equal((target.positions as InvoiceRecord[]).length,2);
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    writes=moyskladWrites;
+    const repeat=await createEvent(`goods-repeat-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(repeat.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes);
+    Object.assign(sourceRow,{quantity:4});bitrixInvoices.get(sourceId)!.opportunity=680;
+    failPositionReadAfterWrite=true;
+    const recover=await createEvent(`goods-readback-retry-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(recover.id))?.status,'RETRYABLE_FAILURE');
+    writes=moyskladWrites;
+    await db.inboundEvent.update({where:{id:recover.id},data:{retryAfter:new Date(Date.now()-1)}});
+    assert.equal((await processor.process(recover.id))?.status,'SUCCEEDED');
+    assert.equal(moyskladWrites,writes,'provider success before failed readback must not issue a duplicate row write');
+    assert.equal((target.positions as InvoiceRecord[])[0]!.id,originalRowId);
+    const secondRow=invoiceRows.get(sourceId)!.pop()!;bitrixInvoices.get(sourceId)!.opportunity=600;
+    const removed=await createEvent(`goods-removed-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(removed.id))?.status,'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({where:{id:removed.id}})).lastErrorCategory,'INVOICE_GOODS_SOURCE_ROW_REMOVED');
+    assert.equal((target.positions as InvoiceRecord[]).length,2);
+    assert.equal(moyskladWrites,writes);
+    invoiceRows.get(sourceId)!.push(secondRow);bitrixInvoices.get(sourceId)!.opportunity=680;
+    (target.positions as InvoiceRecord[])[0]!.price=15100;
+    const conflict=await createEvent(`goods-ms-change-${sourceId}`,'BITRIX24','ONCRMDYNAMICITEMUPDATE','invoice',sourceId);
+    assert.equal((await processor.process(conflict.id))?.status,'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({where:{id:conflict.id}})).lastErrorCategory,'INVOICE_GOODS_TARGET_CHANGED');
+    assert.equal(moyskladWrites,writes);
+    const mismatchedId = String(++invoiceCounter);
+    bitrixInvoices.set(mismatchedId, { ...bitrixInvoices.get(sourceId), id: mismatchedId, opportunity: 999 });
+    invoiceRows.set(mismatchedId, invoiceRows.get(sourceId)!.map((row) => ({ ...row, ownerId: Number(mismatchedId) })));
+    const beforeWrites = moyskladWrites;
+    const bad = await createEvent(`wrong-total-${mismatchedId}`, 'BITRIX24', 'ONCRMDYNAMICITEMUPDATE', 'invoice', mismatchedId);
+    assert.equal((await processor.process(bad.id))?.status, 'MANUAL_REVIEW');
+    assert.equal((await db.inboundEvent.findUniqueOrThrow({ where: { id: bad.id } })).lastErrorCategory, 'INVOICE_SOURCE_TOTAL_MISMATCH');
+    assert.equal(moyskladWrites, beforeWrites);
+  } finally {
+    await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', bitrix24Id: {in:[productId,secondProductId]} } });
+  }
 });
 
 test('controlled invoice processor admits a synthetic source, creates and binds its target, then resumes an exact BOTH echo', async () => {
@@ -255,14 +439,21 @@ test('controlled invoice processor admits a synthetic source, creates and binds 
     assert.equal((await db.controlledTestAdmission.findUnique({ where: { eventId: created.id } }))?.targetNativeId, pair.moyskladId);
 
     target.description = 'synthetic echo value';
+    // A real reverse callback is enabled only after the newly verified target is
+    // explicitly pinned in the immutable manifest used by the resumed instance.
+    (runManifest.records[0] as { targetNativeId: string | null }).targetNativeId = pair.moyskladId;
+    await writeFile(manifestPath, JSON.stringify(runManifest), 'utf8');
+    const echoAdmission = new ControlledLiveTestAdmissionService(db);
+    const echoProcessor = new InvoiceEventProcessor(db, new InvoiceHttpApi(), settingsAdapter as never, new SyncModeService(db),
+      { launchBoundary: async () => launchBoundary, assertReady: async () => true } as never, new EventWorkerLeaseService(db), new ClientLifecycleService(db), echoAdmission);
     const echoed = await createEvent(`controlled-echo-${sourceId}`, 'MOYSKLAD', 'UPDATE', 'invoiceout', pair.moyskladId);
     echoEventId = echoed.id;
-    await admission.withCurrentSourceRead(echoed.id, 'MOYSKLAD', pair.moyskladId, 'invoice', async () => {
+    await echoAdmission.withCurrentSourceRead(echoed.id, 'MOYSKLAD', pair.moyskladId, 'invoice', async () => {
       const current = await new InvoiceHttpApi().readMoysklad(pair.moyskladId);
-      await admission.admit(echoed.id, { entity: 'invoice', sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId,
+      await echoAdmission.admit(echoed.id, { entity: 'invoice', sourceSystem: 'MOYSKLAD', sourceNativeId: pair.moyskladId,
         currentNativeId: String(current.id), currentName: String(current.name), sourceCreatedAt: new Date(String(current.created)) });
     });
-    await controlledProcessor.process(echoed.id);
+    await echoProcessor.process(echoed.id);
     const echoState = await db.inboundEvent.findUniqueOrThrow({ where: { id: echoed.id } });
     assert.equal(echoState.status, 'SUCCEEDED', JSON.stringify(echoState));
     assert.equal(bitrixInvoices.get(sourceId)?.description, 'synthetic echo value');
@@ -293,10 +484,13 @@ test('invoice worker durably defers before the deal/order pair exists, then auto
   const waiting = await db.inboundEvent.findUniqueOrThrow({ where: { id: event.id } });
   assert.equal(waiting.status, 'WAITING_FOR_ORDER');
   assert.equal(waiting.lastErrorCategory, 'INVOICE_LINKED_ORDER_PAIR_PENDING');
+  assert.equal(waiting.attempts, 0);
+  assert.ok(waiting.retryAfter && waiting.retryAfter.getTime() > Date.now());
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId } }), 0);
   const writesBeforeOrderPair = moyskladWrites;
   assert.equal(writesBeforeOrderPair, writesBeforeInvoiceEvent, 'the waiting invoice must not create an invoiceout or bypass the order-pair gate');
   await db.entityPair.create({ data: { id: `invoice55-${suffix}-deal-${nextDeal}`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
+  await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
   startRecoveryScanner();
   await waitForEventStatus(event.id, 'SUCCEEDED');
   assert.equal(await db.entityPair.count({ where: { entityType: 'INVOICE', bitrix24Id: sourceId, moyskladParentId: nextOrder } }), 1);
@@ -323,6 +517,7 @@ test('MySklad invoiceout durably waits for a new customer order pair and automat
 
   deals.set(nextDeal, { ID: nextDeal, DATE_CREATE: createdAfterBoundary });
   await db.entityPair.create({ data: { id: `invoice55-${suffix}-ms-deal-${nextOrder}`, entityType: 'DEAL', bitrix24Id: nextDeal, moyskladId: nextOrder, moyskladType: 'customerorder', source: 'MANUAL' } });
+  await db.inboundEvent.update({ where: { id: event.id }, data: { retryAfter: new Date(0) } });
   startRecoveryScanner();
   await waitForEventStatus(event.id, 'SUCCEEDED');
   const pair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'INVOICE', moyskladId: sourceId } });
@@ -759,14 +954,25 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const method = url.pathname.split('/').at(-1);
     if (method === 'crm.item.get.json') {
       const id = form.get('id') ?? '';
+      invoiceReadCounts.set(id, (invoiceReadCounts.get(id) ?? 0) + 1);
+      const fault = invoiceReadFaults.get(id);
+      if (fault && fault.remaining > 0) {
+        fault.remaining--;
+        if (fault.retryAfter) response.setHeader('retry-after', fault.retryAfter);
+        return send(response, { error: 'SYNTHETIC_PROVIDER_FAILURE' }, fault.status);
+      }
       const item = bitrixInvoices.get(id);
-      return send(response, item ? { result: { item: { id, ...item } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, item ? 200 : 400);
+      return send(response, item ? { result: { item: { id, opportunity: 0, currencyId: 'RUB', ...item } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, item ? 200 : 400);
+    }
+    if (method === 'crm.item.productrow.list.json') {
+      assert.equal(form.get('filter[=ownerType]'), 'SI');
+      return send(response, { result: { productRows: invoiceRows.get(form.get('filter[=ownerId]') ?? '') ?? [] } });
     }
     if (method === 'crm.item.fields.json') return send(response, { result: { fields: { title: { type: 'string', title: 'Title', isReadOnly: false }, code: { type: 'string', title: 'Code', isReadOnly: false } } } });
     if (method === 'crm.deal.get.json') {
       const id = form.get('id') ?? '';
       const deal = deals.get(id);
-      return send(response, deal ? { result: { deal } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, deal ? 200 : 400);
+      return send(response, deal ? { result: { deal: { CURRENCY_ID: 'RUB', ...deal } } } : { error: 'NOT_FOUND', error_description: 'Element not found' }, deal ? 200 : 400);
     }
     if (method === 'crm.item.add.json') {
       const id = String(++invoiceCounter);
@@ -808,14 +1014,37 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       moyskladWrites++;
       const body = JSON.parse(raw) as InvoiceRecord;
       const id = randomUUID();
-      const invoice = { ...body, id, created: createdAfterBoundary, meta: { type: 'invoiceout' } };
+      const positions = Array.isArray(body.positions) ? body.positions.map((row:any)=>({...row,id:randomUUID()})) : [];
+      const invoice = { ...body, positions, id, created: createdAfterBoundary, meta: { type: 'invoiceout' } };
       moyskladInvoices.set(id, invoice);
       return send(response, { id, meta: { type: 'invoiceout' } });
     }
     const invoiceId = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/invoiceout\/([0-9a-f-]{36})$/i)?.[1];
     if (invoiceId && request.method === 'GET') {
       const invoice = moyskladInvoices.get(invoiceId);
-      return send(response, invoice ?? { errors: [{ error: 'not found' }] }, invoice ? 200 : 404);
+      return send(response, invoice ? {...invoice,sum:invoiceSum(invoice)} : { errors: [{ error: 'not found' }] }, invoice ? 200 : 404);
+    }
+    const positionPath = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/invoiceout\/([0-9a-f-]{36})\/positions(?:\/([0-9a-f-]{36}))?$/i);
+    if(positionPath) {
+      const invoice = moyskladInvoices.get(positionPath[1]!);
+      if(!invoice) return send(response,{},404);
+      const rows=Array.isArray(invoice.positions)?invoice.positions as InvoiceRecord[]:[];
+      if(request.method==='GET') {
+        if(failNextPositionRead) {failNextPositionRead=false;return send(response,{errors:[{code:1000}]},503);}
+        return send(response,{meta:{size:rows.length},rows});
+      }
+      if(request.method==='POST') {
+        moyskladWrites++;
+        const row={...JSON.parse(raw),id:randomUUID()};rows.push(row);invoice.positions=rows;
+        return send(response,[row]);
+      }
+      if(request.method==='PUT') {
+        const row=rows.find(r=>r.id===positionPath[2]);
+        if(!row) return send(response,{},404);
+        moyskladWrites++;Object.assign(row,JSON.parse(raw));
+        if(failPositionReadAfterWrite) {failPositionReadAfterWrite=false;failNextPositionRead=true;}
+        return send(response,row);
+      }
     }
     if (invoiceId && request.method === 'PUT') {
       if (failNextMoyskladUpdate) { failNextMoyskladUpdate = false; return send(response, { errors: [{ error: 'temporary' }] }, 503); }
@@ -829,7 +1058,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       return send(response, invoice ?? {}, invoice ? 200 : 404);
     }
     const order = url.pathname.match(/^\/api\/remap\/1\.2\/entity\/customerorder\/([0-9a-f-]{36})$/i)?.[1];
-    if (order && request.method === 'GET') return send(response, orders.get(order) ?? { id: order, meta: { type: 'customerorder' }, created: createdAfterBoundary });
+    if (order && request.method === 'GET') return send(response, {
+      organization: { meta: { href: `${base}api/remap/1.2/entity/organization/02ada5df-d515-11e2-3c12-7054d21a8d1e`, type: 'organization' } },
+      agent: { meta: { href: `${base}api/remap/1.2/entity/counterparty/b0b309ee-13e3-11e9-9109-f8fc0001f188`, type: 'counterparty' } },
+      ...(orders.get(order) ?? { id: order, meta: { type: 'customerorder' }, created: createdAfterBoundary }),
+    });
   }
   return send(response, { error: 'NOT_FOUND', path: url.pathname }, 404);
 }
@@ -837,6 +1070,11 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
 function send(response: ServerResponse, value: unknown, status = 200) {
   response.writeHead(status, { 'content-type': 'application/json' });
   response.end(JSON.stringify(value));
+}
+
+function invoiceSum(invoice:InvoiceRecord):number {
+  const rows=Array.isArray(invoice.positions)?invoice.positions as InvoiceRecord[]:[];
+  return rows.reduce((sum,row)=>sum+Math.round(Number(row.price)*Number(row.quantity)*(1-Number(row.discount??0)/100)*(invoice.vatEnabled===true&&invoice.vatIncluded!==true?1+Number(row.vat??0)/100:1)),0);
 }
 
 function restoreEnv(name: string, value: string | undefined) {

@@ -39,6 +39,8 @@ const fakeDatabase = {
   },
   syncSetting: { upsert: async () => ({ serviceMode: 'on' }) },
   syncDirectionSetting: { findUnique: async () => ({ bitrix24ToMoysklad: true, moyskladToBitrix24: true }) },
+  controlledTestSourceBinding: { findMany: async () => [] },
+  controlledTestAdmission: { findUnique: async () => null },
   $queryRaw: async () => [{ serviceMode: 'on' }],
   $transaction: async <T>(operation: (transaction: unknown) => Promise<T>) => operation(fakeDatabase),
 };
@@ -89,7 +91,7 @@ before(async () => {
       {
         entity: 'deal-order', direction: 'BOTH', name: 'тест LIVE-TEST-20261020T120000Z-a1b2c3 incomplete pair', syntheticOnly: true,
         sourceSystem: 'BITRIX24', sourceNativeId: 'b24-deal-no-target', targetSystem: 'MOYSKLAD', targetNativeId: null,
-        createdAfterUtc: '2026-10-20T12:00:00Z', allowedActions: ['UPDATE'],
+        createdAfterUtc: '2026-10-20T12:00:00Z', allowedActions: ['CREATE'],
       },
       {
         entity: 'deal-order', direction: 'BITRIX24_TO_MOYSKLAD', name: 'тест LIVE-TEST-20261020T120000Z-a1b2c3 one-way deal', syntheticOnly: true,

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { AsyncResource } from 'node:async_hooks';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 import { withServiceModeOn } from './service-mode-transaction';
@@ -9,6 +10,9 @@ const EVENT_WORKER_LEASE_MS = 60_000;
 const EVENT_WORKER_RENEW_MS = 15_000;
 
 type Lease = { slot: number; ownerToken: string };
+type PendingWorker = { eventId: string; execute: () => Promise<void>; cancel: () => void };
+const MAX_PENDING_PER_LANE = 100;
+const BUSY_RETRY_MS = 250;
 export interface EventWorkerLeaseContext {
   assertOwned(): Promise<void>;
   assertOwnedIn?(transaction: Pick<Prisma.TransactionClient, 'eventWorkerLease' | 'inboundEntityLock'>): Promise<void>;
@@ -16,12 +20,86 @@ export interface EventWorkerLeaseContext {
 
 /** A PostgreSQL-backed global semaphore shared by all event processors/instances. */
 @Injectable()
-export class EventWorkerLeaseService {
+export class EventWorkerLeaseService implements OnModuleDestroy {
+  private readonly waiting = new Map<string, PendingWorker[]>();
+  private readonly scheduled = new Map<string, Promise<unknown>>();
+  private readonly lanes: string[] = [];
+  private running = 0;
+  private stopped = false;
+  private retryTimer?: NodeJS.Timeout;
   constructor(private readonly database: DatabaseService) {}
 
-  async run<T>(eventId: string, work: (lease: EventWorkerLeaseContext) => Promise<T>): Promise<T | null> {
-    const lease = await this.acquire(eventId);
-    if (!lease) return null;
+  run<T>(eventId: string, work: (lease: EventWorkerLeaseContext) => Promise<T>, lane = 'events'): Promise<T | null> {
+    if (this.stopped) return Promise.resolve(null);
+    const existing = this.scheduled.get(eventId);
+    if (existing) return existing as Promise<T | null>;
+    let queue = this.waiting.get(lane);
+    if ((queue?.length ?? 0) >= MAX_PENDING_PER_LANE) return Promise.resolve(null);
+    if (!queue) { queue = []; this.waiting.set(lane, queue); this.lanes.push(lane); }
+    let settle!: (value: T | null) => void;
+    let reject!: (reason: unknown) => void;
+    const result = new Promise<T | null>((resolve, fail) => { settle = resolve; reject = fail; });
+    this.scheduled.set(eventId, result);
+    queue.push({ eventId, cancel: () => settle(null), execute: AsyncResource.bind(async () => {
+      try {
+        // The local queue is only fair admission; PostgreSQL remains the global
+        // four-slot authority. Do not consume a worker while polling another instance.
+        const acquired = await this.acquire(eventId);
+        if (this.stopped) {
+          if (acquired.enabled && acquired.lease) await this.release(acquired.lease);
+          settle(null); return;
+        }
+        if (!acquired.enabled) { settle(null); this.cancelWaiting(); return; }
+        if (!acquired.lease) {
+          if (this.stopped) settle(null);
+          else {
+            let retryQueue = this.waiting.get(lane);
+            if (!retryQueue) { retryQueue = []; this.waiting.set(lane, retryQueue); this.lanes.push(lane); }
+            retryQueue.push(entry);
+            this.scheduleRetry();
+          }
+          return;
+        }
+        settle(await this.execute(acquired.lease, work));
+      } catch (error) { reject(error); }
+    }) });
+    const entry = queue[queue.length - 1]!;
+    void result.finally(() => this.scheduled.delete(eventId)).catch(() => undefined);
+    this.pump();
+    return result;
+  }
+
+  onModuleDestroy() {
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.cancelWaiting();
+  }
+
+  private cancelWaiting() {
+    for (const queue of this.waiting.values()) for (const entry of queue) entry.cancel();
+    this.waiting.clear(); this.lanes.length = 0;
+  }
+
+  private scheduleRetry() {
+    if (this.retryTimer || this.stopped) return;
+    this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.pump(); }, BUSY_RETRY_MS);
+    this.retryTimer.unref();
+  }
+
+  private pump() {
+    if (this.stopped || this.retryTimer) return;
+    while (this.running < MAX_CONCURRENT_EVENT_WORKERS && this.lanes.length) {
+      const lane = this.lanes.shift()!;
+      const queue = this.waiting.get(lane)!;
+      const entry = queue.shift()!;
+      if (queue.length) this.lanes.push(lane);
+      else this.waiting.delete(lane);
+      this.running++;
+      void entry.execute().finally(() => { this.running--; this.pump(); });
+    }
+  }
+
+  private async execute<T>(lease: Lease, work: (lease: EventWorkerLeaseContext) => Promise<T>): Promise<T> {
     let lost = false;
     const renewal = setInterval(() => {
       void this.renew(lease).then((renewed) => { if (!renewed) lost = true; }).catch(() => { lost = true; });
@@ -53,7 +131,7 @@ export class EventWorkerLeaseService {
     }
   }
 
-  private async acquire(eventId: string): Promise<Lease | null> {
+  private async acquire(eventId: string): Promise<{ enabled: false } | { enabled: true; lease: Lease | null }> {
     const now = new Date();
     const ownerToken = randomUUID();
     // Serialize new persistent semaphore leases with ON→OFF; never hold this lock
@@ -73,7 +151,7 @@ export class EventWorkerLeaseService {
       }
       return null;
     });
-    return result.enabled ? result.value : null;
+    return result.enabled ? { enabled: true, lease: result.value } : { enabled: false };
   }
 
   private async renew(lease: Lease): Promise<boolean> {

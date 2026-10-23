@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
+import { withNightlySettingLock } from '../nightly-setting-lock';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, NamedReferenceKind, NamedReferencePair, VersionedFieldSettingsDto } from './field-settings.dto';
@@ -9,6 +10,7 @@ import { EntityPairService, EntityType } from '../pairs/entity-pair.service';
 import { validateChildResourceBindings } from '../clients/client-child-resource-sync';
 import { applyFieldTransform, FieldTransform } from './field-transform';
 import { confirmedDealStageReference } from './deal-stage-catalog-key';
+import { sameClientFieldEntity, canonicalClientFieldEntity } from './client-field-entity';
 
 type JsonRecord = Record<string, unknown>;
 type FieldSettingsConfig = FieldSettingsConfigDto;
@@ -20,6 +22,8 @@ export class EventIntakeDisabledError extends Error {
 
 @Injectable()
 export class FieldSettingsService {
+  private acceptanceInitialization: Promise<void> | null = null;
+
   constructor(
     private readonly database: DatabaseService,
     private readonly readOnlyData: ReadOnlyFieldDataProvider,
@@ -27,7 +31,7 @@ export class FieldSettingsService {
   ) {}
 
   async active() {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT version."version", version."config", version."createdAt"
       FROM "FieldSettingsState" AS state
@@ -40,7 +44,7 @@ export class FieldSettingsService {
 
   async version(version: number) {
     if (!Number.isInteger(version) || version < 1) throw new BadRequestException('version must be a positive integer');
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT "version", "config", "createdAt" FROM "FieldSettingsVersion" WHERE "version" = ${version}
     `;
@@ -50,7 +54,7 @@ export class FieldSettingsService {
 
   async save(value: unknown, bitrixAccessToken: string) {
     const config = validateConfiguration(value);
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     await this.validateConfiguredFields(config, bitrixAccessToken);
     const active = await this.active();
     const riskChanges = fieldRuleRiskChanges(active.config, config);
@@ -90,7 +94,11 @@ export class FieldSettingsService {
     if (catalogs.priceTypes.bitrix24.some((priceType) => !configuredPriceSources.has(priceType.id))) throw new BadRequestException('Every current Bitrix24 price type must remain visible in the mapping table');
     const liveUnitIds = new Set(catalogs.units.moysklad.map((unit) => unit.id));
     const livePriceTypeIds = new Set(catalogs.priceTypes.moysklad.map((priceType) => priceType.id));
-    for (const unit of config.references.units) if (unit.moyskladId && !liveUnitIds.has(unit.moyskladId)) throw new BadRequestException(`MySklad unit ${unit.moyskladId} no longer exists`);
+    for (const unit of config.references.units) {
+      for (const id of [unit.moyskladId, ...(unit.reverseMoyskladIds ?? [])]) {
+        if (id && !liveUnitIds.has(id)) throw new BadRequestException(`MySklad unit ${id} no longer exists`);
+      }
+    }
     for (const priceType of config.references.priceTypes) if (priceType.moyskladId && !livePriceTypeIds.has(priceType.moyskladId)) throw new BadRequestException(`MySklad price type ${priceType.moyskladId} no longer exists`);
     for (const pair of config.references.namedPairs ?? []) {
       const sourceIds = new Set(namedCatalogs[pair.kind].bitrix24.map((item) => item.id));
@@ -98,6 +106,16 @@ export class FieldSettingsService {
       if (!sourceIds.has(pair.bitrix24Id)) throw new BadRequestException(`Bitrix24 reference ${pair.bitrix24Id} no longer exists in ${pair.kind}`);
       if (pair.moyskladId && !targetIds.has(pair.moyskladId)) throw new BadRequestException(`MySklad reference ${pair.moyskladId} no longer exists in ${pair.kind}`);
       if (pair.status === 'confirmed' && !pair.moyskladId) throw new BadRequestException(`Reference ${pair.bitrix24Id} in ${pair.kind} must have a target before it is confirmed`);
+    }
+    const transitions = config.dealOrderRuntime?.stageTransitions;
+    if (transitions) {
+      const sources = new Set(namedCatalogs.dealStages.bitrix24.map(item => item.id));
+      const targets = new Set(namedCatalogs.dealStages.moysklad.map(item => item.id));
+      for (const pair of [...transitions.bitrix24ToMoysklad, ...transitions.moyskladToBitrix24]) {
+        const custom = /^C([1-9]\d*):/.exec(pair.bitrix24StageId);
+        const catalogKey = custom ? `${custom[1]}:${pair.bitrix24StageId}` : `0:${pair.bitrix24StageId}`;
+        if (!sources.has(catalogKey) || !targets.has(pair.moyskladId)) throw new BadRequestException('Stage transition references must exist in the current provider catalogs');
+      }
     }
     }
     const version = await this.database.$transaction(async (transaction) => {
@@ -201,6 +219,18 @@ export class FieldSettingsService {
   }
 
   private async validateConfiguredFields(config: FieldSettingsConfig, bitrixAccessToken: string) {
+    const destinations = new Map<string, string>();
+    const reserve = (entity: string, direction: string, field: string) => {
+      const key = `${canonicalClientFieldEntity(entity)}|${direction}|${field}`;
+      const prior = destinations.get(key);
+      if (prior && prior !== entity) throw new BadRequestException('Contact mapping aliases cannot write the same target field');
+      destinations.set(key, entity);
+    };
+    for (const rule of config.rules) {
+      if (rule.bitrix24ToMoysklad.enabled) reserve(rule.entity, 'BITRIX24_TO_MOYSKLAD', rule.targetField);
+      if (rule.moyskladToBitrix24.enabled) reserve(rule.entity, 'MOYSKLAD_TO_BITRIX24', rule.sourceField);
+    }
+    for (const group of config.groups) reserve(group.entity, group.direction, group.targetField);
     const ruleEntities = [...config.rules, ...config.groups].map((entry) => {
       if (!isRecord(entry) || !isString(entry.entity)) throw new BadRequestException('Every mapping must use a supported entity');
       return entry.entity;
@@ -276,7 +306,7 @@ export class FieldSettingsService {
   }
 
   async pinEvent(eventId: string) {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     return this.database.$transaction(async (transaction) => {
       const state = await transaction.$queryRaw<Array<{ version: number }>>`
         SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR SHARE
@@ -305,7 +335,21 @@ export class FieldSettingsService {
     requireServiceNotOff?: boolean;
     nightlyLeaseToken?: string;
   }) {
-    await this.ensureInitialized();
+    // Initial backfill scans historical events. Do it once per process, not
+    // once for every webhook/nightly row; each accepted row is pinned below.
+    await this.ensureInitializedOnce();
+    // A nightly page can enqueue dozens of events. Renew the lease in its own
+    // short statement, rather than holding SyncSetting's write lock for the
+    // lifetime of each event/settings-pin transaction. The transaction still
+    // checks the token and expiry under FOR SHARE before it accepts an event.
+    if (input.nightlyLeaseToken) {
+      const renewed = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
+        UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
+        WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken}
+          AND "serviceMode" = 'on' AND "nightlyLeaseExpiresAt" > (clock_timestamp() AT TIME ZONE 'UTC')
+      `);
+      if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
+    }
     return this.database.$transaction(async (transaction) => {
       if (input.requireServiceNotOff) {
         const mode = await transaction.$queryRaw<Array<{ serviceMode: string; nightlyLeaseToken: string | null; nightlyLeaseExpiresAt: Date | null }>>`
@@ -313,15 +357,9 @@ export class FieldSettingsService {
         `;
         if (!mode[0] || mode[0].serviceMode === 'off') throw new EventIntakeDisabledError();
         if (input.nightlyLeaseToken && mode[0].serviceMode !== 'on') throw new EventIntakeDisabledError();
-        if (input.nightlyLeaseToken && mode[0].nightlyLeaseToken !== input.nightlyLeaseToken) {
+        if (input.nightlyLeaseToken && (mode[0].nightlyLeaseToken !== input.nightlyLeaseToken ||
+            !mode[0].nightlyLeaseExpiresAt || mode[0].nightlyLeaseExpiresAt.getTime() <= Date.now())) {
           throw new Error('Nightly run lease was lost before durable enqueue');
-        }
-        if (input.nightlyLeaseToken) {
-          const renewed = await transaction.$executeRaw`
-            UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds'
-            WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken} AND "nightlyLeaseExpiresAt" > NOW()
-          `;
-          if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
         }
       }
       const event = await transaction.inboundEvent.upsert({
@@ -352,7 +390,7 @@ export class FieldSettingsService {
   }
 
   async eventConfig(eventId: string): Promise<VersionedFieldSettingsDto> {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT version."version", version."config", version."createdAt"
       FROM "InboundEventSettings" AS pin
@@ -375,7 +413,7 @@ export class FieldSettingsService {
     const rules = Array.isArray(config.rules) ? config.rules : [];
     const sourceFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'sourceField' : 'targetField';
     const targetFieldKey = direction === 'BITRIX24_TO_MOYSKLAD' ? 'targetField' : 'sourceField';
-    const rule = rules.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate[targetFieldKey] === targetField);
+    const rule = rules.find((candidate) => isRecord(candidate) && sameClientFieldEntity(candidate.entity, entity) && candidate[targetFieldKey] === targetField);
     if (isRecord(rule)) {
       const mapping = rule[ruleDirection];
       if (isRecord(mapping) && mapping.enabled === true && isRecord(mapping.transform)) {
@@ -385,7 +423,7 @@ export class FieldSettingsService {
       }
     }
     const groups = Array.isArray(config.groups) ? config.groups : [];
-    const group = groups.find((candidate) => isRecord(candidate) && candidate.entity === entity && candidate.direction === direction && candidate.targetField === targetField);
+    const group = groups.find((candidate) => isRecord(candidate) && sameClientFieldEntity(candidate.entity, entity) && candidate.direction === direction && candidate.targetField === targetField);
     if (isRecord(group)) {
       if (!Array.isArray(group.sourceFields) || !isRecord(group.transform) || typeof group.transform.separator !== 'string') {
         return { status: 'error' as const, reason: 'transform is not supported', transform: 'unsupported' };
@@ -436,7 +474,7 @@ export class FieldSettingsService {
       await this.ensureInitialized(transaction);
       return this.repinEventInTransaction(transaction, eventId);
     }
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     return this.database.$transaction((tx) => this.repinEventInTransaction(tx, eventId), { isolationLevel: 'Serializable' });
   }
 
@@ -464,6 +502,16 @@ export class FieldSettingsService {
         WHERE "id" = ${eventId}
       `;
     return activeVersion;
+  }
+
+  private ensureInitializedOnce(): Promise<void> {
+    if (!this.acceptanceInitialization) {
+      this.acceptanceInitialization = this.ensureInitialized().catch((error) => {
+        this.acceptanceInitialization = null;
+        throw error;
+      });
+    }
+    return this.acceptanceInitialization;
   }
 
   private async ensureInitialized(transaction?: Prisma.TransactionClient) {
@@ -663,6 +711,14 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
   if (!isRecord(value) || typeof value.nativeOrderNumberingVerified !== 'boolean' || !Array.isArray(value.currencies) || !Array.isArray(value.stages) || !Array.isArray(value.organizations) || !Array.isArray(value.stores) || !Array.isArray(value.employees)) {
     throw new BadRequestException('dealOrderRuntime must include confirmed currency, stage, organization, store, and employee mappings');
   }
+  const unmappedReferencePolicy = value.unmappedReferencePolicy;
+  const unmappedStagePolicy = value.unmappedStagePolicy;
+  if (unmappedStagePolicy !== undefined && unmappedStagePolicy !== 'hold' && unmappedStagePolicy !== 'preserve-and-warn') {
+    throw new BadRequestException('unmappedStagePolicy must be hold or preserve-and-warn');
+  }
+  if (unmappedReferencePolicy !== undefined && unmappedReferencePolicy !== 'hold' && unmappedReferencePolicy !== 'confirmed-defaults') {
+    throw new BadRequestException('unmappedReferencePolicy must be hold or confirmed-defaults');
+  }
   const id = (candidate: unknown) => isString(candidate) && isUuid(candidate);
   const productCatalogId = value.bitrix24ProductCatalogId === undefined || value.bitrix24ProductCatalogId === null || value.bitrix24ProductCatalogId === ''
     ? null
@@ -698,6 +754,25 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     if (!isRecord(item) || !isString(item.bitrix24StageId) || !item.bitrix24StageId.trim() || !id(item.moyskladId) || typeof item.creationEnabled !== 'boolean') throw new BadRequestException('Deal stage mapping is invalid');
     return { bitrix24StageId: item.bitrix24StageId.trim(), moyskladId: item.moyskladId as string, creationEnabled: item.creationEnabled };
   });
+  let stageTransitions: NonNullable<FieldSettingsConfigDto['dealOrderRuntime']>['stageTransitions'];
+  if (value.stageTransitions !== undefined) {
+    if (!isRecord(value.stageTransitions)) throw new BadRequestException('Stage transitions must contain both directional maps');
+    const parse = (rows: unknown, source: 'bitrix24StageId' | 'moyskladId') => {
+      if (!Array.isArray(rows)) throw new BadRequestException('Stage transitions must contain both directional maps');
+      const seen = new Set<string>();
+      return rows.map(row => {
+        if (!isRecord(row) || typeof row.bitrix24StageId !== 'string' || !/^(?:C[1-9]\d*:)?[A-Z0-9_]+$/.test(row.bitrix24StageId) || !id(row.moyskladId)) throw new BadRequestException('Stage transition is invalid');
+        const pair = { bitrix24StageId: row.bitrix24StageId, moyskladId: row.moyskladId as string };
+        if (seen.has(pair[source])) throw new BadRequestException('Stage transition source is duplicated in its direction');
+        seen.add(pair[source]);
+        return pair;
+      });
+    };
+    stageTransitions = {
+      bitrix24ToMoysklad: parse(value.stageTransitions.bitrix24ToMoysklad, 'bitrix24StageId'),
+      moyskladToBitrix24: parse(value.stageTransitions.moyskladToBitrix24, 'moyskladId'),
+    };
+  }
   const organizations = pairs(value.organizations, 'Organization');
   const stores = pairs(value.stores, 'Store');
   const employees = pairs(value.employees, 'Employee');
@@ -713,6 +788,14 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
   const confirmed = (kind: NamedReferenceKind, sourceId: string, targetId: string) => namedPairs.some((pair) => pair.kind === kind && pair.bitrix24Id === sourceId && pair.moyskladId === targetId && pair.status === 'confirmed');
   for (const item of currencies) if (!confirmed('currencies', item.bitrix24Code, item.moyskladId)) throw new BadRequestException(`Currency ${item.bitrix24Code} must be a confirmed named reference`);
   for (const item of stages) if (!confirmedDealStageReference(item.bitrix24StageId, item.moyskladId, namedPairs)) throw new BadRequestException(`Deal stage ${item.bitrix24StageId} must resolve to one confirmed named reference`);
+  if (unmappedReferencePolicy === 'confirmed-defaults') {
+    const preparationStages = stages.filter((item) =>
+      (item.bitrix24StageId === 'PREPARATION' || item.bitrix24StageId === '0:PREPARATION') &&
+      item.creationEnabled && confirmedDealStageReference(item.bitrix24StageId, item.moyskladId, namedPairs));
+    if (preparationStages.length !== 1) {
+      throw new BadRequestException('confirmed-defaults requires exactly one confirmed creation-enabled PREPARATION stage');
+    }
+  }
   for (const item of organizations) if (!confirmed('organizations', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Organization ${item.bitrix24Id} must be a confirmed named reference`);
   for (const item of stores) if (!confirmed('warehouses', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Store ${item.bitrix24Id} must be a confirmed warehouse named reference`);
   for (const item of employees) if (!confirmed('employees', item.bitrix24Id, item.moyskladId)) throw new BadRequestException(`Employee ${item.bitrix24Id} must be a confirmed named reference`);
@@ -721,7 +804,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), ...(unmappedStagePolicy === undefined ? {} : { unmappedStagePolicy }), ...(stageTransitions === undefined ? {} : { stageTransitions }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {
@@ -775,7 +858,7 @@ function validateDictionaries(value: unknown) {
   return dictionaries;
 }
 
-function validateUnits(value: unknown) {
+export function validateUnits(value: unknown) {
   if (!Array.isArray(value)) throw new BadRequestException('references.units must be an array');
   const seenSources = new Set<number>();
   const seenTargets = new Set<string>();
@@ -790,6 +873,14 @@ function validateUnits(value: unknown) {
     if (targetId && !isUuid(targetId)) throw new BadRequestException('The selected MySklad unit ID must be a UUID');
     if (targetId && seenTargets.has(targetId)) throw new BadRequestException('A MySklad unit can only be assigned once');
     if (targetId) seenTargets.add(targetId);
+    if (candidate.reverseMoyskladIds !== undefined) {
+      if (!targetId || !Array.isArray(candidate.reverseMoyskladIds)) throw new BadRequestException('Reverse units require a configured canonical unit and an array');
+      for (const id of candidate.reverseMoyskladIds) {
+        if (typeof id !== 'string' || !isUuid(id)) throw new BadRequestException('Each reverse MySklad unit must be a UUID');
+        if (seenTargets.has(id)) throw new BadRequestException('A MySklad unit can only be assigned once, including reverse units');
+        seenTargets.add(id);
+      }
+    }
     return { ...candidate, moyskladId: targetId, status: targetId ? 'configured' : 'unmapped' };
   });
   return units;
@@ -1001,7 +1092,7 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
   if (!isRecord(config)) return result;
   const ruleDirection = direction === 'BITRIX24_TO_MOYSKLAD' ? 'bitrix24ToMoysklad' : 'moyskladToBitrix24';
   for (const rule of Array.isArray(config.rules) ? config.rules : []) {
-    if (!isRecord(rule) || rule.entity !== entity || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
+    if (!isRecord(rule) || !sameClientFieldEntity(rule.entity, entity) || !isString(rule.sourceField) || !isString(rule.targetField)) continue;
     const mapping = rule[ruleDirection];
     if (!isRecord(mapping) || mapping.enabled !== true || !isRecord(mapping.transform)) continue;
     const sourceField = direction === 'BITRIX24_TO_MOYSKLAD' ? rule.sourceField : rule.targetField;
@@ -1011,7 +1102,7 @@ function applyFieldSettings(config: unknown, entity: string, source: JsonRecord,
     result[targetField] = { value: transformed.status === 'mapped' ? transformed.value : null, status: transformed.status, ...(transformed.status === 'error' ? { error: transformed.reason } : {}), ...(transformed.status === 'skip' ? { reason: transformed.reason } : {}), transform: transformed.transform };
   }
   for (const group of Array.isArray(config.groups) ? config.groups : []) {
-    if (!isRecord(group) || group.entity !== entity || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
+    if (!isRecord(group) || !sameClientFieldEntity(group.entity, entity) || group.direction !== direction || !isString(group.targetField) || !Array.isArray(group.sourceFields) || !isRecord(group.transform)) continue;
     const fields = group.sourceFields.filter(isString);
     if (typeof group.transform.separator !== 'string') {
       result[group.targetField] = { value: null, status: 'error', error: 'transform is not supported', transform: String(group.transform.kind) };

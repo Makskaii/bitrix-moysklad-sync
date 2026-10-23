@@ -268,6 +268,26 @@ model OperationalLog {
   @@index([category, occurredAt])
 }
 
+// Durable notifications are independent of successful document delivery.
+model DealTimelineNotice {
+  id              String   @id @default(cuid())
+  dedupKey        String   @unique
+  bitrix24DealId  String
+  kind            String
+  reason          String?
+  moyskladOrderId String?
+  status          String   @default("PENDING")
+  attempts        Int      @default(0)
+  retryAfter      DateTime @default(now())
+  leaseToken      String?
+  leaseUntil      DateTime?
+  commentId       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status, retryAfter])
+}
+
 model DryRunWriteProposal {
   id         String   @id
   eventId    String?

@@ -1,3 +1,5 @@
+import { parseClientMoyskladTimestamp } from '../clients/client-moysklad-date';
+
 export type InvoiceLinkResolution =
   | { status: 'linked'; orderId: string }
   | { status: 'missing' }
@@ -52,8 +54,7 @@ export function invoiceCreatedAt(value: unknown): Date | null {
   if (!isRecord(value)) return null;
   const raw = value.createdTime ?? value.created ?? value.CREATED_TIME ?? value.DATE_CREATE;
   if (typeof raw !== 'string' || !raw.trim()) return null;
-  const date = new Date(raw);
-  return Number.isNaN(date.getTime()) ? null : date;
+  return parseClientMoyskladTimestamp(raw);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

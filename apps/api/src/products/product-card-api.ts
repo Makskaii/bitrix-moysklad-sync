@@ -3,6 +3,7 @@ import { assertApplyExternalWrite } from '../external-write-guard';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProductCardApi, ProductCardManualReviewError, ProductCardSnapshot } from './product-card-sync.service';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const EXACT_NAME_CANDIDATE_LIMIT = 25;
@@ -23,6 +24,28 @@ export class ProductCardHttpApi implements ProductCardApi {
   private readonly bitrixCatalogVatIds = new Map<string, string | null>();
 
   constructor(private readonly dryWrites?: DryRunWriteJournal) {}
+
+  async readBitrix24CreateEchoCard(id: string, kind: 'product' | 'service'): Promise<Record<string, unknown>> {
+    if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
+    const result = asRecord(await this.bitrixCall(kind === 'service' ? 'catalog.product.service.get' : 'catalog.product.get', { id }));
+    const card = isRecord(result[kind]) ? result[kind] : result;
+    if (String(card.id ?? '') !== id) throw new ProductCardManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    if (Number(card.type) !== (kind === 'service' ? 7 : 1)) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
+    return card;
+  }
+
+  async findBitrix24CreateEchoIds(catalogId: string, xmlId: string, kind: 'product' | 'service'): Promise<string[]> {
+    if (!/^\d{1,20}$/.test(catalogId) || !/^MOYSKLAD_(PRODUCT|SERVICE)_[0-9a-f-]{36}$/i.test(xmlId)) throw new Error('PRODUCT_IMPORT_ECHO_IDENTITY_INVALID');
+    const result = asRecord(await this.bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', {
+      select: ['id', 'iblockId', 'xmlId', 'type'], filter: { iblockId: Number(catalogId), xmlId }, order: { id: 'ASC' }, start: 0,
+    }, true));
+    const rows = result[kind === 'service' ? 'services' : 'products'];
+    if (!Array.isArray(rows) || !Number.isInteger(result.total) || Number(result.total) < 0) throw new ProductCardManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_UNAVAILABLE');
+    if (Number(result.total) > 1) throw new ProductCardManualReviewError('PRODUCT_IMPORT_ECHO_AMBIGUOUS');
+    if (rows.length !== result.total || rows.some(row => !isRecord(row) || !scalarId(row.id) || !/^\d{1,20}$/.test(String(row.id)) ||
+      String(row.iblockId) !== catalogId || row.xmlId !== xmlId || Number(row.type) !== (kind === 'service' ? 7 : 1))) throw new ProductCardManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    return rows.map(row => String(row.id));
+  }
 
   async readBitrix24PriceProductId(priceId: string): Promise<string> {
     if (!/^\d{1,20}$/.test(priceId)) throw new Error('PRODUCT_PRICE_ID_INVALID');
@@ -154,17 +177,22 @@ export class ProductCardHttpApi implements ProductCardApi {
     if (product.id !== id || !isRecord(product.meta)) throw new Error('PRODUCT_CARD_READ_INVALID');
     if (product.meta.type !== kind) throw new ProductCardManualReviewError('PRODUCT_CARD_TYPE_UNSUPPORTED');
     const uom = isRecord(product.uom) && isRecord(product.uom.meta) ? idFromHref(product.uom.meta.href) : null;
+    // Coalesce repeated currency relations only within this snapshot. Twelve
+    // price types commonly refer to the same currency; no cross-event cache.
+    const currencies = new Map<string, Promise<string | null>>();
     const prices = Array.isArray(product.salePrices) ? await Promise.all(product.salePrices.filter(isRecord).map(async (price) => {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
       const typeId = idFromHref(typeMeta.href);
-      const value = finiteNumber(price.value);
+      // Remap salePrices.value is in minor units; catalog.price uses major units.
+      const nativeMinorValue = finiteNumber(price.value);
+      const value = nativeMinorValue === null || nativeMinorValue < 0 ? null : nativeMinorValue / 100;
       if (!typeId || value === null) throw new Error('PRODUCT_PRICE_READ_INVALID');
       const rawCurrency = isRecord(price.currency) ? price.currency : undefined;
       const currencyId = isRecord(rawCurrency?.meta) ? idFromHref(rawCurrency.meta.href) : null;
       let currencyCode = explicitIsoCode(rawCurrency);
       if (!currencyCode && currencyId) {
-        const currency = asRecord(await this.moyskladRequest(`entity/currency/${encodeURIComponent(currencyId)}`, 'GET'));
-        currencyCode = explicitIsoCode(currency);
+        if (!currencies.has(currencyId)) currencies.set(currencyId, this.moyskladRequest(`entity/currency/${encodeURIComponent(currencyId)}`, 'GET').then(currency => explicitIsoCode(asRecord(currency))));
+        currencyCode = await currencies.get(currencyId)!;
       }
       const currencyRef = currencyId ? { meta: {
         href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${currencyId}`,
@@ -189,7 +217,8 @@ export class ProductCardHttpApi implements ProductCardApi {
       const typeMeta = isRecord(price.priceType) && isRecord(price.priceType.meta) ? price.priceType.meta : {};
       const typeId = idFromHref(typeMeta.href);
       const current = typeId ? values.prices.find((entry) => entry.typeId === typeId) : undefined;
-      const value = finiteNumber(price.value);
+      const nativeMinorValue = finiteNumber(price.value);
+      const value = nativeMinorValue === null || nativeMinorValue < 0 ? null : nativeMinorValue / 100;
       if (!typeId || value === null) return null;
       return {
         priceId: typeId, typeId, value,
@@ -212,6 +241,13 @@ export class ProductCardHttpApi implements ProductCardApi {
   async updateBitrix24(id: string, fields: Record<string, unknown>, kind: 'product' | 'service' = 'product'): Promise<void> {
     if (!/^\d{1,20}$/.test(id)) throw new Error('PRODUCT_ID_INVALID');
     if (Object.keys(fields).some((key) => key === 'measure' ? !isSafeUnitValue(fields[key]) : !isSafeCatalogScalarField(key, fields[key]))) throw new Error('PRODUCT_FIELD_NOT_ALLOWED');
+    if (typeof fields.detailText === 'string' || fields.detailText === null) {
+      try { fields = { ...fields, detailText: bitrixProductDescription(fields.detailText ?? ''), detailTextType: 'text' }; }
+      catch (error) {
+        if (error instanceof ProductDescriptionEncodingError) throw new ProductCardManualReviewError(error.reason);
+        throw error;
+      }
+    }
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: kind, entityId: id, operation: 'UPDATE', fields })) return;
     assertApplyExternalWrite('BITRIX24', 'PRODUCT_UPDATE');
     await this.bitrixCall(kind === 'service' ? 'catalog.product.service.update' : 'catalog.product.update', { id, fields });
@@ -232,7 +268,7 @@ export class ProductCardHttpApi implements ProductCardApi {
     await this.moyskladRequest(`entity/${kind}/${encodeURIComponent(id)}`, 'PUT', fields);
   }
 
-  private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async bitrixCall(method: string, params: Record<string, unknown>, includePagination = false): Promise<unknown> {
     if (/\.update(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'PRODUCT_REQUEST');
     const base = process.env.BITRIX24_REST_BASE_URL;
     if (!base) throw new Error('BITRIX24_PRODUCT_API_NOT_CONFIGURED');
@@ -246,7 +282,9 @@ export class ProductCardHttpApi implements ProductCardApi {
     if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
     if (!isRecord(payload) || 'error' in payload || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
-    return payload.result;
+    return includePagination && isRecord(payload.result)
+      ? { ...(typeof payload.total === 'number' ? { total: payload.total } : {}), ...payload.result }
+      : payload.result;
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'PUT', body?: Record<string, unknown>): Promise<unknown> {
@@ -257,7 +295,7 @@ export class ProductCardHttpApi implements ProductCardApi {
     const url = new URL(path, ensureSlash(base));
     const response = await fetch(url, {
       method,
-      headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+      headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
       redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });

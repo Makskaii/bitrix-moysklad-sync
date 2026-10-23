@@ -8,18 +8,22 @@ import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
 import { ProductCatalogManualReviewError } from '../src/products/product-catalog-create.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../src/deals-orders/deal-order-reverse-create.service';
+import { ProviderFailure, retryAtForFailure } from '../src/provider-failure';
 
 process.env.SYNC_MODE ??= 'apply';
 const db = new PrismaClient();
 const database = new DatabaseService();
 const portMarker = 'issue54_reverse_test';
 const ids = {
-  order: '11111111-1111-4111-8111-111111111111',
-  company: '22222222-2222-4222-8222-222222222222',
-  product: '33333333-3333-4333-8333-333333333333',
+  order: '11111111-1111-11f1-0a80-111111111111',
+  company: '22222222-2222-11f1-0a80-222222222222',
+  product: '33333333-3333-11f1-0a80-333333333333',
   state: '44444444-4444-4444-8444-444444444444',
-  currency: '55555555-5555-4555-8555-555555555555',
+  currency: '55555555-5555-11e2-4ba4-555555555555',
   unit: '66666666-6666-4666-8666-666666666666',
+  preparationState: '77777777-7777-4777-8777-777777777777',
+  unmappedState: '88888888-8888-4888-8888-888888888888',
+  unknownCurrency: '99999999-9999-4999-8999-999999999999',
 };
 let server: Server;
 let base = '';
@@ -33,6 +37,8 @@ let rows: Record<string, unknown>[] = [];
 let products: Record<string, unknown>[] = [];
 let orderPositions: Record<string, unknown>[] = [];
 let activeOrderId = ids.order;
+let activeOrderStateId = ids.state;
+let activeOrderCurrencyId = ids.currency;
 let sourceProductName = 'MS product name';
 let productAdds = 0;
 let msProductWrites = 0;
@@ -41,6 +47,13 @@ let pauseModeAck: Promise<void> | null = null;
 const suffix = randomUUID();
 let pairIds: string[] = [];
 let service: DealOrderReverseCreateService;
+let expectedClientWorkerLease: { assertOwned(): Promise<void> } | null = null;
+let clientWorkerLeaseChecks = 0;
+let renameNextCreatedDeal = false;
+let nativeTitleUpdates = 0;
+let loseNextTitleUpdateResponse = false;
+let nextRateLimitProvider: 'MOYSKLAD' | 'BITRIX24' | null = null;
+let nextRateLimitHeaders: Record<string, string> = {};
 const clientPair: any = { id: '', entityType: 'COMPANY', bitrix24Id: '901', moyskladId: ids.company };
 
 before(async () => {
@@ -65,7 +78,14 @@ before(async () => {
   process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-only';
   process.env.BITRIX24_API_TOKEN = 'synthetic-test-only';
   service = new DealOrderReverseCreateService(database, new SyncModeService(database), {
-    async resolveForDocument() { return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' }; },
+    async resolveForDocument(_input: unknown, workerLease: unknown) {
+      if (expectedClientWorkerLease) {
+        assert.equal(workerLease, expectedClientWorkerLease, 'claimed worker context must reach the client dependency');
+        await expectedClientWorkerLease.assertOwned();
+        clientWorkerLeaseChecks++;
+      }
+      return { status: 'RESOLVED', pair: clientPair, companyPair: clientPair, selectedSourceId: ids.company, reason: 'TEST_PAIR' };
+    },
     async scheduleOptionalContactRetry() {}, async verifyServiceCounterparty() { return true; },
   } as never);
 });
@@ -119,7 +139,7 @@ test('partial B24 row-create response loss resumes the same deal and addressed r
   assert.equal(dealAdds, 1, 'deal is never duplicated');
   assert.equal(rowAdds, 3, 'ambiguous row response recovered by durable sort slots, no duplicate row is added');
   assert.equal(rows.length, 3, 'invalid source position is omitted without dropping valid rows');
-  assert.equal(items[0].title, 'Заказ покупателя SO-54');
+  assert.equal(items[0].title, 'SO-54');
   assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
   assert.equal(items[0].originId, ids.order);
   assert.deepEqual(rows.map((row) => [row.sort, row.productId, row.price, row.quantity]), [[1, 903, 111.11, 2], [2, 903, 123.45, 3], [3, 903, 0, 1]]);
@@ -172,8 +192,11 @@ test('existing paired order receives addressed MS-only positions without replaci
   const dealPair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '880', moyskladId: orderId, source: 'MANUAL' } });
   pairIds.push(dealPair.id);
   try {
-    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true };
+    expectedClientWorkerLease = { assertOwned: async () => {} };
+    clientWorkerLeaseChecks = 0;
+    const input = { pairId: dealPair.id, bitrix24DealId: '880', moyskladOrderId: orderId, eventId: `event-${suffix}-existing-add`, eventConfig: config(), positionIds: ['same-sku-1', 'same-sku-2'], assertPairLease: async () => true, workerLease: expectedClientWorkerLease };
     await assert.rejects(service.addPositionsToExistingPair(input), /Provider request failed \(500\)/);
+    assert.equal(clientWorkerLeaseChecks, 1);
     assert.equal(rows.length, 3, 'provider applied the row before its response was lost');
     const first = await service.addPositionsToExistingPair(input);
     assert.deepEqual(first, { status: 'ROWS_ADDED' });
@@ -188,6 +211,7 @@ test('existing paired order receives addressed MS-only positions without replaci
     assert.equal(rows.length, 3, 'repeat is idempotent');
     assert.equal(rowAdds, 2);
   } finally {
+    expectedClientWorkerLease = null;
     await db.dealOrderPositionPair.deleteMany({ where: { pairId: dealPair.id } });
     await db.dealOrderReversePositionOperation.deleteMany({ where: { moyskladOrderId: orderId } });
     await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
@@ -298,6 +322,59 @@ test('an existing product pair is preserved when the MySklad product name change
   }
 });
 
+test('a portal-generated title is restored once to the native MS order name before pairing', async () => {
+  const previousPositions = orderPositions;
+  const orderId = randomUUID(); activeOrderId = orderId; orderPositions = []; items = []; rows = [];
+  renameNextCreatedDeal = true; nativeTitleUpdates = 0; dealAdds = 0; loseNextTitleUpdateResponse = true;
+  try {
+    const input = { moyskladOrderId: orderId, eventId: `title-${suffix}`, eventConfig: config() };
+    await assert.rejects(service.createAndPair(input), /Provider request failed/);
+    const pending = await db.dealOrderReverseCreateOperation.findUniqueOrThrow({ where: { moyskladOrderId: orderId } });
+    assert.equal(pending.status, 'PENDING');
+    assert.ok(pending.bitrix24DealId, 'target ID stays durable after title-update response loss');
+    const result = await service.createAndPair(input);
+    assert.equal(result.status, 'CREATED');
+    assert.equal(items[0].title, 'SO-54');
+    assert.equal(items[0].originId, orderId);
+    assert.equal(items[0].UF_CRM_1729757435964, 'SO-54');
+    assert.equal(nativeTitleUpdates, 1);
+    assert.equal(dealAdds, 1);
+    await service.createAndPair({ moyskladOrderId: orderId, eventId: `title-repeat-${suffix}`, eventConfig: config() });
+    assert.equal(nativeTitleUpdates, 1, 'completed repeats do not rename again');
+    assert.equal(dealAdds, 1);
+  } finally {
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    renameNextCreatedDeal = false; loseNextTitleUpdateResponse = false; activeOrderId = ids.order; orderPositions = previousPositions;
+  }
+});
+
+test('reverse creation carries native provider Retry-After into durable scheduling without a duplicate write', async () => {
+  const previousPositions = orderPositions;
+  try {
+    const scenarios: Array<{ provider: 'MOYSKLAD' | 'BITRIX24'; headers: Record<string, string> }> = [
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': '30000' } },
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': 'invalid', 'Retry-After': '30' } },
+      { provider: 'MOYSKLAD', headers: { 'X-Lognex-Retry-After': '30000', 'Retry-After': '5' } },
+      { provider: 'BITRIX24', headers: { 'X-Lognex-Retry-After': '3600000', 'Retry-After': '30' } },
+    ];
+    for (const { provider, headers } of scenarios) {
+      const orderId = randomUUID(); activeOrderId = orderId; orderPositions = []; items = []; rows = [];
+      nextRateLimitProvider = provider; nextRateLimitHeaders = headers; dealAdds = 0;
+      const before = Date.now();
+      const error = await service.createAndPair({ moyskladOrderId: orderId, eventId: `rate-limit-${suffix}`, eventConfig: config() }).then(() => null, error => error);
+      assert.ok(error instanceof ProviderFailure);
+      assert.equal(error.provider, provider); assert.equal(error.status, 429);
+      assert.ok(error.retryAfterAt && error.retryAfterAt.getTime() >= before + 29_000);
+      assert.ok(error.retryAfterAt.getTime() < before + 31_000, 'native milliseconds are not interpreted as seconds or accepted for Bitrix');
+      assert.equal(retryAtForFailure(error, 1), error.retryAfterAt);
+      assert.equal(dealAdds, 0);
+      assert.equal((await db.dealOrderReverseCreateOperation.findUnique({ where: { moyskladOrderId: orderId } }))?.bitrix24DealId ?? null, null);
+      await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    }
+  } finally { nextRateLimitProvider = null; activeOrderId = ids.order; orderPositions = previousPositions; }
+});
+
 test('missing pinned numbering/runtime references are held for review before any provider write', async () => {
   dealAdds = 0; rowAdds = 0;
   const orderId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -326,6 +403,75 @@ test('missing confirmed product-catalog selection holds an unpaired product for 
   assert.equal(dealAdds, 0);
 });
 
+test('confirmed-defaults uses the uniquely confirmed main PREPARATION stage for an unmapped reverse stage', async () => {
+  const orderId = randomUUID();
+  activeOrderId = orderId;
+  activeOrderStateId = ids.unmappedState;
+  activeOrderCurrencyId = ids.currency;
+  orderPositions = [];
+  items = [];
+  rows = [];
+  dealAdds = 0;
+  const eventConfig = config();
+  eventConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  eventConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  eventConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+
+  const result = await service.createAndPair({ moyskladOrderId: orderId, eventId: `event-${suffix}-stage-fallback`, eventConfig });
+  assert.equal(result.status, 'CREATED');
+  assert.equal(items[0]?.stageId, 'PREPARATION');
+  assert.equal(dealAdds, 1);
+  assert.ok(await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId, active: true } }));
+
+  const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+  if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+  await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+  await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+  activeOrderId = ids.order;
+  activeOrderStateId = ids.state;
+});
+
+test('confirmed defaults never use a preparation fallback for mapped-disabled stages or unknown currencies', async () => {
+  const disabledOrderId = randomUUID();
+  activeOrderId = disabledOrderId;
+  activeOrderStateId = ids.state;
+  activeOrderCurrencyId = ids.currency;
+  orderPositions = [];
+  items = [];
+  dealAdds = 0;
+  const disabledConfig = config();
+  disabledConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  disabledConfig.config.dealOrderRuntime.stages[0].creationEnabled = false;
+  disabledConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  disabledConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+  await assert.rejects(service.createAndPair({ moyskladOrderId: disabledOrderId, eventId: `event-${suffix}-disabled-stage`, eventConfig: disabledConfig }),
+    (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  assert.equal(dealAdds, 0);
+
+  const currencyOrderId = randomUUID();
+  activeOrderId = currencyOrderId;
+  activeOrderStateId = ids.unmappedState;
+  activeOrderCurrencyId = ids.unknownCurrency;
+  const currencyConfig = config();
+  currencyConfig.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  currencyConfig.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'PREPARATION', moyskladId: ids.preparationState, creationEnabled: true });
+  currencyConfig.config.references.namedPairs = [
+    { kind: 'dealStages', bitrix24Id: 'PREPARATION', bitrix24Label: 'Обработан', moyskladId: ids.preparationState, moyskladLabel: 'Обработан', status: 'confirmed' },
+  ];
+  await assert.rejects(service.createAndPair({ moyskladOrderId: currencyOrderId, eventId: `event-${suffix}-unknown-currency`, eventConfig: currencyConfig }),
+    (error: unknown) => error instanceof DealOrderReverseManualReviewError);
+  assert.equal(dealAdds, 0);
+  assert.equal(await db.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: { in: [disabledOrderId, currencyOrderId] } } }), 0);
+
+  activeOrderId = ids.order;
+  activeOrderStateId = ids.state;
+  activeOrderCurrencyId = ids.currency;
+});
+
 test('ambiguous Bitrix24 product recovery identity is held for review without creating a deal', async () => {
   activeOrderId = ids.order;
   await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: ids.order } });
@@ -339,6 +485,33 @@ test('ambiguous Bitrix24 product recovery identity is held for review without cr
   await assert.rejects(service.createAndPair({ moyskladOrderId: ids.order, eventId: `event-${suffix}-ambiguous`, eventConfig: config() }), (error: unknown) => error instanceof ProductCatalogManualReviewError);
   assert.equal(productAdds, 0);
   assert.equal(dealAdds, 0);
+});
+
+test('reverse order reuses a legacy UUID card before creating rows, without creating or rewriting the product', async () => {
+  activeOrderId = ids.order; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: ids.order } });
+  await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: ids.product } });
+  await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: ids.order } });
+  await db.entityPair.deleteMany({ where: { entityType: 'PRODUCT', moyskladId: ids.product } });
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false; items = []; rows = [];
+  const legacy = { id: 49006, iblockId: 42, type: 1, active: 'Y', xmlId: 'legacy-external-code', property108: { value: ids.product }, name: 'Existing catalogue title', measure: 9 };
+  products = [legacy]; orderPositions = [position('legacy-uuid-row', 2)];
+  const input = { moyskladOrderId: ids.order, eventId: `event-${suffix}-legacy-uuid`, eventConfig: config() };
+  await service.createAndPair(input);
+  assert.equal(productAdds, 0);
+  assert.equal(msProductWrites, 0);
+  assert.deepEqual(products, [legacy], 'linking a prerequisite must not replace a working catalogue card');
+  assert.equal(dealAdds, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].productId, 49006);
+  assert.equal(rows[0].quantity, 2);
+  assert.equal(rows[0].price, 123.45);
+  assert.equal((await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: ids.product, active: true } })).bitrix24Id, '49006');
+  await service.createAndPair(input);
+  assert.equal(dealAdds, 1);
+  assert.equal(productAdds, 0);
+  assert.equal(rowAdds, 1);
 });
 
 function config(): any {
@@ -356,6 +529,64 @@ function config(): any {
     },
   }, references: { units: [], priceTypes: [], dictionaries: [] } };
 }
+test('reverse-only UOM alternative retains a real order position without changing the canonical forward unit', async () => {
+  const orderId = randomUUID();
+  activeOrderId = orderId; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  items = []; rows = []; orderPositions = [position('reverse-alternative-row', 2)];
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false;
+  const settings = config();
+  const canonical = 'aaaaaaaa-1111-4111-8111-111111111111';
+  settings.config.references.units[0].moyskladId = canonical;
+  settings.config.references.units[0].reverseMoyskladIds = [ids.unit];
+  try {
+    const result = await service.createAndPair({ moyskladOrderId: orderId, eventId: `event-${suffix}-alternative`, eventConfig: settings });
+    assert.equal(result.status, 'CREATED');
+    assert.equal(dealAdds, 1);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].measureCode, 796);
+    assert.equal(rows[0].quantity, 2);
+    assert.equal(settings.config.references.units[0].moyskladId, canonical);
+    assert.equal(msProductWrites, 0);
+  } finally {
+    const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    activeOrderId = ids.order;
+  }
+});
+
+test('a mixed product/service order reads native service resource and creates one deal with both rows', async () => {
+  const orderId = randomUUID(), serviceId = randomUUID();
+  activeOrderId = orderId; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  items = []; rows = []; products = [];
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false;
+  orderPositions = [position('mixed-product', 2), { ...position('mixed-service', 1), assortment: { id: serviceId, meta: { type: 'service' } } }];
+  try {
+    const input = { moyskladOrderId: orderId, eventId: `event-${suffix}-mixed`, eventConfig: config() };
+    const result = await service.createAndPair(input);
+    assert.equal(result.status, 'CREATED');
+    assert.equal(rows.length, 2);
+    const servicePair = await db.entityPair.findFirstOrThrow({ where: { entityType: 'PRODUCT', moyskladId: serviceId, active: true } });
+    assert.equal(servicePair.moyskladType, 'service');
+    assert.equal(rows[1].productId, Number(servicePair.bitrix24Id));
+    assert.equal(products.filter(product => product.type === 7).length, 1);
+    await service.createAndPair(input);
+    assert.equal(dealAdds, 1);
+    assert.equal(rows.length, 2);
+    assert.equal(msProductWrites, 0);
+  } finally {
+    const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.dealOrderReverseProductOperation.deleteMany({ where: { moyskladProductId: serviceId } });
+    await db.entityPair.deleteMany({ where: { OR: [{ entityType: 'DEAL', moyskladId: orderId }, { entityType: 'PRODUCT', moyskladId: serviceId }] } });
+    activeOrderId = ids.order;
+  }
+});
+
 function position(id: string, quantity: number): Record<string, unknown> {
   return { id, quantity, price: 12345, discount: 0, vat: 0, vatEnabled: false, assortment: { id: ids.product, uom: { id: ids.unit } } };
 }
@@ -365,24 +596,51 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   const bodyText = Buffer.concat(chunks).toString('utf8');
   const body = bodyText ? JSON.parse(bodyText) as Record<string, any> : {};
   const pathname = new URL(request.url ?? '/', base).pathname;
-  const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/product\/([0-9a-f-]+)$/i);
-  if (productRead) return send(response, { id: productRead[1], meta: { type: 'product' }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
-  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: ids.state }, rate: { currency: { id: ids.currency } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
+  if ((nextRateLimitProvider === 'MOYSKLAD' && pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) ||
+      (nextRateLimitProvider === 'BITRIX24' && pathname === '/rest/crm.item.list')) {
+    nextRateLimitProvider = null;
+    response.writeHead(429, { ...nextRateLimitHeaders, 'content-type': 'application/json' }); response.end(JSON.stringify({ error: 'RATE_LIMIT' })); return;
+  }
+  if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(pathname) && body.useOriginalUfNames !== 'Y') {
+    response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
+  }
+  const productRead = pathname.match(/^\/api\/remap\/1\.2\/entity\/(product|service)\/([0-9a-f-]+)$/i);
+  if (productRead) return send(response, { id: productRead[2], meta: { type: productRead[1] }, name: sourceProductName, code: 'MS-SKU-54', description: 'MS product description', uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${ids.unit}`} } });
+  if (pathname === '/api/remap/1.2/entity/customerorder/' + activeOrderId) return send(response, { id: activeOrderId, name: 'SO-54', sum: 50000, vatIncluded: true, vatEnabled: true, state: { id: activeOrderStateId }, rate: { currency: { id: activeOrderCurrencyId } }, agent: { id: ids.company, meta: { type: 'counterparty' } }, description: 'from MS' });
   if (pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}/positions`) {
+    assert.equal(new URL(request.url ?? '/', base).searchParams.get('expand'), 'assortment');
     const offset = Number(new URL(request.url ?? '/', base).searchParams.get('offset') ?? 0);
     return send(response, { rows: orderPositions.slice(offset, offset + 100) });
   }
   if (pathname === '/rest/crm.item.list') return send(response, { result: { items: items.filter((item) => item.originatorId === body.filter?.originatorId && item.originId === body.filter?.originId) } });
   if (pathname === '/rest/crm.item.add') {
     dealAdds++;
-    const item = { ...body.fields, id: nextDealId++ };
+    const item = { ...body.fields, id: nextDealId++, ...(renameNextCreatedDeal ? { title: 'Synthetic portal-generated company/date title' } : {}) };
+    renameNextCreatedDeal = false;
     items.push(item);
     return send(response, { result: { item } });
   }
   if (pathname === '/rest/crm.item.get') return send(response, { result: { item: items.find((item) => String(item.id) === String(body.id)) } });
+  if (pathname === '/rest/crm.item.update') {
+    assert.equal(body.useOriginalUfNames, 'Y');
+    assert.deepEqual(Object.keys(body.fields), ['title']);
+    const item = items.find(item => String(item.id) === String(body.id));
+    assert.ok(item); Object.assign(item, body.fields); nativeTitleUpdates++;
+    if (loseNextTitleUpdateResponse) {
+      loseNextTitleUpdateResponse = false;
+      response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic title-update response lost after success' })); return;
+    }
+    return send(response, { result: { item } });
+  }
   if (pathname === '/rest/crm.item.productrow.list') {
+    if (!body.filter?.['=ownerType'] || !body.filter?.['=ownerId']) {
+      response.writeHead(400); response.end(JSON.stringify({ error: 'REQUIRED_ARG_MISSING' })); return;
+    }
+    assert.equal(body.filter['=ownerType'], 'D');
+    assert.equal(body.select, undefined);
     const start = Number(body.start ?? 0);
-    return send(response, { result: { productRows: rows.slice(start, start + 50) } });
+    const owned = rows.filter((row) => Number(row.ownerId) === Number(body.filter['=ownerId']));
+    return send(response, { result: { productRows: owned.slice(start, start + 50) }, total: owned.length, ...(start + 50 < owned.length ? { next: start + 50 } : {}) });
   }
   if (pathname === '/rest/crm.item.productrow.add') {
     rowAdds++;
@@ -400,27 +658,29 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     }
     return send(response, { result: { productRow: added } });
   }
-  if (pathname === '/rest/catalog.product.list') {
-    const found = products.filter((product) => product.xmlId === body.filter?.xmlId && String(product.iblockId) === String(body.filter?.iblockId));
-    return send(response, { result: { products: found }, total: found.length });
+  if (['/rest/catalog.product.list', '/rest/catalog.product.service.list'].includes(pathname)) {
+    const found = products.filter((product: any) => (body.filter?.property108 ? product.property108?.value === body.filter.property108 : product.xmlId === body.filter?.xmlId) && String(product.iblockId) === String(body.filter?.iblockId));
+    return send(response, { result: { [pathname.includes('.service.') ? 'services' : 'products']: found }, total: found.length });
   }
-  if (pathname === '/rest/catalog.product.getFieldsByFilter') {
+  if (['/rest/catalog.product.getFieldsByFilter','/rest/catalog.product.service.getFieldsByFilter'].includes(pathname)) {
     // ProductCatalogCreateService checks writable fields before catalog.product.add.
     // Mirror the Bitrix response envelope consumed by that production caller.
-    return send(response, { result: { product: {
+    return send(response, { result: { [pathname.includes('.service.') ? 'service' : 'product']: {
       name: { type: 'string', isReadOnly: false },
       code: { type: 'string', isReadOnly: false },
       detailText: { type: 'string', isReadOnly: false },
+      detailTextType: { type: 'string', isReadOnly: false },
       measure: { type: 'integer', isReadOnly: false },
       property108: { type: 'productproperty', propertyType: 'S', isMultiple: false, isReadOnly: false },
     } } });
   }
-  if (pathname === '/rest/catalog.product.add') {
+  if (['/rest/catalog.product.add','/rest/catalog.product.service.add'].includes(pathname)) {
     productAdds++;
-    const created = { ...body.fields, type: 1, id: String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
+    const isService = pathname.includes('.service.');
+    const created = { ...body.fields, type: isService ? 7 : 1, id: isService ? 990 : String(body.fields.xmlId).includes('eeeeeeee') ? 944 : 903 };
     products.push(created);
     if (loseProductCreateResponse) { loseProductCreateResponse = false; response.writeHead(500); response.end(JSON.stringify({ error: 'synthetic product create response loss' })); return; }
-    return send(response, { result: { element: created } });
+    return send(response, { result: { [isService ? 'service' : 'element']: created } });
   }
   response.writeHead(404); response.end(JSON.stringify({ error: `unexpected ${request.method} ${pathname}` }));
 }

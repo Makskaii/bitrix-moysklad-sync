@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../database.service';
 import { CLIENT_DEPENDENCY_RESOLVER, ClientDependencyResolver } from '../clients/client-dependency-resolver';
-import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
+import { NamedReferencePair, VersionedFieldSettingsDto } from '../field-settings/field-settings.dto';
 import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { SyncModeService } from '../sync-mode.service';
 import { writeOperationalLog } from '../monitoring-log';
@@ -11,12 +11,32 @@ import { resolveDictionaryValue } from './deal-order-field-runtime.service';
 import { moySkladMoneyToBitrix } from './deal-order-money';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
+import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
+import { ProviderFailure, providerResponseFailure } from '../provider-failure';
+import { assertNoForwardOrderOwner, ForwardOrderPairPendingError } from './forward-order-origin';
 
 type Row = Record<string, unknown>;
 type PreparedRow = { msPositionId: string; snapshot: Row; fields: { ownerId: number; ownerType: 'D'; productId: number; price: number; quantity: number; discountTypeId: 2; discountRate: number; discountSum: 0; taxRate: number | null; taxIncluded: 'Y' | 'N'; measureCode: number; sort: number } };
 type Prepared = { orderId: string; eventId: string; settingsVersion: number; sourceSnapshot: Row; fields: Row; rows: PreparedRow[]; skippedRows: Array<{ sourceRowId: string; reason: string }>; companyPairId: string | null; companyId: string | null };
+type ReverseStage = { bitrix24StageId: string; moyskladId: string; creationEnabled: boolean };
+
+export function resolveReverseOrderStage(input: {
+  sourceStageId: string;
+  stages: readonly ReverseStage[];
+  namedPairs: readonly Pick<NamedReferencePair, 'kind' | 'bitrix24Id' | 'moyskladId' | 'status'>[];
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
+}): { status: 'MAPPED' | 'FALLBACK' | 'UNMAPPED' | 'DISABLED'; stage?: ReverseStage } {
+  const mapped = input.stages.find((candidate) => candidate.moyskladId === input.sourceStageId);
+  if (mapped) return mapped.creationEnabled ? { status: 'MAPPED', stage: mapped } : { status: 'DISABLED' };
+  if (input.unmappedReferencePolicy !== 'confirmed-defaults') return { status: 'UNMAPPED' };
+  const candidates = input.stages.filter((candidate) =>
+    isMainPreparationStage(candidate.bitrix24StageId) && candidate.creationEnabled &&
+    hasUniqueConfirmedStagePair(candidate, input.namedPairs));
+  return candidates.length === 1 ? { status: 'FALLBACK', stage: candidates[0] } : { status: 'UNMAPPED' };
+}
 
 export type ReverseCreateResult = { status: 'CREATED' | 'PARTIAL' | 'ALREADY_PAIRED'; bitrix24DealId: string; skippedRows?: Array<{ sourceRowId: string; reason: string }> };
 export class DealOrderReverseManualReviewError extends Error {}
@@ -42,7 +62,7 @@ export class DealOrderReverseCreateService {
 
   private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
-  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
+  async createAndPair(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; assertWorkerLease?: () => Promise<void>; workerLease?: EventWorkerLeaseContext; controlledSyntheticName?: string }): Promise<ReverseCreateResult> {
     if (!isUuid(input.moyskladOrderId)) throw new Error('Customer-order identity is invalid');
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) {
       throw new Error('Reverse deal creation is disabled');
@@ -53,6 +73,7 @@ export class DealOrderReverseCreateService {
     if ((operation?.status === 'SUCCEEDED' || operation?.status === 'PARTIAL') && operation.bitrix24DealId) return { status: operation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: operation.bitrix24DealId, skippedRows: readSkippedRows(operation.skippedRows) };
     const existingPair = await this.database.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: input.moyskladOrderId, active: true }, select: { bitrix24Id: true } });
     if (existingPair) return { status: 'ALREADY_PAIRED', bitrix24DealId: existingPair.bitrix24Id };
+    await assertNoForwardOrderOwner(this.database, input.moyskladOrderId);
     if (!operation || operation.status === 'WAITING') {
       const prepared = await this.prepare(input);
       if (input.controlledSyntheticName && this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
@@ -102,7 +123,7 @@ export class DealOrderReverseCreateService {
     try {
       const dealId = operation.bitrix24DealId ?? await this.createOrRecoverDeal(prepared, leaseToken, input.assertWorkerLease);
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') this.controlledAdmission.allowTargetReadback('BITRIX24', dealId);
-      const verified = await this.verifyDeal(dealId, prepared);
+      const verified = await this.verifyDeal(dealId, prepared, leaseToken, input.assertWorkerLease);
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         const createdAt = parseBitrixCreatedAt(verified.createdTime ?? verified.DATE_CREATE);
         if (!createdAt) throw new DealOrderReverseManualReviewError('Controlled target creation timestamp is unavailable');
@@ -112,7 +133,15 @@ export class DealOrderReverseCreateService {
       return await this.persistPair(prepared, dealId, leaseToken);
     } catch (error) {
       if (error instanceof ServiceModeNotOnError) throw error;
-      await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'REVERSE_CREATE_RETRYABLE' } }).catch(() => undefined);
+      // Only a NEW, previously unattempted journal blocked before its first
+      // B24 ADD can be returned to preparation. Never reset an older uncertain
+      // reverse write. This also avoids poisoning future paired row additions
+      // with a stale, never-sent reverse-document payload.
+      const waitingForForward = error instanceof ForwardOrderPairPendingError && !operation.attemptedAt && !operation.bitrix24DealId;
+      await this.database.dealOrderReverseCreateOperation.updateMany({ where: { moyskladOrderId: input.moyskladOrderId, leaseToken }, data: {
+        leaseToken: null, leaseUntil: null, lastErrorCategory: waitingForForward ? 'FORWARD_ORDER_PAIR_PENDING' : 'REVERSE_CREATE_RETRYABLE',
+        ...(waitingForForward ? { status: 'WAITING' } : {}),
+      } }).catch(() => undefined);
       throw error;
     }
   }
@@ -120,7 +149,7 @@ export class DealOrderReverseCreateService {
   /** Add only explicitly unlinked MS positions to the existing Bitrix24 deal.
    * The parent operation is a durable row-add journal; no document create or
    * replacement-pair path is invoked. */
-  async addPositionsToExistingPair(input: { pairId: string; bitrix24DealId: string; moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds: string[]; assertPairLease: () => Promise<boolean> }): Promise<{ status: 'ROWS_ADDED' | 'PARTIAL'; skippedRows?: Array<{ sourceRowId: string; reason: string }> }> {
+  async addPositionsToExistingPair(input: { pairId: string; bitrix24DealId: string; moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds: string[]; assertPairLease: () => Promise<boolean>; workerLease?: EventWorkerLeaseContext }): Promise<{ status: 'ROWS_ADDED' | 'PARTIAL'; skippedRows?: Array<{ sourceRowId: string; reason: string }> }> {
     if (!input.positionIds.length) return { status: 'ROWS_ADDED' };
     if (process.env.SYNC_MODE !== 'apply' || (await this.mode.read()).mode !== 'on' || !await this.mode.isDirectionEnabled('deals-orders', 'moyskladToBitrix24')) throw new Error('Reverse row addition is disabled');
     const pair = await this.database.entityPair.findFirst({ where: { id: input.pairId, entityType: 'DEAL', active: true, bitrix24Id: input.bitrix24DealId, moyskladId: input.moyskladOrderId }, select: { id: true } });
@@ -139,7 +168,7 @@ export class DealOrderReverseCreateService {
     } else {
       const existingB24Rows = await b24AllRows(input.bitrix24DealId, this.providerGate);
       const nextSort = existingB24Rows.reduce((highest, row) => Math.max(highest, Number(row.sort) || 0), 0) + 1;
-      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, writePair: { id: pair.id, entityType: 'DEAL' } });
+      const prepared = await this.prepare({ moyskladOrderId: input.moyskladOrderId, eventId: input.eventId, eventConfig: input.eventConfig, positionIds: new Set(input.positionIds), assertPairLease: input.assertPairLease, workerLease: input.workerLease, writePair: { id: pair.id, entityType: 'DEAL' } });
       frozen = { ...prepared, rows: prepared.rows.map((row, index) => ({ ...row, fields: { ...row.fields, sort: nextSort + index } })), skippedRows: prepared.skippedRows.filter((row) => input.positionIds.includes(row.sourceRowId)) };
     }
     const existingLinks = await this.database.dealOrderPositionPair.findMany({ where: { pairId: input.pairId }, select: { moyskladPositionId: true } });
@@ -204,14 +233,25 @@ export class DealOrderReverseCreateService {
     }
   }
 
-  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
+  private async prepare(input: { moyskladOrderId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; positionIds?: Set<string>; assertPairLease?: () => Promise<boolean>; assertWorkerLease?: () => Promise<void>; workerLease?: EventWorkerLeaseContext; writePair?: { id: string; entityType: string } }): Promise<Prepared> {
     const config = input.eventConfig.config.dealOrderRuntime;
     if (!config || !config.nativeOrderNumberingVerified) throw new DealOrderReverseManualReviewError('Deal-order runtime settings or native numbering confirmation are missing');
       const order = await msGet(`entity/customerorder/${input.moyskladOrderId}?expand=agent,state,rate.currency`, this.providerGate);
     if (!isRecord(order) || order.id !== input.moyskladOrderId || !isRecord(order.agent) || !isRecord(order.agent.meta) || !isUuid(order.agent.id) || !isRecord(order.state) || !isUuid(order.state.id) || !isRecord(order.rate) || !isRecord(order.rate.currency) || !isUuid(order.rate.currency.id) || typeof order.name !== 'string' || !order.name.trim()) {
       throw new DealOrderReverseManualReviewError('Customer-order header is incomplete');
     }
-    const stage = config.stages.find((item) => item.moyskladId === order.state?.id);
+    if (!input.writePair) await assertNoForwardOrderOwner(this.database, input.moyskladOrderId, order.syncId);
+    const stageResolution = resolveReverseOrderStage({
+      sourceStageId: order.state.id,
+      stages: config.stages,
+      namedPairs: input.eventConfig.config.references.namedPairs ?? [],
+      unmappedReferencePolicy: config.unmappedReferencePolicy,
+    });
+    const stage = stageResolution.stage;
+    if (stageResolution.status === 'DISABLED') {
+      throw new DealOrderReverseManualReviewError('Mapped customer-order stage is not enabled for deal creation');
+    }
+    const stageFallbackUsed = stageResolution.status === 'FALLBACK';
     const currency = config.currencies.find((item) => item.moyskladId === order.rate.currency.id);
     if (!stage || !currency) throw new DealOrderReverseManualReviewError('Customer-order stage or currency has no confirmed Bitrix24 mapping');
 
@@ -219,7 +259,7 @@ export class DealOrderReverseCreateService {
     let companyId: string | null = null;
     const configuredServiceId = input.eventConfig.config.serviceCounterpartyId;
     if (order.agent.id !== configuredServiceId) {
-      const client = await this.clients?.resolveForDocument({ eventId: input.eventId, sourceSystem: 'MOYSKLAD', entity: 'COMPANY', sourceId: order.agent.id });
+      const client = await this.clients?.resolveForDocument({ eventId: input.eventId, sourceSystem: 'MOYSKLAD', entity: 'COMPANY', sourceId: order.agent.id }, input.workerLease);
       if (!client || client.status === 'REVIEW') throw new DealOrderReverseManualReviewError('Customer-order counterparty pair is not confirmed');
       if (client.status !== 'RESOLVED') throw new Error('Customer-order counterparty pair resolution is retryable');
       companyPairId = client.pair.id;
@@ -241,6 +281,14 @@ export class DealOrderReverseCreateService {
       const id = readId(position.id)!;
       if (input.positionIds && !input.positionIds.has(id)) continue;
       const assortment = isRecord(position.assortment) ? position.assortment : {};
+      const nativeKind = isRecord(assortment.meta) ? assortment.meta.type : undefined;
+      // Old normalized fixtures omit meta.type; real native services must never
+      // be addressed through the product endpoint (which returns a permanent404).
+      const kind = nativeKind === undefined ? 'product' : nativeKind;
+      if (kind !== 'product' && kind !== 'service') {
+        await skip(id, 'ASSORTMENT_TYPE_UNSUPPORTED');
+        continue;
+      }
       const assortmentId = readId(assortment.id);
       if (!assortmentId || !isUuid(assortmentId)) {
         await skip(id, 'PRODUCT_ID_MISSING');
@@ -248,31 +296,31 @@ export class DealOrderReverseCreateService {
       }
       let mappedProduct = resolvedProducts.get(assortmentId);
       if (!mappedProduct) {
-        let productPairs = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, moyskladId: assortmentId }, select: { bitrix24Id: true, moyskladId: true }, take: 2 });
+        let productPairs = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, moyskladId: assortmentId }, select: { bitrix24Id: true, moyskladId: true, moyskladType: true }, take: 2 });
         if (productPairs.length > 1) throw new DealOrderReverseManualReviewError(`MySklad product ${assortmentId} has ambiguous active Bitrix24 pairs`);
+        if (productPairs[0]?.moyskladType && productPairs[0].moyskladType !== kind) throw new DealOrderReverseManualReviewError('MySklad assortment kind conflicts with the saved product pair');
         if (!productPairs.length && !config.bitrix24ProductCatalogId) {
           throw new DealOrderReverseManualReviewError('A confirmed Bitrix24 product catalog is required to create a missing product pair');
         }
-        const product = await msGet(`entity/product/${encodeURIComponent(assortmentId)}`, this.providerGate);
-        if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== 'product') {
+        const product = await msGet(`entity/${kind}/${encodeURIComponent(assortmentId)}`, this.providerGate);
+        if (!isRecord(product) || product.id !== assortmentId || !isRecord(product.meta) || product.meta.type !== kind) {
           throw new DealOrderReverseManualReviewError(`MySklad assortment ${assortmentId} is not a readable product`);
         }
         const uomId = moyskladUomReferenceId(product.uom, configuredBase('MOYSKLAD_API_BASE_URL'));
-        const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === uomId);
+        const unit = input.eventConfig.config.references.units.filter((candidate) => matchesReverseUnit(candidate, uomId));
         if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1 || !numericBitrixMeasureCode(unit[0]?.bitrix24Code)) {
           await skip(id, 'UNIT_UNMAPPED');
           continue;
         }
         let bitrix24Id = productPairs[0]?.bitrix24Id;
         if (!bitrix24Id) {
-          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined), writePair: input.writePair });
-          productPairs = [{ bitrix24Id, moyskladId: assortmentId }];
+          bitrix24Id = await this.createOrRecoverProductPair({ productId: assortmentId, moyskladType: kind, product, eventId: input.eventId, eventConfig: input.eventConfig, bitrix24MeasureId: unit[0].bitrix24Id, assertPairLease: input.assertPairLease ?? (input.assertWorkerLease ? async () => { await input.assertWorkerLease!(); return true; } : undefined), writePair: input.writePair });
         }
         if (!/^\d{1,20}$/.test(bitrix24Id)) throw new DealOrderReverseManualReviewError(`MySklad product ${assortmentId} has an invalid Bitrix24 pair`);
         mappedProduct = { bitrix24Id, uomId: uomId! };
         resolvedProducts.set(assortmentId, mappedProduct);
       }
-      const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === mappedProduct!.uomId);
+      const unit = input.eventConfig.config.references.units.filter((candidate) => matchesReverseUnit(candidate, mappedProduct!.uomId));
       const measureCode = unit.length === 1 ? numericBitrixMeasureCode(unit[0]?.bitrix24Code) : null;
       const price = typeof position.price === 'number' && Number.isFinite(position.price) && position.price >= 0 ? position.price / 100 : null;
       const quantity = typeof position.quantity === 'number' && Number.isFinite(position.quantity) && position.quantity > 0 ? position.quantity : null;
@@ -298,7 +346,7 @@ export class DealOrderReverseCreateService {
       });
     }
     const dealFields: Row = {
-      title: `Заказ покупателя ${order.name}`,
+      title: order.name,
       categoryId: categoryFromStage(stage.bitrix24StageId),
       stageId: stage.bitrix24StageId,
       currencyId: currency.bitrix24Code,
@@ -311,6 +359,9 @@ export class DealOrderReverseCreateService {
       ...(typeof order.description === 'string' ? { comments: order.description } : {}),
     };
     const fields = mapConfiguredFields(input.eventConfig, order, dealFields);
+    if (stageFallbackUsed) {
+      await writeOperationalLog(this.database, 'EVENT', 'MySklad customer order used configured Bitrix24 PREPARATION stage; reason=UNMAPPED_SOURCE_STAGE_DEFAULT_APPLIED', input.eventId);
+    }
     return { orderId: input.moyskladOrderId, eventId: input.eventId, settingsVersion: input.eventConfig.version, sourceSnapshot: order, fields, rows, skippedRows, companyPairId, companyId };
   }
 
@@ -320,7 +371,11 @@ export class DealOrderReverseCreateService {
     let dealId = items.length === 1 ? readNumericId(items[0].id) : null;
     if (items.length === 1 && (items[0].originId !== prepared.orderId || items[0].originatorId !== 'MOYSKLAD')) throw new DealOrderReverseManualReviewError('Bitrix24 deal recovery identity is ambiguous');
     if (!dealId) {
-      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => { await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken); return true; }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: true }, this.providerGate));
+      const created = await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => {
+        await assertWorkerLease?.(); await this.assertOperationLease(prepared.orderId, leaseToken);
+        await assertNoForwardOrderOwner(this.database, prepared.orderId, prepared.sourceSnapshot.syncId);
+        return true;
+      }, undefined, () => b24('crm.item.add', { entityTypeId: 2, fields: prepared.fields, useOriginalUfNames: 'Y' }, this.providerGate));
       const item = isRecord(created) && isRecord(created.item) ? created.item : null;
       dealId = item ? readNumericId(item.id) : null;
       if (!dealId) throw new Error('Bitrix24 deal create response did not include a numeric ID');
@@ -333,15 +388,34 @@ export class DealOrderReverseCreateService {
   /** Create only the missing Bitrix24 prerequisite product, using an explicitly
    * confirmed catalog/unit and a stable external key. MySklad product records
    * are read-only in this path. */
-  private async createOrRecoverProductPair(input: { productId: string; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean>; writePair?: { id: string; entityType: string } }): Promise<string> {
+  private async createOrRecoverProductPair(input: { productId: string; moyskladType?: 'product' | 'service'; product: Row; eventId: string; eventConfig: VersionedFieldSettingsDto; bitrix24MeasureId: number; assertPairLease?: () => Promise<boolean>; writePair?: { id: string; entityType: string } }): Promise<string> {
     const creator = this.productCatalogCreate ?? new ProductCatalogCreateService(this.database, this.mode);
     return creator.createOrRecover(input);
   }
 
-  private async verifyDeal(dealId: string, prepared: Prepared): Promise<Row> {
-    const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: true }, this.providerGate);
-    const item = isRecord(result) && isRecord(result.item) ? result.item : null;
-    if (!item || String(item.id) !== dealId || item.title !== prepared.fields.title || item.originatorId !== 'MOYSKLAD' || item.originId !== prepared.orderId || String(item.UF_CRM_1729757435964 ?? '') !== String(prepared.sourceSnapshot.name)) {
+  private async verifyDeal(dealId: string, prepared: Prepared, leaseToken: string, assertWorkerLease?: () => Promise<void>): Promise<Row> {
+    const read = async () => {
+      const result = await b24('crm.item.get', { entityTypeId: 2, id: Number(dealId), useOriginalUfNames: 'Y' }, this.providerGate);
+      return isRecord(result) && isRecord(result.item) ? result.item : null;
+    };
+    const hasExactIdentity = (item: Row | null): item is Row => !!item && String(item.id) === dealId &&
+      item.originatorId === 'MOYSKLAD' && item.originId === prepared.orderId &&
+      String(item.UF_CRM_1729757435964 ?? '') === String(prepared.sourceSnapshot.name);
+    let item = await read();
+    if (!hasExactIdentity(item)) {
+      throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
+    }
+    if (item.title !== prepared.fields.title) {
+      // User-approved source-authoritative title after portal creation rules.
+      // This is bounded to the exact journal-owned new deal, never a bulk rename.
+      await this.mode.runDealOrderExternalWrite('moyskladToBitrix24', async () => {
+        await assertWorkerLease?.();
+        await this.assertOperationLease(prepared.orderId, leaseToken);
+        return true;
+      }, undefined, () => b24('crm.item.update', { entityTypeId: 2, id: Number(dealId), fields: { title: prepared.fields.title }, useOriginalUfNames: 'Y' }, this.providerGate));
+      item = await read();
+    }
+    if (!hasExactIdentity(item) || item.title !== prepared.fields.title) {
       throw new DealOrderReverseManualReviewError('Bitrix24 deal readback did not match the durable MySklad order operation');
     }
     return item;
@@ -485,6 +559,7 @@ async function msGetAllPositions(orderId: string, gate: ProviderGate = requestJs
   for (let offset = 0; offset < 10_000;) {
     const url = new URL(`entity/customerorder/${orderId}/positions`, ensureSlash(base));
     url.searchParams.set('limit', '100'); url.searchParams.set('offset', String(offset));
+    url.searchParams.set('expand', 'assortment');
     const body = await gate(url, { method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' } });
     const rows = isRecord(body) && Array.isArray(body.rows) ? body.rows.filter(isRecord) : null;
     if (!rows) throw new Error('MySklad positions response is invalid');
@@ -499,19 +574,25 @@ async function b24(method: string, params: Row, gate: ProviderGate = requestJson
   return gate(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(params) }).then((response) => {
     if (!isRecord(response) || response.error) throw new Error(`Bitrix24 ${method} failed`);
     const result = response.result;
-    if (isRecord(result) && typeof response.total === 'number' && result.total === undefined) return { ...result, total: response.total };
+    if (isRecord(result)) return {
+      ...result,
+      ...(typeof response.total === 'number' && result.total === undefined ? { total: response.total } : {}),
+      ...(typeof response.next === 'number' && result.next === undefined ? { next: response.next } : {}),
+    };
     return result;
   });
 }
 async function b24AllRows(dealId: string, gate: ProviderGate = requestJson): Promise<Row[]> {
   const result: Row[] = [];
   for (let start = 0; start < 10_000;) {
-    const value = await b24('crm.item.productrow.list', { filter: { ownerId: Number(dealId), ownerType: 'D' }, select: ['*'], start }, gate);
-    const rows = isRecord(value) && Array.isArray(value.productRows) ? value.productRows.filter(isRecord) : null;
-    if (!rows) throw new Error('Bitrix24 product-row readback is invalid');
+    const value = await b24('crm.item.productrow.list', { filter: { '=ownerId': Number(dealId), '=ownerType': 'D' }, start }, gate);
+    const rows = isRecord(value) && Array.isArray(value.productRows) ? value.productRows : null;
+    if (!rows || rows.some((row) => !isRecord(row) || !readNumericId(row.id) || String(row.ownerId) !== dealId || row.ownerType !== 'D')) throw new Error('Bitrix24 product-row readback is invalid');
+    if (rows.some((row) => result.some((prior) => String(prior.id) === String(row.id))) || new Set(rows.map((row) => String(row.id))).size !== rows.length) throw new Error('Bitrix24 product-row identities are duplicated');
     result.push(...rows);
     const next = isRecord(value) ? value.next : undefined;
     if (typeof next !== 'number') return result;
+    if (!Number.isSafeInteger(next) || next <= start || !rows.length) throw new Error('Bitrix24 product-row pagination is invalid');
     start = next;
   }
   throw new Error('Bitrix24 returned too many product rows');
@@ -542,9 +623,36 @@ function categoryFromStage(stageId: string): number {
   if (prefix) return Number(prefix[1]);
   return 0;
 }
+function isMainPreparationStage(stageId: string): boolean {
+  return stageId === 'PREPARATION' || stageId === '0:PREPARATION';
+}
+function hasUniqueConfirmedStagePair(
+  stage: ReverseStage,
+  pairs: readonly Pick<NamedReferencePair, 'kind' | 'bitrix24Id' | 'moyskladId' | 'status'>[],
+): boolean {
+  const sourceKeys = stage.bitrix24StageId === 'PREPARATION'
+    ? new Set(['PREPARATION', '0:PREPARATION'])
+    : new Set([stage.bitrix24StageId]);
+  const matches = pairs.filter((pair) => pair.kind === 'dealStages' && sourceKeys.has(pair.bitrix24Id));
+  return matches.length === 1 && matches[0]?.status === 'confirmed' && matches[0]?.moyskladId === stage.moyskladId;
+}
 async function requestJson(url: URL, init: RequestInit): Promise<unknown> {
   const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(12_000) });
-  if (!response.ok) throw new Error(`Provider request failed (${response.status})`);
+  if (!response.ok) {
+    const msBase = configuredBase('MOYSKLAD_API_BASE_URL');
+    const provider = url.origin === msBase.origin && url.pathname.startsWith(msBase.pathname.replace(/\/?$/, '/')) ? 'MOYSKLAD' : 'BITRIX24';
+    let failure = providerResponseFailure(provider, response.status, response.headers.get('retry-after'));
+    const nativeRetry = response.headers.get('x-lognex-retry-after');
+    if (provider === 'MOYSKLAD' && response.status === 429 && nativeRetry && /^\d+$/.test(nativeRetry) && Number.isSafeInteger(Number(nativeRetry))) {
+      // MySklad's native header is a duration in milliseconds, not seconds.
+      const nativeAt = new Date(Date.now() + Math.min(Number(nativeRetry), 60 * 60_000));
+      if (!failure.retryAfterAt || nativeAt > failure.retryAfterAt) failure = new ProviderFailure(provider, response.status, nativeAt);
+    }
+    // Retain the existing credential-free message while preserving Retry-After
+    // for the durable event scheduler rather than retrying into a rate limit.
+    failure.message = `Provider request failed (${response.status})`;
+    throw failure;
+  }
   const body: unknown = await response.json().catch(() => null);
   if (isRecord(body) && body.errors) throw new Error('Provider returned an error response');
   return body;
@@ -562,7 +670,8 @@ function isRecord(value: unknown): value is Record<string, any> { return typeof 
 function readId(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value : null; }
 function readNumericId(value: unknown): string | null { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^\d{1,20}$/.test(value)) ? String(value) : null; }
 function isUniqueViolation(error: unknown): boolean { return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'; }
-function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+// MySklad native identifiers use UUID-shaped hex groups without RFC variant/version restrictions.
+function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value); }
 function parseBitrixCreatedAt(value: unknown): Date | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   const date = new Date(value);

@@ -1,7 +1,10 @@
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
 
-/** Run work while holding the authoritative global mode row against ON→OFF. */
+/** Run work while holding the authoritative global mode row against ON→OFF.
+ * Mode setters and recovery OFF transitions explicitly take FOR UPDATE. KEY
+ * SHARE therefore still fences them, while allowing non-key nightly metadata
+ * updates; a SHARE lock would starve those updates under continuous traffic. */
 export async function withServiceModeOn<T>(
   database: DatabaseService,
   work: (transaction: Prisma.TransactionClient) => Promise<T>,
@@ -10,7 +13,7 @@ export async function withServiceModeOn<T>(
   // slightly longer than one operation, never an unbounded worker lifetime.
   return database.$transaction(async (transaction) => {
     const rows = await transaction.$queryRaw<Array<{ serviceMode: string }>>`
-      SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR SHARE
+      SELECT "serviceMode" FROM "SyncSetting" WHERE "id" = 'global' FOR KEY SHARE
     `;
     if (rows[0]?.serviceMode !== 'on') return { enabled: false };
     return { enabled: true, value: await work(transaction) };

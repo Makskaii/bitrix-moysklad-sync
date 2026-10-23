@@ -2,6 +2,7 @@ import { Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { withNightlySettingLock } from './nightly-setting-lock';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
@@ -22,10 +23,25 @@ const NIGHTLY_TIME_ZONE = 'Europe/Moscow';
 type RecordValue = Record<string, unknown>;
 type NightlyScope = 'contacts-companies' | 'deals-orders' | 'invoices' | 'products-variations';
 
+function nightlySafeDiagnostic(error: unknown): string {
+  if (isRecord(error) && typeof error.code === 'string' && /^P\d{4}$/.test(error.code)) return error.code;
+  if (error instanceof Error && [
+    'Nightly run lease was lost',
+    'Nightly run lease was lost before durable enqueue',
+    'Nightly lease or MoySklad cursor changed before checkpoint',
+    'Nightly lease was lost before MoySklad feed completion',
+  ].includes(error.message)) return 'LEASE_LOST';
+  return 'INTERNAL';
+}
+
 @Injectable()
 export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDestroy {
   private nightlyRunning = false;
   private lastNightlyRequestAt = 0;
+  // Only omit a parent after all its pages were validated and its changed
+  // contacts durably accepted. Restart intentionally rescans, using the same
+  // persistent delivery keys; this cache is not a source-of-truth cursor.
+  private contactpersonProgress: { window: string; completed: Set<string> } | null = null;
   private timer?: NodeJS.Timeout;
 
   constructor(
@@ -218,15 +234,15 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       if (!current) return;
       const now = new Date();
       if (current.nightlyStatus === 'failed' && current.nightlyRetryAfter && current.nightlyRetryAfter > now) return;
-      const lease = await this.database.$executeRaw`
+      const lease = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
         UPDATE "SyncSetting"
-        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds',
+        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds',
             "nightlyStatus" = 'running', "nightlyRetryAfter" = NULL, "nightlyError" = NULL,
             "nightlyAttempts" = "nightlyAttempts" + 1, "updatedAt" = NOW()
         WHERE "id" = 'global' AND "nightlyScheduledDate" IS NOT DISTINCT FROM ${current.nightlyScheduledDate}
           AND "nightlyStatus" IN ('pending', 'running', 'failed')
-          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= NOW())
-      `;
+          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC'))
+      `);
       if (lease !== 1) return;
       let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (!setting || !['pending', 'running', 'failed'].includes(setting.nightlyStatus) ||
@@ -280,7 +296,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           ...(complete ? { nightlyError: 'Active interval feeds are queued for processing. Skipped intervals are shown in coverage; delete and archival changes remain outside this slice.' } : {}),
         },
       });
-    } catch {
+    } catch (error) {
+      await writeOperationalLog(this.database, 'ERROR', `Nightly run ${nightlySafeDiagnostic(error)}`, 'nightly').catch(() => undefined);
       const current = await this.database.syncSetting.findFirst({
         where: { id: 'global', nightlyLeaseToken: leaseToken }, select: { nightlyAttempts: true },
       });
@@ -303,6 +320,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
 
   private async runBitrixFeed(initial: NonNullable<Awaited<ReturnType<DatabaseService['syncSetting']['findUnique']>>>, leaseToken: string) {
     let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? initial;
+    let phase = 'read';
     if (setting.nightlyBitrixStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
@@ -315,6 +333,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           ? await this.readBitrixProductPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedLastId)
           : await this.readBitrixPage(setting.nightlyFrom!, setting.nightlyThrough!, queriedEntityTypeId, queriedLastId);
         await this.renewNightlyLease(leaseToken);
+        phase = 'enqueue';
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
         if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
@@ -342,14 +361,16 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         });
         if (result.count !== 1) throw new Error('Nightly lease or Bitrix cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        phase = 'read';
       }
     } catch (error) {
-      await this.markProviderFailed('BITRIX24', error, leaseToken);
+      await this.markProviderFailed('BITRIX24', error, leaseToken, phase);
     }
   }
 
   private async runMoyskladFeed(initial: NonNullable<Awaited<ReturnType<DatabaseService['syncSetting']['findUnique']>>>, leaseToken: string) {
     let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? initial;
+    let phase = 'read';
     if (setting.nightlyMoyskladStatus === 'complete') return;
     if (setting.nightlyStatus === 'skipped') return;
     try {
@@ -361,6 +382,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         await this.renewNightlyLease(leaseToken);
         const page = await this.readMoyskladUpdatedPage(queriedEntity, setting.nightlyFrom!, setting.nightlyThrough!, queriedOffset);
         await this.renewNightlyLease(leaseToken);
+        phase = 'enqueue';
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
         if (await this.nightlyIsPaused()) return;
         if (await this.nightlyMustSkip(setting, new Date())) { await this.markNightlySkipped(leaseToken); return; }
@@ -379,6 +401,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         });
         if (result.count !== 1) throw new Error('Nightly lease or MoySklad cursor changed before checkpoint');
         setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } }) ?? setting;
+        phase = 'read';
       }
       await this.runMoyskladContactpersonFeed(setting.nightlyFrom!, setting.nightlyThrough!, nightlyJobKey(setting), leaseToken);
       if (await this.nightlyIsPaused()) return;
@@ -390,18 +413,22 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       });
       if (completed.count !== 1) throw new Error('Nightly lease was lost before MoySklad feed completion');
     } catch (error) {
-      await this.markProviderFailed('MOYSKLAD', error, leaseToken);
+      await this.markProviderFailed('MOYSKLAD', error, leaseToken, phase);
     }
   }
 
   private async runMoyskladContactpersonFeed(from: Date, through: Date, jobKey: string, leaseToken: string) {
+    const window = `${jobKey}:${from.toISOString()}:${through.toISOString()}`;
+    if (this.contactpersonProgress?.window !== window) this.contactpersonProgress = { window, completed: new Set() };
+    const progress = this.contactpersonProgress;
     const entityPairs = await this.database.entityPair.findMany({
       where: { entityType: 'COMPANY', active: true, moyskladType: 'counterparty' },
       select: { moyskladId: true },
     });
     const parents = [...new Set(entityPairs.map((pair) => pair.moyskladId))].filter(Boolean).sort();
-    const changed: Array<{ id: string; parentId: string }> = [];
     for (const parentId of parents) {
+      if (progress.completed.has(parentId)) continue;
+      const changed: Array<{ id: string; parentId: string }> = [];
       let offset = 0;
       let expectedSize: number | null = null;
       let pageNumber = 0;
@@ -428,8 +455,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         if (page.rows.length === 0) throw new UnsupportedPaginationError('MoySklad contact-person pagination returned an empty page before the advertised total; no contact-person events were queued.');
         offset += page.rows.length;
       }
+      await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
+      await this.renewNightlyLease(leaseToken);
+      progress.completed.add(parentId);
     }
-    await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
   }
 
   /** Recheck durable events accepted in this window and attached to a pair.
@@ -597,7 +626,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     try {
       await this.waitForNightlyRequestSlot();
       response = await fetch(url, {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
@@ -605,6 +634,25 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       throw error;
     }
     await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}/contactpersons', 'GET', response.status, response.ok);
+    if (response.status === 404) {
+      await response.body?.cancel().catch(() => undefined);
+      // A stale active pair must not stop all other parents. Confirm that the
+      // parent itself is absent; a missing nested endpoint alone is ambiguous.
+      await this.waitForNightlyRequestSlot();
+      const parent = await fetch(new URL(`entity/counterparty/${encodeURIComponent(parentId)}`, base.endsWith('/') ? base : `${base}/`), {
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
+        redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      await this.recordApiAttempt('MOYSKLAD', 'entity/counterparty/{id}', 'GET', parent.status, parent.ok);
+      if (parent.status === 404) {
+        const missing: unknown = await parent.json();
+        if (isRecord(missing) && Array.isArray(missing.errors) && missing.errors.some(error => isRecord(error) && error.code === 1021)) {
+          await writeOperationalLog(this.database, 'EVENT', 'Nightly MOYSKLAD contactpersons PARENT_NOT_FOUND; existing pairs preserved.', 'nightly');
+          return { rows: [], size: 0 };
+        }
+      }
+      await parent.body?.cancel().catch(() => undefined);
+    }
     if (!response.ok) throw providerFeedError(response);
     const payload: unknown = await response.json();
     if (!isRecord(payload) || !Array.isArray(payload.rows) || !isRecord(payload.meta) ||
@@ -657,7 +705,12 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     if (failures.length) throw new Error(`Could not durably queue ${failures.length} changed MoySklad contact-person event(s)`);
   }
 
-  private async markProviderFailed(provider: 'BITRIX24' | 'MOYSKLAD', error: unknown, leaseToken: string) {
+  private async markProviderFailed(provider: 'BITRIX24' | 'MOYSKLAD', error: unknown, leaseToken: string, phase: string) {
+    const diagnostic = error instanceof UnsupportedPaginationError ? 'PAGINATION'
+      : error instanceof ProviderFeedError ? 'PROVIDER_HTTP'
+        : isRecord(error) && typeof error.code === 'string' && /^P\d{4}$/.test(error.code) ? error.code
+          : nightlySafeDiagnostic(error);
+    await writeOperationalLog(this.database, 'ERROR', `Nightly ${provider} ${phase} ${diagnostic}`, 'nightly');
     const current = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { nightlyAttempts: true } });
     await this.database.syncSetting.updateMany({
       where: { id: 'global', nightlyLeaseToken: leaseToken },
@@ -686,10 +739,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
   }
 
   private async renewNightlyLease(leaseToken: string) {
-    const renewed = await this.database.$executeRaw`
-      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = NOW() + INTERVAL '60 seconds', "updatedAt" = NOW()
-      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > NOW()
-    `;
+    const renewed = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
+      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds', "updatedAt" = NOW()
+      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > (clock_timestamp() AT TIME ZONE 'UTC')
+    `);
     if (renewed !== 1) throw new Error('Nightly run lease was lost');
   }
 
@@ -769,7 +822,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       '>=timestampX': from.toISOString(), '<=timestampX': through.toISOString(),
       ...(lastId === null ? {} : { '>id': Number(lastId) }),
     };
-    const body = { filter, order: { id: 'ASC' }, select: ['id', 'timestampX'], start: 0 };
+    const body = { filter, order: { id: 'ASC' }, select: ['id', 'iblockId', 'timestampX'], start: 0 };
     let response: Response;
     try {
       await this.waitForNightlyRequestSlot();
@@ -814,7 +867,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     try {
       await this.waitForNightlyRequestSlot();
       response = await fetch(url, {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {

@@ -78,41 +78,32 @@ export class ClientRuntimeResolver {
     const conflictingEmail = emailMatches.filter((candidate) => candidate.occupiedByPair || candidate.duplicateMarked === true ||
       Boolean(inn && nonEmpty(candidate.inn) && candidate.inn !== inn));
     if (conflictingEmail.length) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: conflictingEmail.map((candidate) => candidate.id) };
-    if (emailMatches.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: emailMatches.map((candidate) => candidate.id) };
-    const emailMatch = emailMatches[0];
     const exactInn = inn ? await this.gateway.companyByInn(inn, targetSystem) : [];
     // A search result with no INN is not an exact-INN match and must not be
     // selected (nor populated with the source's INN as a side effect).
     const innMatches = exactInn.filter((candidate) => !candidate.occupiedByPair && candidate.inn === inn);
     const permittedByInn = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(innMatches) : innMatches;
-    const innChoice = chooseCandidate(permittedByInn, 'exact_inn', targetSystem);
     if (permittedByInn.length) {
-      if (emailMatch && !permittedByInn.some((candidate) => candidate.id === emailMatch.id)) {
-        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permittedByInn.map((candidate) => candidate.id), emailMatch.id])] };
+      const intersection = emailMatches.filter((candidate) => permittedByInn.some((match) => match.id === candidate.id));
+      if (emailMatches.length && !intersection.length) {
+        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permittedByInn, ...emailMatches].map((candidate) => candidate.id))] };
       }
-      if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
-      if (innChoice) return innChoice;
+      return chooseCandidate(intersection.length ? intersection : permittedByInn, intersection.length ? 'exact_inn_and_email' : 'exact_inn', targetSystem)!;
     }
-    if (inn && permittedByInn.length) return permittedByInn.length > 1
-      ? { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permittedByInn.map((candidate) => candidate.id) }
-      : permittedByInn[0] ? candidateResolution(permittedByInn[0], 'exact_inn', false, targetSystem) : { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : 'company', targetSystem, reason: 'NO_CANDIDATE' };
 
     const name = nonEmpty(source.name);
     const phone = nonEmpty(source.phone);
     const fallback = name && phone ? await this.gateway.companyByExactNameAndPhone(name, phone, targetSystem) : [];
     const fallbackMatches = fallback.filter((candidate) => !candidate.occupiedByPair && (!nonEmpty(candidate.inn) || !inn || candidate.inn === inn));
     const permitted = targetSystem === 'BITRIX24' ? preferUnmarkedCompany(fallbackMatches) : fallbackMatches;
-    const choice = chooseCandidate(permitted, 'exact_name_and_phone', targetSystem);
     if (permitted.length) {
-      if (emailMatch && !permitted.some((candidate) => candidate.id === emailMatch.id)) {
-        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted.map((candidate) => candidate.id), emailMatch.id])] };
+      const intersection = emailMatches.filter((candidate) => permitted.some((match) => match.id === candidate.id));
+      if (emailMatches.length && !intersection.length) {
+        return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted, ...emailMatches].map((candidate) => candidate.id))] };
       }
-      if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
-      if (choice) return choice;
+      return chooseCandidate(intersection.length ? intersection : permitted, intersection.length ? 'exact_name_phone_and_email' : 'exact_name_and_phone', targetSystem)!;
     }
-    if (permitted.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permitted.map((candidate) => candidate.id) };
-    if (permitted.length === 1) return candidateResolution(permitted[0], 'exact_name_and_phone', false, targetSystem);
-    if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
+    if (emailMatches.length) return chooseCandidate(emailMatches, emailMatches.length === 1 ? 'normalized_email' : 'normalized_email_ranked', targetSystem)!;
     return { action: 'CREATE', targetType: targetSystem === 'MOYSKLAD' ? 'counterparty' : 'company', targetSystem, reason: 'NO_CANDIDATE' };
   }
 
@@ -134,15 +125,18 @@ export class ClientRuntimeResolver {
         ? await this.gateway.contactByStandaloneNamePhone(name, phone, email ?? undefined, targetSystem)
         : await this.gateway.contactByStandaloneNameEmail(name, email!, targetSystem) : [];
     const emailCandidates = email ? await this.gateway.contactByEmail(email, primaryCompanyTargetId ?? null, targetSystem) : [];
-    if (emailCandidates.some((candidate) => candidate.occupiedByPair) || emailCandidates.length > 1) {
+    if (emailCandidates.some((candidate) => candidate.occupiedByPair)) {
       return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: emailCandidates.map((candidate) => candidate.id) };
     }
-    const emailMatch = emailCandidates[0];
     const permitted = keyedCandidates.filter((candidate) => !candidate.occupiedByPair);
-    if (emailMatch && permitted.some((candidate) => candidate.id !== emailMatch.id)) {
-      return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted.map((candidate) => candidate.id), emailMatch.id])] };
+    const intersection = emailCandidates.filter((candidate) => permitted.some((match) => match.id === candidate.id));
+    if (emailCandidates.length && permitted.length && !intersection.length) {
+      return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: [...new Set([...permitted, ...emailCandidates].map((candidate) => candidate.id))] };
     }
-    if (emailMatch) return candidateResolution(emailMatch, 'normalized_email', false, targetSystem);
+    if (emailCandidates.length) {
+      const matches = intersection.length ? intersection : emailCandidates;
+      return chooseCandidate(matches, matches.length === 1 ? 'normalized_email' : 'normalized_email_ranked', targetSystem)!;
+    }
     const choice = chooseCandidate(permitted, phone ? 'normalized_name_and_phone' : 'normalized_name_and_email', targetSystem);
     if (choice) return choice;
     if (permitted.length > 1) return { action: 'MANUAL_REVIEW', reason: 'AMBIGUOUS_CANDIDATES', candidates: permitted.map((candidate) => candidate.id) };

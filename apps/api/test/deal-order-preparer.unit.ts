@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
 import { DatabaseService } from '../src/database.service';
-import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
+import { DealOrderCreationPreparer, readRuntimeReferences } from '../src/deals-orders/deal-order-creation-preparer.service';
 
 const uuids = {
   company: '11111111-1111-4111-8111-111111111111',
@@ -32,6 +32,7 @@ let rows: Record<string, unknown>[] = [];
 let deal: Record<string, unknown>;
 let requestCount = 0;
 let nextRowId = 1;
+let operationalMessages: string[] = [];
 let requireExactMoyskladReadHeaders = false;
 let observedMoyskladReferenceHeaders: Array<{ accept: string | null; acceptEncoding: string | null }> = [];
 
@@ -65,6 +66,27 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
 });
 
+test('assembly handoff needs explicit creation admission; a transition mapping alone does not create orders', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.STAGE_ID = 'UC_DZSNZ0';
+  const config = eventConfig();
+  config.config.dealOrderRuntime!.stageTransitions = {
+    bitrix24ToMoysklad: [{ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state }],
+    moyskladToBitrix24: [{ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state }],
+  };
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'assembly-before', eventConfig: config }),
+    { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' });
+  const originalStages = structuredClone(config.config.dealOrderRuntime!.stages);
+  config.config.dealOrderRuntime!.stages.push({ bitrix24StageId: 'UC_DZSNZ0', moyskladId: uuids.state, creationEnabled: true });
+  const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'assembly-after', eventConfig: config });
+  assert.equal(result.status, 'READY');
+  if (result.status === 'READY') assert.equal(result.input.payload.positions.length, 1);
+  assert.deepEqual(config.config.dealOrderRuntime!.stages.slice(0, -1), originalStages);
+  deal.STAGE_ID = 'UC_G3M2W5';
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'another-stage', eventConfig: config }),
+    { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' });
+});
 test('claimed deal worker lease is forwarded unchanged to client dependencies, never replaced by a RECEIVED assumption', async()=>{
   reset(); rows=[productRow(10,1)];
   let asserted=0;
@@ -170,10 +192,104 @@ test('native MySklad numbering must be explicitly verified before an order can b
   assert.deepEqual(result, { status: 'WAITING', reason: 'NATIVE_ORDER_NUMBERING_UNVERIFIED' });
 });
 
+test('unmapped store and employee use only confirmed configured defaults when policy explicitly allows it', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.UF_CRM_1732004209 = '999';
+  deal.ASSIGNED_BY_ID = '998';
+  const settings = eventConfig();
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-default-fallback', eventConfig: settings });
+
+  assert.equal(result.status, 'READY');
+  if (result.status !== 'READY') return;
+  assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
+  assert.equal(result.input.payload.owner.meta.href, msRef('employee', uuids.employee));
+  assert.ok(operationalMessages.some((message) => message.includes('reason=UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED')));
+  assert.ok(operationalMessages.some((message) => message.includes('reason=UNMAPPED_SOURCE_EMPLOYEE_DEFAULT_APPLIED')));
+});
+
+test('unmapped store holds while legacy employee fallback remains compatible unless explicit hold is saved', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.UF_CRM_1732004209 = '999';
+  const storeHeld = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-strict-store', eventConfig: eventConfig() });
+  assert.deepEqual(storeHeld, { status: 'WAITING', reason: 'STORE_MAPPING_UNCONFIRMED' });
+
+  reset();
+  rows = [productRow(10, 1)];
+  deal.ASSIGNED_BY_ID = '998';
+  const employeeHeld = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-strict-employee', eventConfig: eventConfig() });
+  assert.equal(employeeHeld.status, 'READY', 'legacy configs keep the previously supported configured-default employee fallback');
+
+  reset();
+  rows = [productRow(10, 1)];
+  deal.ASSIGNED_BY_ID = '998';
+  const strictSettings = eventConfig();
+  strictSettings.config.dealOrderRuntime.unmappedReferencePolicy = 'hold';
+  assert.deepEqual(
+    await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-explicit-employee-hold', eventConfig: strictSettings }),
+    { status: 'WAITING', reason: 'EMPLOYEE_MAPPING_UNCONFIRMED' },
+  );
+});
+
+test('confirmed defaults never turn an unmapped forward deal stage into an order create', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.STAGE_ID = 'NEW';
+  const settings = eventConfig();
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  assert.deepEqual(
+    await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-stage', eventConfig: settings }),
+    { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' },
+  );
+});
+
+test('confirmed defaults preserve explicitly configured creation-enabled custom forward stages', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.STAGE_ID = 'NEW';
+  const settings = eventConfig();
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  settings.config.dealOrderRuntime.stages.push({ bitrix24StageId: 'NEW', moyskladId: uuids.state, creationEnabled: true });
+  const result = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-configured-custom-stage', eventConfig: settings });
+  assert.equal(result.status, 'READY');
+});
+
+test('confirmed defaults use RUB without FX and the default organization for unmapped source values', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  const settings = eventConfig();
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'confirmed-defaults';
+  deal.CURRENCY_ID = 'USD';
+  const currencyResult = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-currency', eventConfig: settings });
+  assert.equal(currencyResult.status, 'READY');
+  if (currencyResult.status === 'READY') {
+    assert.equal(currencyResult.input.payload.rate.currency.meta.href, msRef('currency', uuids.currency));
+    assert.equal(currencyResult.input.payload.positions[0]?.price, 1000);
+  }
+
+  reset();
+  rows = [productRow(10, 1)];
+  deal.UF_CRM_1776347243 = '1234';
+  const organizationResult = await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-organization', eventConfig: settings });
+  assert.equal(organizationResult.status, 'READY');
+  if (organizationResult.status === 'READY') assert.equal(organizationResult.input.payload.organization.meta.href, msRef('organization', uuids.organization));
+  settings.config.dealOrderRuntime.unmappedReferencePolicy = 'hold';
+  assert.deepEqual(await preparer.prepare({ bitrix24DealId: '100', eventId: 'event-unmapped-organization-held', eventConfig: settings }),
+    { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' });
+});
+
+test('runtime policy parsing defaults to hold and rejects unknown policy values', () => {
+  const runtime = eventConfig().config.dealOrderRuntime;
+  assert.equal(readRuntimeReferences(runtime)?.unmappedReferencePolicy, undefined);
+  assert.equal(readRuntimeReferences({ ...runtime, unmappedReferencePolicy: 'guess' }), null);
+});
+
 function createPreparerDatabase(): DatabaseService {
   const database: any = {
     entityPair: { findMany },
-    operationalLog: { create: async () => ({}) },
+    operationalLog: { create: async ({ data }: { data?: { message?: string } }) => { if (data?.message) operationalMessages.push(data.message); return {}; } },
     $transaction: async (work: (transaction: any) => Promise<unknown>) => work({
       $queryRaw: async () => [{ serviceMode: 'on' }],
     }),
@@ -199,7 +315,7 @@ function eventConfig(): any {
         defaultStoreId: uuids.store,
         defaultEmployeeId: uuids.employee,
         currencies: [{ bitrix24Code: 'RUB', moyskladId: uuids.currency }],
-        stages: [{ bitrix24StageId: 'NEW', moyskladId: uuids.state, creationEnabled: true }],
+        stages: [{ bitrix24StageId: 'PREPARATION', moyskladId: uuids.state, creationEnabled: true }],
         organizations: [], stores: [], employees: [],
       },
     },
@@ -214,8 +330,9 @@ function productRow(price: number, quantity: number) {
 function reset() {
   requestCount = 0;
   nextRowId = 1;
+  operationalMessages = [];
   productPairExists = true;
-  deal = { ID: '100', COMPANY_ID: 200, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null };
+  deal = { ID: '100', COMPANY_ID: 200, STAGE_ID: 'PREPARATION', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null };
 }
 
 async function findMany(args: { where: { entityType: string; bitrix24Id: string }; take: number }) {

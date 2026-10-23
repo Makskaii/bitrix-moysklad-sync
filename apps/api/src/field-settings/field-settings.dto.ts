@@ -5,6 +5,8 @@ export type UnitReference = {
   bitrix24Code: string;
   moyskladId: string | null;
   moyskladCode: string | null;
+  /** Additional explicitly approved MS units accepted only in MS -> Bitrix. */
+  reverseMoyskladIds?: string[];
   status: 'configured' | 'unmapped';
 };
 
@@ -57,6 +59,10 @@ export type FieldGroupDto = {
 
 export type DealOrderRuntimeDto = {
   nativeOrderNumberingVerified: boolean;
+  /** Explicit opt-in to safe stage/store/employee fallbacks; omitted configs retain strict behavior. */
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
+  /** Existing documents only: preserve an unmapped native stage, warn, and continue other fields. */
+  unmappedStagePolicy?: 'hold' | 'preserve-and-warn';
   /** Explicitly selected Bitrix24 product catalog for the MS→B24 prerequisite path. */
   bitrix24ProductCatalogId?: string | null;
   /** Optional explicit default Bitrix24 catalog section for newly created products. */
@@ -69,6 +75,11 @@ export type DealOrderRuntimeDto = {
   defaultProductGroupId?: string | null;
   currencies: Array<{ bitrix24Code: string; moyskladId: string }>;
   stages: Array<{ bitrix24StageId: string; moyskladId: string; creationEnabled: boolean }>;
+  /** Explicit existing-document transitions; independent from creation eligibility. */
+  stageTransitions?: {
+    bitrix24ToMoysklad: Array<{ bitrix24StageId: string; moyskladId: string }>;
+    moyskladToBitrix24: Array<{ bitrix24StageId: string; moyskladId: string }>;
+  };
   organizations: Array<{ bitrix24Id: string; moyskladId: string }>;
   stores: Array<{ bitrix24Id: string; moyskladId: string }>;
   employees: Array<{ bitrix24Id: string; moyskladId: string }>;

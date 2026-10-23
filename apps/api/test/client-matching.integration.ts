@@ -68,6 +68,44 @@ function candidate(id: string, values: Partial<ClientCandidate> = {}): ClientCan
   return { id, type: 'counterparty', createdAt: '2025-01-01T00:00:00.000Z', usageCount: 0, filledFields: 1, occupiedByPair: false, ...values };
 }
 
+test('shared company email uses approved usage/fullness/age ranking instead of an unconditional review', async () => {
+  let rows = [candidate('newer', { createdAt: '2026-01-01T00:00:00Z' }), candidate('older', { createdAt: '2022-01-01T00:00:00Z' })];
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByEmail: async () => rows,
+    companyByInn: async () => [], companyByExactNameAndPhone: async () => [],
+  } as never);
+  const source = { id: 'source', entity: 'COMPANY' as const, name: 'Example', email: 'shared@example.test' };
+  for (const order of [rows, [...rows].reverse()]) {
+    rows = order;
+    const result = await resolver.resolve(source);
+    assert.equal(result.action === 'USE_CANDIDATE' && result.targetId, 'older');
+  }
+  rows = rows.map((row) => ({ ...row, usageCount: row.id === 'newer' ? 10 : 0 }));
+  const result = await resolver.resolve(source);
+  assert.equal(result.action === 'USE_CANDIDATE' && result.targetId, 'newer');
+});
+
+test('shared email is narrowed by exact INN before candidates are ranked', async () => {
+  const rows = [candidate('email-only', { usageCount: 100 }), candidate('same-inn', { inn: '123' })];
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, companyByEmail: async () => rows,
+    companyByInn: async () => rows.filter((row) => row.inn === '123'), companyByExactNameAndPhone: async () => [],
+  } as never);
+  const result = await resolver.resolve({ id: 'source', entity: 'COMPANY', name: 'Example', inn: '123', email: 'shared@example.test' });
+  assert.equal(result.action === 'USE_CANDIDATE' && result.targetId, 'same-inn');
+});
+
+test('shared contact email is ranked within its explicit parent without overriding conflicting name/phone', async () => {
+  const rows = [candidate('later', { type: 'contactperson', parentId: 'parent', usageCount: null, usageMetricUnavailable: true, createdAt: '2026-01-01T00:00:00Z' }),
+    candidate('earlier', { type: 'contactperson', parentId: 'parent', usageCount: null, usageMetricUnavailable: true, createdAt: '2022-01-01T00:00:00Z' })];
+  const resolver = new ClientRuntimeResolver({
+    findPair: async () => null, contactByEmail: async (_email: string, parent: string) => parent === 'parent' ? rows : [],
+    contactByCompanyAndNameEmail: async () => rows,
+  } as never);
+  const result = await resolver.resolve({ id: 'source', entity: 'CONTACT', name: 'Example', email: 'shared@example.test', companyId: 'b24-parent' }, 'parent');
+  assert.equal(result.action === 'USE_CANDIDATE' && result.targetId, 'earlier');
+});
+
 test('candidate selection follows usage, filled fields and earliest creation date without inventing a tie-break', () => {
   assert.equal(chooseCandidate([
     candidate('more-used', { usageCount: 5, filledFields: 1 }),

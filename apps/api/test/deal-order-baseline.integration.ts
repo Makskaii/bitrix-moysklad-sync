@@ -36,6 +36,8 @@ let bitrixCompanyId = '0';
 let moyskladAgentId: string | null = null;
 let bitrixOpportunity = '1';
 let moyskladOrderSum: number | string = 1;
+let nativeCurrencyRelation = false;
+const nativeCurrencyId = '02afc9d5-d515-11e2-4ba4-7054d21a8d1e';
 let runtimeCompanyId = '';
 let runtimeCompanyMoyskladId = '';
 let runtimeCompanyEmail = 'Match.Email@Example.Test';
@@ -107,6 +109,7 @@ beforeEach(async () => {
   moyskladAgentId = null;
   bitrixOpportunity = '1';
   moyskladOrderSum = 1;
+  nativeCurrencyRelation = false;
   opportunityWrites = 0;
   bitrixRowPrice = 1;
   moyskladPositionPrice = 100;
@@ -411,6 +414,33 @@ test('document totals retain only B24-origin one-kopeck RUB residue and otherwis
   await waitForEventStatus(database, directionEventId, 'SUCCEEDED');
   assert.equal(opportunityWrites, 3, 'a B24 target write follows the MS→B24 direction even when B24→MS is disabled');
   await database.syncDirectionSetting.upsert({ where: { entityKey: 'deals-orders' }, create: { entityKey: 'deals-orders', bitrix24ToMoysklad: true, moyskladToBitrix24: true }, update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
+});
+
+test('public paired updates normalize native currency and kopecks while refusing ambiguous legacy total snapshots', async () => {
+  const database = app.get(DatabaseService);
+  bitrixId = String(7_420_000_000 + Math.floor(Math.random() * 1_000_000)); moyskladId = randomUUID();
+  const settingsVersion = 990_000 + Math.floor(Math.random() * 1000);
+  const pair = await createConfirmedPairAndSettings(database, settingsVersion);
+  const settings = await app.get(FieldSettingsService).version(settingsVersion);
+  await database.fieldSettingsVersion.update({where:{version:settingsVersion},data:{config:{...settings.config,
+    dealOrderRuntime:{currencies:[{bitrix24Code:'RUB',moyskladId:nativeCurrencyId}]}} as any}});
+  nativeCurrencyRelation = true;
+  const first = await postB24(bitrixId, bitrixComments, 'native-currency-total');
+  await waitForEventStatus(database, (await first.json() as {eventId:string}).eventId, 'SUCCEEDED');
+  const baseline = await database.entityPairBaseline.findUniqueOrThrow({where:{pairId:pair.id}});
+  assert.deepEqual((baseline.moyskladValues as any)['deal-order-total'],{amount:'1',currencyCode:'RUB',amountUnit:'major-v1'});
+  bitrixOpportunity = '1.03';
+  const next = await postB24(bitrixId, bitrixComments, 'native-currency-correction');
+  await waitForEventStatus(database,(await next.json() as {eventId:string}).eventId,'SUCCEEDED');
+  assert.equal(bitrixOpportunity,'1','100 kopecks must never become 100 rubles in B24');
+  assert.equal(opportunityWrites,1);
+  const legacy = {...baseline.moyskladValues as any,'deal-order-total':{amount:100,currencyCode:null}};
+  await database.entityPairBaseline.update({where:{pairId:pair.id},data:{moyskladValues:legacy}});
+  const held = await postB24(bitrixId, bitrixComments, 'legacy-total-no-guess');
+  const heldId = (await held.json() as {eventId:string}).eventId;
+  await waitForEventStatus(database,heldId,'MANUAL_REVIEW');
+  assert.equal((await database.inboundEvent.findUniqueOrThrow({where:{id:heldId}})).lastErrorCategory,'DEAL_ORDER_TOTAL_LEGACY_BASELINE_REVIEW_REQUIRED');
+  assert.equal(opportunityWrites,1);
 });
 
 test('deal/order source read failures persist bounded Retry-After; permanent 4xx is held for review', async () => {
@@ -829,7 +859,9 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(failure.status); response.end(JSON.stringify({ error: 'read failure' }));
       return;
     }
-    const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, name: moyskladName, description: moyskladDescription, sum: moyskladOrderSum, currency: { isoCode: 'RUB' }, vatIncluded: false, created: '2026-10-05 13:00:00', updated: '2026-10-07T10:00:00+00:00' };
+    const order: Record<string, unknown> = { id: moyskladId, meta: { type: 'customerorder' }, name: moyskladName, description: moyskladDescription, sum: Math.round(Number(moyskladOrderSum) * 100),
+      ...(nativeCurrencyRelation ? {rate:{currency:{meta:{href:`${fakeBase}/ms/api/remap/1.2/entity/currency/${nativeCurrencyId}`,type:'currency'}}}} : {currency:{isoCode:'RUB'}}),
+      vatIncluded: false, created: '2026-10-05 13:00:00', updated: '2026-10-07T10:00:00+00:00' };
     if (moyskladAgentId) order.agent = { id: moyskladAgentId, meta: { href: `${fakeBase}/entity/counterparty/${moyskladAgentId}`, type: 'counterparty' } };
     response.writeHead(200); response.end(JSON.stringify(order));
   } else if (new URL(path, fakeBase).pathname === '/ms/api/remap/1.2/entity/counterparty' && request.method === 'GET') {

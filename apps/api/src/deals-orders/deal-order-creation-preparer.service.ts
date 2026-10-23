@@ -8,7 +8,8 @@ import { DealOrderPreparedInput } from './deal-order-create-operation.service';
 import { bitrixMoneyToMoySklad } from './deal-order-money';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
-import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
+import { DocumentProductIdentityError, DocumentProductIdentityReadError, ensureDocumentProductIdentity, productIdentityResponseFailure, productIdentityUserAction } from '../products/document-product-identity';
+import { retryAtForFailure } from '../provider-failure';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
 import { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
@@ -20,6 +21,7 @@ const EXACT_OPTIONAL_STRING_ATTRIBUTES: Record<string, string> = {
 };
 
 export type RuntimeReferenceSettings = {
+  unmappedReferencePolicy?: 'hold' | 'confirmed-defaults';
   nativeOrderNumberingVerified: boolean;
   defaultOrganizationId: string;
   defaultStoreId: string;
@@ -34,7 +36,8 @@ export type RuntimeReferenceSettings = {
 
 export type DealOrderPreparationResult =
   | { status: 'READY'; input: DealOrderPreparedInput }
-  | { status: 'WAITING'; reason: string };
+  | { status: 'WAITING'; reason: string; productIdentityReadFailure?: true; retryAfter?: Date }
+  | { status: 'MANUAL_REVIEW'; reason: string; userAction: string };
 
 /** Resolves a complete create payload from the event-pinned config and persisted dependency pairs. */
 @Injectable()
@@ -50,7 +53,7 @@ export class DealOrderCreationPreparer {
     return result.value;
   }
 
-  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto }, workerLease?: EventWorkerLeaseContext): Promise<DealOrderPreparationResult> {
+  async prepare(input: { bitrix24DealId: string; eventId: string; eventConfig: VersionedFieldSettingsDto; attempt?: number }, workerLease?: EventWorkerLeaseContext): Promise<DealOrderPreparationResult> {
     await workerLease?.assertOwned();
     const references = readRuntimeReferences(input.eventConfig.config.dealOrderRuntime);
     if (!references) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
@@ -67,6 +70,20 @@ export class DealOrderCreationPreparer {
     }
 
     if (String(deal.ID ?? '') !== input.bitrix24DealId) return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
+    if (readString(deal.ORIGINATOR_ID) === 'MOYSKLAD') {
+      const sourceOrderId = readString(deal.ORIGIN_ID);
+      if (!isUuid(sourceOrderId)) return { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_INVALID' };
+      const reverse = await this.database.dealOrderReverseCreateOperation.findUnique({
+        where: { moyskladOrderId: sourceOrderId }, select: { bitrix24DealId: true, status: true },
+      });
+      if (!reverse || !['WAITING', 'PENDING', 'SUCCEEDED', 'PARTIAL'].includes(reverse.status) ||
+          (reverse.bitrix24DealId && reverse.bitrix24DealId !== input.bitrix24DealId)) {
+        return { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' };
+      }
+      // Provider callbacks can arrive before the CREATE acknowledgement and
+      // pair commit. Never send an imported deal back as another MS order.
+      return { status: 'WAITING', reason: 'REVERSE_DEAL_CREATE_PENDING' };
+    }
     const stageId = readString(deal.STAGE_ID);
     const stage = references.stages.find((candidate) => candidate.bitrix24StageId === stageId);
     if (!stage) return { status: 'WAITING', reason: 'STAGE_NOT_CONFIGURED' };
@@ -81,22 +98,34 @@ export class DealOrderCreationPreparer {
     if (rows.length > 1000) return { status: 'WAITING', reason: 'ROWS_INCOMPLETE' };
 
     const currencyCode = readString(deal.CURRENCY_ID);
-    const currency = references.currencies.find((candidate) => candidate.bitrix24Code === currencyCode);
+    const mappedCurrency = references.currencies.find((candidate) => candidate.bitrix24Code === currencyCode);
+    const currencyFallbackUsed = !mappedCurrency && references.unmappedReferencePolicy === 'confirmed-defaults';
+    // Explicit user policy: an unmapped currency is RUB without FX conversion.
+    // A counterparty price type is not currency evidence.
+    const currency = mappedCurrency ?? (currencyFallbackUsed ? references.currencies.find((candidate) => candidate.bitrix24Code === 'RUB') : undefined);
     if (!currency) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
+    const rawStoreSource = deal.UF_CRM_1732004209;
     const storeSource = readOptionalId(deal.UF_CRM_1732004209);
-    const targetStoreId = storeSource
-      ? references.stores.find((candidate) => candidate.bitrix24Id === storeSource)?.moyskladId
-      : references.defaultStoreId;
+    if (hasOptionalValue(rawStoreSource) && !storeSource) return { status: 'WAITING', reason: 'STORE_SOURCE_INVALID' };
+    const mappedStoreId = storeSource ? references.stores.find((candidate) => candidate.bitrix24Id === storeSource)?.moyskladId : undefined;
+    const storeFallbackUsed = !!storeSource && !mappedStoreId && references.unmappedReferencePolicy === 'confirmed-defaults';
+    if (storeSource && !mappedStoreId && !storeFallbackUsed) return { status: 'WAITING', reason: 'STORE_MAPPING_UNCONFIRMED' };
+    const targetStoreId = mappedStoreId ?? references.defaultStoreId;
     const organizationSource = readOptionalId(deal.UF_CRM_1776347243);
-    const targetOrganizationId = organizationSource
+    const mappedOrganizationId = organizationSource
       ? references.organizations.find((candidate) => candidate.bitrix24Id === organizationSource)?.moyskladId
       : references.defaultOrganizationId;
+    const organizationFallbackUsed = !!organizationSource && !mappedOrganizationId && references.unmappedReferencePolicy === 'confirmed-defaults';
+    const targetOrganizationId = mappedOrganizationId ?? (organizationFallbackUsed ? references.defaultOrganizationId : undefined);
     if (!targetStoreId || !targetOrganizationId) return { status: 'WAITING', reason: 'RUNTIME_REFERENCES_MISSING' };
-    const assignedBy = readOptionalId(deal.ASSIGNED_BY_ID);
-    const targetEmployeeId = assignedBy
-      ? references.employees.find((candidate) => candidate.bitrix24Id === assignedBy)?.moyskladId ?? references.defaultEmployeeId
-      : references.defaultEmployeeId;
-    const employeeFallbackUsed = !!assignedBy && !references.employees.some((candidate) => candidate.bitrix24Id === assignedBy);
+    const rawAssignedBy = deal.ASSIGNED_BY_ID;
+    const assignedBy = readOptionalId(rawAssignedBy);
+    if (hasOptionalValue(rawAssignedBy) && !assignedBy) return { status: 'WAITING', reason: 'EMPLOYEE_SOURCE_INVALID' };
+    const mappedEmployeeId = assignedBy ? references.employees.find((candidate) => candidate.bitrix24Id === assignedBy)?.moyskladId : undefined;
+    const employeeFallbackAllowed = references.unmappedReferencePolicy !== 'hold';
+    const employeeFallbackUsed = !!assignedBy && !mappedEmployeeId && employeeFallbackAllowed;
+    if (assignedBy && !mappedEmployeeId && !employeeFallbackUsed) return { status: 'WAITING', reason: 'EMPLOYEE_MAPPING_UNCONFIRMED' };
+    const targetEmployeeId = mappedEmployeeId ?? references.defaultEmployeeId;
 
     const referencesVerified = await Promise.all([
       verifyMySkladReference('organization', targetOrganizationId, (work) => this.providerModeGate(work)),
@@ -223,7 +252,8 @@ export class DealOrderCreationPreparer {
           bitrix24CatalogId: input.eventConfig.config.productCatalogRuntime?.bitrix24CatalogId ?? input.eventConfig.config.dealOrderRuntime?.bitrix24ProductCatalogId ?? '',
         });
       } catch (error) {
-        if (error instanceof DocumentProductIdentityError) return { status: 'WAITING', reason: error.reason };
+        const failure = productIdentityPreparationFailure(error, input.attempt ?? 1);
+        if (failure) return failure;
         throw error;
       }
       const productPairs = await this.database.entityPair.findMany({
@@ -247,7 +277,13 @@ export class DealOrderCreationPreparer {
         }
         await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_DUPLICATE_ALIAS_USED_FOR_DOCUMENT_ROW', eventId: input.eventId, dealId: input.bitrix24DealId, sourceProductId: productId }), input.eventId);
       } else { await skipRow('PRODUCT_PAIR_AMBIGUOUS'); continue; }
-      const assortment = await readMoySkladAssortment(targetProductId, (work) => this.providerModeGate(work));
+      let assortment: Awaited<ReturnType<typeof readMoySkladAssortment>>;
+      try { assortment = await readMoySkladAssortment(targetProductId, (work) => this.providerModeGate(work)); }
+      catch (error) {
+        const failure = productIdentityPreparationFailure(error, input.attempt ?? 1);
+        if (failure) return failure;
+        throw error;
+      }
       if (!assortment || assortment.uomId !== unit.moyskladId) { await skipRow('PRODUCT_UNIT_MISMATCH'); continue; }
 
       rowsPrepared.push({
@@ -295,7 +331,13 @@ export class DealOrderCreationPreparer {
         ...preparedAttributes.nativeFields,
       },
     };
-    if (employeeFallbackUsed) await writeOperationalLog(this.database, 'ADMIN', 'Deal order used configured default MySklad responsible', input.bitrix24DealId);
+    if (storeFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad store; reason=UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED', input.eventId);
+    if (currencyFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured RUB currency without converting numeric prices; reason=UNMAPPED_SOURCE_CURRENCY_RUB_APPLIED', input.eventId);
+    if (organizationFallbackUsed) await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad organization; reason=UNMAPPED_SOURCE_ORGANIZATION_DEFAULT_APPLIED', input.eventId);
+    if (employeeFallbackUsed) {
+      await writeOperationalLog(this.database, 'EVENT', 'Deal order used configured default MySklad responsible; reason=UNMAPPED_SOURCE_EMPLOYEE_DEFAULT_APPLIED', input.eventId);
+      await writeOperationalLog(this.database, 'ADMIN', 'Deal order used configured default MySklad responsible', input.eventId);
+    }
     return { status: 'READY', input: inputPrepared };
   }
 }
@@ -306,7 +348,10 @@ function prepareMappedAttributes(
   base: URL,
 ): { attributes: Array<{ meta: { href: string; type: 'attributemetadata'; mediaType: 'application/json' }; value: unknown }>; nativeFields: Record<string, unknown>; skippedOptionalRules: string[] } | null {
   if (config.groups.some((group) => group.entity === 'deals-orders')) return null;
-  const activeRules = config.rules.filter((rule) => rule.entity === 'deals-orders' && (rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled));
+  // Order creation sends only forward fields. Reverse-only mappings remain
+  // available to the existing-pair field runtime, not to this MS payload.
+  const activeRules = config.rules.filter((rule) => rule.entity === 'deals-orders' &&
+    (rule.bitrix24ToMoysklad.enabled || isQ26PaidSumRule(rule)));
   const targets = new Set<string>();
   const attributes: Array<{ meta: { href: string; type: 'attributemetadata'; mediaType: 'application/json' }; value: unknown }> = [];
   const nativeFields: Record<string, unknown> = {};
@@ -486,15 +531,30 @@ async function readMoySkladAssortment(id: string, gate: ProviderModeGate): Promi
   const url = new URL('entity/assortment', withSlash(base));
   url.searchParams.set('filter', `id=${id}`);
   url.searchParams.set('limit', '2');
-  const response = await gate(() => fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) }));
+  const response = await gate(async () => {
+    try { return await fetch(url, { method: 'GET', headers: msHeaders(), redirect: 'error', signal: AbortSignal.timeout(10_000) }); }
+    catch { throw new DocumentProductIdentityReadError('MOYSKLAD', null); }
+  });
+  if (response.status === 404) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_NOT_FOUND');
+  if (!response.ok) throw productIdentityResponseFailure('MOYSKLAD', response);
   const body: unknown = await response.json().catch(() => null);
-  if (!response.ok || !isRecord(body) || !Array.isArray(body.rows) || body.rows.length !== 1 || !isRecord(body.rows[0])) throw new Error('MySklad assortment read failed');
+  if (!isRecord(body) || !Array.isArray(body.rows)) throw new DocumentProductIdentityReadError('MOYSKLAD', null);
+  if (body.rows.length === 0) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_NOT_FOUND');
+  if (body.rows.length !== 1 || !isRecord(body.rows[0])) throw new DocumentProductIdentityReadError('MOYSKLAD', null);
   const row = body.rows[0];
   const type = isRecord(row.meta) ? row.meta.type : null;
+  if (row.id !== id || type !== 'product' || row.archived === true) throw new DocumentProductIdentityError('PRODUCT_UUID_TARGET_INVALID');
   const uomId = moyskladUomReferenceId(row.uom, base);
   if (row.id !== id || type !== 'product' || !uomId) return null;
   const href = isRecord(row.meta) && typeof row.meta.href === 'string' ? row.meta.href : '';
   return { type, uomId, href };
+}
+
+function productIdentityPreparationFailure(error: unknown, attempt: number): Exclude<DealOrderPreparationResult, { status: 'READY' }> | null {
+  if (error instanceof DocumentProductIdentityError) return { status: 'MANUAL_REVIEW', reason: error.reason, userAction: productIdentityUserAction(error.reason) };
+  if (!(error instanceof DocumentProductIdentityReadError)) return null;
+  if (!error.retryable) return { status: 'MANUAL_REVIEW', reason: 'PRODUCT_UUID_PROVIDER_READ_REJECTED', userAction: productIdentityUserAction('PRODUCT_UUID_PROVIDER_READ_REJECTED') };
+  return { status: 'WAITING', reason: 'PRODUCT_UUID_PROVIDER_READ_FAILED', productIdentityReadFailure: true, retryAfter: retryAtForFailure(error, attempt) };
 }
 
 async function verifyMySkladReference(type: 'organization' | 'store' | 'employee' | 'currency' | 'state', id: string, gate: ProviderModeGate): Promise<boolean> {
@@ -514,6 +574,8 @@ async function verifyMySkladReference(type: 'organization' | 'store' | 'employee
 export function readRuntimeReferences(value: unknown): RuntimeReferenceSettings | null {
   if (!isRecord(value) || typeof value.nativeOrderNumberingVerified !== 'boolean' || !isUuid(value.defaultOrganizationId) || !isUuid(value.defaultStoreId) || !isUuid(value.defaultEmployeeId) ||
       !Array.isArray(value.currencies) || !Array.isArray(value.stages) || !Array.isArray(value.organizations) || !Array.isArray(value.stores) || !Array.isArray(value.employees)) return null;
+  const unmappedReferencePolicy = value.unmappedReferencePolicy;
+  if (unmappedReferencePolicy !== undefined && unmappedReferencePolicy !== 'hold' && unmappedReferencePolicy !== 'confirmed-defaults') return null;
   const currencies = value.currencies.filter((entry): entry is { bitrix24Code: string; moyskladId: string } =>
     isRecord(entry) && typeof entry.bitrix24Code === 'string' && /^[A-Z]{3}$/.test(entry.bitrix24Code) && isUuid(entry.moyskladId));
   const stages = value.stages.filter((entry): entry is { bitrix24StageId: string; moyskladId: string; creationEnabled: boolean } =>
@@ -528,7 +590,7 @@ export function readRuntimeReferences(value: unknown): RuntimeReferenceSettings 
   if (new Set(currencies.map((entry) => entry.bitrix24Code)).size !== currencies.length || new Set(stages.map((entry) => entry.bitrix24StageId)).size !== stages.length ||
       new Set(organizations.map((entry) => entry.bitrix24Id)).size !== organizations.length || new Set(stores.map((entry) => entry.bitrix24Id)).size !== stores.length || new Set(employees.map((entry) => entry.bitrix24Id)).size !== employees.length) return null;
   const defaultProductGroupId = value.defaultProductGroupId === null || value.defaultProductGroupId === undefined ? null : isUuid(value.defaultProductGroupId) ? value.defaultProductGroupId : null;
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, defaultOrganizationId: value.defaultOrganizationId, defaultStoreId: value.defaultStoreId, defaultEmployeeId: value.defaultEmployeeId, defaultProductGroupId, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, unmappedReferencePolicy, defaultOrganizationId: value.defaultOrganizationId, defaultStoreId: value.defaultStoreId, defaultEmployeeId: value.defaultEmployeeId, defaultProductGroupId, currencies, stages, organizations, stores, employees };
 }
 
 function toMinorUnits(value: unknown): number | null {
@@ -544,6 +606,7 @@ function readString(value: unknown): string | null { return typeof value === 'st
 function readNumericId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readRowId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readOptionalId(value: unknown): string | null { if (value === null || value === undefined || value === '') return null; return readNumericId(value); }
+function hasOptionalValue(value: unknown): boolean { return value !== null && value !== undefined && value !== ''; }
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function bitrixBase(): URL { return configuredBase('BITRIX24_REST_BASE_URL', true); }

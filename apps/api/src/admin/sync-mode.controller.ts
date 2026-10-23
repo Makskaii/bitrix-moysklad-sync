@@ -68,6 +68,17 @@ export class SyncModeController {
     return this.recovery.readStatus();
   }
 
+  @Post('first-launch/confirm')
+  async confirmFirstLaunch(@Body() body: Record<string, unknown> | null, @Req() request: { header(name: string): string | undefined }) {
+    if (!body || !this.databaseRecovery) throw new BadRequestException('First-launch confirmation is required');
+    const token = request.header('authorization')?.match(/^Bearer ([^\s]+)$/i)?.[1];
+    const actorId = token ? await readBitrixAdministratorIdentity(token) : null;
+    if (!actorId) throw new ForbiddenException('Administrator identity could not be verified');
+    const result = await this.databaseRecovery.confirmFirstLaunch(body, actorId);
+    await writeOperationalLog(this.database, 'ADMIN', 'Clean first launch confirmed; service remains Off');
+    return result;
+  }
+
   @Get('entities')
   readEntitySettings() {
     return this.syncMode.readEntitySettings();

@@ -29,7 +29,7 @@ type FieldGroup = {
   criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
 };
-type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
+type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; reverseMoyskladIds?: string[]; status: string };
 type PriceTypePair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladLabel: string | null; status: string };
 type DictionaryMap = {
   key: string;
@@ -43,6 +43,7 @@ type ReferenceKind = 'employees' | 'currencies' | 'organizations' | 'warehouses'
 type NamedReferencePair = { kind: ReferenceKind; bitrix24Id: string; bitrix24Label: string; moyskladId: string | null; moyskladLabel: string | null; status: 'suggested' | 'confirmed' | 'unmapped' };
 type DealOrderRuntime = {
   nativeOrderNumberingVerified: boolean;
+  unmappedStagePolicy?: 'hold' | 'preserve-and-warn';
   bitrix24ProductCatalogId?: string | null;
   bitrix24DefaultProductSectionId?: string | null;
   moyskladProductFields?: Array<'name' | 'code' | 'description'>;
@@ -353,7 +354,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   function changeUnit(bitrix24Id: number, moyskladId: string) {
     changeDraft((current) => ({
       ...current,
-      references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === bitrix24Id ? { ...row, moyskladId: moyskladId || null, moyskladCode: catalogs?.units.moysklad.find((candidate) => candidate.id === moyskladId)?.code ?? null, status: moyskladId ? 'configured' : 'unmapped' } : row) },
+      references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === bitrix24Id ? { ...row, moyskladId: moyskladId || null, moyskladCode: catalogs?.units.moysklad.find((candidate) => candidate.id === moyskladId)?.code ?? null, reverseMoyskladIds: moyskladId ? row.reverseMoyskladIds?.filter((id) => id !== moyskladId) : undefined, status: moyskladId ? 'configured' : 'unmapped' } : row) },
     }));
   }
 
@@ -759,6 +760,10 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           return <article key={unit.bitrix24Id} className="reference-map-row">
             <div><strong>Bitrix24 ID {unit.bitrix24Id} · код {unit.bitrix24Code}</strong><small>{unit.moyskladId ? `Сохранённая пара · код ${unit.moyskladCode ?? '—'}` : [14, 16, 20].includes(unit.bitrix24Id) ? 'Намеренно без пары' : 'Без пары'}</small></div>
             <label>МойСклад<select aria-label={`Единица МойСклад для ${unit.bitrix24Id}`} value={unit.moyskladId ?? ''} onChange={(event) => changeUnit(unit.bitrix24Id, event.target.value)}><option value="">Без пары</option>{catalogs.units.moysklad.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.code} · {candidate.id}</option>)}</select></label>
+            <label>Дополнительно только МС → Битрикс<select multiple disabled={!unit.moyskladId} aria-label={`Дополнительные обратные единицы для ${unit.bitrix24Id}`} value={unit.reverseMoyskladIds ?? []} onChange={(event) => {
+              const ids = Array.from(event.target.selectedOptions, (option) => option.value);
+              setDraft((current) => current ? { ...current, references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === unit.bitrix24Id ? { ...row, reverseMoyskladIds: ids } : row) } } : current);
+            }}>{catalogs.units.moysklad.filter((candidate) => candidate.id !== unit.moyskladId && !draft.references.units.some((other) => other.bitrix24Id !== unit.bitrix24Id && (other.moyskladId === candidate.id || other.reverseMoyskladIds?.includes(candidate.id)))).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.label} · {candidate.id}</option>)}</select><small>Не меняет единицу при отправке из Битрикса.</small></label>
             {suggestion && <span className="exact-match-note">Точный код: {suggestion.code}</span>}
           </article>;
         })}</div>
@@ -871,6 +876,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
               <label><input type="checkbox" checked={productFields.includes('description')} onChange={(event) => setProductField('description', event.currentTarget.checked)} />Описание</label>
             </fieldset>
             <label><input type="checkbox" checked={runtime.nativeOrderNumberingVerified} onChange={(event) => changeRuntime((current) => ({ ...current, nativeOrderNumberingVerified: event.currentTarget.checked }))} />Проверена нумерация заказов MyСклад (номер записывается в отдельное поле Bitrix24)</label>
+            <label>Стадия существующего документа без соответствия<select aria-label="Политика несопоставленных стадий" value={runtime.unmappedStagePolicy ?? 'hold'} onChange={(event) => { const value = event.currentTarget.value as 'hold' | 'preserve-and-warn'; changeRuntime((current) => ({ ...current, unmappedStagePolicy: value })); }}><option value="hold">Остановить для разбора</option><option value="preserve-and-warn">Сохранить стадии, предупредить и продолжить остальные поля</option></select></label>
             <label>Организация MyСклад по умолчанию<select aria-label="Организация MyСклад по умолчанию" value={runtime.defaultOrganizationId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultOrganizationId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{organizationOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
             <label>Склад MyСклад по умолчанию<select aria-label="Склад MyСклад по умолчанию" value={runtime.defaultStoreId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultStoreId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{storeOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
             <label>Ответственный MyСклад по умолчанию<select aria-label="Ответственный MyСклад по умолчанию" value={runtime.defaultEmployeeId ?? ''} onChange={(event) => changeRuntime((current) => ({ ...current, defaultEmployeeId: event.currentTarget.value || null }))}><option value="">Выберите подтверждённую пару</option>{employeeOptions.map((pair) => <option key={pair.bitrix24Id} value={pair.moyskladId!}>{pair.bitrix24Label} · {pair.moyskladId}</option>)}</select></label>
@@ -1004,6 +1010,7 @@ function runtimeFromConfirmedPairs(config: SettingsConfig, previous?: DealOrderR
   const mappings = (kind: ReferenceKind) => confirmed(kind).map((pair) => ({ bitrix24Id: pair.bitrix24Id, moyskladId: pair.moyskladId! }));
   return {
     nativeOrderNumberingVerified: previous?.nativeOrderNumberingVerified ?? false,
+    ...(previous?.unmappedStagePolicy === undefined ? {} : { unmappedStagePolicy: previous.unmappedStagePolicy }),
     bitrix24ProductCatalogId: previous?.bitrix24ProductCatalogId ?? null,
     bitrix24DefaultProductSectionId: previous?.bitrix24DefaultProductSectionId ?? null,
     moyskladProductFields: previous?.moyskladProductFields ?? ['name'],

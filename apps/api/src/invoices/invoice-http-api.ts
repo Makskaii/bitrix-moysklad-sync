@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
 import { ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { assertApplyExternalWrite } from '../external-write-guard';
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const logger = new Logger('InvoiceHttpApi');
 export type InvoiceRecord = Record<string, unknown>;
 
 @Injectable()
@@ -25,6 +26,16 @@ export class InvoiceHttpApi {
     if (item.id !== id || record(item.meta).type !== 'invoiceout') throw new Error('INVOICE_MOYSKLAD_READBACK_INVALID');
     const proposed = await this.dryWrites?.readback('MOYSKLAD', 'invoiceout', id);
     return { ...item, ...(proposed ?? {}) };
+  }
+
+  async readBitrix24ProductRowsPage(id: string, start: number): Promise<{ rows: InvoiceRecord[]; next: number | null }> {
+    if (!/^\d{1,20}$/.test(id) || !Number.isSafeInteger(start) || start < 0) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    const page = record(await this.bitrixCall('crm.item.productrow.list', { filter: { '=ownerType': 'SI', '=ownerId': id }, start }, true));
+    const result = record(page.result);
+    if (!Array.isArray(result.productRows) || result.productRows.some((row) => !isRecord(row) || row.ownerType !== 'SI' || String(row.ownerId) !== id)) throw new Error('INVOICE_ROWS_RESPONSE_INVALID');
+    const next = page.next === undefined ? null : page.next;
+    if (next !== null && (typeof next !== 'number' || !Number.isSafeInteger(next) || next <= start)) throw new Error('INVOICE_ROWS_PAGINATION_INVALID');
+    return { rows: result.productRows as InvoiceRecord[], next: next as number | null };
   }
 
   async findMoyskladByExternalCode(externalCode: string): Promise<InvoiceRecord[]> {
@@ -52,7 +63,7 @@ export class InvoiceHttpApi {
     const base = ensureSlash(requiredEnv('MOYSKLAD_API_BASE_URL'));
     const body = { ...moyskladFields(fields, base), externalCode: sourceId, customerOrder: { meta: meta(base, 'customerorder', orderId) } };
     if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'invoiceout', entityId: `externalCode:${sourceId}`, operation: 'CREATE', fields: body })) return `dry:${sourceId}`;
-    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_CREATE');
+    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_CREATE', null, 'invoice');
     const created = record(await this.moyskladRequest('entity/invoiceout', 'POST', body));
     const id = typeof created.id === 'string' && isUuid(created.id) ? created.id : '';
     if (!id) throw new Error('INVOICE_CREATE_RESPONSE_INVALID');
@@ -63,14 +74,36 @@ export class InvoiceHttpApi {
     const body = moyskladFields(fields, ensureSlash(requiredEnv('MOYSKLAD_API_BASE_URL')));
     if (Object.keys(body).length === 0) return;
     if (await this.dryWrites?.propose({ provider: 'MOYSKLAD', entityType: 'invoiceout', entityId: id, operation: 'UPDATE', fields: body })) return;
-    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_UPDATE');
+    assertApplyExternalWrite('MOYSKLAD', 'INVOICE_UPDATE', id, 'invoice');
     await this.moyskladRequest(`entity/invoiceout/${encodeURIComponent(id)}`, 'PUT', body);
+  }
+
+  async readMoyskladPositionsPage(id: string, offset: number): Promise<{ rows: InvoiceRecord[]; next: number | null }> {
+    if (!isUuid(id) || !Number.isSafeInteger(offset) || offset < 0) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    const root = record(await this.moyskladRequest(`entity/invoiceout/${id}/positions?limit=1000&offset=${offset}`, 'GET'));
+    const size = record(root.meta).size;
+    if (!Array.isArray(root.rows) || root.rows.some((row) => !isRecord(row)) || typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0 || offset + root.rows.length > size || root.rows.length === 0 && size > offset) throw new Error('INVOICE_ROWS_RESPONSE_INVALID');
+    return { rows: root.rows as InvoiceRecord[], next: offset + root.rows.length < size ? offset + root.rows.length : null };
+  }
+
+  async updateMoyskladPosition(id: string, positionId: string, fields: InvoiceRecord): Promise<void> {
+    if (!isUuid(id) || !isUuid(positionId)) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    assertApplyExternalWrite('MOYSKLAD','INVOICE_POSITION_UPDATE',id,'invoice');
+    await this.moyskladRequest(`entity/invoiceout/${id}/positions/${positionId}`,'PUT',fields);
+  }
+
+  async addMoyskladPosition(id: string, fields: InvoiceRecord): Promise<string> {
+    if (!isUuid(id)) throw new Error('INVOICE_ROWS_SCOPE_INVALID');
+    assertApplyExternalWrite('MOYSKLAD','INVOICE_CHILD_CREATE',id,'invoice');
+    const row = record(await this.moyskladRequest(`entity/invoiceout/${id}/positions`,'POST',fields));
+    if (typeof row.id !== 'string' || !isUuid(row.id)) throw new Error('INVOICE_POSITION_CREATE_RESPONSE_INVALID');
+    return row.id;
   }
 
   async createBitrix24(sourceId: string, dealId: string, fields: InvoiceRecord): Promise<string> {
     const body = { ...fields, parentId2: Number(dealId), originatorId: 'MOYSKLAD', originId: sourceId };
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'crm_dynamic_31', entityId: `origin:${sourceId}`, operation: 'CREATE', fields: body })) return `dry:${sourceId}`;
-    assertApplyExternalWrite('BITRIX24', 'INVOICE_CREATE');
+    assertApplyExternalWrite('BITRIX24', 'INVOICE_CREATE', null, 'invoice');
     const created = record(await this.bitrixCall('crm.item.add', { entityTypeId: 31, fields: body }));
     const item = record(created.item ?? created);
     const id = scalarId(item.id);
@@ -82,7 +115,7 @@ export class InvoiceHttpApi {
     if (!/^\d{1,20}$/.test(id)) throw new Error('INVOICE_ID_INVALID');
     if (Object.keys(fields).length === 0) return;
     if (await this.dryWrites?.propose({ provider: 'BITRIX24', entityType: 'crm_dynamic_31', entityId: id, operation: 'UPDATE', fields })) return;
-    assertApplyExternalWrite('BITRIX24', 'INVOICE_UPDATE');
+    assertApplyExternalWrite('BITRIX24', 'INVOICE_UPDATE', id, 'invoice');
     await this.bitrixCall('crm.item.update', { entityTypeId: 31, id, fields });
   }
 
@@ -101,8 +134,8 @@ export class InvoiceHttpApi {
     return order;
   }
 
-  private async bitrixCall(method: string, params: Record<string, unknown>): Promise<unknown> {
-    if (/\.(?:add|update)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', 'INVOICE_REQUEST');
+  private async bitrixCall(method: string, params: Record<string, unknown>, envelope = false): Promise<unknown> {
+    if (/\.(?:add|update)(?:\.json)?$/i.test(method)) assertApplyExternalWrite('BITRIX24', /\.add$/i.test(method) ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', /\.add$/i.test(method) ? null : scalarId(params.id), 'invoice');
     const base = requiredEnv('BITRIX24_REST_BASE_URL');
     const url = new URL(`${method}.json`, ensureSlash(base));
     const form = new URLSearchParams();
@@ -112,7 +145,7 @@ export class InvoiceHttpApi {
     if (!response.ok) throw providerResponseFailure('BITRIX24', response.status, response.headers.get('retry-after'));
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('BITRIX24', null); });
     if (!isRecord(payload) || 'error' in payload || !('result' in payload)) throw new ProviderFailure('BITRIX24', 400);
-    return payload.result;
+    return envelope ? payload : payload.result;
   }
 
   private async moyskladRequest(path: string, method: 'GET' | 'POST' | 'PUT', body?: InvoiceRecord): Promise<unknown> {
@@ -120,13 +153,32 @@ export class InvoiceHttpApi {
   }
 
   private async moyskladRequestUrl(url: URL, method: 'GET' | 'POST' | 'PUT', body?: InvoiceRecord): Promise<unknown> {
-    if (method !== 'GET') assertApplyExternalWrite('MOYSKLAD', 'INVOICE_REQUEST');
+    if (method !== 'GET') {
+      const position = /\/entity\/invoiceout\/([0-9a-f-]{36})\/positions(?:\/[0-9a-f-]{36})?$/.exec(url.pathname);
+      assertApplyExternalWrite('MOYSKLAD', position ? method === 'POST' ? 'INVOICE_CHILD_CREATE' : 'INVOICE_POSITION_UPDATE' : method === 'POST' ? 'INVOICE_CREATE' : 'INVOICE_UPDATE', position ? position[1] : method === 'POST' ? null : url.pathname.split('/').at(-1), 'invoice');
+    }
     const token = requiredEnv('MOYSKLAD_API_TOKEN');
-    const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const response = await fetch(url, { method, headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
-    if (!response.ok) throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    if (!response.ok) {
+      const rejected: unknown = await response.clone().json().catch(() => null);
+      const codes = isRecord(rejected) && Array.isArray(rejected.errors)
+        ? rejected.errors.filter(isRecord).map((error) => error.code).filter((code): code is number => typeof code === 'number' && Number.isSafeInteger(code)) : [];
+      logger.warn(JSON.stringify({ provider: 'MOYSKLAD', operation: method, resource: url.pathname.includes('/invoiceout') ? 'invoiceout' : 'customerorder', status: response.status, codes }));
+      throw providerResponseFailure('MOYSKLAD', response.status, response.headers.get('retry-after'));
+    }
     if (response.status === 204) return {};
     const payload: unknown = await response.json().catch(() => { throw new ProviderFailure('MOYSKLAD', null); });
+    // The positions collection can acknowledge a single add with a one-row
+    // collection response. Normalize only this endpoint; generic entity reads
+    // and writes must keep their object-only contract.
+    if (method === 'POST' && /\/entity\/invoiceout\/[0-9a-f-]{36}\/positions$/.test(url.pathname) && Array.isArray(payload)) {
+      if (payload.length !== 1 || !isRecord(payload[0]) || typeof payload[0].id !== 'string' || !isUuid(payload[0].id) || 'errors' in payload[0]) {
+        throw new ProviderFailure('MOYSKLAD', null);
+      }
+      logger.log(JSON.stringify({ provider: 'MOYSKLAD', operation: 'INVOICE_POSITION_CREATE', status: response.status, responseShape: 'single-row-array' }));
+      return payload[0];
+    }
     if (!isRecord(payload)) throw new ProviderFailure('MOYSKLAD', 400);
     return payload;
   }

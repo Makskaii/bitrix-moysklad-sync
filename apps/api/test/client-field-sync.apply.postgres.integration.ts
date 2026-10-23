@@ -40,6 +40,8 @@ const writes: Array<{ method: string; path: string; body: string }> = [];
 let applyTestSequence: Promise<unknown> = Promise.resolve();
 let failNextCompanyReadback = false;
 let failReadbackAfterNextCompanyWrite = false;
+let failNextMoyskladReadback = false;
+let failReadbackAfterNextMoyskladWrite = false;
 
 @Module({
   controllers: [FieldSettingsController, EventsController],
@@ -98,9 +100,10 @@ before(async () => {
   settings = new FieldSettingsService(database, {
     async fieldCatalogs() {
       return {
-        bitrix24: [...['TITLE', 'NAME', 'UF_AGE', 'UF_COMPOSED'].map((code) => ({ code, type: 'string', cardinality: 'single' as const, shape: 'scalar' as const, writable: true })),
+        bitrix24: [...['TITLE', 'NAME', 'COMMENTS', 'UF_AGE', 'UF_COMPOSED'].map((code) => ({ code, type: 'string', cardinality: 'single' as const, shape: 'scalar' as const, writable: true })),
+          { code: 'EMAIL', type: 'crm_multifield', cardinality: 'multiple' as const, shape: 'array' as const, writable: true },
           { code: 'UF_CATEGORY', type: 'project', referenceKind: 'project', cardinality: 'single' as const, shape: 'scalar' as const, writable: true }],
-        moysklad: [{ code: 'name', type: 'string', cardinality: 'single', shape: 'scalar', writable: true }, { code: 'age', type: 'integer', cardinality: 'single', shape: 'scalar', writable: true }, { code: 'description', type: 'string', cardinality: 'single', shape: 'scalar', writable: true },
+        moysklad: [{ code: 'name', type: 'string', cardinality: 'single', shape: 'scalar', writable: true }, { code: 'age', type: 'integer', cardinality: 'single', shape: 'scalar', writable: true }, { code: 'description', type: 'string', cardinality: 'single', shape: 'scalar', writable: true }, { code: 'email', type: 'string', cardinality: 'single', shape: 'scalar', writable: true },
           { code: 'category', type: 'project', referenceKind: 'project', cardinality: 'single', shape: 'scalar', writable: true }],
       };
     },
@@ -189,12 +192,22 @@ before(async () => {
       return;
     }
     if (path.endsWith(`/entity/counterparty/${targetId}`) && method === 'GET') {
+      if (failNextMoyskladReadback) {
+        failNextMoyskladReadback = false;
+        response.statusCode = 503;
+        response.end(JSON.stringify({ error: 'synthetic MySklad readback failure' }));
+        return;
+      }
       response.end(JSON.stringify(moysklad));
       return;
     }
     if (path.endsWith(`/entity/counterparty/${targetId}`) && method === 'PUT') {
       const fields = JSON.parse(body) as Record<string, unknown>;
       moysklad = { ...moysklad, ...fields };
+      if (Object.keys(fields).length && failReadbackAfterNextMoyskladWrite) {
+        failReadbackAfterNextMoyskladWrite = false;
+        failNextMoyskladReadback = true;
+      }
       response.end(JSON.stringify(moysklad));
       return;
     }
@@ -354,15 +367,23 @@ test('new client mappings reconcile from MySklad and old pinned work cannot roll
   assert.equal(moysklad.age, 42);
 
   await database.entityPair.create({ data: { id: contactPairId, entityType: 'CONTACT', bitrix24Id: contactSourceId, moyskladId: contactTargetId, moyskladType: 'contactperson', moyskladParentId: targetId, active: true, source: 'MANUAL' } });
+  bitrixContact.EMAIL=[{VALUE:'before@example.invalid',VALUE_TYPE:'WORK'}];
+  moyskladContact.email='before@example.invalid';
   const withContactName = await saveThroughAdmin({ ...(await settings.active()).config, rules: [
     ...(await settings.active()).config.rules,
-    { id: 'contact-name', entity: 'contacts-companies', sourceField: 'NAME', targetField: 'name', criticality: 'optional',
+    { id: 'contact-name', entity: 'contacts', sourceField: 'NAME', targetField: 'name', criticality: 'optional',
       bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
       moyskladToBitrix24: { enabled: true, transform: { kind: 'copy' } } },
-  ] });
+  ], groups:[...(await settings.active()).config.groups,{id:'ui-contact-email',entity:'contacts',direction:'BITRIX24_TO_MOYSKLAD',sourceFields:['EMAIL'],targetField:'email',criticality:'optional',transform:{kind:'join-non-empty',separator:'; '}}] });
   const acceptContact = async (key: string) => acceptBitrixWebhook('ONCRMCONTACTUPDATE', contactSourceId, key);
   const contactBaseline = await acceptContact('contact-settings-baseline');
   assert.equal(await processor.process(contactBaseline), 'BASELINE');
+  bitrixContact.EMAIL=[{VALUE:'first@example.invalid',VALUE_TYPE:'WORK'}];
+  assert.equal(await processor.process(await acceptContact('ui-contact-email-first')), 'SYNCED');
+  assert.equal(moyskladContact.email,'first@example.invalid','the real processor applies the UI contacts group to a nested contactperson');
+  bitrixContact.EMAIL=[{VALUE:'second@example.invalid',VALUE_TYPE:'WORK'},{VALUE:'third@example.invalid',VALUE_TYPE:'HOME'}];
+  assert.equal(await processor.process(await acceptContact('ui-contact-email-second')), 'SYNCED');
+  assert.equal(moyskladContact.email,'second@example.invalid; third@example.invalid','repeat updates retain every configured nonempty email without substituting the company email');
   const oldContactEvent = await acceptContact('contact-old-pinned');
   const withContactAge = await saveThroughAdmin({ ...withContactName.config, rules: [
     ...withContactName.config.rules,
@@ -378,6 +399,74 @@ test('new client mappings reconcile from MySklad and old pinned work cannot roll
   bitrixContact = { ...bitrixContact, UF_AGE: '99' };
   assert.equal(await processor.process(oldContactEvent), 'UNCHANGED');
   assert.equal(moyskladContact.age, 37, 'an older pinned contact event cannot overwrite the current MySklad value');
+}));
+
+test('an optional forward-only mapping on an existing company pair writes its current Bitrix value to MySklad', async () => serializeApplyTest(async () => {
+  const processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never,
+    new HttpClientSyncGateway(), { readCompanyInn: async () => null } as never);
+  bitrix = { ...bitrix, COMMENTS: 'forward-only baseline' };
+  const baselineResult = await processor.process(await acceptCompanyWebhook('forward-only-baseline'));
+  assert.ok(baselineResult === 'BASELINE' || baselineResult === 'UNCHANGED', 'the pair baseline may already exist from an earlier case in this suite');
+  const establishedBaseline = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId } });
+  assert.equal(establishedBaseline.settingsVersion, (await settings.active()).version);
+
+  const active = await settings.active();
+  const next = await saveThroughAdmin({ ...active.config, rules: [
+    ...active.config.rules,
+    { id: 'company-comments-description-forward-only', entity: 'companies', sourceField: 'COMMENTS', targetField: 'description', criticality: 'optional',
+      bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+      moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } },
+  ] });
+
+  bitrix = { ...bitrix, COMMENTS: 'current Bitrix description' };
+  const revisionEvent = await acceptCompanyWebhook('forward-only-revision');
+  writes.length = 0;
+  const previousBaseline = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId } });
+  failReadbackAfterNextMoyskladWrite = true;
+  assert.equal(await processor.process(revisionEvent), 'RETRY', 'a forward write whose target readback fails remains pending');
+  assert.equal(moysklad.description, 'current Bitrix description', 'the target provider accepted the first write even though its readback failed');
+  assert.equal((await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId } })).settingsVersion, previousBaseline.settingsVersion,
+    'baseline does not advance after an unverified forward write');
+  assert.equal((await database.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId, toSettingsVersion: next.version } } })).status, 'PREPARED');
+
+  writes.length = 0;
+  const retryEvent = await acceptCompanyWebhook('forward-only-revision-retry');
+  assert.equal(await processor.process(retryEvent), 'UNCHANGED');
+  assert.equal(moysklad.description, 'current Bitrix description', 'the newly configured forward direction writes and reads back the current source value');
+  assert.equal(bitrix.COMMENTS, 'current Bitrix description', 'the source value is not rewritten from MySklad');
+  assert.equal(writes.filter((request) => request.method === 'PUT' && request.path.includes('/entity/counterparty/')).length, 1,
+    'retry performs the pending forward write once more, idempotently');
+  assert.equal(writes.some((request) => request.path.endsWith('/crm.company.update.json')), false, 'forward-only rebase performs no reverse Bitrix write');
+  const baseline = await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId } });
+  const state = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId } });
+  assert.equal(baseline.settingsVersion, next.version);
+  assert.equal(state.settingsVersion, next.version);
+  const revision = await database.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId, toSettingsVersion: next.version } } });
+  assert.equal(revision.status, 'COMPLETE', 'the revision advances only after the forward write was read back');
+
+}));
+
+test('field settings reject a forward copy mapping with incompatible types and cardinality', async () => serializeApplyTest(async () => {
+  const active = await settings.active();
+  const response = await fetch(`${adminUrl}/api/admin/field-settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-loopback-token' },
+    body: JSON.stringify({ config: { ...active.config, rules: [...active.config.rules,
+      { id: 'company-email-to-scalar', entity: 'companies', sourceField: 'EMAIL', targetField: 'email', criticality: 'optional',
+        bitrix24ToMoysklad: { enabled: true, transform: { kind: 'copy' } },
+        moyskladToBitrix24: { enabled: false, transform: { kind: 'tbd' } } }], groups: active.config.groups } }),
+  });
+  const body = await response.text();
+  assert.equal(response.status, 400, body);
+  assert.match(body, /exact type and cardinality compatibility/i);
+  assert.equal((await settings.active()).version, active.version, 'the rejected incompatible mapping creates no settings version');
+}));
+
+test('UI and legacy contact aliases cannot configure conflicting writes to the same field', async () => serializeApplyTest(async () => {
+  const active=await settings.active();
+  const response=await fetch(`${adminUrl}/api/admin/field-settings`,{method:'PUT',headers:{'content-type':'application/json',authorization:'Bearer synthetic-loopback-token'},body:JSON.stringify({config:{...active.config,groups:[...active.config.groups,{id:'conflicting-legacy-contact-email',entity:'contacts-companies',direction:'BITRIX24_TO_MOYSKLAD',sourceFields:['EMAIL'],targetField:'email',criticality:'optional',transform:{kind:'join-non-empty',separator:' / '}}]}})});
+  assert.equal(response.status,400);
+  assert.match(await response.text(),/Contact mapping aliases cannot write the same target field/);
+  assert.equal((await settings.active()).version,active.version);
 }));
 
 test('child-only settings revisions initialize changed exact requisite fields from MySklad and verify readback', async () => serializeApplyTest(async () => {
@@ -423,4 +512,49 @@ test('child-only settings revisions initialize changed exact requisite fields fr
   assert.equal(bitrixRequisite.RQ_KPP, 'later-bitrix-value', 'removal leaves physical child data untouched');
   assert.equal(writes.some((request) => request.method === 'POST' && request.path.endsWith('/crm.requisite.update.json')), false);
   assert.equal((await database.entityPairSettingsRevision.findUniqueOrThrow({ where: { pairId_toSettingsVersion: { pairId, toSettingsVersion: withoutChildMapping.version } } })).status, 'COMPLETE');
+}));
+
+test('concurrent repeated company callbacks serialize the forward mapping without losing the latest source value', async () => serializeApplyTest(async () => {
+  const processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never,
+    new HttpClientSyncGateway(), { readCompanyInn: async () => null } as never);
+  const active = await settings.active();
+  const expected = 'concurrent Bitrix description';
+  bitrix = { ...bitrix, COMMENTS: expected };
+  const concurrentEventIds = [
+    await acceptCompanyWebhook('forward-concurrent-a'),
+    await acceptCompanyWebhook('forward-concurrent-b'),
+  ];
+  writes.length = 0;
+  const outcomes = await Promise.all(concurrentEventIds.map((eventId) => processor.process(eventId)));
+  const persisted = await database.inboundEvent.findMany({ where: { id: { in: concurrentEventIds } }, select: { status: true, attempts: true, lastErrorCategory: true, retryAfter: true } });
+  assert.ok(outcomes.some((outcome) => outcome === 'SYNCED' || outcome === 'UNCHANGED'),
+    `one concurrent callback applies the current source value: ${JSON.stringify({ outcomes, persisted })}`);
+  assert.ok(persisted.every((event) => ['SUCCEEDED', 'RETRYABLE_FAILURE'].includes(event.status)),
+    `contended delivery is retained as retryable rather than discarded: ${JSON.stringify(persisted)}`);
+  assert.equal(persisted.filter((event) => event.status === 'SUCCEEDED').length, 1);
+  assert.equal(persisted.filter((event) => event.status === 'RETRYABLE_FAILURE').length, 1);
+  assert.ok(persisted.find((event) => event.status === 'RETRYABLE_FAILURE')?.retryAfter instanceof Date,
+    'pair contention schedules the second identical callback for normal retry');
+  assert.equal(moysklad.description, expected, 'the successful callback leaves the latest source value on the target');
+  assert.equal(writes.filter((request) => request.method === 'PUT' && request.path.includes('/entity/counterparty/')).length, 1,
+    'concurrent identical callbacks issue one target update, not duplicate writes');
+  assert.equal(writes.some((request) => request.path.endsWith('/crm.company.update.json')), false,
+    'forward-only concurrency never writes the source in the reverse direction');
+  assert.equal((await database.entityPairBaseline.findUniqueOrThrow({ where: { pairId } })).settingsVersion, active.version);
+}));
+
+test('changing an existing forward-only mapping remains held for review', async () => serializeApplyTest(async () => {
+  const processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never,
+    new HttpClientSyncGateway(), { readCompanyInn: async () => null } as never);
+  const active = await settings.active();
+  const changedConfig = { ...active.config, rules: active.config.rules.map((rule) =>
+    rule.id === 'company-comments-description-forward-only' ? { ...rule, targetField: 'email' } : rule) };
+  await saveThroughAdmin(changedConfig);
+  const eventId = await acceptCompanyWebhook('changed-forward-only-rule-needs-review');
+  writes.length = 0;
+  assert.equal(await processor.process(eventId), 'REVIEW', 'changing an existing mapping is not treated as a newly-added mapping');
+  assert.equal((await database.manualReviewCase.findUniqueOrThrow({ where: { eventId } })).reason,
+    'CLIENT_SETTINGS_REVISION_REVERSE_MAPPING_REQUIRED');
+  assert.equal(writes.some((request) => request.method === 'PUT' || request.path.endsWith('/crm.company.update.json')), false,
+    'the scoped policy does not silently change existing mapping authority');
 }));
