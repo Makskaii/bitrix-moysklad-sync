@@ -7,7 +7,7 @@ import { PrismaClient } from '@prisma/client';
 import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
 import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
-import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
+import { DealOrderCreateOperationService, DealOrderPairConflictError } from '../src/deals-orders/deal-order-create-operation.service';
 
 process.env.SYNC_MODE ??= 'apply';
 const db = new PrismaClient();
@@ -376,6 +376,35 @@ test('lost MS CREATE response retains syncId through restart and copies native n
   assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '908' } })).syncId, pending.syncId);
   assert.equal(b24DealTitle, 'SO-54'); assert.equal(b24OrderNumber, 'SO-54');
   assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '908' } }), 1);
+});
+
+test('proven ownership conflict freezes the original journal and a cold retry cannot touch providers', async () => {
+  const input = preparedInput('909'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  failNextB24DealRead = false; b24OrderNumber = 'SO-54'; b24DealTitle = 'SO-54';
+  const syncId = randomUUID();
+  await db.dealOrderCreateOperation.create({ data: { bitrix24DealId: '909', moyskladOrderId: activeOrderId,
+    syncId, payload: input.payload as never, confirmedCustomerPairIds: [companyPairId], settingsVersion: 4,
+    status: 'PENDING', attemptedAt: new Date() } });
+  const conflicting = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '910', moyskladId: activeOrderId, source: 'MANUAL' } });
+  try {
+    await assert.rejects(service.createAndPair(input), DealOrderPairConflictError);
+    const held = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '909' } });
+    assert.equal(held.status, 'CONFLICT'); assert.equal(held.lastErrorCategory, 'PAIR_CONFLICT');
+    assert.equal(held.moyskladOrderId, activeOrderId); assert.equal(held.syncId, syncId);
+    assert.deepEqual(held.payload, input.payload); assert.equal(held.leaseToken, null);
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; throw new Error('PROVIDER_MUST_NOT_BE_CALLED'); };
+    const restarted = new DatabaseService();
+    try { await assert.rejects(new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input), DealOrderPairConflictError); }
+    finally { globalThis.fetch = realFetch; await restarted.$disconnect(); }
+    assert.equal(calls, 0); assert.equal(posts, 0); assert.equal(numberUpdates, 0);
+    assert.equal((await db.entityPair.findUniqueOrThrow({ where: { id: conflicting.id } })).bitrix24Id, '910');
+    assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '909' } }), 0);
+  } finally {
+    await db.dealOrderCreateOperation.delete({ where: { bitrix24DealId: '909' } });
+    await db.entityPair.delete({ where: { id: conflicting.id } });
+  }
 });
 
 test('controlled create and persisted-ID recovery reserve their owning event before any target create or binding',async()=>{

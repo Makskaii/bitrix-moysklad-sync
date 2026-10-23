@@ -16,7 +16,7 @@ import { DatabaseRecoveryService } from '../database-recovery.service';
 import { writeOperationalLog } from '../monitoring-log';
 import { DealOrderCreationPreparer } from '../deals-orders/deal-order-creation-preparer.service';
 import { DealTimelineNoticeService } from '../deals-orders/deal-timeline-notice.service';
-import { DealOrderCreateOperationService } from '../deals-orders/deal-order-create-operation.service';
+import { DealOrderCreateOperationService, DealOrderPairConflictError } from '../deals-orders/deal-order-create-operation.service';
 import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../deals-orders/deal-order-reverse-create.service';
@@ -371,6 +371,10 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       } catch (error) {
         if (error instanceof ServiceModeNotOnError) return null;
         if (await this.finishForWriteGateError(event.id, error, workerLease)) return null;
+        if (error instanceof DealOrderPairConflictError) {
+          await this.finish(event.id, 'MANUAL_REVIEW', 'CUSTOMER_ORDER_PAIR_CONFLICT', workerLease);
+          return null;
+        }
         const reason = error instanceof Error ? error.message : 'CUSTOMER_ORDER_CREATE_FAILED';
         await this.finish(event.id, 'RETRYABLE_FAILURE', 'CUSTOMER_ORDER_CREATE_RETRY', workerLease,
           retryAtForFailure(error, event.attempts + 1));

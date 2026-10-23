@@ -130,6 +130,9 @@ export class DealOrderCreateOperationService {
   async createAndPair(input: DealOrderPreparedInput, assertWorkerLease?: () => Promise<boolean>): Promise<Result> {
     await this.assertWriteEnabled();
     const existingOperation = await this.database.dealOrderCreateOperation.findUnique({ where: { bitrix24DealId: input.bitrix24DealId } });
+    // A proven pair ownership conflict needs an explicit repair decision, not
+    // another provider attempt. Keep the native target and frozen journal.
+    if (existingOperation?.status === 'CONFLICT') throw new DealOrderPairConflictError();
     if ((existingOperation?.status === 'SUCCEEDED' || existingOperation?.status === 'PARTIAL') && existingOperation.moyskladOrderId) {
       return { status: existingOperation.status === 'PARTIAL' ? 'PARTIAL' : 'CREATED', bitrix24DealId: input.bitrix24DealId, moyskladOrderId: existingOperation.moyskladOrderId,
         skippedRows: readSkippedRows(existingOperation.skippedRows) };
@@ -232,7 +235,8 @@ export class DealOrderCreateOperationService {
       if (error instanceof ServiceModeNotOnError) throw error;
       await this.database.dealOrderCreateOperation.updateMany({
         where: { bitrix24DealId: input.bitrix24DealId, leaseToken },
-        data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'CREATE_RETRYABLE' },
+        data: { leaseToken: null, leaseUntil: null,
+          ...(error instanceof DealOrderPairConflictError ? { status: 'CONFLICT', lastErrorCategory: 'PAIR_CONFLICT' } : { lastErrorCategory: 'CREATE_RETRYABLE' }) },
       }).catch(() => undefined);
       throw error;
     }

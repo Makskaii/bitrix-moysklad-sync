@@ -26,7 +26,7 @@ import { DealOrderReverseCreateService } from '../src/deals-orders/deal-order-re
 const company = { bitrix24Id: `81${Date.now()}`, moyskladId: '11111111-1111-4111-8111-111111111111' };
 const product = { bitrix24Id: `82${Date.now()}`, moyskladId: '22222222-2222-4222-8222-222222222222' };
 const refs = {
-  organization: '33333333-3333-4333-8333-333333333333', store: '44444444-4444-4444-8444-444444444444',
+  organization: '02ada5df-d515-11e2-3c12-7054d21a8d1e', store: '44444444-4444-4444-8444-444444444444',
   state: '55555555-5555-4555-8555-555555555555', employee: '66666666-6666-4666-8666-666666666666',
   currency: '77777777-7777-4777-8777-777777777777', unit: '88888888-8888-4888-8888-888888888888',
   order: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', position: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
@@ -197,6 +197,25 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   assert.equal(await app.get(DatabaseService).dealTimelineNotice.count({ where: { bitrix24DealId: dealId, kind: 'CREATED' } }), 1);
 });
 
+test('public callbacks for a proven create ownership conflict are held without retrying or creating a duplicate', async () => {
+  const db = app.get(DatabaseService), dealId = `83${Date.now()}93`, orderId = randomUUID();
+  const prepared = preparedOrder(dealId, 'old-conflict-event');
+  await db.dealOrderCreateOperation.create({ data: { bitrix24DealId: dealId, moyskladOrderId: orderId, syncId: randomUUID(),
+    status: 'CONFLICT', lastErrorCategory: 'PAIR_CONFLICT', settingsVersion: 1, payload: prepared.payload as Prisma.InputJsonValue,
+    attemptedAt: new Date(), confirmedCustomerPairIds: [companyPairId] } });
+  const before = createPosts;
+  for (const type of ['ONCRMDEALADD', 'ONCRMDEALUPDATE']) {
+    const accepted = await postDealEvent(type, dealId);
+    const held = await waitForEvent(accepted.eventId, 'MANUAL_REVIEW');
+    assert.equal(held.lastErrorCategory, 'CUSTOMER_ORDER_PAIR_CONFLICT');
+    assert.equal(held.retryAfter, null);
+  }
+  const journal = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } });
+  assert.equal(journal.status, 'CONFLICT'); assert.equal(journal.moyskladOrderId, orderId);
+  assert.equal(createPosts, before);
+  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: dealId } }), 0);
+});
+
 test('public invalid-product event atomically queues a human-readable error without attempting CREATE', async () => {
   const dealId = `83${Date.now()}90`;
   sourceCreatedAt.set(dealId, new Date());
@@ -256,6 +275,7 @@ test('public eligible deal obeys the existing stage-preparer hold without creati
 
 test('public MS UPDATE waits for the already accepted CREATE instead of opening a blocking review', async () => {
   const database = app.get(DatabaseService), id = randomUUID();
+  extraOrders.set(id, nativeOrder(id));
   const create = await database.inboundEvent.create({ data: {
     source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'customerorder', externalEntityId: id,
     deliveryKey: `delayed-create-${randomUUID()}`, payload: {}, status: 'RETRYABLE_FAILURE', retryAfter: new Date(Date.now() + 86_400_000),
@@ -358,7 +378,7 @@ test('native syncId proves an attempted forward origin before target-ID save; a 
   extraOrders.set(id, nativeOrder(id, { ...input.payload, syncId }));
   failNativeReadOnce = true;
   const failed = await postMs('UPDATE', id); const failedEvent = await waitForEvent(failed, 'RETRYABLE_FAILURE');
-  assert.equal(failedEvent.lastErrorCategory, 'FORWARD_ORDER_ORIGIN_READ_FAILED');
+  assert.equal(failedEvent.lastErrorCategory, 'ORDER_ORGANIZATION_READ_RETRY');
   const waiting = await postMs('CREATE', id); assert.equal((await waitForEvent(waiting, 'RETRYABLE_FAILURE')).lastErrorCategory, 'FORWARD_ORDER_PAIR_PENDING');
   assert.equal(reverseAdds, before); assert.equal(await db.pairReviewCase.count({ where: { sourceEntityId: id } }), 0);
   await app.get(DealOrderCreateOperationService).createAndPair(input);
@@ -408,6 +428,7 @@ test('OFF fences an already received native echo without claims, reverse writes 
 });
 
 async function forwardJournal(sourceId: string, target: string) {
+  if (!extraOrders.has(target)) extraOrders.set(target, nativeOrder(target));
   return app.get(DatabaseService).dealOrderCreateOperation.create({ data: { bitrix24DealId: sourceId, syncId: randomUUID(), payload: {}, settingsVersion: 1, status: 'PENDING', moyskladOrderId: target, attemptedAt: new Date() } });
 }
 async function postMs(action: string, id: string): Promise<string> {
@@ -417,7 +438,11 @@ async function postMs(action: string, id: string): Promise<string> {
 function nativeOrder(id: string, payload: Record<string, any> = {}): Record<string, any> {
   return { id, name: 'SO-TEST-1', meta: { type: 'customerorder' }, sum: 0,
     agent: { id: company.moyskladId, meta: { type: 'counterparty' } }, state: { id: refs.state }, rate: { currency: { id: refs.currency } },
-    ...payload, positions: { rows: (payload.positions ?? []).map((p: any) => ({ ...p, id: refs.position })) } };
+    ...payload,
+    // The production organization filter validates native reference identity,
+    // not the loopback transport used by this provider fixture.
+    organization: { id: refs.organization, meta: { type: 'organization', href: `https://api.moysklad.ru/api/remap/1.2/entity/organization/${refs.organization}` } },
+    positions: { rows: (payload.positions ?? []).map((p: any) => ({ ...p, id: refs.position })) } };
 }
 
 async function postDealEvent(event: string, id: string): Promise<{ eventId: string }> {
@@ -476,7 +501,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (['/rest/crm.item.add', '/rest/crm.item.get'].includes(url.pathname) && JSON.parse(text).useOriginalUfNames !== 'Y') {
     response.writeHead(400); response.end(JSON.stringify({ error: '100', error_description: 'useOriginalUfNames expects native Y/N string' })); return;
   }
-  if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}`)return send(response,{id:reverseOrderId,name:'SYNTHETIC-REVERSE',sum:0,agent:{id:company.moyskladId,meta:{type:'counterparty'}},state:{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc'},rate:{currency:{id:refs.currency}}});
+  if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}`)return send(response,{...nativeOrder(reverseOrderId),name:'SYNTHETIC-REVERSE',state:{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc'}});
   if(url.pathname===`/api/remap/1.2/entity/customerorder/${reverseOrderId}/positions`)return send(response,{rows:[],meta:{size:0,offset:0,limit:1000}});
   if(url.pathname==='/rest/crm.item.list'){
     if (beforeReverseAdd) { const hook = beforeReverseAdd; beforeReverseAdd = null; await hook(); }
