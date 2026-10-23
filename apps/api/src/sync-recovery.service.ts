@@ -38,6 +38,10 @@ function nightlySafeDiagnostic(error: unknown): string {
 export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDestroy {
   private nightlyRunning = false;
   private lastNightlyRequestAt = 0;
+  // Only omit a parent after all its pages were validated and its changed
+  // contacts durably accepted. Restart intentionally rescans, using the same
+  // persistent delivery keys; this cache is not a source-of-truth cursor.
+  private contactpersonProgress: { window: string; completed: Set<string> } | null = null;
   private timer?: NodeJS.Timeout;
 
   constructor(
@@ -414,13 +418,17 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
   }
 
   private async runMoyskladContactpersonFeed(from: Date, through: Date, jobKey: string, leaseToken: string) {
+    const window = `${jobKey}:${from.toISOString()}:${through.toISOString()}`;
+    if (this.contactpersonProgress?.window !== window) this.contactpersonProgress = { window, completed: new Set() };
+    const progress = this.contactpersonProgress;
     const entityPairs = await this.database.entityPair.findMany({
       where: { entityType: 'COMPANY', active: true, moyskladType: 'counterparty' },
       select: { moyskladId: true },
     });
     const parents = [...new Set(entityPairs.map((pair) => pair.moyskladId))].filter(Boolean).sort();
-    const changed: Array<{ id: string; parentId: string }> = [];
     for (const parentId of parents) {
+      if (progress.completed.has(parentId)) continue;
+      const changed: Array<{ id: string; parentId: string }> = [];
       let offset = 0;
       let expectedSize: number | null = null;
       let pageNumber = 0;
@@ -447,8 +455,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
         if (page.rows.length === 0) throw new UnsupportedPaginationError('MoySklad contact-person pagination returned an empty page before the advertised total; no contact-person events were queued.');
         offset += page.rows.length;
       }
+      await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
+      await this.renewNightlyLease(leaseToken);
+      progress.completed.add(parentId);
     }
-    await this.saveMoyskladContactpersonEvents(changed, jobKey, leaseToken);
   }
 
   /** Recheck durable events accepted in this window and attached to a pair.

@@ -30,6 +30,9 @@ class NightlyStore {
   contactParents: string[] = [];
   contactParentStatus = 404;
   contactParentErrorCode = 1021;
+  contactRowsByParent: Record<string, string[]> = {};
+  failContactParentOnce: string | null = null;
+  failContactEnqueueOnce = false;
   failBitrix = false;
   pairLifecycleStatus = 'ACTIVE';
   pairEntityType = 'CONTACT';
@@ -183,6 +186,12 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
     assert.equal(headers.get('accept-encoding'),'gzip');
     if (requestUrl.pathname.endsWith('/counterparty/missing-parent/contactpersons')) return Response.json({ errors: [{ code: 1021 }] }, { status: 404 });
     if (requestUrl.pathname.endsWith('/counterparty/missing-parent')) return Response.json({ errors: [{ code: store.contactParentErrorCode }] }, { status: store.contactParentStatus });
+    const contactParent = requestUrl.pathname.match(/\/counterparty\/([^/]+)\/contactpersons$/)?.[1];
+    if(contactParent && store.contactRowsByParent[contactParent]) {
+      if(store.failContactParentOnce === contactParent) { store.failContactParentOnce = null; return Response.json({}, {status:503}); }
+      const rows = store.contactRowsByParent[contactParent].map(id=>({id,updated:'2026-10-20 20:00:00'}));
+      return Response.json({rows,meta:{size:rows.length,limit:1000,offset:0}});
+    }
     store.moyskladWindows.push(requestUrl.searchParams.get('filter') ?? '');
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
     const entity = requestUrl.pathname.split('/').filter(Boolean).at(-1) ?? 'counterparty';
@@ -198,6 +207,7 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
   const fieldSettings = {
     active: async () => ({ config: { productCatalogRuntime: store.productCatalogConfigured ? { bitrix24CatalogId: '23' } : null } }),
     saveAcceptedEvent: async (event: Record<string, unknown>) => {
+      if(event.externalEntityType === 'contactperson' && store.failContactEnqueueOnce) { store.failContactEnqueueOnce=false; throw new Error('synthetic durable enqueue failed'); }
       const key = `${event.source}:${event.deliveryKey}`;
       const existing = store.queued.get(key);
       if (existing) return { id: existing.id };
@@ -208,10 +218,11 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
     },
   };
   const dispatcher = { dispatch: async (id: string) => { store.dispatched.push(id); } };
-  const service = new SyncRecoveryService(store as never, syncMode, {} as ContactSyncProcessor,
+  const freshService = () => new SyncRecoveryService(store as never, syncMode, {} as ContactSyncProcessor,
     undefined, fieldSettings as unknown as FieldSettingsService, dispatcher as unknown as EventDispatcherService);
+  const service = freshService();
   return {
-    store, service, syncMode,
+    store, service, syncMode, freshService,
     close: () => {
       service.onModuleDestroy();
       mock.timers.reset();
@@ -596,6 +607,67 @@ test('nightly continues past a parent confirmed absent without treating ambiguou
       assert.equal(harness.store.accepted.some(event => event.externalEntityType === 'contactperson'), false);
     } finally { harness.close(); }
   }
+});
+
+test('nightly contact retry retains durably queued prior parents but retries the failed parent without duplicate acceptance', async () => {
+  const harness = await createHarness('on');
+  harness.store.contactParents = ['parent-a','parent-b'];
+  harness.store.contactRowsByParent = { 'parent-a':['contact-a'], 'parent-b':['contact-b'] };
+  harness.store.failContactParentOnce = 'parent-b';
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(()=>harness.store.state.nightlyStatus==='failed');
+    assert.equal(harness.store.state.nightlyStatus,'failed');
+    assert.deepEqual(harness.store.accepted.filter(e=>e.externalEntityType==='contactperson').map(e=>e.externalEntityId),['contact-a']);
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    mock.timers.tick(harness.store.state.nightlyRetryAfter.getTime()-Date.now()+1000);
+    await settleUntil(()=>harness.store.state.nightlyStatus==='awaiting_processing');
+    assert.equal(harness.store.state.nightlyStatus,'awaiting_processing');
+    assert.equal(harness.store.providerCalls.filter(url=>url.includes('/parent-a/contactpersons')).length,1);
+    assert.equal(harness.store.providerCalls.filter(url=>url.includes('/parent-b/contactpersons')).length,2);
+    assert.deepEqual(harness.store.accepted.filter(e=>e.externalEntityType==='contactperson').map(e=>e.externalEntityId),['contact-a','contact-b']);
+  }finally{harness.close();}
+});
+
+test('nightly never marks a contact parent completed before durable acceptance succeeds', async () => {
+  const harness = await createHarness('on');
+  harness.store.contactParents = ['parent-a'];
+  harness.store.contactRowsByParent = { 'parent-a':['contact-a'] };
+  harness.store.failContactEnqueueOnce = true;
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(()=>harness.store.state.nightlyStatus==='failed');
+    assert.equal(harness.store.state.nightlyStatus,'failed');
+    assert.equal(harness.store.accepted.filter(e=>e.externalEntityType==='contactperson').length,0);
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    mock.timers.tick(harness.store.state.nightlyRetryAfter.getTime()-Date.now()+1000);
+    await settleUntil(()=>harness.store.state.nightlyStatus==='awaiting_processing');
+    assert.equal(harness.store.state.nightlyStatus,'awaiting_processing');
+    assert.equal(harness.store.providerCalls.filter(url=>url.includes('/parent-a/contactpersons')).length,2);
+    assert.equal(harness.store.accepted.filter(e=>e.externalEntityType==='contactperson').length,1);
+  }finally{harness.close();}
+});
+
+test('a process restart safely rescans contact parents using their durable delivery keys', async () => {
+  const harness = await createHarness('on');
+  harness.store.contactParents = ['parent-a','parent-b'];
+  harness.store.contactRowsByParent = { 'parent-a':['contact-a'], 'parent-b':['contact-b'] };
+  harness.store.failContactParentOnce = 'parent-b';
+  let restarted: SyncRecoveryService | undefined;
+  try {
+    harness.service.onApplicationBootstrap();
+    await settleUntil(()=>harness.store.state.nightlyStatus==='failed');
+    assert.equal(harness.store.state.nightlyStatus,'failed');
+    harness.service.onModuleDestroy();
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    restarted=harness.freshService();
+    mock.timers.tick(harness.store.state.nightlyRetryAfter.getTime()-Date.now()+1000);
+    restarted.onApplicationBootstrap();
+    await settleUntil(()=>harness.store.state.nightlyStatus==='awaiting_processing');
+    assert.equal(harness.store.state.nightlyStatus,'awaiting_processing');
+    assert.equal(harness.store.providerCalls.filter(url=>url.includes('/parent-a/contactpersons')).length,2);
+    assert.deepEqual(harness.store.accepted.filter(e=>e.externalEntityType==='contactperson').map(e=>e.externalEntityId),['contact-a','contact-b']);
+  }finally{restarted?.onModuleDestroy();harness.close();}
 });
 
 test('nightly configured catalog product feed uses the processor event contract and deduplicated delivery key', async () => {
