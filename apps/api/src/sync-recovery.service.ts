@@ -2,6 +2,7 @@ import { Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from './database.service';
+import { withNightlySettingLock } from './nightly-setting-lock';
 import { ContactSyncProcessor } from './contact-sync.service';
 import { SyncModeService } from './sync-mode.service';
 import { writeOperationalLog } from './monitoring-log';
@@ -229,15 +230,15 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       if (!current) return;
       const now = new Date();
       if (current.nightlyStatus === 'failed' && current.nightlyRetryAfter && current.nightlyRetryAfter > now) return;
-      const lease = await this.database.$executeRaw`
+      const lease = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
         UPDATE "SyncSetting"
-        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds',
+        SET "nightlyLeaseToken" = ${leaseToken}, "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds',
             "nightlyStatus" = 'running', "nightlyRetryAfter" = NULL, "nightlyError" = NULL,
             "nightlyAttempts" = "nightlyAttempts" + 1, "updatedAt" = NOW()
         WHERE "id" = 'global' AND "nightlyScheduledDate" IS NOT DISTINCT FROM ${current.nightlyScheduledDate}
           AND "nightlyStatus" IN ('pending', 'running', 'failed')
-          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= (NOW() AT TIME ZONE 'UTC'))
-      `;
+          AND ("nightlyLeaseToken" IS NULL OR "nightlyLeaseExpiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC'))
+      `);
       if (lease !== 1) return;
       let setting = await this.database.syncSetting.findUnique({ where: { id: 'global' } });
       if (!setting || !['pending', 'running', 'failed'].includes(setting.nightlyStatus) ||
@@ -709,10 +710,10 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
   }
 
   private async renewNightlyLease(leaseToken: string) {
-    const renewed = await this.database.$executeRaw`
-      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds', "updatedAt" = NOW()
-      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
-    `;
+    const renewed = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
+      UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds', "updatedAt" = NOW()
+      WHERE "id" = 'global' AND "nightlyLeaseToken" = ${leaseToken} AND "nightlyLeaseExpiresAt" > (clock_timestamp() AT TIME ZONE 'UTC')
+    `);
     if (renewed !== 1) throw new Error('Nightly run lease was lost');
   }
 

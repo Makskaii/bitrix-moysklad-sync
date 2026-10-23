@@ -121,6 +121,8 @@ class NightlyStore {
   };
   readonly contactPair = { findMany: async () => [], findFirst: async () => null };
   readonly apiAttempt = { create: async () => ({}) };
+  async $transaction<T>(run: (tx: this) => Promise<T>) { return run(this); }
+  async $queryRaw() { return []; }
 
   async $executeRaw(strings: TemplateStringsArray, ...values: unknown[]) {
     const sql = strings.join('?');

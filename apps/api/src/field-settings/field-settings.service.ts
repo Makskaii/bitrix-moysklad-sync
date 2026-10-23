@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
+import { withNightlySettingLock } from '../nightly-setting-lock';
 import { writeOperationalLog } from '../monitoring-log';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
 import { FieldSettingsConfigDto, NamedReferenceKind, NamedReferencePair, VersionedFieldSettingsDto } from './field-settings.dto';
@@ -338,11 +339,11 @@ export class FieldSettingsService {
     // lifetime of each event/settings-pin transaction. The transaction still
     // checks the token and expiry under FOR SHARE before it accepts an event.
     if (input.nightlyLeaseToken) {
-      const renewed = await this.database.$executeRaw`
-        UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
+      const renewed = await withNightlySettingLock(this.database, tx => tx.$executeRaw`
+        UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
         WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken}
-          AND "serviceMode" = 'on' AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
-      `;
+          AND "serviceMode" = 'on' AND "nightlyLeaseExpiresAt" > (clock_timestamp() AT TIME ZONE 'UTC')
+      `);
       if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
     }
     return this.database.$transaction(async (transaction) => {

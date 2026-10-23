@@ -11,7 +11,9 @@ function fixture(options: { renewed?: number; mode?: string; token?: string; exp
   let initializationCount = 0;
   let guardReadCount = 0;
   const transaction = {
-    $queryRaw: async () => {
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      if (strings.join('').includes('set_config')) return [];
+      if (strings.join('').includes('FOR UPDATE')) { calls.push('lock'); return [{ id: 'global' }]; }
       calls.push('read-guard');
       guardReadCount += 1;
       return guardReadCount === 1
@@ -19,7 +21,10 @@ function fixture(options: { renewed?: number; mode?: string; token?: string; exp
         : [{ version: 7 }];
     },
     inboundEvent: { upsert: async () => { calls.push('upsert'); return { id: 'event-1' }; } },
-    $executeRaw: async () => { calls.push('pin'); return 1; },
+    $executeRaw: async (strings: TemplateStringsArray) => {
+      if (strings.join('').includes('clock_timestamp')) { calls.push('renew'); return options.renewed ?? 1; }
+      calls.push('pin'); return 1;
+    },
   };
   const database = {
     $queryRaw: async () => [{ version: 7, config: DEFAULT_FIELD_SETTINGS, createdAt: new Date() }],
@@ -46,7 +51,7 @@ function fixture(options: { renewed?: number; mode?: string; token?: string; exp
 test('nightly lease renews before the short durable enqueue transaction', async () => {
   const { calls, accept } = fixture();
   assert.equal((await accept()).id, 'event-1');
-  assert.deepEqual(calls, ['renew', 'begin', 'read-guard', 'upsert', 'read-guard', 'pin']);
+  assert.deepEqual(calls, ['begin', 'lock', 'renew', 'begin', 'read-guard', 'upsert', 'read-guard', 'pin']);
 });
 
 test('event intake performs the historical settings backfill only once per service instance', async () => {
