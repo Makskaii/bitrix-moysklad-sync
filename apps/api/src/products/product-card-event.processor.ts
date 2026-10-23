@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
@@ -647,7 +648,7 @@ function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a
 
 function mappedUnitId(moyskladUnitId: string | null, settings: ProductCardSettings): number | undefined {
   if (!moyskladUnitId) return undefined;
-  const rows = settings.references.units.filter((item) => asRecord(item).status === 'configured' && String(asRecord(item).moyskladId) === moyskladUnitId);
+  const rows = settings.references.units.filter((item) => matchesReverseUnit(item, moyskladUnitId));
   if (rows.length !== 1 || !Number.isInteger(asRecord(rows[0]).bitrix24Id)) throw new ProductCatalogManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
   return Number(asRecord(rows[0]).bitrix24Id);
 }

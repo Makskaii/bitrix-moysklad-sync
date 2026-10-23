@@ -529,6 +529,34 @@ function config(): any {
     },
   }, references: { units: [], priceTypes: [], dictionaries: [] } };
 }
+test('reverse-only UOM alternative retains a real order position without changing the canonical forward unit', async () => {
+  const orderId = randomUUID();
+  activeOrderId = orderId; activeOrderStateId = ids.state; activeOrderCurrencyId = ids.currency;
+  items = []; rows = []; orderPositions = [position('reverse-alternative-row', 2)];
+  dealAdds = 0; rowAdds = 0; productAdds = 0; msProductWrites = 0;
+  loseProductCreateResponse = false; loseSecondRowResponse = false;
+  const settings = config();
+  const canonical = 'aaaaaaaa-1111-4111-8111-111111111111';
+  settings.config.references.units[0].moyskladId = canonical;
+  settings.config.references.units[0].reverseMoyskladIds = [ids.unit];
+  try {
+    const result = await service.createAndPair({ moyskladOrderId: orderId, eventId: `event-${suffix}-alternative`, eventConfig: settings });
+    assert.equal(result.status, 'CREATED');
+    assert.equal(dealAdds, 1);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].measureCode, 796);
+    assert.equal(rows[0].quantity, 2);
+    assert.equal(settings.config.references.units[0].moyskladId, canonical);
+    assert.equal(msProductWrites, 0);
+  } finally {
+    const pair = await db.entityPair.findFirst({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    if (pair) await db.dealOrderPositionPair.deleteMany({ where: { pairId: pair.id } });
+    await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: orderId } });
+    await db.entityPair.deleteMany({ where: { entityType: 'DEAL', moyskladId: orderId } });
+    activeOrderId = ids.order;
+  }
+});
+
 function position(id: string, quantity: number): Record<string, unknown> {
   return { id, quantity, price: 12345, discount: 0, vat: 0, vatEnabled: false, assortment: { id: ids.product, uom: { id: ids.unit } } };
 }

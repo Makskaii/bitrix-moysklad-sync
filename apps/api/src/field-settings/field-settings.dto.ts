@@ -5,6 +5,8 @@ export type UnitReference = {
   bitrix24Code: string;
   moyskladId: string | null;
   moyskladCode: string | null;
+  /** Additional explicitly approved MS units accepted only in MS -> Bitrix. */
+  reverseMoyskladIds?: string[];
   status: 'configured' | 'unmapped';
 };
 

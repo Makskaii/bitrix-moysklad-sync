@@ -29,7 +29,7 @@ type FieldGroup = {
   criticality: 'critical' | 'optional' | 'tbd';
   transform: { kind: 'join-non-empty'; separator: string } | { kind: 'split-non-empty'; separator: string; valueType: string };
 };
-type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; status: string };
+type UnitPair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladCode: string | null; reverseMoyskladIds?: string[]; status: string };
 type PriceTypePair = { bitrix24Id: number; bitrix24Code: string; moyskladId: string | null; moyskladLabel: string | null; status: string };
 type DictionaryMap = {
   key: string;
@@ -353,7 +353,7 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
   function changeUnit(bitrix24Id: number, moyskladId: string) {
     changeDraft((current) => ({
       ...current,
-      references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === bitrix24Id ? { ...row, moyskladId: moyskladId || null, moyskladCode: catalogs?.units.moysklad.find((candidate) => candidate.id === moyskladId)?.code ?? null, status: moyskladId ? 'configured' : 'unmapped' } : row) },
+      references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === bitrix24Id ? { ...row, moyskladId: moyskladId || null, moyskladCode: catalogs?.units.moysklad.find((candidate) => candidate.id === moyskladId)?.code ?? null, reverseMoyskladIds: moyskladId ? row.reverseMoyskladIds?.filter((id) => id !== moyskladId) : undefined, status: moyskladId ? 'configured' : 'unmapped' } : row) },
     }));
   }
 
@@ -759,6 +759,10 @@ export function FieldSettingsPage({ accessToken, onForbidden, onError }: {
           return <article key={unit.bitrix24Id} className="reference-map-row">
             <div><strong>Bitrix24 ID {unit.bitrix24Id} · код {unit.bitrix24Code}</strong><small>{unit.moyskladId ? `Сохранённая пара · код ${unit.moyskladCode ?? '—'}` : [14, 16, 20].includes(unit.bitrix24Id) ? 'Намеренно без пары' : 'Без пары'}</small></div>
             <label>МойСклад<select aria-label={`Единица МойСклад для ${unit.bitrix24Id}`} value={unit.moyskladId ?? ''} onChange={(event) => changeUnit(unit.bitrix24Id, event.target.value)}><option value="">Без пары</option>{catalogs.units.moysklad.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.code} · {candidate.id}</option>)}</select></label>
+            <label>Дополнительно только МС → Битрикс<select multiple disabled={!unit.moyskladId} aria-label={`Дополнительные обратные единицы для ${unit.bitrix24Id}`} value={unit.reverseMoyskladIds ?? []} onChange={(event) => {
+              const ids = Array.from(event.target.selectedOptions, (option) => option.value);
+              setDraft((current) => current ? { ...current, references: { ...current.references, units: current.references.units.map((row) => row.bitrix24Id === unit.bitrix24Id ? { ...row, reverseMoyskladIds: ids } : row) } } : current);
+            }}>{catalogs.units.moysklad.filter((candidate) => candidate.id !== unit.moyskladId && !draft.references.units.some((other) => other.bitrix24Id !== unit.bitrix24Id && (other.moyskladId === candidate.id || other.reverseMoyskladIds?.includes(candidate.id)))).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.label} · {candidate.id}</option>)}</select><small>Не меняет единицу при отправке из Битрикса.</small></label>
             {suggestion && <span className="exact-match-note">Точный код: {suggestion.code}</span>}
           </article>;
         })}</div>

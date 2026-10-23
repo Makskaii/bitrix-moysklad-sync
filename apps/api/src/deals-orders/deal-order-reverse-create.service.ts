@@ -11,6 +11,7 @@ import { resolveDictionaryValue } from './deal-order-field-runtime.service';
 import { moySkladMoneyToBitrix } from './deal-order-money';
 import { ProductCatalogCreateService } from '../products/product-catalog-create.service';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
@@ -297,7 +298,7 @@ export class DealOrderReverseCreateService {
           throw new DealOrderReverseManualReviewError(`MySklad assortment ${assortmentId} is not a readable product`);
         }
         const uomId = moyskladUomReferenceId(product.uom, configuredBase('MOYSKLAD_API_BASE_URL'));
-        const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === uomId);
+        const unit = input.eventConfig.config.references.units.filter((candidate) => matchesReverseUnit(candidate, uomId));
         if (unit.length !== 1 || !Number.isInteger(unit[0]?.bitrix24Id) || unit[0].bitrix24Id < 1 || !numericBitrixMeasureCode(unit[0]?.bitrix24Code)) {
           await skip(id, 'UNIT_UNMAPPED');
           continue;
@@ -311,7 +312,7 @@ export class DealOrderReverseCreateService {
         mappedProduct = { bitrix24Id, uomId: uomId! };
         resolvedProducts.set(assortmentId, mappedProduct);
       }
-      const unit = input.eventConfig.config.references.units.filter((candidate) => candidate.status === 'configured' && candidate.moyskladId === mappedProduct!.uomId);
+      const unit = input.eventConfig.config.references.units.filter((candidate) => matchesReverseUnit(candidate, mappedProduct!.uomId));
       const measureCode = unit.length === 1 ? numericBitrixMeasureCode(unit[0]?.bitrix24Code) : null;
       const price = typeof position.price === 'number' && Number.isFinite(position.price) && position.price >= 0 ? position.price / 100 : null;
       const quantity = typeof position.quantity === 'number' && Number.isFinite(position.quantity) && position.quantity > 0 ? position.quantity : null;

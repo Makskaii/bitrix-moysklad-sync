@@ -94,7 +94,11 @@ export class FieldSettingsService {
     if (catalogs.priceTypes.bitrix24.some((priceType) => !configuredPriceSources.has(priceType.id))) throw new BadRequestException('Every current Bitrix24 price type must remain visible in the mapping table');
     const liveUnitIds = new Set(catalogs.units.moysklad.map((unit) => unit.id));
     const livePriceTypeIds = new Set(catalogs.priceTypes.moysklad.map((priceType) => priceType.id));
-    for (const unit of config.references.units) if (unit.moyskladId && !liveUnitIds.has(unit.moyskladId)) throw new BadRequestException(`MySklad unit ${unit.moyskladId} no longer exists`);
+    for (const unit of config.references.units) {
+      for (const id of [unit.moyskladId, ...(unit.reverseMoyskladIds ?? [])]) {
+        if (id && !liveUnitIds.has(id)) throw new BadRequestException(`MySklad unit ${id} no longer exists`);
+      }
+    }
     for (const priceType of config.references.priceTypes) if (priceType.moyskladId && !livePriceTypeIds.has(priceType.moyskladId)) throw new BadRequestException(`MySklad price type ${priceType.moyskladId} no longer exists`);
     for (const pair of config.references.namedPairs ?? []) {
       const sourceIds = new Set(namedCatalogs[pair.kind].bitrix24.map((item) => item.id));
@@ -850,7 +854,7 @@ function validateDictionaries(value: unknown) {
   return dictionaries;
 }
 
-function validateUnits(value: unknown) {
+export function validateUnits(value: unknown) {
   if (!Array.isArray(value)) throw new BadRequestException('references.units must be an array');
   const seenSources = new Set<number>();
   const seenTargets = new Set<string>();
@@ -865,6 +869,14 @@ function validateUnits(value: unknown) {
     if (targetId && !isUuid(targetId)) throw new BadRequestException('The selected MySklad unit ID must be a UUID');
     if (targetId && seenTargets.has(targetId)) throw new BadRequestException('A MySklad unit can only be assigned once');
     if (targetId) seenTargets.add(targetId);
+    if (candidate.reverseMoyskladIds !== undefined) {
+      if (!targetId || !Array.isArray(candidate.reverseMoyskladIds)) throw new BadRequestException('Reverse units require a configured canonical unit and an array');
+      for (const id of candidate.reverseMoyskladIds) {
+        if (typeof id !== 'string' || !isUuid(id)) throw new BadRequestException('Each reverse MySklad unit must be a UUID');
+        if (seenTargets.has(id)) throw new BadRequestException('A MySklad unit can only be assigned once, including reverse units');
+        seenTargets.add(id);
+      }
+    }
     return { ...candidate, moyskladId: targetId, status: targetId ? 'configured' : 'unmapped' };
   });
   return units;

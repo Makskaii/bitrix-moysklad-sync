@@ -949,6 +949,37 @@ test('accepted events stay pinned across activation and only an explicit one-eve
   assert.equal((await settings.eventConfig(accepted.id)).version, next.version);
 });
 
+test('public settings save validates explicit reverse-only unit alternatives against live catalogs and ownership', async () => {
+  const original = (await fetch(`${apiUrl}/api/admin/field-settings`).then(response => response.json()) as { config: Record<string, any> }).config;
+  const alias = '402a6315-fe55-11e4-90a2-8ecb002f8f70';
+  fakeMsUnitIds.push(alias);
+  const save = (config: unknown) => fetch(`${apiUrl}/api/admin/field-settings`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic-admin-token' }, body: JSON.stringify({ config }) });
+  try {
+    const config = structuredClone(original);
+    const selected = config.references.units.find((row: Record<string, any>) => row.moyskladId);
+    assert.ok(selected);
+    const canonical = selected.moyskladId;
+    selected.reverseMoyskladIds = [alias];
+    const response = await save(config);
+    assert.equal(response.status, 200, await response.clone().text());
+    const saved = await response.json() as { config: Record<string, any>; version: number };
+    const actual = saved.config.references.units.find((row: Record<string, any>) => row.bitrix24Id === selected.bitrix24Id);
+    assert.equal(actual.moyskladId, canonical);
+    assert.deepEqual(actual.reverseMoyskladIds, [alias]);
+    const missing = structuredClone(config);
+    missing.references.units.find((row: Record<string, any>) => row.bitrix24Id === selected.bitrix24Id).reverseMoyskladIds = ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+    assert.equal((await save(missing)).status, 400);
+    const conflict = structuredClone(config);
+    conflict.references.units.find((row: Record<string, any>) => row.moyskladId && row.bitrix24Id !== selected.bitrix24Id).reverseMoyskladIds = [alias];
+    assert.equal((await save(conflict)).status, 400);
+    const latest = await fetch(`${apiUrl}/api/admin/field-settings`).then(response => response.json()) as { version: number };
+    assert.equal(latest.version, saved.version);
+  } finally {
+    assert.equal((await save(original)).status, 200);
+    fakeMsUnitIds.pop();
+  }
+});
+
 test('public settings save validates directional stage maps without requiring a bijection or changing creation eligibility', async () => {
   const previousStatuses = fakeB24DealStatuses;
   const previousStates = fakeMoyskladOrderStates;
