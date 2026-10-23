@@ -329,6 +329,18 @@ export class FieldSettingsService {
     nightlyLeaseToken?: string;
   }) {
     await this.ensureInitialized();
+    // A nightly page can enqueue dozens of events. Renew the lease in its own
+    // short statement, rather than holding SyncSetting's write lock for the
+    // lifetime of each event/settings-pin transaction. The transaction still
+    // checks the token and expiry under FOR SHARE before it accepts an event.
+    if (input.nightlyLeaseToken) {
+      const renewed = await this.database.$executeRaw`
+        UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
+        WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken}
+          AND "serviceMode" = 'on' AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
+      `;
+      if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
+    }
     return this.database.$transaction(async (transaction) => {
       if (input.requireServiceNotOff) {
         const mode = await transaction.$queryRaw<Array<{ serviceMode: string; nightlyLeaseToken: string | null; nightlyLeaseExpiresAt: Date | null }>>`
@@ -336,15 +348,9 @@ export class FieldSettingsService {
         `;
         if (!mode[0] || mode[0].serviceMode === 'off') throw new EventIntakeDisabledError();
         if (input.nightlyLeaseToken && mode[0].serviceMode !== 'on') throw new EventIntakeDisabledError();
-        if (input.nightlyLeaseToken && mode[0].nightlyLeaseToken !== input.nightlyLeaseToken) {
+        if (input.nightlyLeaseToken && (mode[0].nightlyLeaseToken !== input.nightlyLeaseToken ||
+            !mode[0].nightlyLeaseExpiresAt || mode[0].nightlyLeaseExpiresAt.getTime() <= Date.now())) {
           throw new Error('Nightly run lease was lost before durable enqueue');
-        }
-        if (input.nightlyLeaseToken) {
-          const renewed = await transaction.$executeRaw`
-            UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt" = (NOW() AT TIME ZONE 'UTC') + INTERVAL '60 seconds'
-            WHERE "id" = 'global' AND "nightlyLeaseToken" = ${input.nightlyLeaseToken} AND "nightlyLeaseExpiresAt" > (NOW() AT TIME ZONE 'UTC')
-          `;
-          if (renewed !== 1) throw new Error('Nightly run lease was lost before durable enqueue');
         }
       }
       const event = await transaction.inboundEvent.upsert({
