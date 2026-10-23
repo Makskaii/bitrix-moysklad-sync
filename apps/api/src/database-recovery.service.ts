@@ -24,7 +24,10 @@ export class DatabaseRecoveryService {
       setDatabaseRecoveryReady(true);
       return;
     }
-    await this.database.syncSetting.updateMany({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+    await this.database.$transaction(async tx => {
+      await tx.$queryRaw`SELECT "id" FROM "SyncSetting" WHERE "id"='global' FOR UPDATE`;
+      await tx.syncSetting.updateMany({ where: { id: 'global' }, data: { serviceMode: 'off' } });
+    });
   }
 
   async readStatus() {
@@ -143,6 +146,7 @@ export class DatabaseRecoveryService {
 
     await this.database.$transaction(async (transaction) => {
       await transaction.$queryRaw<Array<{ locked: string }>>`SELECT pg_advisory_xact_lock(hashtext('database-recovery-global'))::text AS locked`;
+      await transaction.$queryRaw`SELECT "id" FROM "SyncSetting" WHERE "id"='global' FOR UPDATE`;
       const existing = await transaction.databaseRecoveryState.findUnique({ where: { id: 'global' } });
       if (isReadyState(existing)) throw new ConflictException('Database recovery was already acknowledged; its launch boundary cannot be replaced through this action');
       await transaction.databaseRecoveryState.upsert({

@@ -3,6 +3,8 @@ import { strict as assert } from 'node:assert';
 import { PrismaClient } from '@prisma/client';
 import { withNightlySettingLock } from '../src/nightly-setting-lock';
 import { DatabaseService } from '../src/database.service';
+import { withServiceModeOn } from '../src/service-mode-transaction';
+import { SyncModeService } from '../src/sync-mode.service';
 
 test('lease clock must be checked after a conflicting mode lock is released', async () => {
   const url = new URL(process.env.DATABASE_URL ?? '');
@@ -45,6 +47,26 @@ test('lease clock must be checked after a conflicting mode lock is released', as
       await hold;
       assert.equal(changed, duration === 150 ? 0 : 1, 'expired ownership is rejected after lock wait, live ownership renews');
     }
+    await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
+    let entered!: () => void;
+    let release!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const provider = withServiceModeOn(db as DatabaseService, async () => { entered(); await gate; return 'provider-finished'; });
+    await entry;
+    try {
+      await withNightlySettingLock(db as DatabaseService, tx => tx.$executeRaw`UPDATE "SyncSetting" SET "nightlyLeaseExpiresAt"=(clock_timestamp() AT TIME ZONE 'UTC')+interval '60 seconds' WHERE id='global'`);
+      let modeChanged = false;
+      const off = new SyncModeService(db as DatabaseService).setMode('off').then(() => { modeChanged = true; });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(modeChanged, false, 'actual OFF setter must wait for the provider gate');
+      release();
+      assert.deepEqual(await provider, { enabled: true, value: 'provider-finished' });
+      await off;
+      let called = false;
+      assert.deepEqual(await withServiceModeOn(db as DatabaseService, async () => { called = true; }), { enabled: false });
+      assert.equal(called, false);
+    } finally { release(); await provider; }
   } finally {
     await db.$executeRaw`UPDATE "SyncSetting" SET "nightlyLeaseToken"=NULL,"nightlyLeaseExpiresAt"=NULL WHERE id='global' AND "nightlyLeaseToken"='clock-probe'`;
     await db.$executeRaw`DROP TABLE IF EXISTS "NightlyLeaseClockProbe"`;

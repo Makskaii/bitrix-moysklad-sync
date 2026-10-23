@@ -13,7 +13,7 @@ function fixture(options: { renewed?: number; mode?: string; token?: string; exp
   const transaction = {
     $queryRaw: async (strings: TemplateStringsArray) => {
       if (strings.join('').includes('set_config')) return [];
-      if (strings.join('').includes('FOR UPDATE')) { calls.push('lock'); return [{ id: 'global' }]; }
+      if (strings.join('').includes('FOR NO KEY UPDATE')) { calls.push('lock'); return [{ id: 'global' }]; }
       calls.push('read-guard');
       guardReadCount += 1;
       return guardReadCount === 1
