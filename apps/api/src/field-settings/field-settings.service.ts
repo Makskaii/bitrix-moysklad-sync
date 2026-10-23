@@ -712,6 +712,10 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
     throw new BadRequestException('dealOrderRuntime must include confirmed currency, stage, organization, store, and employee mappings');
   }
   const unmappedReferencePolicy = value.unmappedReferencePolicy;
+  const unmappedStagePolicy = value.unmappedStagePolicy;
+  if (unmappedStagePolicy !== undefined && unmappedStagePolicy !== 'hold' && unmappedStagePolicy !== 'preserve-and-warn') {
+    throw new BadRequestException('unmappedStagePolicy must be hold or preserve-and-warn');
+  }
   if (unmappedReferencePolicy !== undefined && unmappedReferencePolicy !== 'hold' && unmappedReferencePolicy !== 'confirmed-defaults') {
     throw new BadRequestException('unmappedReferencePolicy must be hold or confirmed-defaults');
   }
@@ -800,7 +804,7 @@ function validateDealOrderRuntime(value: unknown, namedPairs: NamedReferencePair
       !namedPairs.some((pair) => pair.kind === 'employees' && pair.moyskladId === value.defaultEmployeeId && pair.status === 'confirmed')) {
     throw new BadRequestException('Default organization, store, and employee must be confirmed named references');
   }
-  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), ...(stageTransitions === undefined ? {} : { stageTransitions }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
+  return { nativeOrderNumberingVerified: value.nativeOrderNumberingVerified, ...(unmappedReferencePolicy === undefined ? {} : { unmappedReferencePolicy }), ...(unmappedStagePolicy === undefined ? {} : { unmappedStagePolicy }), ...(stageTransitions === undefined ? {} : { stageTransitions }), bitrix24ProductCatalogId: productCatalogId, bitrix24DefaultProductSectionId: productSectionId, moyskladProductFields, defaultOrganizationId: value.defaultOrganizationId as string, defaultStoreId: value.defaultStoreId as string, defaultEmployeeId: value.defaultEmployeeId as string, defaultProductGroupId: (value.defaultProductGroupId ?? null) as string | null, currencies, stages, organizations, stores, employees };
 }
 
 function assertUniqueIds(items: unknown[], label: string) {

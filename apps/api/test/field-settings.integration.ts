@@ -996,6 +996,7 @@ test('public settings save validates directional stage maps without requiring a 
     const config = structuredClone(original);
     assert.ok(config.dealOrderRuntime);
     const originalCreation = structuredClone(config.dealOrderRuntime.stages);
+    config.dealOrderRuntime.unmappedStagePolicy = 'preserve-and-warn';
     config.dealOrderRuntime.stageTransitions = {
       bitrix24ToMoysklad: [{ bitrix24StageId: 'UC_BBJSFZ', moyskladId: lower }, { bitrix24StageId: 'LOSE', moyskladId: lower }, { bitrix24StageId: 'UC_RH2DBY', moyskladId: returned }],
       moyskladToBitrix24: [{ bitrix24StageId: 'UC_BBJSFZ', moyskladId: lower }, { bitrix24StageId: 'UC_BBJSFZ', moyskladId: upper }, { bitrix24StageId: 'UC_RH2DBY', moyskladId: returned }],
@@ -1005,6 +1006,9 @@ test('public settings save validates directional stage maps without requiring a 
     const saved = await response.json() as { version: number; config: Record<string, any> };
     assert.deepEqual(saved.config.dealOrderRuntime.stageTransitions, config.dealOrderRuntime.stageTransitions);
     assert.deepEqual(saved.config.dealOrderRuntime.stages, originalCreation);
+    assert.equal(saved.config.dealOrderRuntime.unmappedStagePolicy, 'preserve-and-warn');
+    const badPolicy = structuredClone(config); badPolicy.dealOrderRuntime.unmappedStagePolicy = 'invent-another-stage';
+    assert.equal((await save(badPolicy)).status, 400);
     for (const kind of ['forward-duplicate', 'reverse-duplicate', 'missing-direction', 'unknown-ms', 'unknown-b24', 'catalog-key-not-runtime-id']) {
       const bad = structuredClone(config); const transitions = bad.dealOrderRuntime.stageTransitions;
       if (kind === 'forward-duplicate') transitions.bitrix24ToMoysklad.push({ bitrix24StageId: 'LOSE', moyskladId: upper });

@@ -114,6 +114,38 @@ test('unknown or duplicate stages hold without writes', async () => {
   assert.deepEqual(await service.process({ pair, eventId: 'duplicate-stage', eventConfig: duplicate }), { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' });
   assert.equal(writes, 0);
 });
+
+test('explicit preserve-and-warn continues existing-document processing without writing or baselining unknown stages', async () => {
+  await reset();
+  const configured = structuredClone(config);
+  configured.config.dealOrderRuntime.unmappedStagePolicy = 'preserve-and-warn';
+  const unknown = '0cb61f8b-b504-11ee-0a80-0ff500135272';
+  msStage = unknown;
+  const before = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
+  const result = await service.process({ pair, eventId: 'stage-preserved-warning', eventConfig: configured });
+  assert.deepEqual(result, { status: 'SYNCED', heldRules: 0 });
+  assert.equal(msStage, unknown); assert.equal(b24Stage, 'PREPARATION'); assert.equal(writes, 0);
+  const after = await database.entityPairSyncState.findUniqueOrThrow({ where: { pairId: pair.id } });
+  assert.deepEqual(after.bitrix24Values, before.bitrix24Values);
+  assert.deepEqual(after.moyskladValues, before.moyskladValues);
+  assert.ok(await database.operationalLog.count({ where: { referenceId: 'stage-preserved-warning', message: { contains: 'DEAL_ORDER_STAGE_PRESERVED_UNMAPPED' } } }));
+});
+
+test('preserve-and-warn still rejects foreign stage references and duplicate directional mappings', async () => {
+  await reset();
+  const configured = structuredClone(config);
+  configured.config.dealOrderRuntime.unmappedStagePolicy = 'preserve-and-warn';
+  const read = reader.readMoySkladCustomerOrderForBaseline;
+  reader.readMoySkladCustomerOrderForBaseline = async () => ({ state: { meta: { type: 'state', href: 'https://foreign.invalid/entity/customerorder/metadata/states/0cb61f8b-b504-11ee-0a80-0ff500135272' } } });
+  try {
+    assert.deepEqual(await service.process({ pair, eventId: 'stage-foreign-warning', eventConfig: configured }), { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' });
+    assert.equal(writes, 0);
+  } finally { reader.readMoySkladCustomerOrderForBaseline = read; }
+  await reset(); b24Stage = 'UC_7QBU06';
+  configured.config.dealOrderRuntime.stageTransitions.bitrix24ToMoysklad.push(configured.config.dealOrderRuntime.stageTransitions.bitrix24ToMoysklad[2]);
+  assert.deepEqual(await service.process({ pair, eventId: 'stage-duplicate-warning', eventConfig: configured }), { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' });
+  assert.equal(writes, 0);
+});
 test('stage reference parser rejects foreign, query, malformed and type-conflicting references', () => {
   const stages = configuredStagePairs(config.config);
   const exact = `${base}entity/customerorder/metadata/states/${map.pairs[2].moyskladId}`;

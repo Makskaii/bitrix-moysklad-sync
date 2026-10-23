@@ -388,7 +388,15 @@ export class DealOrderFieldRuntimeService {
     } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_STAGE_READ_FAILED' }; }
     const b24Current = readConfiguredStage(b24, stages, 'BITRIX24');
     const msCurrent = readConfiguredStage(moysklad, stages, 'MOYSKLAD');
-    if (!b24Current || !msCurrent) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
+    const preserveUnmappedStage = async (): Promise<Result | null> => {
+      if (input.eventConfig.config.dealOrderRuntime?.unmappedStagePolicy !== 'preserve-and-warn' ||
+          !readNativeStage(b24, 'BITRIX24') || !readNativeStage(moysklad, 'MOYSKLAD')) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
+      }
+      await writeOperationalLog(this.database, 'EVENT', 'Deal/order native stages preserved; other fields continue; reason=DEAL_ORDER_STAGE_PRESERVED_UNMAPPED', input.eventId);
+      return null;
+    };
+    if (!b24Current || !msCurrent) return preserveUnmappedStage();
     if (typeof b24State['native:stage'] !== 'string' || typeof msState['native:stage'] !== 'string') {
       // Old snapshots did not include stages. Only establish an observation
       // when both providers already agree; never guess the winner of an old
@@ -420,6 +428,7 @@ export class DealOrderFieldRuntimeService {
     const mapping = direction === 'BITRIX24_TO_MOYSKLAD'
       ? transitions.bitrix24ToMoysklad.filter(stage => stage.bitrix24StageId === sourceId)
       : transitions.moyskladToBitrix24.filter(stage => stage.moyskladId === sourceId);
+    if (mapping.length === 0) return preserveUnmappedStage();
     if (mapping.length !== 1 || !isNativeStageId(mapping[0].moyskladId) || !mapping[0].bitrix24StageId) {
       return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
     }
@@ -710,9 +719,14 @@ export function readConfiguredStage(
   stages: DealStagePair[],
   side: 'BITRIX24' | 'MOYSKLAD',
 ): string | null {
+  const id = readNativeStage(record, side);
+  return id && stages.some(stage => (side === 'BITRIX24' ? stage.bitrix24StageId : stage.moyskladId) === id) ? id : null;
+}
+
+function readNativeStage(record: RecordValue, side: 'BITRIX24' | 'MOYSKLAD'): string | null {
   if (side === 'BITRIX24') {
     const id = typeof record.STAGE_ID === 'string' ? record.STAGE_ID : null;
-    return id && stages.some((stage) => stage.bitrix24StageId === id) ? id : null;
+    return id && /^(?:C\d+:)?[A-Z][A-Z0-9_]*$/.test(id) ? id : null;
   }
   const state = isRecord(record.state) ? record.state : null;
   const meta = state && isRecord(state.meta) ? state.meta : null;
@@ -725,7 +739,7 @@ export function readConfiguredStage(
     const suffix = target.pathname.startsWith(`${prefix}/`) ? target.pathname.slice(prefix.length) : '';
     const match = suffix.match(/^\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/i);
     const id = target.origin === base.origin && !target.search && !target.hash && !target.username && !target.password ? match?.[1] ?? null : null;
-    return id && stages.some((stage) => stage.moyskladId === id) ? id : null;
+    return id;
   } catch { return null; }
 }
 function jsonRecord(value: Prisma.JsonValue): RecordValue {
