@@ -22,6 +22,17 @@ const NIGHTLY_TIME_ZONE = 'Europe/Moscow';
 type RecordValue = Record<string, unknown>;
 type NightlyScope = 'contacts-companies' | 'deals-orders' | 'invoices' | 'products-variations';
 
+function nightlySafeDiagnostic(error: unknown): string {
+  if (isRecord(error) && typeof error.code === 'string' && /^P\d{4}$/.test(error.code)) return error.code;
+  if (error instanceof Error && [
+    'Nightly run lease was lost',
+    'Nightly run lease was lost before durable enqueue',
+    'Nightly lease or MoySklad cursor changed before checkpoint',
+    'Nightly lease was lost before MoySklad feed completion',
+  ].includes(error.message)) return 'LEASE_LOST';
+  return 'INTERNAL';
+}
+
 @Injectable()
 export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDestroy {
   private nightlyRunning = false;
@@ -280,7 +291,8 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
           ...(complete ? { nightlyError: 'Active interval feeds are queued for processing. Skipped intervals are shown in coverage; delete and archival changes remain outside this slice.' } : {}),
         },
       });
-    } catch {
+    } catch (error) {
+      await writeOperationalLog(this.database, 'ERROR', `Nightly run ${nightlySafeDiagnostic(error)}`, 'nightly').catch(() => undefined);
       const current = await this.database.syncSetting.findFirst({
         where: { id: 'global', nightlyLeaseToken: leaseToken }, select: { nightlyAttempts: true },
       });
@@ -667,7 +679,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     const diagnostic = error instanceof UnsupportedPaginationError ? 'PAGINATION'
       : error instanceof ProviderFeedError ? 'PROVIDER_HTTP'
         : isRecord(error) && typeof error.code === 'string' && /^P\d{4}$/.test(error.code) ? error.code
-          : 'INTERNAL';
+          : nightlySafeDiagnostic(error);
     await writeOperationalLog(this.database, 'ERROR', `Nightly ${provider} ${phase} ${diagnostic}`, 'nightly');
     const current = await this.database.syncSetting.findUnique({ where: { id: 'global' }, select: { nightlyAttempts: true } });
     await this.database.syncSetting.updateMany({

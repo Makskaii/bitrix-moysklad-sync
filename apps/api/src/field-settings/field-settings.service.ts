@@ -30,7 +30,7 @@ export class FieldSettingsService {
   ) {}
 
   async active() {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT version."version", version."config", version."createdAt"
       FROM "FieldSettingsState" AS state
@@ -43,7 +43,7 @@ export class FieldSettingsService {
 
   async version(version: number) {
     if (!Number.isInteger(version) || version < 1) throw new BadRequestException('version must be a positive integer');
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT "version", "config", "createdAt" FROM "FieldSettingsVersion" WHERE "version" = ${version}
     `;
@@ -53,7 +53,7 @@ export class FieldSettingsService {
 
   async save(value: unknown, bitrixAccessToken: string) {
     const config = validateConfiguration(value);
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     await this.validateConfiguredFields(config, bitrixAccessToken);
     const active = await this.active();
     const riskChanges = fieldRuleRiskChanges(active.config, config);
@@ -301,7 +301,7 @@ export class FieldSettingsService {
   }
 
   async pinEvent(eventId: string) {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     return this.database.$transaction(async (transaction) => {
       const state = await transaction.$queryRaw<Array<{ version: number }>>`
         SELECT "version" FROM "FieldSettingsState" WHERE "id" = 'global' FOR SHARE
@@ -332,13 +332,7 @@ export class FieldSettingsService {
   }) {
     // Initial backfill scans historical events. Do it once per process, not
     // once for every webhook/nightly row; each accepted row is pinned below.
-    if (!this.acceptanceInitialization) {
-      this.acceptanceInitialization = this.ensureInitialized().catch((error) => {
-        this.acceptanceInitialization = null;
-        throw error;
-      });
-    }
-    await this.acceptanceInitialization;
+    await this.ensureInitializedOnce();
     // A nightly page can enqueue dozens of events. Renew the lease in its own
     // short statement, rather than holding SyncSetting's write lock for the
     // lifetime of each event/settings-pin transaction. The transaction still
@@ -391,7 +385,7 @@ export class FieldSettingsService {
   }
 
   async eventConfig(eventId: string): Promise<VersionedFieldSettingsDto> {
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     const rows = await this.database.$queryRaw<VersionRow[]>`
       SELECT version."version", version."config", version."createdAt"
       FROM "InboundEventSettings" AS pin
@@ -475,7 +469,7 @@ export class FieldSettingsService {
       await this.ensureInitialized(transaction);
       return this.repinEventInTransaction(transaction, eventId);
     }
-    await this.ensureInitialized();
+    await this.ensureInitializedOnce();
     return this.database.$transaction((tx) => this.repinEventInTransaction(tx, eventId), { isolationLevel: 'Serializable' });
   }
 
@@ -503,6 +497,16 @@ export class FieldSettingsService {
         WHERE "id" = ${eventId}
       `;
     return activeVersion;
+  }
+
+  private ensureInitializedOnce(): Promise<void> {
+    if (!this.acceptanceInitialization) {
+      this.acceptanceInitialization = this.ensureInitialized().catch((error) => {
+        this.acceptanceInitialization = null;
+        throw error;
+      });
+    }
+    return this.acceptanceInitialization;
   }
 
   private async ensureInitialized(transaction?: Prisma.TransactionClient) {
