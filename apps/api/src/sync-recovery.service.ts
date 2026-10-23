@@ -597,7 +597,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     try {
       await this.waitForNightlyRequestSlot();
       response = await fetch(url, {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
@@ -769,7 +769,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
       '>=timestampX': from.toISOString(), '<=timestampX': through.toISOString(),
       ...(lastId === null ? {} : { '>id': Number(lastId) }),
     };
-    const body = { filter, order: { id: 'ASC' }, select: ['id', 'timestampX'], start: 0 };
+    const body = { filter, order: { id: 'ASC' }, select: ['id', 'iblockId', 'timestampX'], start: 0 };
     let response: Response;
     try {
       await this.waitForNightlyRequestSlot();
@@ -814,7 +814,7 @@ export class SyncRecoveryService implements OnApplicationBootstrap, OnModuleDest
     try {
       await this.waitForNightlyRequestSlot();
       response = await fetch(url, {
-        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        method: 'GET', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {

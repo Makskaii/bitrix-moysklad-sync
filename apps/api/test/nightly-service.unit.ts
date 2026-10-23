@@ -162,13 +162,19 @@ async function createHarness(mode: 'on' | 'pause' | 'off' = 'on') {
       if (store.failBitrix) return new Response('{}', { status: 503, headers: { 'retry-after': '3600' } });
       const request = JSON.parse(String(init?.body));
       if (request.filter?.['>=updatedTime']) store.bitrixWindows.push([request.filter['>=updatedTime'], request.filter['<=updatedTime']]);
-      if (url.includes('catalog.product.list')) return new Response(JSON.stringify({ result: { products: store.bitrixProductIds.map((id) => ({ id })) } }), { status: 200 });
+      if (url.includes('catalog.product.list')) {
+        assert.ok(request.select.includes('iblockId'),'native product list requires iblockId in select');
+        return new Response(JSON.stringify({ result: { products: store.bitrixProductIds.map((id) => ({ id })) } }), { status: 200 });
+      }
       const ids = request.entityTypeId === 3 && store.bitrixEvents.length
         ? store.bitrixEvents.filter((item) => item.changedAt >= request.filter['>=updatedTime'] && item.changedAt <= request.filter['<=updatedTime']).map((item) => item.id)
         : request.entityTypeId === 2 ? store.bitrixDealIds : request.entityTypeId === 3 ? store.bitrixIds : request.entityTypeId === 31 ? store.bitrixInvoiceIds : [];
       return new Response(JSON.stringify({ result: { items: ids.map((id) => ({ id })) } }), { status: 200 });
     }
     const requestUrl = new URL(url);
+    const headers=new Headers(init?.headers);
+    assert.equal(headers.get('accept'),'application/json;charset=utf-8');
+    assert.equal(headers.get('accept-encoding'),'gzip');
     store.moyskladWindows.push(requestUrl.searchParams.get('filter') ?? '');
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0);
     const entity = requestUrl.pathname.split('/').filter(Boolean).at(-1) ?? 'counterparty';
