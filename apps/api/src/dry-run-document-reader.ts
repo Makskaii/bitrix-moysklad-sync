@@ -74,7 +74,7 @@ export class DryRunDocumentReader {
     return this.withMode(async () => {
       const response = await fetch(url, {
         method: 'GET',
-        headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+        headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip' },
         redirect: 'error',
         signal: AbortSignal.timeout(READ_TIMEOUT_MS),
       }).catch(() => { throw new ProviderFailure('MOYSKLAD', null); });

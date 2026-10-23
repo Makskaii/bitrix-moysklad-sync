@@ -19,6 +19,7 @@ import { DealOrderCreateOperationService } from '../deals-orders/deal-order-crea
 import { DealOrderPositionRuntimeService } from '../deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from '../deals-orders/deal-order-field-runtime.service';
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from '../deals-orders/deal-order-reverse-create.service';
+import { orderOrganizationDecision } from '../deals-orders/moysklad-order-organization-policy';
 import { DealOrderTotalReconciliationHandler } from '../deals-orders/deal-order-total-reconciliation';
 import { withDealOrderPairLock } from '../deals-orders/deal-order-pair-lock';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
@@ -219,6 +220,37 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
       });
     });
     if (!claim.enabled || claim.value.count !== 1) return null;
+
+    // Admission precedes pair resolution and every deal/row/header mutation.
+    // A DELETE has no source order to inspect; it remains on the existing
+    // lifecycle path, which cannot create a new Bitrix24 deal.
+    if (event.source === 'MOYSKLAD' && event.eventType !== 'DELETE') {
+      if (!this.documentReader) {
+        await this.finish(event.id, 'MANUAL_REVIEW', 'ORDER_ORGANIZATION_READER_UNAVAILABLE', workerLease);
+        return null;
+      }
+      let order: Record<string, unknown>;
+      try {
+        await workerLease?.assertOwned();
+        order = await this.documentReader.readMoySkladCustomerOrderForBaseline(event.externalEntityId);
+        await workerLease?.assertOwned();
+      } catch (error) {
+        if (error instanceof ServiceModeNotOnError) return null;
+        if (error instanceof ProviderFailure && !isRetryableFailure(error)) {
+          await this.finish(event.id, 'MANUAL_REVIEW', 'ORDER_ORGANIZATION_READ_REJECTED', workerLease);
+        } else {
+          await this.finish(event.id, 'RETRYABLE_FAILURE', 'ORDER_ORGANIZATION_READ_RETRY', workerLease,
+            retryAtForFailure(error, event.attempts + 1));
+        }
+        return null;
+      }
+      const organizationDecision = orderOrganizationDecision(order);
+      if (organizationDecision !== 'ALLOWED') {
+        await this.finish(event.id, organizationDecision === 'EXCLUDED' ? 'SKIPPED_DISABLED' : 'MANUAL_REVIEW',
+          organizationDecision === 'EXCLUDED' ? 'ORDER_ORGANIZATION_EXCLUDED' : 'ORDER_ORGANIZATION_UNVERIFIED', workerLease);
+        return null;
+      }
+    }
 
     const input: PairResolutionInput = {
       entityType: 'DEAL',
