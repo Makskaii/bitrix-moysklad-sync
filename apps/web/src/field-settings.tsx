@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 
 type Transform =
-  | { kind: 'tbd' | 'copy' }
+  | { kind: 'tbd' | 'copy' | 'price-type-uuid' }
   | { kind: 'string-to-number'; numberType: 'integer' | 'decimal'; precision?: number; leadingZeros?: 'reject' | 'allow' }
   | { kind: 'number-to-string'; precision?: number }
   | { kind: 'date-to-datetime'; timeZone: string; time?: string }
@@ -149,6 +149,7 @@ function fieldOptionLabel(field: FieldCandidate) {
 function transformForKind(kind: string): Transform {
   switch (kind) {
     case 'copy': return { kind };
+    case 'price-type-uuid': return { kind };
     case 'string-to-number': return { kind, numberType: 'decimal', leadingZeros: 'reject' };
     case 'number-to-string': return { kind };
     case 'date-to-datetime': return { kind, timeZone: 'Europe/Moscow', time: '00:00:00' };
@@ -165,6 +166,7 @@ function transformForKind(kind: string): Transform {
 function transformKinds(): Array<[string, string]> {
   return [
     ['tbd', 'Не задано (TBD)'], ['copy', 'Копировать без преобразования'],
+    ['price-type-uuid', 'Тип цены компании → UUID МойСклад'],
     ['string-to-number', 'Строка → число (явная политика)'], ['number-to-string', 'Число → строка'],
     ['date-to-datetime', 'Дата → дата и время (с часовым поясом)'], ['datetime-to-date', 'Дата и время → дата (с часовым поясом)'],
     ['boolean-map', 'Логическое значение → явные значения'], ['enum-map', 'Сопоставление вариантов перечисления'],

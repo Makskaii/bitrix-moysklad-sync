@@ -73,6 +73,8 @@ import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 import { ProductDuplicatesController } from './admin/product-duplicates.controller';
 import { ProductDuplicateAliasService } from './products/product-duplicate-alias.service';
 import { ApplicationLaunchController } from './application-launch.controller';
+import { WarehouseDirectorySyncService } from './warehouses/warehouse-directory-sync.service';
+import { CompanyPriceTypeDirectoryService } from './clients/company-price-type-directory.service';
 
 @Controller()
 class AppController {
@@ -90,7 +92,7 @@ class AppController {
   controllers: [AppController, ApplicationLaunchController, AdminController, AdminAuditController, ClientLifecycleController, ProductDuplicatesController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
     { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
-    EventWorkerLeaseService, DatabaseRecoveryService,
+    EventWorkerLeaseService, DatabaseRecoveryService, WarehouseDirectorySyncService, CompanyPriceTypeDirectoryService,
     WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
