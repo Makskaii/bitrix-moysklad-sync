@@ -341,9 +341,10 @@ test('an already-correct number preserves a customer title and commits the pair 
 });
 
 test('lost B24 update response recovers after a cold service restart by readback, with one native MS order', async () => {
-  const input = preparedInput('907'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
   failNextB24DealRead = false; b24OrderNumber = null; b24DealTitle = 'Original source title';
   nativeOrderName = 'МС / 2026 & №000054 — Обработан'; loseNextOrderNumberUpdateResponse = true;
+  const input = preparedInput('907');
   try {
     await assert.rejects(service.createAndPair(input));
     const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '907' } });
@@ -431,6 +432,7 @@ function preparedInput(bitrix24DealId = '901'): any {
     sourceRowValues: [{ id: '301', productId: 904, quantity: 2, price: 0, measureCode: 796 }], sourceMeasureCodes: [796],
     unitMappings: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }],
     payload: {
+      name: nativeOrderName,
       agent: ref('counterparty', ids.company), organization: ref('organization', ids.organization), store: ref('store', ids.store),
       state: { meta: { type: 'state', href: `${base}api/remap/1.2/entity/customerorder/metadata/states/${ids.state}` } },
       owner: ref('employee', ids.employee), rate: { currency: ref('currency', ids.currency) },
@@ -484,7 +486,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (url.pathname === '/rest/crm.deal.get.json') {
     if (body.get('id') === headerContractDealId) return send(response, { result: {
       ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,
-      OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture',
+      OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture', UF_CRM_KVENTRU57: 'SO-54',
       ...headerContractOverrides,
     } });
     if (nextNumberReadBarrier) {
@@ -494,7 +496,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       await barrier.wait;
     }
     if (failNextB24DealRead) { failNextB24DealRead = false; response.writeHead(500); response.end('{}'); return; }
-    return send(response, { result: { ID: body.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
+    return send(response, { result: { ID: body.get('id'), TITLE: b24DealTitle, UF_CRM_KVENTRU57: nativeOrderName, UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.item.productrow.list' && body.get('filter[=ownerId]') === headerContractDealId) {
     return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: headerContractMeasureCode, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });

@@ -66,6 +66,22 @@ test('complete preflight preserves every row, including repeated products and ex
   assert.equal(result.input.payload.store.meta.href, msRef('store', uuids.store));
 });
 
+test('MySklad order number comes from UF_CRM_KVENTRU57 and is mandatory before row reads', async () => {
+  reset();
+  rows = [productRow(10, 1)];
+  deal.UF_CRM_KVENTRU57 = '  ';
+  const blank = await preparer.prepare({ bitrix24DealId: '100', eventId: 'missing-kventru-number', eventConfig: eventConfig() });
+  assert.deepEqual(blank, { status: 'WAITING', reason: 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE' });
+  assert.equal(requestCount, 1, 'a blank source order number stops preflight before row and provider-reference reads');
+
+  reset();
+  rows = [productRow(10, 1)];
+  deal.UF_CRM_KVENTRU57 = '000057-AB';
+  const ready = await preparer.prepare({ bitrix24DealId: '100', eventId: 'filled-kventru-number', eventConfig: eventConfig() });
+  assert.equal(ready.status, 'READY');
+  if (ready.status === 'READY') assert.equal(ready.input.payload.name, '000057-AB', 'preserve the exact business-process value, including leading zeroes');
+});
+
 test('assembly handoff needs explicit creation admission; a transition mapping alone does not create orders', async () => {
   reset();
   rows = [productRow(10, 1)];
@@ -332,7 +348,7 @@ function reset() {
   nextRowId = 1;
   operationalMessages = [];
   productPairExists = true;
-  deal = { ID: '100', COMPANY_ID: 200, STAGE_ID: 'PREPARATION', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null };
+  deal = { ID: '100', COMPANY_ID: 200, STAGE_ID: 'PREPARATION', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null, UF_CRM_KVENTRU57: 'SO-TEST-1' };
 }
 
 async function findMany(args: { where: { entityType: string; bitrix24Id: string }; take: number }) {

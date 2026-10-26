@@ -222,6 +222,7 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
+      if (order.name !== payload.name) throw new Error('Customer-order native number does not match the Bitrix source field');
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
         const createdAt = parseMoySkladCreatedAt(order.created);
@@ -412,6 +413,13 @@ export class DealOrderCreateOperationService {
         where: { bitrix24DealId: input.bitrix24DealId },
         data: { status: partial ? 'PARTIAL' : 'SUCCEEDED', moyskladOrderId, lastErrorCategory: partial ? 'ROWS_SKIPPED' : null, leaseToken: null, leaseUntil: null },
       });
+      await transaction.inboundEvent.updateMany({
+        where: {
+          source: 'BITRIX24', externalEntityType: 'deal', externalEntityId: input.bitrix24DealId,
+          status: 'WAITING_FOR_DATA', lastErrorCategory: 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE',
+        },
+        data: { status: 'SUCCEEDED', lastErrorCategory: 'DEAL_ORDER_CREATED_BY_LATER_EVENT', retryAfter: null },
+      });
       await transaction.pairReviewCase.updateMany({
         where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: input.bitrix24DealId, status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
@@ -428,6 +436,7 @@ function validatePreparedOrder(input: DealOrderPreparedInput) {
       !Array.isArray(input.confirmedCustomerPairIds) ||
       input.confirmedCustomerPairIds.length > 10 || new Set(input.confirmedCustomerPairIds).size !== input.confirmedCustomerPairIds.length ||
       input.confirmedCustomerPairIds.some((id) => typeof id !== 'string' || !id.trim()) ||
+      typeof input.payload.name !== 'string' || !input.payload.name.trim() ||
       !input.eventId || !Number.isInteger(input.settingsVersion) || input.settingsVersion < 1) {
     throw new Error('Prepared customer-order identity is invalid');
   }
