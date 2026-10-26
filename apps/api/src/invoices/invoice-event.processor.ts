@@ -16,10 +16,13 @@ import { InvoiceFieldRule, planInvoiceField } from './invoice-field-plan';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
 import { InvoicePairLease, withInvoicePairLock } from './invoice-pair-lock';
 import { serviceModeBoundProvider, withServiceModeOn } from '../service-mode-transaction';
+import { bitrixMoneyToMoySklad } from '../deals-orders/deal-order-money';
+import { invoiceGoodsValue, InvoiceGoodsReview, InvoiceGoodsRow, InvoiceGoodsState, planInvoiceGoods, sameGoods } from './invoice-goods-plan';
 
 const logger = new Logger('InvoiceEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
 const RECOVERY_INTERVAL_MS = 1_000;
+const ORDER_WAIT_RETRY_MS = 30_000;
 const MAX_ATTEMPTS = 8;
 type Source = 'BITRIX24' | 'MOYSKLAD';
 type InvoiceDirection = 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24';
@@ -70,7 +73,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   async process(eventId: string) {
-    return this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease));
+    return this.workerLease.run(eventId, (lease) => this.processWithLease(eventId, lease), 'invoices');
   }
 
   private requestRecoveryScan() {
@@ -92,7 +95,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
             ] },
             { OR: [
               { status: 'RECEIVED' },
-              { status: 'WAITING_FOR_ORDER' },
+              { status: 'WAITING_FOR_ORDER', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: now } }] },
               { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: staleBefore } }] },
@@ -133,7 +136,8 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
 
     const claim = await withServiceModeOn(this.database, (transaction) => transaction.inboundEvent.updateMany({
       where: { id: event.id, OR: [
-        { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' },
+        { status: 'RECEIVED' },
+        { status: 'WAITING_FOR_ORDER', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'RETRYABLE_FAILURE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'DEFERRED_PAUSE', OR: [{ retryAfter: null }, { retryAfter: { lte: new Date() } }] },
         { status: 'PROCESSING', OR: [{ processingStartedAt: null }, { processingStartedAt: { lt: new Date(Date.now() - PROCESSING_LEASE_MS) } }] },
@@ -175,7 +179,7 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const resolveOrder = () => this.resolveOrderPair(source, link.orderId, boundary);
       const order = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? await this.controlledAdmission.runForEvent(event.id, resolveOrder) : await resolveOrder();
-      if (order.status === 'WAITING_FOR_ORDER') return this.finish(event, 'WAITING_FOR_ORDER', order.reason, null, lease);
+      if (order.status === 'WAITING_FOR_ORDER') return this.finish(event, 'WAITING_FOR_ORDER', order.reason, new Date(Date.now() + ORDER_WAIT_RETRY_MS), lease);
       if (order.status === 'SKIPPED_OUT_OF_SCOPE') return this.finish(event, 'SKIPPED_PRE_LAUNCH', order.reason, null, lease);
       if (order.status === 'MANUAL_REVIEW') return this.finish(event, 'MANUAL_REVIEW', order.reason, null, lease);
 
@@ -199,10 +203,13 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
           }
           const pair = await this.persistPair(source, sourceId, created.partnerId, order.pair.moyskladId, event.id, lease);
           if (!pair) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_PERSIST_FAILED', retryAtForFailure(new Error('INVOICE_PAIR_PERSIST_FAILED'), event.attempts + 1), lease);
-          const baselineLock = await withInvoicePairLock(this.database, pair.id, event.id, async (pairLease) => {
+          const initialize = () => withInvoicePairLock(this.database, pair.id, event.id, async (pairLease) => {
             await this.initializeBaseline(pair.id, event.id, settings, rules, groups, bitrix, moysklad, pairLease);
+            if (source === 'BITRIX24') await this.synchronizeInvoiceGoods(pair, order.pair, settings, lease, pairLease);
             return true;
           });
+          const baselineLock = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
+            ? await this.controlledAdmission.runForEvent(event.id, initialize) : await initialize();
           if (!baselineLock) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
           return this.finish(event, 'SUCCEEDED', 'INVOICE_CREATED_AND_PAIRED', null, lease);
         });
@@ -218,12 +225,16 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         const baselineResult = await this.ensureBaseline(invoicePair.pair, order.pair, event.id, settings, rules, groups, bitrix, moysklad, lease, pairLease);
         if (baselineResult.status === 'SUPERSEDED') return { status: 'UNCHANGED', reason: 'SETTINGS_PIN_SUPERSEDED', retryAfter: null } as const;
         if (baselineResult.status !== 'READY') return baselineResult;
-        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventConfig: settings, rules, groups, baseline: baselineResult.baseline, bitrix: baselineResult.bitrix, moysklad: baselineResult.moysklad, lease, pairLease });
+        const sync = () => this.syncFields({ pair: invoicePair.pair, order: order.pair, eventId: event.id, eventSource: source, eventConfig: settings, rules, groups, baseline: baselineResult.baseline, bitrix: baselineResult.bitrix, moysklad: baselineResult.moysklad, lease, pairLease });
         return this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled' ? this.controlledAdmission.runForEvent(event.id, sync) : sync();
       }));
       if (!result) return this.finish(event, 'RETRYABLE_FAILURE', 'INVOICE_PAIR_LOCK_BUSY', retryAtForFailure(new Error('INVOICE_PAIR_LOCK_BUSY'), event.attempts + 1), lease);
       return this.finish(event, result.status, result.reason ?? '', result.retryAfter ?? null, lease);
     } catch (error) {
+      if (error instanceof InvoiceGoodsReview) return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
+      if (error instanceof Error && /^INVOICE_(?:PRODUCT_|SOURCE_TOTAL_|ORDER_CURRENCY_|ORDER_CONTEXT_|ROWS_)/.test(error.message)) {
+        return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
+      }
       if (error instanceof Error && error.message.startsWith('INVOICE_FIELD_TRANSFORM_CRITICAL:')) {
         return this.finish(event, 'MANUAL_REVIEW', error.message, null, lease);
       }
@@ -268,6 +279,10 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       const syntheticName = controlledInvoiceName(input.sourceRecord);
       if (!syntheticName) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
       fields[input.source === 'BITRIX24' ? 'name' : 'title'] = syntheticName;
+      const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
+      if (scope.targetNativeId === null) {
+        await this.controlledAdmission.assertCreateReserved(input.eventId, 'invoice', input.source === 'BITRIX24' ? 'MOYSKLAD' : 'BITRIX24');
+      }
     }
     if (input.source === 'BITRIX24') {
       const existing = await this.api.findMoyskladByExternalCode(input.sourceId);
@@ -285,7 +300,9 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
         return { status: 'CREATED', partnerId: recoveredId };
       }
       await input.lease.assertOwned();
-      const partnerId = await this.api.createMoysklad(input.sourceId, input.orderId, fields);
+      const prepared = await this.prepareMoyskladCreation(input.sourceId, input.sourceRecord, input.dealId, input.orderId, fields);
+      await input.lease.assertOwned();
+      const partnerId = await this.api.createMoysklad(input.sourceId, input.orderId, prepared.document);
       if (partnerId.startsWith('dry:')) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_DRY_CREATE_READBACK_UNAVAILABLE' };
       this.controlledAdmission?.allowTargetReadback('MOYSKLAD', partnerId);
       const verified = await this.api.readMoysklad(partnerId);
@@ -318,6 +335,114 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
     if (link.status !== 'linked' || link.orderId !== input.dealId) return { status: 'MANUAL_REVIEW', reason: 'INVOICE_CREATE_READBACK_ORDER_LINK_MISMATCH' };
     await this.bindControlledInvoiceTarget(input.eventId, 'BITRIX24', partnerId, verified);
     return { status: 'CREATED', partnerId };
+  }
+
+  /** Invoice goods are authoritative on the invoice, not inherited wholesale from its order. */
+  private async prepareMoyskladCreation(sourceId: string, source: InvoiceRecord, dealId: string, orderId: string, fields: InvoiceRecord): Promise<{ document: InvoiceRecord; rows: InvoiceGoodsRow[] }> {
+    const order = await this.api.readCustomerOrder(orderId);
+    const deal = await this.api.readDeal(dealId);
+    if (typeof source.currencyId !== 'string' || source.currencyId !== deal.CURRENCY_ID) throw new Error('INVOICE_ORDER_CURRENCY_MISMATCH');
+    const base = new URL(process.env.MOYSKLAD_API_BASE_URL!.replace(/\/?$/, '/'));
+    const relation = (value: unknown, kind: string): InvoiceRecord => {
+      const meta = record(record(value).meta);
+      const href = typeof meta.href === 'string' ? meta.href : '';
+      const id = href.split('/').at(-1) ?? '';
+      if (!isMoyskladId(id) || meta.type !== kind || href !== new URL(`entity/${kind}/${id}`, base).href) throw new Error('INVOICE_ORDER_CONTEXT_INVALID');
+      return { meta: { href, type: kind, mediaType: 'application/json' } };
+    };
+    const positions: InvoiceRecord[] = [];
+    const sourceRows: InvoiceGoodsRow[] = [];
+    const seen = new Set<string>();
+    let start: number | null = 0;
+    let totalMinor = 0;
+    let pages = 0;
+    let vatMode: { enabled: boolean; included: boolean } | null = null;
+    while (start !== null) {
+      if (++pages > 200) throw new Error('INVOICE_PRODUCT_ROW_LIMIT');
+      const page = await this.api.readBitrix24ProductRowsPage(sourceId, start);
+      for (const row of page.rows) {
+        const id = scalarId(row.id), productId = scalarId(row.productId);
+        const quantity = row.quantity;
+        const money = bitrixMoneyToMoySklad(row);
+        if (!id || seen.has(id) || !productId || typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0 || !money) throw new Error('INVOICE_PRODUCT_ROW_INVALID');
+        seen.add(id);
+        const pairs = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', bitrix24Id: productId, active: true, lifecycleStatus: 'ACTIVE' }, take: 2 });
+        if (pairs.length !== 1 || !isMoyskladId(pairs[0]!.moyskladId) || !['product', 'service'].includes(pairs[0]!.moyskladType ?? '')) throw new Error('INVOICE_PRODUCT_PAIR_REQUIRED');
+        const mode = { enabled: money.vatEnabled, included: money.vatIncluded ?? false };
+        if (vatMode && (vatMode.enabled !== mode.enabled || vatMode.included !== mode.included)) throw new Error('INVOICE_PRODUCT_VAT_MODE_MIXED');
+        vatMode = mode;
+        totalMinor += Math.round(Number(row.price) * quantity * 100);
+        const product = pairs[0]!;
+        const position = { quantity, price: money.price, discount: money.discount, vat: money.vat,
+          assortment: { meta: { href: new URL(`entity/${product.moyskladType}/${product.moyskladId}`, base).href, type: product.moyskladType, mediaType: 'application/json' } } };
+        positions.push(position);
+        sourceRows.push({ id, value: invoiceGoodsValue(position, base.href) });
+      }
+      start = page.next;
+      if (positions.length > 10000) throw new Error('INVOICE_PRODUCT_ROW_LIMIT');
+    }
+    const amount = Number(source.opportunity);
+    if (!Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(totalMinor) || Math.round(amount * 100) !== totalMinor) throw new Error('INVOICE_SOURCE_TOTAL_MISMATCH');
+    return { document: { ...fields, organization: relation(order.organization, 'organization'), agent: relation(order.agent, 'counterparty'),
+      ...(order.rate ? { rate: order.rate } : {}), positions, vatEnabled: vatMode?.enabled ?? false, vatIncluded: vatMode?.included ?? false }, rows: sourceRows };
+  }
+
+  private async synchronizeInvoiceGoods(pair: {id:string;bitrix24Id:string;moyskladId:string}, order: {bitrix24Id:string;moyskladId:string}, settings: VersionedFieldSettingsDto, lease: EventWorkerLeaseContext, pairLease: InvoicePairLease): Promise<void> {
+    const read = async () => {
+      await lease.assertOwned();
+      const source = await this.api.readBitrix24(pair.bitrix24Id);
+      const prepared = await this.prepareMoyskladCreation(pair.bitrix24Id,source,order.bitrix24Id,order.moyskladId,{});
+      const target = await this.api.readMoysklad(pair.moyskladId);
+      if (!invoicePairLinksMatchOrder(source,target,order)) throw new InvoiceGoodsReview('INVOICE_GOODS_ORDER_LINK_CHANGED');
+      const rows: InvoiceGoodsRow[] = [];
+      let next: number | null = 0, pages = 0;
+      while(next !== null) {
+        if (++pages > 200) throw new InvoiceGoodsReview('INVOICE_GOODS_ROW_LIMIT');
+        const page = await this.api.readMoyskladPositionsPage(pair.moyskladId,next);
+        for(const row of page.rows) {
+          if(typeof row.id !== 'string' || !isMoyskladId(row.id)) throw new InvoiceGoodsReview('INVOICE_GOODS_TARGET_ROW_ID_INVALID');
+          rows.push({id:row.id,value:invoiceGoodsValue(row,process.env.MOYSKLAD_API_BASE_URL!)});
+        }
+        next=page.next;
+      }
+      return { source:prepared.rows,target:rows,sourceMode:{vatEnabled:prepared.document.vatEnabled===true,vatIncluded:prepared.document.vatIncluded===true},
+        targetMode:{vatEnabled:target.vatEnabled===true,vatIncluded:target.vatIncluded===true},expectedMinor:Math.round(Number(source.opportunity)*100),actualMinor:target.sum };
+    };
+    let current = await read();
+    const saved = await this.database.entityPairSyncState.findUnique({where:{pairId:pair.id}});
+    const children = jsonRecord(saved?.childResourceState);
+    let state = children.invoiceGoods === undefined ? null : children.invoiceGoods as unknown as InvoiceGoodsState;
+    const plan = planInvoiceGoods(current.source,current.target,state,current.sourceMode,current.targetMode);
+    state=plan.state;
+    const checkpoint = async () => {
+      const result = await pairLease.commit(async transaction => {
+        const latest = await transaction.entityPairSyncState.findUniqueOrThrow({where:{pairId:pair.id}});
+        await transaction.entityPairSyncState.update({where:{pairId:pair.id},data:{childResourceState:{...jsonRecord(latest.childResourceState),invoiceGoods:state} as unknown as Prisma.InputJsonValue}});
+      });
+      if(!result.committed) throw new Error('INVOICE_GOODS_PAIR_LOCK_LOST');
+    };
+    await checkpoint();
+    for(const action of plan.actions) {
+      if(process.env.SYNC_MODE !== 'apply') throw new InvoiceGoodsReview('INVOICE_GOODS_DRY_MUTATION_NOT_SUPPORTED');
+      const verified=await read();
+      if(stableJson(verified)!==stableJson(current)) throw new Error('INVOICE_GOODS_CHANGED_BEFORE_WRITE');
+      await this.assertWriteAllowed('BITRIX24_TO_MOYSKLAD',pair.id,lease);
+      if(!await pairLease.assertOwned()) throw new Error('INVOICE_GOODS_PAIR_LOCK_LOST');
+      const value=action.source.value;
+      const body={quantity:value.quantity,price:value.price,discount:value.discount,vat:value.vat,assortment:{meta:{
+        href:new URL(`entity/${value.productType}/${value.productId}`,process.env.MOYSKLAD_API_BASE_URL!.replace(/\/?$/,'/')).href,type:value.productType,mediaType:'application/json'}}};
+      const targetId=action.kind==='update' ? action.targetId : await this.api.addMoyskladPosition(pair.moyskladId,body);
+      if(action.kind==='update') await this.api.updateMoyskladPosition(pair.moyskladId,targetId,body);
+      const after=await read();
+      const row=after.target.find(candidate=>candidate.id===targetId);
+      if(!row || !sameGoods(row.value,value)) throw new Error('INVOICE_GOODS_READBACK_MISMATCH');
+      const binding=state.rows.find(candidate=>candidate.sourceId===action.source.id);
+      if(binding) { binding.source=value;binding.target=row.value; }
+      else state.rows.push({sourceId:action.source.id,targetId,source:value,target:row.value});
+      await checkpoint();
+      current=after;
+    }
+    if(!Number.isSafeInteger(current.actualMinor) || current.actualMinor!==current.expectedMinor) throw new InvoiceGoodsReview('INVOICE_GOODS_TOTAL_READBACK_MISMATCH');
   }
 
   private async bindControlledInvoiceTarget(eventId: string, provider: Source, nativeId: string, record: InvoiceRecord): Promise<void> {
@@ -531,10 +656,11 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
   }
 
   private async syncFields(input: {
-    pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventConfig: VersionedFieldSettingsDto;
+    pair: { id: string; bitrix24Id: string; moyskladId: string }; order: { bitrix24Id: string; moyskladId: string }; eventId: string; eventSource: Source; eventConfig: VersionedFieldSettingsDto;
     rules: VersionedFieldSettingsDto['config']['rules']; groups: VersionedFieldSettingsDto['config']['groups']; baseline: any; bitrix: InvoiceRecord; moysklad: InvoiceRecord; lease: EventWorkerLeaseContext; pairLease: InvoicePairLease;
   }): Promise<{ status: ProcessStatus; reason?: string; retryAfter?: Date }> {
     const directions = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'invoices' }, select: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
+    if(input.eventSource==='BITRIX24' && directions?.bitrix24ToMoysklad) await this.synchronizeInvoiceGoods(input.pair,input.order,input.eventConfig,input.lease,input.pairLease);
     const baselineB24 = jsonRecord(input.baseline.bitrix24Values);
     const baselineMs = jsonRecord(input.baseline.moyskladValues);
     for (const rule of input.rules) {
@@ -688,8 +814,15 @@ export class InvoiceEventProcessor implements OnApplicationBootstrap, OnModuleDe
       }
       if (status === 'SUCCEEDED') await transaction.manualReviewCase.updateMany({ where: { eventId: event.id, status: 'OPEN' }, data: { status: 'RESOLVED', resolvedAt: new Date() } });
       await transaction.inboundEvent.updateMany({
-        where: { id: event.id, OR: [{ status: 'PROCESSING' }, { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' }, { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' }] },
-        data: { status, lastErrorCategory: reason || null, processingStartedAt: null, retryAfter, ...(status === 'SUCCEEDED' ? { lastSuccessfulAt: new Date() } : {}) },
+        where: status === 'WAITING_FOR_ORDER'
+          ? { id: event.id, status: 'PROCESSING', attempts: event.attempts + 1 }
+          : { id: event.id, OR: [{ status: 'PROCESSING' }, { status: 'RECEIVED' }, { status: 'WAITING_FOR_ORDER' }, { status: 'RETRYABLE_FAILURE' }, { status: 'DEFERRED_PAUSE' }] },
+        // A successful dependency check is not a failed processing attempt.
+        // Restore only this owned claim, atomically with its persisted next poll;
+        // preserve any real failures that preceded the wait and never reset them.
+        data: { status, lastErrorCategory: reason || null, processingStartedAt: null, retryAfter,
+          ...(status === 'WAITING_FOR_ORDER' ? { attempts: event.attempts } : {}),
+          ...(status === 'SUCCEEDED' ? { lastSuccessfulAt: new Date() } : {}) },
       });
     });
     return { status, reason };
@@ -828,11 +961,12 @@ function jsonRecord(value: unknown): Record<string, unknown> { return isRecord(v
 function recordId(value: unknown): string | null { if (!isRecord(value) || typeof value.href !== 'string') return null; return value.href.split('/').filter(Boolean).at(-1) ?? null; }
 function sameJson(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 function scalarId(value: unknown): string | null { return typeof value === 'string' || typeof value === 'number' ? String(value) : null; }
-function isMoyskladId(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function isMoyskladId(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
+function record(value: unknown): InvoiceRecord { return isRecord(value) ? value : {}; }
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function isDue(status: string, retryAfter: Date | null, processingStartedAt: Date | null): boolean {
   const now = Date.now();
-  return status === 'RECEIVED' || status === 'WAITING_FOR_ORDER' ||
-    (['RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(status) && (!retryAfter || retryAfter.getTime() <= now)) ||
+  return status === 'RECEIVED' ||
+    (['WAITING_FOR_ORDER', 'RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(status) && (!retryAfter || retryAfter.getTime() <= now)) ||
     (status === 'PROCESSING' && (!processingStartedAt || processingStartedAt.getTime() < now - PROCESSING_LEASE_MS));
 }

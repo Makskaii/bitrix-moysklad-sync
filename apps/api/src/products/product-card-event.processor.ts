@@ -1,13 +1,14 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { Prisma } from '@prisma/client';
 import { DatabaseService } from '../database.service';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
 import { ProductCardHttpApi } from './product-card-api';
 import { ProductCardRuntimeService } from './product-card-runtime.service';
-import { ProductCardPrice, ProductCardSettings, ProductCardSyncResult } from './product-card-sync.service';
+import { ProductCardManualReviewError, ProductCardPrice, ProductCardSettings, ProductCardSyncResult } from './product-card-sync.service';
 import { InboundEventMetadata } from '../event-dispatcher.service';
 import { EventWorkerLeaseContext, EventWorkerLeaseService } from '../event-worker-lease.service';
-import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { isRetryableFailure, ProviderFailure, retryAtForFailure } from '../provider-failure';
 import { DatabaseRecoveryService } from '../database-recovery.service';
 import { ProductCatalogCreateService, ProductCatalogManualReviewError } from './product-catalog-create.service';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
@@ -16,10 +17,12 @@ import { lockEntityPairState } from '../pairs/pair-db-lock';
 import { chooseProductCatalogCandidate, comparableCatalogPrice, ProductCatalogCandidate } from './product-catalog-match-policy';
 import { writeOperationalLog } from '../monitoring-log';
 import { withServiceModeOn } from '../service-mode-transaction';
+import { parseClientMoyskladTimestamp } from '../clients/client-moysklad-date';
 
 const logger = new Logger('ProductCardEventProcessor');
 const PROCESSING_LEASE_MS = 60_000;
 const EVENT_BATCH_DELAY_MS = 250;
+const IMPORT_ECHO_WAIT = 'PRODUCT_IMPORT_ECHO_WAITING';
 
 /**
  * Dispatches catalog signal events through the dedicated MySklad-authoritative
@@ -29,6 +32,7 @@ const EVENT_BATCH_DELAY_MS = 250;
 export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModuleDestroy {
   private recoveryTimer?: NodeJS.Timeout;
   private recoveryScan: Promise<void> | null = null;
+  private recoveryCursor: string | null = null;
   private readonly active = new Set<string>();
 
   constructor(
@@ -91,6 +95,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
         return transaction.inboundEvent.findMany({
         where: {
           AND: [
+            ...(this.recoveryCursor ? [{ id: { gt: this.recoveryCursor } }] : []),
             { OR: [
               { source: 'BITRIX24', eventType: { in: ['CATALOG.PRODUCT.ON.ADD', 'CATALOG.PRODUCT.ON.UPDATE', 'ONCRMPRODUCTADD', 'ONCRMPRODUCTUPDATE', 'ONCRMPRODUCTDELETE', 'CATALOG.PRICE.ON.ADD', 'CATALOG.PRICE.ON.UPDATE', 'CATALOG.PRICE.ON.DELETE'] } },
               { source: 'MOYSKLAD', eventType: { in: ['CREATE', 'UPDATE'] }, externalEntityType: { in: ['product', 'service'] } },
@@ -104,10 +109,12 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
           ],
         },
         select: { id: true },
+        orderBy: { id: 'asc' },
         take: 100,
       });
       });
       if (!pending.enabled) return;
+      this.recoveryCursor = pending.value.length === 100 ? pending.value[99]!.id : null;
       for (const event of pending.value ?? []) this.enqueue(event.id);
     } catch {
       // A later timer tick retries database discovery without blocking startup.
@@ -115,14 +122,14 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   async process(eventId: string): Promise<ProductCardSyncResult | null> {
-    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease));
+    if (this.workerLease) return this.workerLease.run(eventId, (workerLease) => this.processWithLease(eventId, workerLease), 'products');
     return this.processWithLease(eventId);
   }
 
   private async processWithLease(eventId: string, workerLease?: EventWorkerLeaseContext): Promise<ProductCardSyncResult | null> {
     const event = await this.database.inboundEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true, retryAfter: true, processingStartedAt: true },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, status: true, attempts: true, retryAfter: true, processingStartedAt: true, receivedAt: true, lastErrorCategory: true },
     });
     if (!event || !isDue(event.status, event.retryAfter, event.processingStartedAt)) return null;
     if (!isProductEvent(event.source, event.eventType, event.externalEntityType)) return null;
@@ -176,6 +183,52 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true },
       take: 2,
     });
+    if (this.catalogCreate && event.source === 'BITRIX24' && ['CATALOG.PRODUCT.ON.ADD', 'ONCRMPRODUCTADD'].includes(event.eventType ?? '') &&
+      (!matches.length || event.lastErrorCategory === IMPORT_ECHO_WAIT)) {
+      try {
+        const gate = await this.runtime.preflight('BITRIX24', true);
+        if (gate.status !== 'READY') {
+          const result = { ...gate, changedFields: [] as [] };
+          await this.applyResult(event.id, event, result, workerLease); return result;
+        }
+        let kind: 'product' | 'service' = Number(eventFields.TYPE) === 7 ? 'service' : 'product';
+        const readCard = () => this.readUnderMode(() => this.bitrixApi.readBitrix24CreateEchoCard(supported.productId, kind));
+        let card;
+        try { card = await readCard(); }
+        catch (error) {
+          if (![1, 7].includes(Number(eventFields.TYPE)) && (error instanceof ProductCardManualReviewError && error.reason === 'PRODUCT_CARD_TYPE_UNSUPPORTED' || error instanceof ProviderFailure && (error.status === 404 || error.status === 400))) {
+            kind = 'service'; card = await readCard();
+          } else throw error;
+        }
+        const echo = await this.catalogCreate.inspectCreateEcho({ targetId: supported.productId, kind, card, receivedAt: event.receivedAt },
+          (catalogId, xmlId, nativeKind) => this.readUnderMode(() => this.bitrixApi.findBitrix24CreateEchoIds(catalogId, xmlId, nativeKind)));
+        if (echo.status === 'WAIT') {
+          const retryAfter = new Date(Date.now() + 5_000);
+          const parked = await withServiceModeOn(this.database, async transaction => {
+            await assertWorkerLeaseInTransaction(workerLease, transaction);
+            return transaction.inboundEvent.updateMany({ where: { id: event.id, status: 'PROCESSING', attempts: attempt },
+              data: { status: 'RETRYABLE_FAILURE', attempts: event.attempts, lastErrorCategory: IMPORT_ECHO_WAIT, processingStartedAt: null, retryAfter } });
+          });
+          if (!parked.enabled || parked.value?.count !== 1) return null;
+          if (event.lastErrorCategory !== IMPORT_ECHO_WAIT) await writeOperationalLog(this.database, 'EVENT', JSON.stringify({
+            type: 'PRODUCT_IMPORT_ECHO_DEFERRED', eventId: event.id, originEventId: echo.originEventId, moyskladProductId: echo.moyskladProductId, bitrix24ProductId: supported.productId,
+          }), event.id);
+          return { status: 'RETRYABLE_FAILURE', reason: IMPORT_ECHO_WAIT, retryAfter, changedFields: [] };
+        }
+        if (echo.status === 'PAIR') {
+          matches = await this.database.entityPair.findMany({ where: { id: echo.pairId, entityType: 'PRODUCT', active: true },
+            select: { id: true, entityType: true, bitrix24Id: true, moyskladId: true, moyskladType: true, active: true, source: true, reason: true, createdAt: true }, take: 2 });
+          await writeOperationalLog(this.database, 'EVENT', JSON.stringify({ type: 'PRODUCT_IMPORT_ECHO_RESUMED', eventId: event.id,
+            originEventId: echo.originEventId, pairId: echo.pairId, bitrix24ProductId: supported.productId }), event.id);
+        }
+      } catch (error) {
+        const reason = error instanceof ProductCatalogManualReviewError || error instanceof ProductCardManualReviewError ? error.reason : 'PRODUCT_IMPORT_ECHO_READ_FAILED';
+        const result: ProductCardSyncResult = error instanceof ProductCatalogManualReviewError || error instanceof ProductCardManualReviewError || !isRetryableFailure(error)
+          ? { status: 'MANUAL_REVIEW', reason, changedFields: [] }
+          : { status: 'RETRYABLE_FAILURE', reason, changedFields: [], retryAfter: retryAtForFailure(error, attempt) };
+        await this.applyResult(event.id, event, result, workerLease); return result;
+      }
+    }
     if (!matches.length && event.source === 'BITRIX24' && this.duplicateAliases) {
       const resolution = await this.duplicateAliases.resolveBitrix24Product(supported.productId);
       if (resolution.status === 'PAIR') matches = await this.database.entityPair.findMany({ where: { id: resolution.pair.id, entityType: 'PRODUCT', active: true },
@@ -252,7 +305,7 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 
   private async createPostBoundaryProduct(input: { productId: string; kind: 'product' | 'service'; eventId: string; attempt: number; workerLease?: EventWorkerLeaseContext }): Promise<boolean> {
-    const pendingEvent = await this.database.inboundEvent.findUnique({ where: { id: input.eventId }, select: { source: true, eventType: true, externalEntityType: true, externalEntityId: true, attempts: true } });
+    const pendingEvent = await this.database.inboundEvent.findUnique({ where: { id: input.eventId }, select: { source: true, eventType: true, externalEntityType: true, externalEntityId: true, payload: true, receivedAt: true, attempts: true } });
     if (!pendingEvent) return false;
     try {
       const gate = await this.runtime.preflight('MOYSKLAD');
@@ -264,15 +317,32 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
       const record = this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled'
         ? await this.controlledAdmission.withCurrentSourceRead(input.eventId, 'MOYSKLAD', input.productId, entity, () => this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind)))
         : await this.readUnderMode(() => this.bitrixApi.readMoyskladRecord(input.productId, input.kind));
-      const createdAt = typeof record.created === 'string' ? new Date(record.created) : null;
+      const hasProviderCreated = Object.prototype.hasOwnProperty.call(record, 'created');
+      const createdAt = hasProviderCreated
+        ? parseClientMoyskladTimestamp(record.created)
+        : authenticatedMoyskladCreateMoment({
+          pendingEvent,
+          productId: input.productId,
+          kind: input.kind,
+          record,
+          receivedAt: pendingEvent.receivedAt,
+          baseUrl: process.env.MOYSKLAD_API_BASE_URL,
+        });
       const boundary = await this.databaseRecovery?.launchBoundary().catch(() => null);
-      if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime())) {
+      if (!boundary || !createdAt || !Number.isFinite(createdAt.getTime()) || createdAt.getTime() > pendingEvent.receivedAt.getTime()) {
         await this.applyResult(input.eventId, pendingEvent, { status: 'MANUAL_REVIEW', reason: 'PRODUCT_LAUNCH_BOUNDARY_OR_CREATED_AT_UNAVAILABLE', changedFields: [] }, input.workerLease);
         return false;
       }
       if (createdAt.getTime() < boundary.getTime()) {
         await this.finish(input.eventId, 'SKIPPED_PRE_LAUNCH', 'PRE_LAUNCH_PRODUCT', null, input.workerLease);
         return false;
+      }
+      if (!hasProviderCreated) {
+        await writeOperationalLog(this.database, 'EVENT', JSON.stringify({
+          type: 'PRODUCT_CREATE_LAUNCH_TIMESTAMP_ACCEPTED', eventId: input.eventId, productId: input.productId,
+          kind: input.kind, timestampSource: 'MOYSKLAD_CREATE_AUDIT_CONTEXT_MOMENT', createdAt: createdAt.toISOString(),
+          receivedAt: pendingEvent.receivedAt.toISOString(),
+        }), input.eventId);
       }
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         if (typeof record.name !== 'string' || !record.name) throw new Error('CONTROLLED_LIVE_TEST_SOURCE_METADATA_INVALID');
@@ -480,6 +550,78 @@ export class ProductCardEventProcessor implements OnApplicationBootstrap, OnModu
   }
 }
 
+function authenticatedMoyskladCreateMoment(input: {
+  pendingEvent: { source: string; eventType: string | null; externalEntityType: string | null; externalEntityId: string | null; payload: Prisma.JsonValue };
+  productId: string;
+  kind: 'product' | 'service';
+  record: Record<string, unknown>;
+  receivedAt: Date;
+  baseUrl: string | undefined;
+}): Date | null {
+  const { pendingEvent, productId, kind, record, receivedAt } = input;
+  if (pendingEvent.source !== 'MOYSKLAD' || pendingEvent.eventType !== 'CREATE' ||
+      pendingEvent.externalEntityType !== kind || pendingEvent.externalEntityId !== productId ||
+      record.id !== productId || !isRecord(record.meta) || record.meta.type !== kind ||
+      !isUuid(productId) || !isUuid(String(record.accountId ?? '')) || !(receivedAt instanceof Date) || !Number.isFinite(receivedAt.getTime())) return null;
+
+  const base = parseMoyskladEventBase(input.baseUrl);
+  if (!base || !hasExactMoyskladEntityHref(record.meta.href, base, kind, productId)) return null;
+
+  const root = asRecord(pendingEvent.payload);
+  const entries = Array.isArray(root.events) ? root.events.filter(isRecord) : [];
+  const sameEntity = entries.filter((entry) => {
+    const meta = asRecord(entry.meta);
+    const href = typeof meta.href === 'string' ? parseSafeUrl(meta.href) : null;
+    const hrefId = href?.pathname.split('/').filter(Boolean).at(-1);
+    return hrefId === productId || entry.id === productId;
+  });
+  if (sameEntity.length !== 1) return null;
+  const event = sameEntity[0]!;
+  const eventMeta = asRecord(event.meta);
+  if (event.action !== 'CREATE' || event.accountId !== record.accountId || eventMeta.type !== kind ||
+      !hasExactMoyskladEntityHref(eventMeta.href, base, kind, productId)) return null;
+
+  const audit = asRecord(root.auditContext);
+  const auditMeta = asRecord(audit.meta);
+  if (auditMeta.type !== 'audit' || !hasExactMoyskladAuditHref(auditMeta.href, base)) return null;
+  const moment = parseClientMoyskladTimestamp(audit.moment);
+  if (!moment || moment.getTime() > receivedAt.getTime()) return null;
+  return moment;
+}
+
+function parseMoyskladEventBase(value: string | undefined): URL | null {
+  if (!value) return null;
+  const base = parseSafeUrl(value);
+  if (!base || base.username || base.password || base.search || base.hash || !base.pathname.replace(/\/+$/, '').endsWith('/api/remap/1.2')) return null;
+  const localHttp = base.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(base.hostname.toLowerCase().replace(/^\[|\]$/g, ''));
+  if (base.protocol !== 'https:' && !localHttp) return null;
+  return base;
+}
+
+function parseSafeUrl(value: unknown): URL | null {
+  if (typeof value !== 'string') return null;
+  try { return new URL(value); } catch { return null; }
+}
+
+function hasExactMoyskladEntityHref(value: unknown, base: URL, kind: 'product' | 'service', id: string): boolean {
+  const href = parseSafeUrl(value);
+  if (!href || href.origin !== base.origin || href.username || href.password || href.search || href.hash) return false;
+  const basePath = base.pathname.replace(/\/+$/, '');
+  return href.pathname === `${basePath}/entity/${kind}/${id}`;
+}
+
+function hasExactMoyskladAuditHref(value: unknown, base: URL): boolean {
+  const href = parseSafeUrl(value);
+  if (!href || href.origin !== base.origin || href.username || href.password || href.search || href.hash) return false;
+  const basePath = base.pathname.replace(/\/+$/, '');
+  return new RegExp(`^${escapeRegExp(basePath)}/audit/${UUID_PATTERN}$`).test(href.pathname);
+}
+
+const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 async function assertWorkerLeaseInTransaction(
   workerLease: EventWorkerLeaseContext | undefined,
   transaction: Prisma.TransactionClient,
@@ -506,7 +648,7 @@ function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a
 
 function mappedUnitId(moyskladUnitId: string | null, settings: ProductCardSettings): number | undefined {
   if (!moyskladUnitId) return undefined;
-  const rows = settings.references.units.filter((item) => asRecord(item).status === 'configured' && String(asRecord(item).moyskladId) === moyskladUnitId);
+  const rows = settings.references.units.filter((item) => matchesReverseUnit(item, moyskladUnitId));
   if (rows.length !== 1 || !Number.isInteger(asRecord(rows[0]).bitrix24Id)) throw new ProductCatalogManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
   return Number(asRecord(rows[0]).bitrix24Id);
 }

@@ -108,6 +108,9 @@ before(async () => {
   dryTarget.searchParams.set('schema', 'dry_client53_test');
   process.env.DRY_DATABASE_URL = dryTarget.toString();
   database = new DatabaseService();
+  // These public runtime cases intend ON; a fresh migrated database must not
+  // depend on a prior test run having initialized the authoritative mode row.
+  await database.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on', offSince: null } });
   await database.clientInventoryJob.deleteMany({ where: { id: 'client-map' } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeCompanyId } });
   await database.entityPair.deleteMany({ where: { bitrix24Id: runtimeContactId } });
@@ -555,6 +558,64 @@ test('unpaired contact resolves its primary company and creates a nested MoySkla
   assert.equal(pair.moyskladParentId, companyTarget);
   assert.ok(apiCalls.some((call) => call.method === 'POST' && call.url.includes(`/counterparty/${companyTarget}/contactpersons`)));
   assert.ok(apiCalls.every((call) => call.url.includes('.fake/')));
+});
+
+test('document shared-email dependency retries HTTP429 then automatically persists one ranked pair without provider writes', async () => {
+  process.env.MOYSKLAD_API_BASE_URL = 'https://moysklad.fake/api/remap/1.2/';
+  process.env.MOYSKLAD_API_TOKEN = 'synthetic-test-token';
+  process.env.BITRIX24_REST_BASE_URL = 'https://bitrix.fake/rest/';
+  const eventId = `shared-email-event-${suffix}`;
+  const sourceId = `shared-email-company-${suffix}`;
+  const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+  let throttled = true;
+  const calls: string[] = [];
+  const fakeFetch: typeof fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    calls.push(`${init.method ?? 'GET'}:${url.hostname}`);
+    assert.equal(url.hostname.endsWith('.fake'), true);
+    if (url.pathname.includes('crm.requisite.list')) return Response.json({ result: [], total: 0 });
+    assert.equal(init.method, 'GET', 'MoySklad candidates must remain read-only');
+    if (url.pathname.endsWith('/entity/counterparty')) return Response.json({ rows: ids.map((id, index) => ({
+      id, name: 'Existing company', email: 'shared@example.test', companyType: 'legal',
+      created: index === 2 ? '2020-01-01T00:00:00Z' : '2025-01-01T00:00:00Z',
+    })), meta: { size: 4 } });
+    if (url.pathname.endsWith('/entity/customerorder')) return throttled
+      ? new Response('{}', { status: 429, headers: { 'retry-after': '30' } })
+      : Response.json({ rows: [], meta: { size: 0 } });
+    throw new Error('Unexpected synthetic read');
+  };
+  const gateway: ClientSyncGateway = {
+    async readBitrix() { return { ID: sourceId, TITLE: 'Existing company', EMAIL: [{ VALUE: 'shared@example.test' }], UF_CRM_1789126724375: '' }; },
+    async readMoysklad(_type, id) { return { id, name: 'Existing company', email: 'shared@example.test' }; },
+    async updateBitrix() { assert.fail('No provider writes permitted'); },
+    async updateMoysklad() { assert.fail('No provider writes permitted'); },
+  };
+  const settings = new FieldSettingsService(database, {} as never, {} as EntityPairService);
+  await database.inboundEvent.create({ data: { id: eventId, source: 'BITRIX24', deliveryKey: eventId,
+    eventType: 'ONCRMDEALADD', externalEntityId: `deal-shared-${suffix}`, externalEntityType: 'deal', payload: {}, status: 'RECEIVED' } });
+  await settings.pinEvent(eventId);
+  const processor = new ClientSyncProcessor(database, settings, { read: async () => ({ mode: 'on' }) } as never,
+    gateway, new HttpClientCandidateGateway(database, fakeFetch));
+  const input = { eventId, sourceSystem: 'BITRIX24' as const, entity: 'COMPANY' as const, sourceId };
+  const first = await processor.resolveForDocument(input);
+  assert.equal(first.status, 'RETRY');
+  assert.equal(await database.manualReviewCase.count({ where: { eventId } }), 0);
+  assert.equal(await database.entityPair.count({ where: { bitrix24Id: sourceId } }), 0);
+  throttled = false;
+  // Synthetic test fixture only: simulate the next due scheduler delivery.
+  const waiting = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
+  assert.equal(waiting.status, 'RETRYABLE_FAILURE');
+  assert.ok(waiting.retryAfter && waiting.retryAfter.getTime() > Date.now());
+  await database.inboundEvent.update({ where: { id: eventId }, data: { status: 'RECEIVED', retryAfter: null } });
+  const second = await processor.resolveForDocument(input);
+  assert.equal(second.status, 'RESOLVED', JSON.stringify(second));
+  if (second.status !== 'RESOLVED') throw new Error(JSON.stringify(second));
+  assert.equal(second.pair.moyskladId, ids[2]);
+  const repeated = await processor.resolveForDocument(input);
+  assert.equal(repeated.status, 'RESOLVED');
+  assert.equal(await database.entityPair.count({ where: { bitrix24Id: sourceId } }), 1);
+  assert.equal(await database.manualReviewCase.count({ where: { eventId } }), 0);
+  assert.ok(calls.every((call) => call === 'GET:moysklad.fake' || call === 'POST:bitrix.fake'));
 });
 
 test('document dependency canonicalizes a duplicate company to an unmarked equivalent and persists pair under owning event settings', async () => {

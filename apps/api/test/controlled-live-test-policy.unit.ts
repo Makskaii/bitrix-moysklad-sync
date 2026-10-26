@@ -30,6 +30,31 @@ const scope = {
   targetSystem: 'MOYSKLAD' as const, targetNativeId: 'ms-29', admittedSourceName: manifest.records[0].name, admittedSourceCreatedAt: '2026-10-19T01:00:00Z',
 };
 
+function fakeControlledTestSourceBinding() {
+  const rows = new Map<string, Record<string, any>>();
+  let nextId = 0;
+  const matches = (row: Record<string, any>, where: Record<string, any>): boolean => {
+    const { OR, ...equalities } = where;
+    return Object.entries(equalities).every(([key, value]) => row[key] === value) &&
+      (!OR || OR.some((clause: Record<string, any>) => matches(row, clause)));
+  };
+  return {
+    findMany: async ({ where = {} }: { where?: Record<string, any> }) => [...rows.values()].filter((row) => matches(row, where)),
+    findUnique: async ({ where }: { where: { id: string } }) => rows.get(where.id) ?? null,
+    create: async ({ data }: { data: Record<string, any> }) => {
+      const row = { id: `binding-${++nextId}`, createReservedByEventId: null, ...data };
+      rows.set(row.id, row);
+      return row;
+    },
+    updateMany: async ({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => {
+      const row = [...rows.values()].find((candidate) => matches(candidate, where));
+      if (!row) return { count: 0 };
+      Object.assign(row, data);
+      return { count: 1 };
+    },
+  };
+}
+
 test('controlled writes require a dedicated database named exactly in the manifest', () => {
   assert.throws(() => createControlledLiveTestPolicy(manifest, 'postgres://localhost/business?schema=issue60_harness_test'), /DATABASE_IS_NOT_DEDICATED/);
   assert.throws(() => createControlledLiveTestPolicy({ ...manifest, testDatabaseName: 'other_test' }, testDatabaseUrl), /DATABASE_IS_NOT_DEDICATED/);
@@ -251,6 +276,7 @@ test('client source admission, target readback binding and restart scope are dur
   const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], direction: 'BOTH', targetNativeId: null }] };
   const records = new Map<string, any>();
   const fakeDatabase = {
+    controlledTestSourceBinding: fakeControlledTestSourceBinding(),
     controlledTestAdmission: {
       findMany: async ({ where }: any) => [...records.values()].filter((row) => row.runId === where.runId && row.entity === where.entity),
       findUnique: async ({ where }: any) => records.get(where.eventId) ?? null,
@@ -273,6 +299,7 @@ test('client source admission, target readback binding and restart scope are dur
       await admission.admit('evt-1', source);
       enterControlledLiveEventScope(await admission.scopeForEvent('evt-1'));
       assert.throws(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', null, 'client:COMPANY'), /TARGET_NOT_IN_MANIFEST/);
+      await admission.assertCreateReserved('evt-1', 'client:COMPANY', 'MOYSKLAD');
       await admission.bindCreatedTarget('evt-1', 'ms-29', 'ms-29', source.currentName, new Date('2026-10-19T02:00:00Z'));
       assert.doesNotThrow(() => assertApplyExternalWrite('MOYSKLAD', 'CLIENT_UPDATE', 'ms-29', 'client:COMPANY'));
     });
@@ -302,7 +329,7 @@ test('deal-order admission requires an exact source ID while target-null creatio
   };
   const dynamicManifest = { ...manifest, runId, records: [record] };
   const rows = new Map<string, any>();
-  const fakeDatabase = { controlledTestAdmission: {
+  const fakeDatabase = { controlledTestSourceBinding: fakeControlledTestSourceBinding(), controlledTestAdmission: {
     findMany: async () => [...rows.values()],
     findUnique: async ({ where }: any) => rows.get(where.eventId) ?? null,
     upsert: async ({ where, create }: any) => { if (!rows.has(where.eventId)) rows.set(where.eventId, { ...create }); return rows.get(where.eventId); },
@@ -317,9 +344,9 @@ test('deal-order admission requires an exact source ID while target-null creatio
     const admission = new ControlledLiveTestAdmissionService(fakeDatabase as any);
     const source = { entity: 'deal-order', sourceSystem: 'BITRIX24' as const, sourceNativeId: 'b24-test-100', currentNativeId: 'b24-test-100', currentName: sourceName, sourceCreatedAt: new Date() };
     const updateEvent = { sourceSystem: 'BITRIX24' as const, eventType: 'ONCRMDEALUPDATE', externalEntityType: 'deal', sourceNativeId: source.sourceNativeId };
-    assert.equal(admission.allowsIncomingEvent(updateEvent), true);
-    assert.equal(admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: 'b24-foreign-900' }), false);
-    assert.equal(admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: null }), false);
+    assert.equal(await admission.allowsIncomingEvent(updateEvent), true);
+    assert.equal(await admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: 'b24-foreign-900' }), false);
+    assert.equal(await admission.allowsIncomingEvent({ ...updateEvent, sourceNativeId: null }), false);
     await admission.admit('evt-exact-source', source);
     await assert.rejects(admission.admit('evt-foreign-source', { ...source, sourceNativeId: 'b24-foreign-900', currentNativeId: 'b24-foreign-900' }), /SOURCE_NOT_ADMITTED/);
 
@@ -345,14 +372,14 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
   const manifestPath = join(directory, 'manifest.json');
   const dynamicManifest = { ...manifest, records: [{ ...manifest.records[0], direction: 'BOTH', targetNativeId: null }] };
   const rows = new Map<string, any>();
-  const fakeDatabase = { controlledTestAdmission: {
+  const fakeDatabase = { controlledTestSourceBinding: fakeControlledTestSourceBinding(), controlledTestAdmission: {
     findMany: async () => [...rows.values()],
     findUnique: async ({ where }: any) => rows.get(where.eventId) ?? null,
     findFirst: async () => null,
     upsert: async ({ where, create }: any) => { if (!rows.has(where.eventId)) rows.set(where.eventId, { ...create }); return rows.get(where.eventId); },
     updateMany: async ({ where, data }: any) => { const row = rows.get(where.eventId); if (!row || row.targetNativeId !== where.targetNativeId) return { count: 0 }; Object.assign(row, data); return { count: 1 }; },
   } };
-  const database = { controlledTestAdmission: fakeDatabase.controlledTestAdmission };
+  const database = { controlledTestSourceBinding: fakeDatabase.controlledTestSourceBinding, controlledTestAdmission: fakeDatabase.controlledTestAdmission };
   const previous = { mode: process.env.CONTROLLED_LIVE_TEST_MODE, instance: process.env.CONTROLLED_LIVE_TEST_INSTANCE, path: process.env.CONTROLLED_LIVE_TEST_MANIFEST, database: process.env.DATABASE_URL, sync: process.env.SYNC_MODE, msBase: process.env.MOYSKLAD_API_BASE_URL, b24Base: process.env.BITRIX24_REST_BASE_URL, msToken: process.env.MOYSKLAD_API_TOKEN };
   process.env.CONTROLLED_LIVE_TEST_MODE = 'enabled'; process.env.CONTROLLED_LIVE_TEST_INSTANCE = 'isolated';
   process.env.DATABASE_URL = testDatabaseUrl; process.env.CONTROLLED_LIVE_TEST_MANIFEST = manifestPath;
@@ -379,6 +406,7 @@ test('manifest-admitted synthetic client can create, read back, bind, then accep
     await admission.runForEvent('client-create', async () => {
       await admission.admit('client-create', source);
       enterControlledLiveEventScope(await admission.scopeForEvent('client-create'));
+      await admission.assertCreateReserved('client-create', 'client:COMPANY', 'MOYSKLAD');
       const candidate = new HttpClientCandidateGateway({} as any, fetcher);
       const targetId = await candidate.createTarget({ entity: 'COMPANY', targetSystem: 'MOYSKLAD', targetType: 'counterparty', parentId: null, source: { TITLE: source.currentName }, configuredFields: { name: 'forged config override' }, eventId: 'client-create' });
       assert.equal(targetId, 'ms-29');
@@ -507,7 +535,7 @@ test('lifecycle delete scope can only be reconstructed from a previously readbac
   const manifestPath = join(directory, 'manifest.json');
   const runRecord = { ...manifest.records[0], direction: 'BOTH', targetNativeId: null };
   const admissions = new Map<string, any>();
-  const database = { controlledTestAdmission: {
+  const database = { controlledTestSourceBinding: fakeControlledTestSourceBinding(), controlledTestAdmission: {
     findMany: async () => [...admissions.values()],
     findUnique: async ({ where }: any) => admissions.get(where.eventId) ?? null,
     findFirst: async () => null,
@@ -524,6 +552,7 @@ test('lifecycle delete scope can only be reconstructed from a previously readbac
       await admission.admit('origin', { entity: 'client:COMPANY', sourceSystem: 'BITRIX24', sourceNativeId: 'b24-17', currentNativeId: 'b24-17', currentName: name, sourceCreatedAt: new Date('2026-10-19T01:00:00Z') });
     });
     await admission.runForEvent('origin', async () => {
+      await admission.assertCreateReserved('origin', 'client:COMPANY', 'MOYSKLAD');
       await admission.bindCreatedTarget('origin', 'ms-29', 'ms-29', name, new Date('2026-10-19T02:00:00Z'));
     });
     await admission.withExistingManifestPairScope({ eventId: 'delete-ms', entity: 'client:COMPANY', sourceSystem: 'MOYSKLAD', sourceNativeId: 'ms-29', targetSystem: 'BITRIX24', targetNativeId: 'b24-17' }, async () => {
@@ -547,7 +576,7 @@ test('durable admissions preserve non-client manifest entities across current re
   const records = entities.map((entity, index) => ({ entity, direction: 'BITRIX24_TO_MOYSKLAD', name: `тест ${runId} ${entity}`, syntheticOnly: true,
     sourceSystem: 'BITRIX24', sourceNativeId: `b24-${index}`, targetSystem: 'MOYSKLAD', targetNativeId: `ms-${index}`, createdAfterUtc: '2026-10-19T00:00:00Z' }));
   const admissions = new Map<string, any>();
-  const fakeDatabase = { controlledTestAdmission: {
+  const fakeDatabase = { controlledTestSourceBinding: fakeControlledTestSourceBinding(), controlledTestAdmission: {
     findMany: async ({ where }: any) => [...admissions.values()].filter((row) => row.runId === where.runId && row.entity === where.entity),
     findUnique: async ({ where }: any) => admissions.get(where.eventId) ?? null,
     findFirst: async () => null,

@@ -1,0 +1,28 @@
+{
+  "categoryId": 0,
+  "creationEnabledOnly": "PREPARATION",
+  "pairs": [
+    {"bitrix24StageId":"NEW","bitrix24Label":"Новый","moyskladId":"df78f3e4-b503-11ee-0a80-0448001356ee","moyskladLabel":"Новый"},
+    {"bitrix24StageId":"PREPARATION","bitrix24Label":"Обработан","moyskladId":"5cc9f6dc-7d61-11e9-9ff4-31500014f07a","moyskladLabel":"обработан"},
+    {"bitrix24StageId":"UC_7QBU06","bitrix24Label":"Резерв","moyskladId":"2768a233-8cbf-11f1-0a80-0fc40008c726","moyskladLabel":"Резерв"},
+    {"bitrix24StageId":"PREPAYMENT_INVOICE","bitrix24Label":"Комплектация","moyskladId":"3eeaa8da-7a3d-11e3-8f0d-002590a28eca","moyskladLabel":"комплектация"},
+    {"bitrix24StageId":"EXECUTING","bitrix24Label":"Подтвержден","moyskladId":"3eeaa688-7a3d-11e3-b101-002590a28eca","moyskladLabel":"подтвержден"},
+    {"bitrix24StageId":"UC_66WY4D","bitrix24Label":"Согласован","moyskladId":"26b77911-e19f-11e3-c4b2-002590a28eca","moyskladLabel":"согласован"},
+    {"bitrix24StageId":"UC_DZSNZ0","bitrix24Label":"Передан на сборку","moyskladId":"8ac13f78-c40f-11ee-0a80-00d7009dce58","moyskladLabel":"Передан на сборку"},
+    {"bitrix24StageId":"UC_G3M2W5","bitrix24Label":"На сборке","moyskladId":"d789b2f5-819d-11f1-0a80-14070003caa2","moyskladLabel":"На сборке"},
+    {"bitrix24StageId":"UC_LYM82H","bitrix24Label":"Собран без расхождений","moyskladId":"29c99f66-7638-11f1-0a80-172a000038b7","moyskladLabel":"Собран без расхождений"},
+    {"bitrix24StageId":"UC_TW61UY","bitrix24Label":"Собран с расхождениями","moyskladId":"29c9a5fa-7638-11f1-0a80-172a000038b8","moyskladLabel":"Собран с расхождениями"},
+    {"bitrix24StageId":"UC_LNVWT2","bitrix24Label":"Частично укомплектован","moyskladId":"ddccdc67-81a1-11f1-0a80-04d50002cec8","moyskladLabel":"Частично укомплектован"},
+    {"bitrix24StageId":"UC_TA3DQ2","bitrix24Label":"Готов к выдаче","moyskladId":"73819f1e-81a2-11f1-0a80-01700003a3d3","moyskladLabel":"Готов к выдаче"},
+    {"bitrix24StageId":"UC_WXUMYB","bitrix24Label":"Передан на доставку","moyskladId":"7381a59a-81a2-11f1-0a80-01700003a3d4","moyskladLabel":"Передан на доставку"},
+    {"bitrix24StageId":"UC_0JH5M4","bitrix24Label":"Доставлено","moyskladId":"5ab33e0b-e501-11ed-0a80-05f900129f9e","moyskladLabel":"Доставлен"},
+    {"bitrix24StageId":"WON","bitrix24Label":"Завершено","moyskladId":"2dc83312-7a38-11e3-4ccf-002590a28eca","moyskladLabel":"выполнен"},
+    {"bitrix24StageId":"UC_BBJSFZ","bitrix24Label":"Отменен покупателем","moyskladId":"703b0c0d-7a39-11e3-076c-002590a28eca","moyskladLabel":"отменен"},
+    {"bitrix24StageId":"LOSE","bitrix24Label":"Не успешно","moyskladId":"703b0c0d-7a39-11e3-076c-002590a28eca","moyskladLabel":"отменен","moyskladToBitrix24":false},
+    {"bitrix24StageId":"UC_RH2DBY","bitrix24Label":"Возврат средств","moyskladId":"47deae3c-7a3b-11e3-dde0-002590a28eca","moyskladLabel":"возврат"}
+  ],
+  "reverseAliases": [
+    {"bitrix24StageId":"UC_BBJSFZ","bitrix24Label":"Отменен покупателем","moyskladId":"296124dc-b504-11ee-0a80-11990013fdf1","moyskladLabel":"Отменен"}
+  ],
+  "needsDecision": []
+}

@@ -12,6 +12,8 @@ function fakeDatabase(initialMode: 'on' | 'off' = 'off', initialState: Record<st
   const audits = [...initialAudits];
   const database: Record<string, any> = {
     syncSetting: {
+      findUnique: async () => mode,
+      upsert: async ({ create, update }: { create: Record<string, unknown>; update: Record<string, unknown> }) => { Object.assign(mode, update ?? create); return mode; },
       updateMany: async ({ data }: { data: Record<string, unknown> }) => { Object.assign(mode, data); return { count: 1 }; },
     },
     databaseRecoveryState: {
@@ -26,7 +28,7 @@ function fakeDatabase(initialMode: 'on' | 'off' = 'off', initialState: Record<st
       findMany: async () => audits,
       findFirst: async () => audits[0] ?? null,
     },
-    $queryRaw: async () => [{ locked: '' }],
+    $queryRaw: async (query: TemplateStringsArray) => query.join('').includes('AS occupied') ? [{ occupied: false }] : [{ locked: '' }],
     $transaction: async (callback: (transaction: unknown) => unknown) => callback(database),
   };
   return { database, mode, audits, get state() { return state; } };
@@ -121,4 +123,48 @@ test('dry mode still blocks writes even after database recovery is acknowledged'
   setDatabaseRecoveryReady(true);
   process.env.SYNC_MODE = 'dry';
   assert.throws(() => assertApplyExternalWrite('BITRIX24', 'TEST_WRITE'), /WRITE_REQUIRES_APPLY_MODE/);
+});
+
+test('admin audit identity uses base-scope profile without widening application permissions', async () => {
+  const calls: string[] = [];
+  const identity = await readBitrixAdministratorIdentity('test-admin-token', async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ result: { ID: '3664', ADMIN: true } }), { status: 200 });
+  });
+  assert.equal(identity, 'BITRIX24_USER:3664');
+  assert.deepEqual(calls, ['https://aerosystems.bitrix24.ru/rest/profile.json']);
+  assert.equal(await readBitrixAdministratorIdentity('nonadmin', async () => new Response(JSON.stringify({ result: { ID: '7', ADMIN: false } }), { status: 200 })), null);
+  assert.equal(await readBitrixAdministratorIdentity('inactive', async () => new Response(JSON.stringify({ result: [] }), { status: 200 })), null);
+});
+
+test('clean first launch uses server time without false recovery declarations and survives restart', async () => {
+  const store = fakeDatabase();
+  const service = new DatabaseRecoveryService(store.database as never);
+  const before = Date.now();
+  const status = await service.confirmFirstLaunch({ confirmed: true, acknowledgement: 'Explicit clean first production launch; old history is excluded.' }, 'BITRIX24_USER:3664');
+  assert.equal(status.status, 'READY_FRESH');
+  assert.equal(status.pairsRestored, false);
+  assert.equal(status.lostEventsAcknowledged, false);
+  assert.ok(status.previousLaunchBoundary!.getTime() >= before);
+  assert.ok(status.previousLaunchBoundary!.getTime() <= Date.now());
+  assert.equal(store.mode.serviceMode, 'off');
+  assert.equal(store.audits[0]?.action, 'FIRST_LAUNCH_CONFIRMED');
+  await service.initialize();
+  assert.equal(await service.assertReady(), true);
+  await assert.rejects(service.confirmFirstLaunch({ confirmed: true, acknowledgement: 'Attempt to replace the already recorded first launch boundary.' }, 'BITRIX24_USER:3664'), ConflictException);
+  await assert.rejects(service.confirmRecovery(confirmed, 'BITRIX24_USER:3664'), ConflictException);
+});
+
+test('first launch rejects existing exchange history, unverified actors, absent consent and On mode', async () => {
+  const store = fakeDatabase();
+  const service = new DatabaseRecoveryService(store.database as never);
+  const input = { confirmed: true, acknowledgement: 'New clean first launch without any previous exchange history.' };
+  await assert.rejects(service.confirmFirstLaunch(input, ''));
+  await assert.rejects(service.confirmFirstLaunch({ ...input, confirmed: false }, 'BITRIX24_USER:3664'));
+  store.database.$queryRaw = async (query: TemplateStringsArray) => query.join('').includes('AS occupied') ? [{ occupied: true }] : [];
+  await assert.rejects(service.confirmFirstLaunch(input, 'BITRIX24_USER:3664'), /empty exchange database/);
+  assert.equal(store.audits.length, 0);
+  store.database.$queryRaw = async () => [{ occupied: false }];
+  store.mode.serviceMode = 'on';
+  await assert.rejects(service.confirmFirstLaunch(input, 'BITRIX24_USER:3664'), /mode Off/);
 });

@@ -1,9 +1,18 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { classifyPositionAddRecovery } from '../src/deals-orders/deal-order-position-runtime.service';
+import { classifyPositionAddRecovery, positionIdFromCreateResponse } from '../src/deals-orders/deal-order-position-runtime.service';
 import { resolveDealOrderConflict } from '../src/deals-orders/deal-order-field-runtime.service';
 import { resolveDictionaryValue } from '../src/deals-orders/deal-order-field-runtime.service';
 import { normalizePlannedDeliveryDate, toMoySkladPlannedDeliveryDate } from '../src/deals-orders/planned-delivery-date';
+
+test('single-position CREATE ACK accepts only one error-free object with a native UUID', () => {
+  const id = '34e82d37-cd77-11f1-0a80-1e380090e6cc';
+  assert.equal(positionIdFromCreateResponse({ id }), id);
+  assert.equal(positionIdFromCreateResponse([{ id }]), id);
+  for (const value of [null, undefined, '', 1, [], [{ id }, { id }], [[{ id }]], {}, { id: 1 }, { id: 'not-a-uuid' }, { id, errors: [] }, [{ id, errors: [{ code: 123 }] }], { id, error: null }]) {
+    assert.equal(positionIdFromCreateResponse(value), null, JSON.stringify(value));
+  }
+});
 
 test('position recovery never adopts an unlinked position by matching values alone', () => {
   assert.equal(classifyPositionAddRecovery(true, 1), 'DEAL_ORDER_POSITION_ADD_IDENTITY_UNPROVEN');

@@ -1,5 +1,6 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
+import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_MARKER, COMPANY_PRICE_TYPE_IBLOCK, COMPANY_PRICE_TYPE_IBLOCK_TYPE, assertCompanyPriceTypeSchema, companyPriceTypeOptions, selectedCompanyPriceType, normalizeMoyskladPriceType } from '../clients/company-price-type';
 
 export type CatalogCandidate = { id: string; code: string; label: string };
 export type LiveFieldCatalogs = {
@@ -176,11 +177,19 @@ export class ReadOnlyFieldDataProvider {
       this.bitrixCall(bitrixAccessToken, contract.bitrixMethod, contract.bitrixParams),
       this.moyskladGet(contract.moyskladPath),
     ]);
-    const sourceRecord = unwrapSource(entity, source);
+    let sourceRecord = unwrapSource(entity, source);
+    if (entity === 'companies' && sourceRecord[COMPANY_PRICE_TYPE_FIELD]) {
+      const fields = await this.bitrixCall(bitrixAccessToken, 'crm.company.userfield.list', { 'filter[FIELD_NAME]': COMPANY_PRICE_TYPE_FIELD });
+      if (!Array.isArray(fields) || fields.length !== 1 || !isRecord(fields[0])) throw new ServiceUnavailableException('Company price-type field is unavailable');
+      const metadata = await this.bitrixCall(bitrixAccessToken, 'crm.company.userfield.get', { id: String(fields[0].ID) });
+      assertCompanyPriceTypeSchema(metadata);
+      const items = await this.bitrixListElements(bitrixAccessToken, COMPANY_PRICE_TYPE_IBLOCK, COMPANY_PRICE_TYPE_IBLOCK_TYPE);
+      sourceRecord = { ...sourceRecord, [COMPANY_PRICE_TYPE_FIELD]: selectedCompanyPriceType(sourceRecord[COMPANY_PRICE_TYPE_FIELD], companyPriceTypeOptions(items)) };
+    }
     return {
       sourceLabel: sourceLabel(sourceRecord),
       sourceValues: sourceRecord,
-      targetCurrent: asRecord(target),
+      targetCurrent: entity === 'companies' ? normalizeMoyskladPriceType(asRecord(target), process.env.MOYSKLAD_API_BASE_URL) : asRecord(target),
     };
   }
 
@@ -397,11 +406,11 @@ export class ReadOnlyFieldDataProvider {
     throw new ServiceUnavailableException(`Bitrix24 ${method} userfield list exceeds the supported ${MAX_PAGES} page limit`);
   }
 
-  private async bitrixListElements(accessToken: string, listId: string): Promise<Array<Record<string, unknown>>> {
+  private async bitrixListElements(accessToken: string, listId: string, type = 'rest_entity'): Promise<Array<Record<string, unknown>>> {
     const rows: Array<Record<string, unknown>> = [];
     for (let page = 0, start = 0; page < MAX_PAGES; page += 1, start += PAGE_SIZE) {
       const result = await this.bitrixCall(accessToken, 'lists.element.get', {
-        IBLOCK_TYPE_ID: 'rest_entity', IBLOCK_ID: listId, start,
+        IBLOCK_TYPE_ID: type, IBLOCK_ID: listId, start,
         'SELECT[0]': 'ID', 'SELECT[1]': 'CODE', 'SELECT[2]': 'NAME',
       });
       if (!Array.isArray(result)) throw new ServiceUnavailableException(`Bitrix24 returned an invalid list ${listId}`);
@@ -497,7 +506,7 @@ function moyskladStandardFields(entity: string): FieldCandidate[] {
     contacts: [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
     'contacts-companies': [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
     companies: [['name', 'Наименование', 'string', true], ['companyType', 'Тип контрагента', 'enum', true], ['legalTitle', 'Полное наименование', 'string', true], ['inn', 'ИНН', 'string', true], ['kpp', 'КПП', 'string', true], ['legalAddress', 'Юридический адрес', 'string', true], ['actualAddress', 'Фактический адрес', 'string', true], ['email', 'Электронная почта', 'string', true], ['phone', 'Телефон', 'string', true], ['code', 'Код', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['description', 'Комментарий', 'string', true]],
-    'deals-orders': [['name', 'Наименование заказа', 'string', true], ['code', 'Код заказа', 'string', true], ['moment', 'Момент заказа', 'datetime', true], ['deliveryPlannedMoment', 'Плановая отгрузка/доставка', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
+    'deals-orders': [['name', 'Наименование заказа', 'string', true], ['code', 'Код заказа', 'string', true], ['moment', 'Момент заказа', 'datetime', true], ['deliveryPlannedMoment', 'Плановая отгрузка/доставка', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true], ['store', 'Склад заказа (только чтение для обратного сопоставления)', 'store', false]],
     'smart-invoices': [['name', 'Наименование счёта', 'string', true], ['code', 'Код счёта', 'string', true], ['moment', 'Момент счёта', 'datetime', true], ['paymentPlannedMoment', 'Срок оплаты', 'datetime', true], ['description', 'Комментарий', 'string', true], ['externalCode', 'Внешний код', 'string', true]],
     catalog: [
       ['meta', 'Метаданные объекта', 'object', false], ['id', 'Идентификатор', 'uuid', false], ['accountId', 'Идентификатор учётной записи', 'uuid', false],
@@ -520,6 +529,7 @@ function moyskladStandardFields(entity: string): FieldCandidate[] {
     meta: 'product-or-service', id: 'product-or-service', accountId: 'product-or-service', article: 'product', weight: 'product', volume: 'product', supplier: 'product', country: 'product', images: 'product', packs: 'product', trackingType: 'product', tnved: 'product',
     alcoholic: 'product', tobacco: 'product', variantsCount: 'product', isSerialTrackable: 'product', minimumStock: 'product', weighed: 'product', onTap: 'product', partialDisposal: 'product', things: 'product', ppeType: 'product',
   };
+  if (entity === 'companies') fields.companies.push(['priceType', 'Тип цены контрагента', 'pricetype', true]);
   return (fields[entity] ?? []).map(([code, title, type, writable]) => ({ code, title, type, writable, writableEvidence: 'local-standard-schema' as const, category: 'standard' as const, cardinality: cardinality(type === 'array'), shape: fieldShape(type), ...(referenceKind(type) ? { referenceKind: referenceKind(type) } : {}), ...(entity === 'catalog' ? { resource: catalogKinds[code] ?? 'product-or-service' } : {}) }));
 }
 
@@ -580,7 +590,8 @@ function describeBitrixFields(value: unknown, entity: string, userFields?: unkno
     const enumOptions = enumerationOptions(userField?.LIST ?? definition.enumOptions);
     const custom = /^UF_CRM/i.test(code) || (entity === 'catalog' && /^property\d+$/i.test(code));
     const writable = typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null;
-    return [{ code, title, type, writable, writableEvidence: writable === null ? 'unconfirmed' : 'provider-schema', category: custom ? 'custom' : 'standard', cardinality: cardinality(isMultiple), shape: fieldShape(type, isMultiple), ...(enumOptions.length ? { enumOptions } : {}), ...(referenceKind(type) ? { referenceKind: referenceKind(type) } : {}), ...(entity === 'catalog' && resourceByCode?.has(code) ? { resource: resourceByCode.get(code)! } : {}), ...(entity === 'catalog' && code === 'xmlId' ? { reserved: 'PRODUCT_CREATE_RECOVERY_IDENTITY' } : {}) }];
+    const priceTypeReference = entity === 'companies' && code === COMPANY_PRICE_TYPE_FIELD && userField?.XML_ID === COMPANY_PRICE_TYPE_MARKER && type === 'iblock_element' && isRecord(userField.SETTINGS) && String(userField.SETTINGS.IBLOCK_ID) === COMPANY_PRICE_TYPE_IBLOCK && isMultiple === false;
+    return [{ code, title, type, writable, writableEvidence: writable === null ? 'unconfirmed' : 'provider-schema', category: custom ? 'custom' : 'standard', cardinality: cardinality(isMultiple), shape: fieldShape(type, isMultiple), ...(enumOptions.length ? { enumOptions } : {}), ...(priceTypeReference ? { referenceKind: 'pricetype' } : referenceKind(type) ? { referenceKind: referenceKind(type) } : {}), ...(entity === 'catalog' && resourceByCode?.has(code) ? { resource: resourceByCode.get(code)! } : {}), ...(entity === 'catalog' && code === 'xmlId' ? { reserved: 'PRODUCT_CREATE_RECOVERY_IDENTITY' } : {}) }];
   });
 }
 
@@ -615,7 +626,7 @@ function fieldShape(type: string, multiple?: unknown): FieldCandidate['shape'] {
 
 function referenceKind(type: string): string | undefined {
   const normalized = type.trim().toLowerCase();
-  if (['employee', 'crm_status', 'iblock_section', 'iblock_element', 'crm', 'counterparty', 'organization', 'store', 'project', 'currency', 'customerorder', 'invoiceout', 'customentity', 'link'].includes(normalized)) return normalized;
+  if (['employee', 'crm_status', 'iblock_section', 'iblock_element', 'crm', 'counterparty', 'organization', 'store', 'project', 'currency', 'customerorder', 'invoiceout', 'customentity', 'link', 'pricetype'].includes(normalized)) return normalized;
   return undefined;
 }
 

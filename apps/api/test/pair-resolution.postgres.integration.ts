@@ -94,6 +94,33 @@ test('concurrent first-event resolutions converge on one open review case', asyn
   createdReviewIds.push(reviews[0].id);
 });
 
+test('MySklad UPDATE cannot poison a pending authentic CREATE with a permanent review', async () => {
+  const database = app.get(DatabaseService);
+  const provider = app.get(PairResolutionProvider);
+  const externalId = randomUUID();
+  const pending = await database.inboundEvent.create({ data: {
+    source: 'MOYSKLAD', eventType: 'CREATE', externalEntityType: 'customerorder', externalEntityId: externalId,
+    deliveryKey: `pending-create-${suffix}`, payload: {}, status: 'RETRYABLE_FAILURE', retryAfter: new Date(Date.now() + 86_400_000),
+  } });
+  createdEventIds.push(pending.id);
+  for (const status of ['RECEIVED', 'PROCESSING', 'RETRYABLE_FAILURE'] as const) {
+    await database.inboundEvent.update({ where: { id: pending.id }, data: { status, retryAfter: new Date(Date.now() + 86_400_000), processingStartedAt: new Date() } });
+    const [update, create] = await Promise.all([
+      provider.resolve({ entityType: 'DEAL', sourceSystem: 'MOYSKLAD', externalId, eventType: 'UPDATE' }),
+      provider.resolve({ entityType: 'DEAL', sourceSystem: 'MOYSKLAD', externalId, eventType: 'CREATE' }),
+    ]);
+    assert.deepEqual(update, { status: 'unavailable', reason: 'PAIR_CREATE_PENDING' });
+    assert.deepEqual(create, { status: 'unmatched', reason: 'NO_CANDIDATES' });
+    assert.equal(await database.pairReviewCase.count({ where: { sourceSystem: 'MOYSKLAD', sourceEntityId: externalId } }), 0);
+  }
+  // An UPDATE without a viable CREATE still cannot create a deal or bypass review.
+  await database.inboundEvent.update({ where: { id: pending.id }, data: { status: 'MANUAL_REVIEW' } });
+  const held = await provider.resolve({ entityType: 'DEAL', sourceSystem: 'MOYSKLAD', externalId, eventType: 'UPDATE' });
+  assert.equal(held.status, 'manual_review');
+  if (held.status === 'manual_review') createdReviewIds.push(held.reviewCaseId);
+  assert.equal((await provider.resolve({ entityType: 'DEAL', sourceSystem: 'MOYSKLAD', externalId, eventType: 'CREATE' })).status, 'manual_review', 'pre-existing holds are never erased');
+});
+
 test('only a fresh unpaired Bitrix deal ADD or UPDATE is eligible for first-order creation', async () => {
   const provider = app.get(PairResolutionProvider);
   const addId = `eligible-add-${suffix}`;
@@ -271,13 +298,13 @@ test('confirmed pair lookup reports identity without mutating baseline readiness
   assert.equal(event?.lastErrorCategory, null);
 });
 
-test('public MoySklad customer-order webhook resolves through the canonical DEAL type', async () => {
+test('public unpaired MoySklad UPDATE without CREATE resolves through canonical DEAL review', async () => {
   const id = `order-${suffix}`;
   const response = await fetch(`${apiUrl}/webhooks/moysklad/synthetic-ms-webhook-secret?requestId=pair-test-${suffix}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ events: [{
       meta: { type: 'customerorder', href: `https://online.moysklad.ru/api/remap/1.2/entity/customerorder/${id}` },
-      action: 'CREATE',
+      action: 'UPDATE',
     }] }),
   });
   assert.equal(response.status, 200);

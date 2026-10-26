@@ -1,5 +1,5 @@
 export type FieldTransform =
-  | { kind: 'copy' | 'tbd' }
+  | { kind: 'copy' | 'tbd' | 'price-type-uuid' }
   | { kind: 'string-to-number'; numberType: 'integer' | 'decimal'; precision?: number; min?: number; max?: number; leadingZeros?: 'reject' | 'allow' }
   | { kind: 'number-to-string'; precision?: number }
   | { kind: 'date-to-datetime'; timeZone: string; time?: string }
@@ -23,6 +23,11 @@ export function applyFieldTransform(transform: FieldTransform, value: unknown): 
   if (value === null) return { status: 'skip', reason: 'source value is null', transform: kind };
   if (kind === 'tbd') return { status: 'error', reason: 'transform is not configured', transform: kind };
   if (kind === 'copy') return { status: 'mapped', value, transform: kind };
+  if (kind === 'price-type-uuid') {
+    if (value === '' || value === false) return { status: 'skip', reason: 'company price type is not selected', transform: kind };
+    if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return invalid(kind, 'price type must be a verified UUID');
+    return { status: 'mapped', value: value.toLowerCase(), transform: kind };
+  }
 
   if (kind === 'string-to-number') {
     if (typeof value !== 'string' || !/^[+-]?(?:\d+)(?:\.\d+)?$/.test(value)) return invalid(kind, 'value is not a strict decimal string');

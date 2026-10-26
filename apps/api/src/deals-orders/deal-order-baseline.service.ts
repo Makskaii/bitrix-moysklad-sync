@@ -7,8 +7,10 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { PairResolutionResult } from '../pairs/pair-resolver';
 import { ProviderFailure, isRetryableFailure, retryAtForFailure } from '../provider-failure';
 import { FieldSettingsService } from '../field-settings/field-settings.service';
-import { DealOrderFieldRuntimeService, RevisionMappingResult } from './deal-order-field-runtime.service';
+import { DealOrderFieldRuntimeService, RevisionMappingResult, readConfiguredStage, isReverseWarehouseRule, readDealOrderRuleField } from './deal-order-field-runtime.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
+import { bitrixDocumentTotal, moyskladDocumentTotal } from './document-total-snapshot';
+import { configuredStagePairs } from './deal-order-stage-mappings';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 export type DealOrderBaselineResult =
@@ -208,18 +210,24 @@ export class DealOrderBaselineService {
 
 function projectApprovedValues(config: VersionedFieldSettingsDto['config'], record: Record<string, unknown>, system: 'bitrix24' | 'moysklad') {
   const values: Record<string, unknown> = {};
+  const stages = configuredStagePairs(config);
+  if (stages?.length) {
+    const stage = readConfiguredStage(record, stages, system === 'bitrix24' ? 'BITRIX24' : 'MOYSKLAD');
+    if (stage) values['native:stage'] = stage;
+  }
   if (system === 'bitrix24') {
     values['client:companyId'] = approvedValue(record.COMPANY_ID);
-    values['deal-order-total'] = { amount: approvedValue(record.OPPORTUNITY), currencyCode: approvedValue(record.CURRENCY_ID) };
+    values['deal-order-total'] = bitrixDocumentTotal(record);
   } else {
     values['client:agentId'] = approvedValue(agentId(record.agent));
-    values['deal-order-total'] = { amount: approvedValue(record.sum), currencyCode: approvedValue(orderCurrencyCode(record)) };
+    values['deal-order-total'] = moyskladDocumentTotal(record, config);
   }
   const rules = Array.isArray(config.rules) ? config.rules : [];
   for (const rule of rules) {
     if (rule.entity !== 'deals-orders' || (!rule.bitrix24ToMoysklad.enabled && !rule.moyskladToBitrix24.enabled)) continue;
     const field = system === 'bitrix24' ? rule.sourceField : rule.targetField;
-    values[`rule:${rule.id}`] = approvedValue(record[field]);
+    const warehouse = isReverseWarehouseRule(rule) ? readDealOrderRuleField(record, rule, system === 'bitrix24' ? 'BITRIX24' : 'MOYSKLAD') : null;
+    values[`rule:${rule.id}`] = warehouse?.supported ? warehouse.value : approvedValue(record[field]);
   }
   const groups = Array.isArray(config.groups) ? config.groups : [];
   for (const group of groups) {
@@ -230,11 +238,6 @@ function projectApprovedValues(config: VersionedFieldSettingsDto['config'], reco
     else if (system === targetSide) values[`group:${group.id}:target`] = approvedValue(record[group.targetField]);
   }
   return values;
-}
-
-function orderCurrencyCode(record: Record<string, unknown>): unknown {
-  const currency = isRecord(record.currency) ? record.currency : isRecord(record.rate) && isRecord(record.rate.currency) ? record.rate.currency : null;
-  return currency?.isoCode ?? currency?.code ?? null;
 }
 
 function approvedValue(value: unknown): unknown {

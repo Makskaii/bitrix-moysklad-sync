@@ -8,6 +8,8 @@ import { VersionedFieldSettingsDto } from '../field-settings/field-settings.dto'
 import { SyncModeService } from '../sync-mode.service';
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ControlledLiveTestAdmissionService } from '../controlled-live-test-admission.service';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
+import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 
 type Row = Record<string, any>;
 type ProductCreateInput = {
@@ -27,10 +29,85 @@ export class ProductCatalogManualReviewError extends Error {
   constructor(readonly reason: string) { super(reason); }
 }
 
+export type ProductImportEcho = { status: 'NONE' } | { status: 'WAIT'; moyskladProductId: string; originEventId: string } |
+  { status: 'PAIR'; pairId: string; moyskladProductId: string; originEventId: string };
+
 /** Durable MS→B24 product creation shared by catalog events and deal prerequisites. */
 @Injectable()
 export class ProductCatalogCreateService {
   constructor(private readonly database: DatabaseService, private readonly mode: SyncModeService, @Optional() private readonly controlledAdmission?: ControlledLiveTestAdmissionService) {}
+
+  /** Read-only provenance check. Never creates a pair or completes the importing
+   * operation; only its original leased worker can do that after prices/readback.
+   */
+  async inspectCreateEcho(input: { targetId: string; kind: 'product' | 'service'; card: Row; receivedAt: Date },
+    exactTargets: (catalogId: string, xmlId: string, kind: 'product' | 'service') => Promise<string[]>): Promise<ProductImportEcho> {
+    const marker = typeof input.card.xmlId === 'string' ? /^MOYSKLAD_(PRODUCT|SERVICE)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(input.card.xmlId) : null;
+    const operations = await this.database.dealOrderReverseProductOperation.findMany({ where: { OR: [
+      { bitrix24ProductId: input.targetId }, ...(marker ? [{ moyskladProductId: marker[2] }] : []),
+    ] }, take: 2 });
+    if (!operations.length && !marker) return { status: 'NONE' };
+    if (operations.length !== 1) throw new ProductCatalogManualReviewError(operations.length ? 'PRODUCT_IMPORT_ECHO_AMBIGUOUS' : 'PRODUCT_IMPORT_ECHO_IDENTITY_UNPROVEN');
+    const operation = operations[0]!;
+    const frozen: Row = isRecord(operation.payload) ? operation.payload as Row : {};
+    // Reused legacy cards are not products created by this operation. Never
+    // interpret their later callbacks as acknowledgements of our ADD request.
+    if (isRecord(frozen.reusedIdentity)) {
+      const identity = isRecord(input.card.property108) ? input.card.property108.value : input.card.property108;
+      if (input.targetId !== frozen.reusedIdentity.id || String(input.card.id) !== input.targetId ||
+          (input.card.xmlId ?? null) !== frozen.reusedIdentity.xmlId || identity !== operation.moyskladProductId ||
+          String(input.card.iblockId) !== operation.bitrix24CatalogId || Number(input.card.type) !== (input.kind === 'service' ? 7 : 1)) {
+        throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+      }
+      return { status: 'NONE' };
+    }
+    const expected = isRecord(frozen.fields) ? frozen.fields : {};
+    const xmlId = `MOYSKLAD_${input.kind.toUpperCase()}_${operation.moyskladProductId}`;
+    const uuid = isRecord(input.card.property108) ? input.card.property108.value : input.card.property108;
+    if (!marker || marker[1].toLowerCase() !== input.kind || marker[2] !== operation.moyskladProductId ||
+      frozen.kind !== input.kind || frozen.xmlId !== xmlId || expected.xmlId !== xmlId || frozen.catalogId !== operation.bitrix24CatalogId ||
+      String(expected.iblockId) !== operation.bitrix24CatalogId || String(input.card.iblockId) !== operation.bitrix24CatalogId ||
+      input.card.xmlId !== xmlId || uuid !== operation.moyskladProductId || (isRecord(expected.property108) ? expected.property108.value : null) !== uuid ||
+      String(input.card.id) !== input.targetId || Number(input.card.type) !== (input.kind === 'service' ? 7 : 1) ||
+      operation.bitrix24ProductId !== null && operation.bitrix24ProductId !== input.targetId ||
+      !operation.attemptedAt || operation.attemptedAt > input.receivedAt || operation.createdAt > input.receivedAt) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    }
+    const origin = await this.database.inboundEvent.findUnique({ where: { id: operation.eventId },
+      select: { id: true, source: true, eventType: true, externalEntityType: true, externalEntityId: true, status: true } });
+    // Document-origin operations are outside this catalog-echo contract.
+    if (origin?.source === 'MOYSKLAD' && origin.externalEntityType === 'customerorder') return { status: 'NONE' };
+    if (!origin || origin.source !== 'MOYSKLAD' || origin.eventType !== 'CREATE' || origin.externalEntityType !== input.kind || origin.externalEntityId !== operation.moyskladProductId) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_ORIGIN_UNPROVEN');
+    }
+    const targets = await exactTargets(operation.bitrix24CatalogId, xmlId, input.kind);
+    if (targets.length !== 1 || targets[0] !== input.targetId) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_AMBIGUOUS');
+    // Provider reads can overlap the original worker's pair commit. Re-read the
+    // operation, origin and pair in ONE snapshot, never mix pre/post commit rows.
+    const stable = await this.database.$transaction(async transaction => {
+      const current = await transaction.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: operation.moyskladProductId } });
+      const currentOrigin = await transaction.inboundEvent.findUnique({ where: { id: operation.eventId }, select: { status: true } });
+      const pairs = await transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', OR: [
+        { bitrix24Id: input.targetId }, { moyskladId: operation.moyskladProductId },
+      ] }, take: 2 });
+      return { current, currentOrigin, pairs };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+    const { current, currentOrigin, pairs } = stable;
+    if (!current || current.syncId !== operation.syncId || JSON.stringify(current.payload) !== JSON.stringify(operation.payload) ||
+        current.bitrix24ProductId !== null && current.bitrix24ProductId !== input.targetId) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_IDENTITY_MISMATCH');
+    if (pairs.length > 1 || pairs.some(pair => !pair.active || pair.bitrix24Id !== input.targetId || pair.moyskladId !== operation.moyskladProductId || pair.moyskladType !== input.kind)) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_PAIR_CONFLICT');
+    }
+    if (current.status === 'SUCCEEDED') {
+      if (current.bitrix24ProductId !== input.targetId || pairs.length !== 1) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_PAIR_NOT_ACTIVE');
+      return { status: 'PAIR', pairId: pairs[0]!.id, moyskladProductId: operation.moyskladProductId, originEventId: origin.id };
+    }
+    if (current.status !== 'PENDING' || !currentOrigin || !['RECEIVED', 'PROCESSING', 'RETRYABLE_FAILURE', 'DEFERRED_PAUSE'].includes(currentOrigin.status)) {
+      throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_CREATE_NOT_PENDING');
+    }
+    if (!readbackMatches(input.card, expected, input.kind)) throw new ProductCatalogManualReviewError('PRODUCT_IMPORT_ECHO_CREATE_MISMATCH');
+    return { status: 'WAIT', moyskladProductId: operation.moyskladProductId, originEventId: origin.id };
+  }
 
   async createOrRecover(input: ProductCreateInput): Promise<string> {
     const kind = input.moyskladType ?? 'product';
@@ -58,12 +135,23 @@ export class ProductCatalogCreateService {
       if (['name', 'iblockId', 'active', 'xmlId', 'property108', 'measure', 'detailPicture', 'previewPicture', 'iblockSection', 'iblockSectionId'].includes(rule.bitrix24Field)) continue;
       fields[rule.bitrix24Field] = rule.value;
     }
+    if (typeof fields.detailText === 'string') {
+      try { fields.detailText = bitrixProductDescription(fields.detailText); }
+      catch (error) {
+        if (error instanceof ProductDescriptionEncodingError) throw new ProductCatalogManualReviewError(error.reason);
+        throw error;
+      }
+      // An emoji-only optional description is absent; identity/prices/pair
+      // creation still complete. Freeze only the approved provider projection.
+      if (fields.detailText === '') delete fields.detailText;
+      else fields.detailTextType = 'text';
+    }
     await assertCatalogCreateFieldsWritable(catalogId, kind, fields);
     const prices = input.prices ?? [];
     if (!Array.isArray(prices) || prices.some((price) => !Number.isInteger(price.catalogGroupId) || price.catalogGroupId < 1 || !Number.isFinite(price.value) || price.value < 0 || !/^[A-Z]{3}$/.test(price.currency))) {
       throw new ProductCatalogManualReviewError('PRODUCT_CREATE_PRICE_MAPPING_INVALID');
     }
-    const payload = { fields, xmlId, catalogId, prices, kind };
+    const payload = { fields, xmlId, catalogId, prices, kind, uuidLookupVersion: 1, providerCreateAttempted: false };
 
     let operation = await this.database.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: input.productId } });
     if (!operation) {
@@ -80,7 +168,7 @@ export class ProductCatalogCreateService {
     const frozen: Row | null = isRecord(operation.payload) ? operation.payload as unknown as Row : null;
     if (!frozen || !isRecord(frozen.fields) || frozen.xmlId !== xmlId) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_JOURNAL_INVALID');
     if (operation.status === 'SUCCEEDED' && operation.bitrix24ProductId) {
-      await this.persistPair(input.productId, operation.bitrix24ProductId, operation.leaseToken ?? '', input.eventId, kind);
+      await this.persistPair(input.productId, operation.bitrix24ProductId, operation.leaseToken ?? '', input.eventId, kind, Boolean(frozen.reusedIdentity));
       return operation.bitrix24ProductId;
     }
     if (operation.status !== 'PENDING') throw new ProductCatalogManualReviewError('PRODUCT_CREATE_OPERATION_NOT_PENDING');
@@ -92,11 +180,59 @@ export class ProductCatalogCreateService {
     });
     if (claimed.count !== 1) throw new Error('PRODUCT_CREATE_OPERATION_BUSY');
     try {
+      // An inactive/historical binding is occupied, not a missing product.
+      // Normal callers resolve active pairs before entering this create path.
+      const occupied = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', moyskladId: input.productId }, take: 2 });
+      if (occupied.length) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_PAIR_CONFLICT');
+      if (isRecord(frozen.reusedIdentity)) {
+        const candidates = await this.readUuidProducts(input, catalogId, kind);
+        const candidate = uniqueUuidProduct(candidates, catalogId, input.productId, kind);
+        if (!candidate || String(candidate.id) !== frozen.reusedIdentity.id || (candidate.xmlId ?? null) !== frozen.reusedIdentity.xmlId) {
+          throw new ProductCatalogManualReviewError('PRODUCT_UUID_REUSE_IDENTITY_CHANGED');
+        }
+        await this.persistPair(input.productId, String(candidate.id), leaseToken, input.eventId, kind, true);
+        return String(candidate.id);
+      }
       const products = await findProducts(catalogId, xmlId, kind, Object.keys(frozen.fields));
       if (products.length > 1) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_DUPLICATE_EXTERNAL_ID');
+      const candidates = await this.readUuidProducts(input, catalogId, kind);
+      const candidate = uniqueUuidProduct(candidates, catalogId, input.productId, kind);
+      if (products.length && candidate && String(products[0].id) !== String(candidate.id)) {
+        throw new ProductCatalogManualReviewError('PRODUCT_UUID_RECOVERY_CONFLICT');
+      }
+      if (!products.length && candidate) {
+        // Once a prior ADD could have been sent, a different identity cannot
+        // replace the recovery target. Stop rather than create or guess.
+        if (frozen.providerCreateAttempted === true || (frozen.uuidLookupVersion !== 1 && operation.attemptedAt) || operation.bitrix24ProductId) {
+          throw new ProductCatalogManualReviewError('PRODUCT_UUID_REUSE_AFTER_ATTEMPT');
+        }
+        const id = String(candidate.id);
+        const reusedIdentity = { id, xmlId: candidate.xmlId ?? null };
+        const saved = await this.database.dealOrderReverseProductOperation.updateMany({
+          where: { moyskladProductId: input.productId, status: 'PENDING', leaseToken },
+          data: { payload: { ...frozen, reusedIdentity } as Prisma.InputJsonValue, bitrix24ProductId: id },
+        });
+        if (saved.count !== 1) throw new Error('PRODUCT_CREATE_LEASE_LOST');
+        const rechecked = uniqueUuidProduct(await this.readUuidProducts(input, catalogId, kind), catalogId, input.productId, kind);
+        if (!rechecked || String(rechecked.id) !== id || (rechecked.xmlId ?? null) !== reusedIdentity.xmlId) {
+          throw new ProductCatalogManualReviewError('PRODUCT_UUID_REUSE_IDENTITY_CHANGED');
+        }
+        // No card/price writes: adopting identity must not overwrite a working
+        // legacy catalog card with create defaults or empty price mappings.
+        await this.persistPair(input.productId, id, leaseToken, input.eventId, kind, true);
+        return id;
+      }
       let b24Id = operation.bitrix24ProductId ?? (products.length === 1 ? numericId(products[0].id) : null);
       if (products.length === 1 && !readbackMatches(products[0], frozen.fields, kind)) throw new ProductCatalogManualReviewError('PRODUCT_CREATE_RECOVERY_MISMATCH');
       if (!b24Id) {
+        // Fence uncertainty before network. A read/validation-only failure may
+        // later reuse a repaired UUID, but an uncertain ADD must only recover
+        // its reserved marker, never switch to a different legacy card.
+        const fenced = await this.database.dealOrderReverseProductOperation.updateMany({
+          where: { moyskladProductId: input.productId, status: 'PENDING', leaseToken },
+          data: { payload: { ...frozen, providerCreateAttempted: true } as Prisma.InputJsonValue },
+        });
+        if (fenced.count !== 1) throw new Error('PRODUCT_CREATE_LEASE_LOST');
         const response = await this.write(input, () => this.assertLease(input.productId, leaseToken), () => bitrixCall(kind === 'service' ? 'catalog.product.service.add' : 'catalog.product.add', { fields: frozen.fields }));
         const responseKey = kind === 'service' ? 'service' : 'element';
         const created = isRecord(response) && isRecord(response[responseKey]) ? response[responseKey] : null;
@@ -135,6 +271,13 @@ export class ProductCatalogCreateService {
       : this.mode.runDealOrderExternalWrite('moyskladToBitrix24', assertOwned, input.writePair, mutation);
   }
 
+  private async readUuidProducts(input: ProductCreateInput, catalogId: string, kind: 'product' | 'service') {
+    if (input.assertPairLease && !await input.assertPairLease()) throw new Error('PRODUCT_CREATE_PAIR_LEASE_LOST');
+    const result = await withServiceModeOn(this.database, () => findUuidProducts(catalogId, input.productId, kind));
+    if (!result.enabled) throw new ServiceModeNotOnError();
+    return result.value;
+  }
+
   private async createOrRecoverPrice(productId: string, price: Row, moyskladId: string, leaseToken: string, input: ProductCreateInput) {
     const catalogGroupId = Number(price.catalogGroupId);
     const value = Number(price.value);
@@ -155,14 +298,16 @@ export class ProductCatalogCreateService {
     }
   }
 
-  private async persistPair(moyskladId: string, bitrix24Id: string, leaseToken: string, eventId: string, kind: 'product' | 'service') {
-    await this.database.$transaction(async (transaction) => {
+  private async persistPair(moyskladId: string, bitrix24Id: string, leaseToken: string, eventId: string, kind: 'product' | 'service', reused = false) {
+    const committed = await withServiceModeOn(this.database, async (transaction) => {
       await lockEntityPairState(transaction);
       const [bySource, byTarget] = await Promise.all([
-        transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', bitrix24Id, active: true } }),
-        transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', moyskladId, active: true } }),
+        transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', bitrix24Id } }),
+        transaction.entityPair.findMany({ where: { entityType: 'PRODUCT', moyskladId } }),
       ]);
-      if (bySource.some((pair) => pair.moyskladId !== moyskladId) || byTarget.some((pair) => pair.bitrix24Id !== bitrix24Id) || bySource.length > 1 || byTarget.length > 1) {
+      const invalid = (pair: typeof bySource[number]) => !pair.active || pair.lifecycleStatus !== 'ACTIVE' || pair.moyskladType !== null && pair.moyskladType !== kind;
+      const alias = await transaction.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: bitrix24Id } });
+      if (alias || bySource.some((pair) => invalid(pair) || pair.moyskladId !== moyskladId) || byTarget.some((pair) => invalid(pair) || pair.bitrix24Id !== bitrix24Id) || bySource.length > 1 || byTarget.length > 1) {
         throw new ProductCatalogManualReviewError('PRODUCT_CREATE_PAIR_CONFLICT');
       }
       if (!bySource.length && !byTarget.length) await transaction.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id, moyskladId, moyskladType: kind, source: 'AUTO' } });
@@ -175,13 +320,42 @@ export class ProductCatalogCreateService {
         if (leaseToken || succeeded?.status !== 'SUCCEEDED' || succeeded.bitrix24ProductId !== bitrix24Id) throw new Error('PRODUCT_CREATE_PAIR_PERSISTENCE_FAILED');
       }
     });
-    await writeOperationalLog(this.database, 'EVENT', `Created and paired Bitrix24 product ${bitrix24Id} from MySklad product ${moyskladId}`, eventId);
+    if (!committed.enabled) throw new ServiceModeNotOnError();
+    await writeOperationalLog(this.database, 'EVENT', `${reused ? 'Linked existing' : 'Created and paired'} Bitrix24 product ${bitrix24Id} from MySklad product ${moyskladId}`, eventId);
   }
 
   private async assertLease(moyskladId: string, leaseToken: string) {
     const current = await this.database.dealOrderReverseProductOperation.findUnique({ where: { moyskladProductId: moyskladId }, select: { leaseToken: true, leaseUntil: true } });
     if (!current || current.leaseToken !== leaseToken || !current.leaseUntil || current.leaseUntil.getTime() <= Date.now()) throw new Error('PRODUCT_CREATE_LEASE_LOST');
   }
+}
+
+/** Exact UUID, catalog and native-kind lookup; never a name/article fallback.
+ * Do not filter inactive cards away: an occupied inactive identity is a hold,
+ * not permission to create another card with the same UUID. */
+async function findUuidProducts(catalogId: string, uuid: string, kind: 'product' | 'service'): Promise<Row[]> {
+  const value = await bitrixCall(kind === 'service' ? 'catalog.product.service.list' : 'catalog.product.list', {
+    select: ['id', 'iblockId', 'type', 'active', 'xmlId', 'property108'],
+    filter: { iblockId: Number(catalogId), property108: uuid }, order: { id: 'ASC' }, start: 0,
+  });
+  const rows = isRecord(value) ? value[kind === 'service' ? 'services' : 'products'] : null;
+  // More than one match is already a conflict; no full-catalog pagination.
+  if (!isRecord(value) || !Array.isArray(rows) || !Number.isInteger(value.total) || value.total < 0 ||
+      rows.length !== value.total || typeof value.next === 'number') {
+    throw new ProductCatalogManualReviewError('PRODUCT_UUID_LOOKUP_INCOMPLETE');
+  }
+  return rows;
+}
+
+function uniqueUuidProduct(rows: Row[], catalogId: string, uuid: string, kind: 'product' | 'service'): Row | null {
+  if (rows.length > 1) throw new ProductCatalogManualReviewError('PRODUCT_UUID_AMBIGUOUS');
+  if (!rows.length) return null;
+  const card = rows[0];
+  const identity = isRecord(card) && isRecord(card.property108) ? card.property108.value : card?.property108;
+  if (!isRecord(card) || !numericId(card.id) || String(card.iblockId) !== catalogId || Number(card.type) !== (kind === 'service' ? 7 : 1) || card.active !== 'Y' || identity !== uuid) {
+    throw new ProductCatalogManualReviewError('PRODUCT_UUID_EXISTING_CARD_INVALID');
+  }
+  return card;
 }
 
 async function findPrices(productId: string, catalogGroupId: number): Promise<Row[]> {

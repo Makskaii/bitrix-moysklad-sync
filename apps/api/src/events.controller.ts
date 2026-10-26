@@ -89,7 +89,7 @@ export class EventIntakeService {
       externalEntityType,
       payload: safePayload,
     };
-    if (!this.isControlledIngressAllowed('BITRIX24', event)) {
+    if (!await this.isControlledIngressAllowed('BITRIX24', event)) {
       return { accepted: false, reason: 'controlled_scope_rejected' };
     }
     const direction = getEventDirection('BITRIX24', eventType, externalEntityType);
@@ -157,9 +157,10 @@ export class EventIntakeService {
       })
       : readMoySkladEvents(safePayload, query).map((event, index) => ({ event, index }));
     const emptyBatchRejection = controlled && Array.isArray(safePayload.events) && safePayload.events.length === 0 ? 1 : 0;
-    const selectedEvents = controlled
-      ? indexedEvents.filter(({ event }) => this.isControlledIngressAllowed('MOYSKLAD', event))
-      : indexedEvents;
+    const selectedEvents: typeof indexedEvents = [];
+    for (const entry of indexedEvents) {
+      if (!controlled || await this.isControlledIngressAllowed('MOYSKLAD', entry.event)) selectedEvents.push(entry);
+    }
     const rejectedCount = indexedEvents.length - selectedEvents.length + emptyBatchRejection;
     if (controlled && selectedEvents.length === 0) {
       return { accepted: false, eventIds: [], contactEventIds: [], pairEventIds: [], rejectedCount, reason: 'controlled_scope_rejected' };
@@ -212,11 +213,11 @@ export class EventIntakeService {
     }
   }
 
-  private isControlledIngressAllowed(sourceSystem: InboundSource, event: {
+  private async isControlledIngressAllowed(sourceSystem: InboundSource, event: {
     eventType: string | null;
     externalEntityId: string | null;
     externalEntityType: string | null;
-  }): boolean {
+  }): Promise<boolean> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
     if (!this.controlledAdmission) throw new ServiceUnavailableException('Controlled live ingress policy is not configured');
     return this.controlledAdmission.allowsIncomingEvent({

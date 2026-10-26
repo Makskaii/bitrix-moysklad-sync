@@ -598,7 +598,23 @@ function DatabaseRecoveryPanel({ accessToken, status, onUpdated, onError }: {
   const [lostEventsAcknowledged, setLostEventsAcknowledged] = useState(false);
   const [acknowledgement, setAcknowledgement] = useState('');
   const [saving, setSaving] = useState(false);
-  const ready = status.status === 'READY';
+  const ready = status.status === 'READY' || status.status === 'READY_FRESH';
+  const fresh = status.status === 'READY_FRESH';
+  const [firstLaunchConfirmed, setFirstLaunchConfirmed] = useState(false);
+
+  async function confirmFirstLaunch() {
+    setSaving(true);
+    try {
+      const response = await fetch('/api/admin/sync-mode/first-launch/confirm', {
+        method: 'POST', headers: { 'content-type': 'application/json', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+        body: JSON.stringify({ confirmed: firstLaunchConfirmed, acknowledgement }),
+      });
+      const payload = await response.json().catch(() => ({})) as DatabaseRecoveryStatus & { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? 'Не удалось подтвердить первый запуск');
+      onUpdated(payload); setAcknowledgement(''); setFirstLaunchConfirmed(false); onError('');
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setSaving(false); }
+  }
 
   async function confirm() {
     setSaving(true);
@@ -627,9 +643,15 @@ function DatabaseRecoveryPanel({ accessToken, status, onUpdated, onError }: {
   return <section className="panel settings-panel" aria-label="Восстановление после потери базы">
     <div className="panel-heading"><div><p className="eyebrow">ЦЕЛОСТНОСТЬ ДАННЫХ</p><h3>Восстановление после потери базы</h3></div><span className={`mode-chip mode-${ready ? 'on' : 'off'}`}>{ready ? 'Подтверждено' : 'Требуется'}</span></div>
     {ready ? <>
-      <p className="panel-description">Восстановление подтверждено {status.acknowledgedAt ? new Date(status.acknowledgedAt).toLocaleString() : ''}. Граница запуска: <strong>{status.previousLaunchBoundary ? new Date(status.previousLaunchBoundary).toLocaleString() : 'не задана'}</strong>. Подтверждены пары: {status.pairsRestored ? 'да' : 'нет'}; утраченные события признаны: {status.lostEventsAcknowledged ? 'да' : 'нет'}.</p>
+      <p className="panel-description">{fresh ? 'Первый чистый запуск подтверждён' : 'Восстановление подтверждено'} {status.acknowledgedAt ? new Date(status.acknowledgedAt).toLocaleString() : ''}. Граница запуска: <strong>{status.previousLaunchBoundary ? new Date(status.previousLaunchBoundary).toLocaleString() : 'не задана'}</strong>. {fresh ? 'История и старые пары не импортированы. Обмен обрабатывает новые записи после этой границы.' : `Подтверждены пары: ${status.pairsRestored ? 'да' : 'нет'}; утраченные события признаны: ${status.lostEventsAcknowledged ? 'да' : 'нет'}.`}</p>
       {status.audit?.map((entry, index) => <p key={`${entry.occurredAt}-${index}`} className="recovery-line">Аудит: {entry.actorId}, {new Date(entry.occurredAt).toLocaleString()}, граница {new Date(entry.boundaryAt).toLocaleString()}. {entry.acknowledgement}</p>)}
     </> : <>
+      <fieldset><legend>Первый запуск на чистой базе</legend>
+        <p>Только для новой пустой рабочей базы. Дата начала фиксируется сервером сейчас; старые события и связи не импортируются. При наличии истории сервер отклонит действие. Это не подтверждение восстановления и не включает обмен.</p>
+        <label className="pair-check"><input type="checkbox" checked={firstLaunchConfirmed} onChange={(event) => setFirstLaunchConfirmed(event.target.checked)} />Подтверждаю новый запуск без переноса старой очереди и связей.</label>
+        <label>Основание чистого запуска<textarea value={acknowledgement} onChange={(event) => setAcknowledgement(event.target.value)} minLength={20} maxLength={1000} rows={3} /></label>
+        <button type="button" disabled={saving || !firstLaunchConfirmed || acknowledgement.trim().length < 20} onClick={() => void confirmFirstLaunch()}>Подтвердить первый запуск</button>
+      </fieldset>
       <p className="panel-description">База не содержит подтверждённого состояния. Очередь, снимки, аудит и решения, которые хранились только в потерянной базе, невозможно гарантированно восстановить. Автоматическое сопоставление и replay истории не выполняются. Сверьте прежнюю границу с независимой эксплуатационной записью и восстановите пары до подтверждения.</p>
       <label>Прежняя граница рабочего запуска из независимой записи
         <input value={boundary} onChange={(event) => setBoundary(event.target.value)} placeholder="2026-09-01T10:00:00+03:00" autoComplete="off" />

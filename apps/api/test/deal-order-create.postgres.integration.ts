@@ -7,7 +7,7 @@ import { PrismaClient } from '@prisma/client';
 import { DatabaseService } from '../src/database.service';
 import { SyncModeService } from '../src/sync-mode.service';
 import { DealOrderCreationPreparer } from '../src/deals-orders/deal-order-creation-preparer.service';
-import { DealOrderCreateOperationService } from '../src/deals-orders/deal-order-create-operation.service';
+import { DealOrderCreateOperationService, DealOrderPairConflictError } from '../src/deals-orders/deal-order-create-operation.service';
 
 process.env.SYNC_MODE ??= 'apply';
 const db = new PrismaClient();
@@ -25,6 +25,12 @@ let base = '';
 let posts = 0;
 let failNextB24DealRead = true;
 let b24OrderNumber: string | null = null;
+let b24DealTitle: string | null = 'Original title';
+let nativeOrderName = 'SO-54';
+let ignoreNextOrderNumberUpdate = false;
+let loseNextOrderNumberUpdateResponse = false;
+let loseNextCreateResponse = false;
+const providerOrdersBySyncId = new Map<string, string>();
 let activeOrderId = ids.order;
 let nextNumberReadBarrier: { started: () => void; wait: Promise<void> } | null = null;
 let offAcknowledged = false;
@@ -33,6 +39,8 @@ let numberUpdates = 0;
 let headerContractDealId: string | null = null;
 let headerContractRequests: Array<{ path: string; accept: string | undefined; acceptEncoding: string | undefined }> = [];
 let headerContractMeasureCode = 796;
+let headerContractOverrides: Record<string, unknown> = {};
+let missingHeaderStore = false;
 const suffix = randomUUID();
 let companyPairId = '';
 let productPairId = '';
@@ -136,7 +144,11 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
     createdAt: new Date(0),
     config: {
       schemaVersion: 1,
-      rules: [],
+      rules: [{
+        id: 'test-reverse-warehouse', entity: 'deals-orders', sourceField: 'UF_CRM_1732004209', targetField: 'store', criticality: 'optional',
+        bitrix24ToMoysklad: { enabled: false, transform: { kind: 'tbd' } },
+        moyskladToBitrix24: { enabled: true, transform: { kind: 'reference-map', resource: 'store', pairs: [{ source: ids.store, target: '8682' }] } },
+      }],
       groups: [],
       references: {
         units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, moyskladCode: '796', status: 'configured' }],
@@ -210,8 +222,87 @@ test('production preparer resolves a Bitrix unit mapping by catalog code under t
   }
 });
 
+test('confirmed defaults preserve custom forward stages and revalidate the selected store through PostgreSQL gates', async () => {
+  headerContractDealId = `9037${Date.now()}`;
+  headerContractRequests = [];
+  headerContractOverrides = { STAGE_ID: 'C2:PREPARATION', UF_CRM_1732004209: '98765', ASSIGNED_BY_ID: '98766', UF_CRM_1776347243: '98767', CURRENCY_ID: 'USD' };
+  const resolver = { async resolveForDocument() {
+    return { status: 'RESOLVED', pair: { id: companyPairId, entityType: 'COMPANY', bitrix24Id: '902', moyskladId: ids.company }, companyPair: { id: companyPairId, bitrix24Id: '902', moyskladId: ids.company } };
+  } };
+  const preparer = new DealOrderCreationPreparer(database, resolver as never);
+  const settings: any = { version: 1, createdAt: new Date(0), references: {}, config: {
+    schemaVersion: 1, rules: [], groups: [], references: {
+      units: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }], priceTypes: [], dictionaries: [],
+    }, dealOrderRuntime: {
+      nativeOrderNumberingVerified: true, unmappedReferencePolicy: 'confirmed-defaults',
+      defaultOrganizationId: ids.organization, defaultStoreId: ids.store, defaultEmployeeId: ids.employee,
+      currencies: [{ bitrix24Code: 'RUB', moyskladId: ids.currency }],
+      stages: [{ bitrix24StageId: 'C2:PREPARATION', moyskladId: ids.state, creationEnabled: true }],
+      organizations: [], stores: [], employees: [],
+    },
+  } };
+  const priorPosts = posts;
+  try {
+    const result = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `defaults-${suffix}`, eventConfig: settings });
+    assert.equal(result.status, 'READY');
+    if (result.status === 'READY') {
+      assert.equal(result.input.payload.store.meta.href, `${base}api/remap/1.2/entity/store/${ids.store}`);
+      assert.equal(result.input.payload.organization.meta.href, `${base}api/remap/1.2/entity/organization/${ids.organization}`);
+      assert.equal(result.input.payload.rate.currency.meta.href, `${base}api/remap/1.2/entity/currency/${ids.currency}`);
+      assert.equal(result.input.payload.positions.length, 1);
+      assert.equal(result.input.payload.positions[0]?.price, 1000, 'user-approved RUB fallback never converts numeric prices');
+    }
+    assert.ok(headerContractRequests.some((row) => row.path.endsWith(`/store/${ids.store}`)), 'fallback store is read from the provider, not just trusted from config');
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_STORE_DEFAULT_APPLIED' } } }));
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_CURRENCY_RUB_APPLIED' } } }));
+    assert.ok(await db.operationalLog.count({ where: { referenceId: `defaults-${suffix}`, message: { contains: 'UNMAPPED_SOURCE_ORGANIZATION_DEFAULT_APPLIED' } } }));
+    missingHeaderStore = true;
+    const missing = await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `missing-default-${suffix}`, eventConfig: settings });
+    assert.equal(missing.status, 'WAITING');
+    assert.equal(posts, priorPosts, 'a missing selected default never creates an order');
+  } finally {
+    headerContractDealId = null;
+    headerContractOverrides = {};
+    missingHeaderStore = false;
+    headerContractRequests = [];
+  }
+});
+
+test('actual preparer never sends a journal-owned imported deal back as another MS order before pairing', async () => {
+  const sourceOrder = randomUUID();
+  headerContractDealId = `9038${Date.now()}`;
+  headerContractRequests = [];
+  headerContractOverrides = { ORIGINATOR_ID: 'MOYSKLAD', ORIGIN_ID: sourceOrder };
+  let dependenciesCalled = 0;
+  const preparer = new DealOrderCreationPreparer(database, { async resolveForDocument() { dependenciesCalled++; throw new Error('ECHO_MUST_STOP_BEFORE_DEPENDENCIES'); } } as never);
+  const settings: any = { version: 1, config: { schemaVersion: 1, rules: [], groups: [], references: { units: [], priceTypes: [], dictionaries: [] }, dealOrderRuntime: {
+    nativeOrderNumberingVerified: true, defaultOrganizationId: ids.organization, defaultStoreId: ids.store, defaultEmployeeId: ids.employee,
+    currencies: [{ bitrix24Code: 'RUB', moyskladId: ids.currency }], stages: [{ bitrix24StageId: 'NEW', moyskladId: ids.state, creationEnabled: true }], organizations: [], stores: [], employees: [],
+  } } };
+  const priorPosts = posts;
+  await db.dealOrderReverseCreateOperation.create({ data: { moyskladOrderId: sourceOrder, syncId: randomUUID(), eventId: `reverse-echo-${suffix}`, payload: {}, settingsVersion: 1, status: 'PENDING' } });
+  try {
+    for (const targetId of [null, headerContractDealId]) {
+      await db.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: sourceOrder }, data: { bitrix24DealId: targetId } });
+      assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_CREATE_PENDING' });
+    }
+    await db.dealOrderReverseCreateOperation.update({ where: { moyskladOrderId: sourceOrder }, data: { bitrix24DealId: '999' } });
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' });
+    headerContractOverrides.ORIGIN_ID = 'invalid-id';
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_INVALID' });
+    headerContractOverrides.ORIGIN_ID = randomUUID();
+    assert.deepEqual(await preparer.prepare({ bitrix24DealId: headerContractDealId, eventId: `echo-${suffix}`, eventConfig: settings }), { status: 'WAITING', reason: 'REVERSE_DEAL_ORIGIN_UNRESOLVED' });
+    assert.equal(dependenciesCalled, 0);
+    assert.equal(posts, priorPosts);
+    assert.equal(headerContractRequests.some(row => row.path.includes('/api/remap/')), false);
+  } finally {
+    await db.dealOrderReverseCreateOperation.delete({ where: { moyskladOrderId: sourceOrder } });
+    headerContractDealId = null; headerContractOverrides = {}; headerContractRequests = [];
+  }
+});
+
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
-  posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
+  posts = 0; failNextB24DealRead = true; b24OrderNumber = null; b24DealTitle = 'Original source title';
   activeOrderId = ids.order;
   const input = preparedInput();
   input.skippedRows = [{ sourceRowId: '302', reason: 'UNIT_UNMAPPED' }];
@@ -232,6 +323,105 @@ test('MySklad order ID persists after remote create and retry reuses it rather t
   assert.equal(operation.status, 'PARTIAL');
   assert.deepEqual(operation.skippedRows, input.skippedRows);
   assert.equal(b24OrderNumber, 'SO-54');
+  assert.equal(b24DealTitle, 'Original source title', 'forward order-number sync preserves the source deal title');
+  const updates = numberUpdates;
+  await service.createAndPair(input);
+  assert.equal(posts, 1); assert.equal(numberUpdates, updates);
+});
+
+test('an already-correct number preserves a customer title and commits the pair without a title write', async () => {
+  const input = preparedInput('906'); activeOrderId = randomUUID();
+  posts = 0; numberUpdates = 0; failNextB24DealRead = false;
+  b24OrderNumber = 'SO-54'; b24DealTitle = 'Customer supplied title';
+  const result = await service.createAndPair(input);
+  assert.equal(result.status, 'CREATED');
+  assert.equal(posts, 1); assert.equal(numberUpdates, 0);
+  assert.equal(b24DealTitle, 'Customer supplied title'); assert.equal(b24OrderNumber, 'SO-54');
+  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '906', active: true } }), 1);
+});
+
+test('lost B24 update response recovers after a cold service restart by readback, with one native MS order', async () => {
+  const input = preparedInput('907'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  failNextB24DealRead = false; b24OrderNumber = null; b24DealTitle = 'Original source title';
+  nativeOrderName = 'МС / 2026 & №000054 — Обработан'; loseNextOrderNumberUpdateResponse = true;
+  try {
+    await assert.rejects(service.createAndPair(input));
+    const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '907' } });
+    assert.equal(pending.status, 'PENDING'); assert.equal(pending.moyskladOrderId, activeOrderId);
+    assert.equal(b24DealTitle, 'Original source title'); assert.equal(b24OrderNumber, nativeOrderName);
+    const restarted = new DatabaseService();
+    try { await new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input); }
+    finally { await restarted.$disconnect(); }
+    assert.equal(posts, 1); assert.equal(numberUpdates, 1, 'readback sees the successful lost-response source write');
+    assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '907' } })).status, 'SUCCEEDED');
+    await service.createAndPair(input); assert.equal(posts, 1); assert.equal(numberUpdates, 1);
+  } finally { nativeOrderName = 'SO-54'; loseNextOrderNumberUpdateResponse = false; }
+});
+
+test('lost MS CREATE response retains syncId through restart and records native number without renaming the deal', async () => {
+  const input = preparedInput('908'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  failNextB24DealRead = false; b24OrderNumber = null; b24DealTitle = 'Before lost MS response'; loseNextCreateResponse = true;
+  const before = providerOrdersBySyncId.size;
+  await assert.rejects(service.createAndPair(input));
+  const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '908' } });
+  assert.equal(pending.status, 'PENDING'); assert.equal(pending.moyskladOrderId, null); assert.ok(pending.attemptedAt);
+  const restarted = new DatabaseService();
+  try { await new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input); }
+  finally { await restarted.$disconnect(); }
+  assert.equal(providerOrdersBySyncId.size, before + 1); assert.equal(posts, 2, 'second POST has the SAME durable syncId');
+  assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '908' } })).syncId, pending.syncId);
+  assert.equal(b24DealTitle, 'Before lost MS response'); assert.equal(b24OrderNumber, 'SO-54');
+  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '908' } }), 1);
+});
+
+test('proven ownership conflict freezes the original journal and a cold retry cannot touch providers', async () => {
+  const input = preparedInput('909'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  failNextB24DealRead = false; b24OrderNumber = 'SO-54'; b24DealTitle = 'SO-54';
+  const syncId = randomUUID();
+  await db.dealOrderCreateOperation.create({ data: { bitrix24DealId: '909', moyskladOrderId: activeOrderId,
+    syncId, payload: input.payload as never, confirmedCustomerPairIds: [companyPairId], settingsVersion: 4,
+    status: 'PENDING', attemptedAt: new Date() } });
+  const conflicting = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: '910', moyskladId: activeOrderId, source: 'MANUAL' } });
+  try {
+    await assert.rejects(service.createAndPair(input), DealOrderPairConflictError);
+    const held = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '909' } });
+    assert.equal(held.status, 'CONFLICT'); assert.equal(held.lastErrorCategory, 'PAIR_CONFLICT');
+    assert.equal(held.moyskladOrderId, activeOrderId); assert.equal(held.syncId, syncId);
+    assert.deepEqual(held.payload, input.payload); assert.equal(held.leaseToken, null);
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; throw new Error('PROVIDER_MUST_NOT_BE_CALLED'); };
+    const restarted = new DatabaseService();
+    try { await assert.rejects(new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input), DealOrderPairConflictError); }
+    finally { globalThis.fetch = realFetch; await restarted.$disconnect(); }
+    assert.equal(calls, 0); assert.equal(posts, 0); assert.equal(numberUpdates, 0);
+    assert.equal((await db.entityPair.findUniqueOrThrow({ where: { id: conflicting.id } })).bitrix24Id, '910');
+    assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '909' } }), 0);
+  } finally {
+    await db.dealOrderCreateOperation.delete({ where: { bitrix24DealId: '909' } });
+    await db.entityPair.delete({ where: { id: conflicting.id } });
+  }
+});
+
+test('controlled create and persisted-ID recovery reserve their owning event before any target create or binding',async()=>{
+  const previous=process.env.CONTROLLED_LIVE_TEST_MODE;
+  const input=preparedInput('905');let reservations=0;posts=0;
+  const admission={async scopeForEvent(){return {targetNativeId:null};},async assertCreateReserved(eventId:string,entity:string,provider:string){
+    reservations++;assert.equal(eventId,input.eventId);assert.equal(entity,'deal-order');assert.equal(provider,'MOYSKLAD');throw new Error('RESERVATION_BUSY');
+  }};
+  process.env.CONTROLLED_LIVE_TEST_MODE='enabled';
+  try{
+    const controlled=new DealOrderCreateOperationService(database,new SyncModeService(database),admission as never);
+    await assert.rejects(controlled.createAndPair(input),/RESERVATION_BUSY/);
+    assert.equal(posts,0);assert.equal(reservations,1);
+    await db.dealOrderCreateOperation.update({where:{bitrix24DealId:'905'},data:{moyskladOrderId:ids.order}});
+    await assert.rejects(controlled.createAndPair(input),/RESERVATION_BUSY/);
+    assert.equal(posts,0);assert.equal(reservations,2);
+    assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({where:{bitrix24DealId:'905'}})).moyskladOrderId,ids.order);
+  }finally{
+    if(previous===undefined)delete process.env.CONTROLLED_LIVE_TEST_MODE;else process.env.CONTROLLED_LIVE_TEST_MODE=previous;
+    await db.dealOrderCreateOperation.deleteMany({where:{bitrix24DealId:'905'}});
+  }
 });
 
 function preparedInput(bitrix24DealId = '901'): any {
@@ -258,10 +448,14 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (offAcknowledged) requestsAfterOff++;
   if (url.pathname === '/api/remap/1.2/entity/customerorder' && request.method === 'POST') {
     posts++;
-    return send(response, { id: activeOrderId, meta: { type: 'customerorder' } });
+    const input = JSON.parse(text); assert.match(input.syncId, /^[0-9a-f-]{36}$/);
+    const id = providerOrdersBySyncId.get(input.syncId) ?? activeOrderId;
+    providerOrdersBySyncId.set(input.syncId, id);
+    if (loseNextCreateResponse) { loseNextCreateResponse = false; response.destroy(); return; }
+    return send(response, { id, meta: { type: 'customerorder' } });
   }
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${activeOrderId}`) return send(response, {
-    id: activeOrderId, name: 'SO-54', meta: { type: 'customerorder' }, positions: { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` } }, quantity: 2, price: 0, discount: 0, vat: 0, vatEnabled: false }] },
+    id: activeOrderId, name: nativeOrderName, meta: { type: 'customerorder' }, positions: { rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', assortment: { meta: { type: 'product', href: `${base}api/remap/1.2/entity/product/${ids.product}` } }, quantity: 2, price: 0, discount: 0, vat: 0, vatEnabled: false }] },
   });
   if (url.pathname === '/api/remap/1.2/entity/assortment' && headerContractDealId) {
     captureHeaderContractRequest(request, url.pathname);
@@ -274,6 +468,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       captureHeaderContractRequest(request, url.pathname);
       if (!hasRequiredMySkladReadHeaders(request)) return send(response, { errors: [{ code: 1062 }] }, 400);
     }
+    if (missingHeaderStore && entity[1] === 'store') return send(response, {}, 404);
     return send(response, { id: entity[2], meta: { type: entity[1] } });
   }
   const state = url.pathname.match(/\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/);
@@ -290,6 +485,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (body.get('id') === headerContractDealId) return send(response, { result: {
       ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,
       OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture',
+      ...headerContractOverrides,
     } });
     if (nextNumberReadBarrier) {
       const barrier = nextNumberReadBarrier;
@@ -298,14 +494,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       await barrier.wait;
     }
     if (failNextB24DealRead) { failNextB24DealRead = false; response.writeHead(500); response.end('{}'); return; }
-    return send(response, { result: { ID: body.get('id'), UF_CRM_1729757435964: b24OrderNumber } });
+    return send(response, { result: { ID: body.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.item.productrow.list' && body.get('filter[=ownerId]') === headerContractDealId) {
     return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: headerContractMeasureCode, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
     numberUpdates++;
-    b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
+    if (!ignoreNextOrderNumberUpdate) b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
+    if (body.has('fields[TITLE]')) b24DealTitle = body.get('fields[TITLE]');
+    ignoreNextOrderNumberUpdate = false;
+    if (loseNextOrderNumberUpdateResponse) { loseNextOrderNumberUpdateResponse = false; response.destroy(); return; }
     return send(response, { result: true });
   }
   response.writeHead(404); response.end('{}');

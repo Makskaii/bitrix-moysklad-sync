@@ -144,6 +144,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     holdFirst = false;
   }
   if (pathname.startsWith('/api/remap/1.2/entity/customerorder/')) {
+    assert.equal(request.headers.accept, 'application/json;charset=utf-8');
+    assert.equal(request.headers['accept-encoding'], 'gzip');
     return send(response, { id: moyskladOrderId, meta: { type: 'customerorder' }, agent: { id: moyskladOrderId }, description: 'same' });
   }
   if (pathname === '/rest/crm.deal.get.json') {

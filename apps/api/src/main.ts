@@ -32,6 +32,7 @@ import { DealOrderBaselineService } from './deals-orders/deal-order-baseline.ser
 import { DryRunDocumentReader } from './dry-run-document-reader';
 import { DealOrderHeaderSyncProcessor } from './deals-orders/deal-order-header-sync.processor';
 import { DealOrderCreationPreparer } from './deals-orders/deal-order-creation-preparer.service';
+import { DealTimelineNoticeService } from './deals-orders/deal-timeline-notice.service';
 import { DealOrderCreateOperationService } from './deals-orders/deal-order-create-operation.service';
 import { DealOrderPositionRuntimeService } from './deals-orders/deal-order-position-runtime.service';
 import { DealOrderFieldRuntimeService } from './deals-orders/deal-order-field-runtime.service';
@@ -52,6 +53,7 @@ import { CLIENT_DEPENDENCY_RESOLVER } from './clients/client-dependency-resolver
 import { ClientChildResourceSync } from './clients/client-child-resource-sync';
 import { ADDITIONAL_EVENT_PROCESSORS, EventDispatcherService } from './event-dispatcher.service';
 import { EventWorkerLeaseService } from './event-worker-lease.service';
+import { installMoyskladRequestScheduler } from './moysklad-request-scheduler';
 import { ProductCardEventProcessor } from './products/product-card-event.processor';
 import { ProductCardHttpApi } from './products/product-card-api';
 import { ProductCardRuntimeService } from './products/product-card-runtime.service';
@@ -71,6 +73,8 @@ import { InvoiceEventProcessor } from './invoices/invoice-event.processor';
 import { ProductDuplicatesController } from './admin/product-duplicates.controller';
 import { ProductDuplicateAliasService } from './products/product-duplicate-alias.service';
 import { ApplicationLaunchController } from './application-launch.controller';
+import { WarehouseDirectorySyncService } from './warehouses/warehouse-directory-sync.service';
+import { CompanyPriceTypeDirectoryService } from './clients/company-price-type-directory.service';
 
 @Controller()
 class AppController {
@@ -88,11 +92,11 @@ class AppController {
   controllers: [AppController, ApplicationLaunchController, AdminController, AdminAuditController, ClientLifecycleController, ProductDuplicatesController, FieldSettingsController, ContactSyncStatusController, MonitoringController, SyncModeController, EventsController, WebhookDiagnosticsController, PairResolutionController, HistoricalInventoryController, HistoricalDealOrderMatchingController, ClientMappingController],
   providers: [DatabaseService, AdminAccessGuard, EventIntakeService, EventDispatcherService,
     { provide: ADDITIONAL_EVENT_PROCESSORS, useFactory: (products: ProductCardEventProcessor, clients: ClientSyncProcessor, lifecycle: ClientLifecycleService, invoices: InvoiceEventProcessor) => [products, clients, lifecycle, invoices], inject: [ProductCardEventProcessor, ClientSyncProcessor, ClientLifecycleService, InvoiceEventProcessor] },
-    EventWorkerLeaseService, DatabaseRecoveryService,
+    EventWorkerLeaseService, DatabaseRecoveryService, WarehouseDirectorySyncService, CompanyPriceTypeDirectoryService,
     WebhookDiagnosticLog, AdminAuditService, ContactSyncProcessor, ContactSyncStatusReader, SyncModeService, SyncRecoveryService, RetentionService,
     FieldSettingsService, ReadOnlyFieldDataProvider, DryRunDocumentReader, DealOrderBaselineService, DealOrderHeaderSyncProcessor, DealOrderCreationPreparer, DealOrderCreateOperationService, DealOrderPositionRuntimeService, DealOrderFieldRuntimeService, DealOrderReverseCreateService, DealOrderTotalReconciliationHandler,
     EntityPairService, PairResolutionProvider, HistoricalInventoryService, HistoricalDealOrderMatchingService,
-    DryRunWriteJournal,
+    DryRunWriteJournal, DealTimelineNoticeService,
     { provide: InvoiceHttpApi, useFactory: (dry: DryRunWriteJournal) => new InvoiceHttpApi(dry), inject: [DryRunWriteJournal] }, InvoiceEventProcessor,
     { provide: ProductCardHttpApi, useFactory: (dry: DryRunWriteJournal) => new ProductCardHttpApi(dry), inject: [DryRunWriteJournal] }, ProductCatalogCreateService, ProductCardRuntimeService, ProductDuplicateAliasService, ProductCardEventProcessor,
     HttpClientInventoryProvider, { provide: CLIENT_INVENTORY_PROVIDER, useExisting: HttpClientInventoryProvider }, ClientMappingService,
@@ -125,6 +129,7 @@ async function bootstrap() {
       allowLoopbackHttp: process.env.CONTROLLED_LIVE_TEST_FAKE_PROVIDER_HTTP === 'enabled',
     });
   }
+  installMoyskladRequestScheduler();
   setDatabaseRecoveryReady(false);
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: new RotatingFileLogger() });
   await app.get(DatabaseRecoveryService).initialize();

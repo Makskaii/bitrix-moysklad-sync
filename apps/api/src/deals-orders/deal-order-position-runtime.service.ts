@@ -11,7 +11,9 @@ import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } fro
 import { DealOrderReverseCreateService, DealOrderReverseManualReviewError } from './deal-order-reverse-create.service';
 import { ServiceModeNotOnError, withServiceModeOn } from '../service-mode-transaction';
 import { moyskladUomReferenceId } from './moysklad-uom-reference';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { DocumentProductIdentityError, ensureDocumentProductIdentity } from '../products/document-product-identity';
+import type { EventWorkerLeaseContext } from '../event-worker-lease.service';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type Result = { status: 'SYNCED'; rowValuesChanged?: boolean } | { status: 'PARTIAL'; reason: 'DEAL_ORDER_POSITION_ROWS_SKIPPED'; skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }> } | { status: 'MANUAL_REVIEW'; reason: string } | { status: 'RETRY'; reason: string };
@@ -35,14 +37,14 @@ export class DealOrderPositionRuntimeService {
 
   private readonly providerGate = (url: URL, init: RequestInit) => this.providerRequest(url, init);
 
-  async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }): Promise<Result> {
+  async process(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto; workerLease?: EventWorkerLeaseContext }): Promise<Result> {
     if (input.pair.entityType !== 'DEAL') return { status: 'MANUAL_REVIEW', reason: 'UNSUPPORTED_ENTITY' };
     if (process.env.SYNC_MODE !== 'apply') return { status: 'MANUAL_REVIEW', reason: 'SYNC_MODE_NOT_APPLY' };
     return await withDealOrderPairLock(this.database, input.pair.id, input.eventId, (lease) => this.processLocked(input, lease)) ??
       { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_BUSY' };
   }
 
-  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto }, lease: DealOrderPairLease): Promise<Result> {
+  private async processLocked(input: { pair: ConfirmedPair; eventId: string; eventConfig: VersionedFieldSettingsDto; workerLease?: EventWorkerLeaseContext }, lease: DealOrderPairLease): Promise<Result> {
     const assertOwner = lease.assertOwner;
     const runMutation = (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => this.mode.runDealOrderExternalWrite(direction, assertOwner, { id: input.pair.id, entityType: 'DEAL' }, mutation);
     const pair = await this.database.entityPair.findFirst({
@@ -95,7 +97,7 @@ export class DealOrderPositionRuntimeService {
       if (!(directionSetting?.moyskladToBitrix24 ?? true)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_DIRECTION_DISABLED' };
       try {
         const added = await this.reverseCreate.addPositionsToExistingPair({ pairId: pair.id, bitrix24DealId: pair.bitrix24Id, moyskladOrderId: pair.moyskladId,
-          eventId: input.eventId, eventConfig: input.eventConfig, positionIds: unlinkedTargets.map((position) => position.id), assertPairLease: assertOwner });
+          eventId: input.eventId, eventConfig: input.eventConfig, positionIds: unlinkedTargets.map((position) => position.id), assertPairLease: assertOwner, workerLease: input.workerLease });
         for (const skipped of added.skippedRows ?? []) skippedRows.push({ sourceSystem: 'MOYSKLAD', sourceRowId: skipped.sourceRowId, reason: skipped.reason });
       } catch (error) {
         if (error instanceof DealOrderReverseManualReviewError) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_REVERSE_POSITION_REVIEW' };
@@ -187,8 +189,10 @@ export class DealOrderPositionRuntimeService {
         continue;
       }
       try {
-        const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || moyskladUomReferenceId(product.uom, moyskladBase()) !== mappedUnit.moyskladId) {
+        const kind = positionAssortmentKind(target.assortment);
+        if (!kind) { await skipRow('MOYSKLAD', target.id, 'ASSORTMENT_TYPE_UNSUPPORTED'); continue; }
+        const product = await this.providerRequest(new URL(`entity/${kind}/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== kind || !matchesReverseUnit(mappedUnit, moyskladUomReferenceId(product.uom, moyskladBase()))) {
           await skipRow('BITRIX24', link.bitrix24ProductRowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
           continue;
         }
@@ -374,7 +378,7 @@ export class DealOrderPositionRuntimeService {
 
     const targetCounts = new Map<string, number>();
     for (const row of msRows) {
-      const id = row.assortment && isRecord(row.assortment.meta) && row.assortment.meta.type === 'product' ? assortmentId(row.assortment) : null;
+      const id = row.assortment && positionAssortmentKind(row.assortment) ? assortmentId(row.assortment) : null;
       if (!id) return hold('DEAL_ORDER_POSITION_BOOTSTRAP_AMBIGUOUS');
       targetCounts.set(id, (targetCounts.get(id) ?? 0) + 1);
     }
@@ -391,13 +395,14 @@ export class DealOrderPositionRuntimeService {
       const desired = sourceValues(source);
       const mappedUnit = findConfiguredUnitByCode(eventConfig.config.references.units, source.measureCode);
       if (!desired || !mappedUnit?.moyskladId || !isUuid(mappedUnit.moyskladId) ||
-          !isRecord(target.assortment) || !isRecord(target.assortment.meta) || target.assortment.meta.type !== 'product' || !Number.isFinite(target.quantity) || target.quantity <= 0 ||
+          !isRecord(target.assortment) || !positionAssortmentKind(target.assortment) || !Number.isFinite(target.quantity) || target.quantity <= 0 ||
           !Number.isFinite(target.price) || target.price < 0 || (target.discount ?? 0) !== 0 || (target.vatEnabled ?? false) || (target.vat ?? 0) !== 0) {
         return hold('DEAL_ORDER_POSITION_BOOTSTRAP_VALUE_OR_UNIT_UNSUPPORTED');
       }
       try {
-        const product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== 'product' || moyskladUomReferenceId(product.uom, moyskladBase()) !== mappedUnit.moyskladId) {
+        const kind = positionAssortmentKind(target.assortment)!;
+        const product = await this.providerRequest(new URL(`entity/${kind}/${encodeURIComponent(targetProductId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(product) || product.id !== targetProductId || !isRecord(product.meta) || product.meta.type !== kind || !matchesReverseUnit(mappedUnit, moyskladUomReferenceId(product.uom, moyskladBase()))) {
           return hold('DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_MISMATCH');
         }
       } catch (error) { if (error instanceof ServiceModeNotOnError) throw error; return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_BOOTSTRAP_DEPENDENCY_READ_FAILED' }; }
@@ -429,16 +434,18 @@ export class DealOrderPositionRuntimeService {
         await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED');
         continue;
       }
-      let candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true }, take: 2 });
+      let candidates = await this.database.entityPair.findMany({ where: { entityType: 'PRODUCT', active: true, bitrix24Id: productId }, select: { moyskladId: true, moyskladType: true }, take: 2 });
       if (!candidates.length) {
         const alias = await this.database.productDuplicateAlias.findUnique({ where: { duplicateBitrix24Id: productId }, select: { canonicalPairId: true } });
-        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true } }) : null;
+        const canonical = alias ? await this.database.entityPair.findFirst({ where: { id: alias.canonicalPairId, entityType: 'PRODUCT', active: true }, select: { moyskladId: true, moyskladType: true } }) : null;
         if (canonical) candidates = [canonical];
       }
       if (candidates.length !== 1 || !isUuid(candidates[0].moyskladId)) { await skipRow('BITRIX24', rowId, 'DEAL_ORDER_POSITION_DEPENDENCY_CHANGED'); continue; }
+      const kind = candidates[0].moyskladType ?? 'product';
+      if (kind !== 'product' && kind !== 'service') { await skipRow('BITRIX24', rowId, 'ASSORTMENT_TYPE_UNSUPPORTED'); continue; }
       let product: unknown;
       try {
-        product = await this.providerRequest(new URL(`entity/product/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        product = await this.providerRequest(new URL(`entity/${kind}/${encodeURIComponent(candidates[0].moyskladId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
       } catch (error) {
         throwIfServiceModeNotOn(error);
         if (error instanceof PositionProviderRequestError && error.status === 404) {
@@ -448,7 +455,7 @@ export class DealOrderPositionRuntimeService {
         if (isTransientProductLookupFailure(error)) return { status: 'RETRY', reason: 'DEAL_ORDER_PRODUCT_READ_RETRYABLE' };
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_REJECTED' };
       }
-      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== 'product' || !moyskladUomReferenceId(product.uom, moyskladBase())) {
+      if (!isRecord(product) || product.id !== candidates[0].moyskladId || !isRecord(product.meta) || product.meta.type !== kind || !moyskladUomReferenceId(product.uom, moyskladBase())) {
         return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_PRODUCT_READ_INVALID' };
       }
       if (moyskladUomReferenceId(product.uom, moyskladBase()) !== unit.moyskladId) {
@@ -456,7 +463,7 @@ export class DealOrderPositionRuntimeService {
         continue;
       }
       const payload = {
-        assortment: { meta: { type: 'product', href: new URL(`entity/product/${encodeURIComponent(product.id)}`, withSlash(moyskladBase())).href } },
+        assortment: { meta: { type: kind, href: new URL(`entity/${kind}/${encodeURIComponent(product.id)}`, withSlash(moyskladBase())).href } },
         quantity: desired.quantity, price: desired.price, discount: desired.discount, vat: desired.vat, vatEnabled: desired.vatEnabled,
       };
       let operation;
@@ -502,14 +509,15 @@ export class DealOrderPositionRuntimeService {
         const created = await runMutation('bitrix24ToMoysklad', () => this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions`, withSlash(moyskladBase())), {
           method: 'POST', headers: msHeaders(), body: JSON.stringify(payload),
         }));
-        if (!isRecord(created) || !isUuid(created.id)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
+        const createdId = positionIdFromCreateResponse(created);
+        if (!createdId) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID');
         const savedPositionId = await this.database.dealOrderPositionAddOperation.updateMany({
-          where: { id: operation.id, leaseToken }, data: { moyskladPositionId: created.id },
+          where: { id: operation.id, leaseToken }, data: { moyskladPositionId: createdId },
         });
         if (savedPositionId.count !== 1) return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_LEASE_LOST_AFTER_PROVIDER_SUCCESS' };
-        const readback = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(created.id)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
-        if (!isRecord(readback) || readback.id !== created.id || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
-        return await this.persistAddedRow(pairId, row, created.id, payload, operation.id, leaseToken, assertOwner);
+        const readback = await this.providerRequest(new URL(`entity/customerorder/${encodeURIComponent(orderId)}/positions/${encodeURIComponent(createdId)}`, withSlash(moyskladBase())), { method: 'GET', headers: msHeaders() });
+        if (!isRecord(readback) || readback.id !== createdId || !positionMatches(readback, payload)) return this.addUncertain(operation.id, leaseToken, 'DEAL_ORDER_POSITION_ADD_READBACK_MISMATCH');
+        return await this.persistAddedRow(pairId, row, createdId, payload, operation.id, leaseToken, assertOwner);
       } catch (error) {
         throwIfServiceModeNotOn(error);
         await this.database.dealOrderPositionAddOperation.updateMany({ where: { id: operation.id, leaseToken }, data: { leaseToken: null, leaseUntil: null, lastErrorCategory: 'ADD_OUTCOME_UNKNOWN' } }).catch(() => undefined);
@@ -546,12 +554,24 @@ export class DealOrderPositionRuntimeService {
   }
 }
 
+/** A single-row positions POST can acknowledge with either an object or [object]. */
+export function positionIdFromCreateResponse(value: unknown): string | null {
+  const row = Array.isArray(value) ? value.length === 1 ? value[0] : null : value;
+  return isRecord(row) && !('errors' in row) && !('error' in row) && isUuid(row.id) ? row.id : null;
+}
+
 export function classifyPositionAddRecovery(attempted: boolean, matchingUnlinkedCount: number): string | null {
   // Matching values are not an identity proof: another actor can create an
   // indistinguishable position. Never attach it to a Bitrix row implicitly.
   if (matchingUnlinkedCount > 0) return 'DEAL_ORDER_POSITION_ADD_IDENTITY_UNPROVEN';
   if (attempted) return 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN';
   return null;
+}
+
+function positionAssortmentKind(value: unknown): 'product' | 'service' | null {
+  if (!isRecord(value)) return null;
+  const kind = isRecord(value.meta) ? value.meta.type : undefined;
+  return kind === undefined ? 'product' : kind === 'product' || kind === 'service' ? kind : null;
 }
 
 function sourceValues(row: Row): { quantity: number; price: number; discount: number; vat: number; vatEnabled: boolean; vatIncluded: boolean | null } | null {

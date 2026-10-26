@@ -1,5 +1,7 @@
 import { isRetryableFailure, retryAtForFailure } from '../provider-failure';
+import { matchesReverseUnit } from '../field-settings/unit-reference';
 import { applyFieldTransform, type FieldTransform } from '../field-settings/field-transform';
+import { bitrixProductDescription, ProductDescriptionEncodingError } from './bitrix-product-description';
 
 export type ProductCardPair = {
   id: string;
@@ -13,6 +15,7 @@ export type ProductCardPair = {
   createdAt: Date;
 };
 
+/** Snapshots use major currency units on both sides, not native Remap kopecks. */
 export type ProductCardPrice = { priceId: string; typeId: string; value: number; currency: string; currencyRef?: Record<string, unknown> };
 export type ProductCardSnapshot = {
   name: string | null;
@@ -99,8 +102,22 @@ export class ProductCardSyncService {
         this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product'),
         this.state.read(pair.id),
       ]);
+      if (rules.description?.moyskladToBitrix24) {
+        // Compare the same approved projection that CREATE/UPDATE writes. Raw
+        // source fields remain intact; null/empty are one optional empty text.
+        bitrix24 = { ...bitrix24, detailText: bitrix24.detailText ?? '' };
+        moysklad = { ...moysklad, detailText: bitrixProductDescription(moysklad.detailText ?? '') };
+        if (previous) previous = { ...previous,
+          bitrix24Values: { ...previous.bitrix24Values, description: previous.bitrix24Values.description ?? '' },
+          moyskladValues: { ...previous.moyskladValues,
+            ...(typeof previous.moyskladValues.description === 'string'
+              ? { description: bitrixProductDescription(previous.moyskladValues.description) }
+              : { description: previous.moyskladValues.description ?? '' }) },
+        };
+      }
     } catch (error) {
       if (error instanceof ProductCardLeaseError || isRuntimeGateError(error)) throw error;
+      if (error instanceof ProductDescriptionEncodingError) return review(error.reason);
       return error instanceof ProductCardManualReviewError ? review(error.reason) : isRetryableFailure(error)
         ? retry('PRODUCT_CARD_READ_FAILED', [], retryAtForFailure(error, input.attempt ?? 1)) : review('PRODUCT_PROVIDER_REJECTED');
     }
@@ -195,9 +212,9 @@ export class ProductCardSyncService {
       if (verified) {
         try {
           setState(next, direction, 'BITRIX24', direction.bitrix24Key,
-            direction.target === 'BITRIX24' ? normalizeDirectionState(direction.field, direction.value) : readField(bitrix24, direction.field, direction));
+            direction.target === 'BITRIX24' ? normalizeDirectionState(direction.field, direction.value) : readField(bitrix24, direction.field, direction, 'BITRIX24'));
           setState(next, direction, 'MOYSKLAD', direction.moyskladKey,
-            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction));
+            direction.target === 'MOYSKLAD' ? direction.value : readField(moysklad, direction.field, direction, 'MOYSKLAD'));
           await this.state.write(pair.id, settingsVersion, next);
           changedFields.push(direction.field);
         } catch (error) {
@@ -277,7 +294,7 @@ export class ProductCardSyncService {
           // Remap exposes salePrices as an embedded collection. Re-read before
           // writing and include every current entry, preserving unpaired types.
           salePrices: moysklad.prices.map((price) => ({
-            value: price.typeId === direction.moyskladKey ? direction.value : price.value,
+            value: Number(price.typeId === direction.moyskladKey ? direction.value : price.value) * 100,
             ...(price.currencyRef ? { currency: price.currencyRef } : {}),
             priceType: { meta: {
               href: `https://api.moysklad.ru/api/remap/1.2/context/companysettings/pricetype/${price.typeId}`,
@@ -299,7 +316,7 @@ export class ProductCardSyncService {
       ? await this.api.readBitrix24(pair.bitrix24Id, pair.moyskladType === 'service' ? 'service' : 'product')
       : await this.api.readMoysklad(pair.moyskladId, pair.moyskladType === 'service' ? 'service' : 'product');
     if (field === 'name') return snapshot.name;
-    if (field === 'description') return snapshot.detailText;
+    if (field === 'description') return snapshot.detailText ?? '';
     if (field === 'code') return snapshot.code;
     if (field === 'unit') return snapshot.unitId;
     if (field.startsWith('field:') && direction.bitrix24Field) return snapshot.fields?.[direction.bitrix24Field];
@@ -403,7 +420,7 @@ function chooseUnit(b24: unknown, ms: unknown, oldB24: unknown, oldMs: unknown, 
   }
   if (sameIdentifier(b24, oldB24) && same(ms, oldMs)) return null;
   const target: Side = 'BITRIX24';
-  const row = mappings.filter((item) => record(item) && String(item.moyskladId) === ms && item.status === 'configured' && Number.isInteger(item.bitrix24Id) && Number(item.bitrix24Id) > 0);
+  const row = mappings.filter((item) => record(item) && matchesReverseUnit(item, typeof ms === 'string' ? ms : null) && Number.isInteger(item.bitrix24Id) && Number(item.bitrix24Id) > 0);
   if (row.length !== 1 || !record(row[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
   return { field: 'unit', target, value: row[0].bitrix24Id };
 }
@@ -480,7 +497,7 @@ function authoritativeRestoreDirections(b24: ProductCardSnapshot, ms: ProductCar
     }
   }
   if (ms.unitId) {
-    const matches = settings.references.units.filter((candidate) => record(candidate) && candidate.status === 'configured' && String(candidate.moyskladId) === ms.unitId && Number.isInteger(candidate.bitrix24Id));
+    const matches = settings.references.units.filter((candidate) => record(candidate) && matchesReverseUnit(candidate, ms.unitId) && Number.isInteger(candidate.bitrix24Id));
     if (matches.length !== 1 || !record(matches[0])) throw new ProductCardManualReviewError('PRODUCT_UNIT_MAPPING_MISSING_OR_AMBIGUOUS');
     const bitrix24Id = Number(matches[0].bitrix24Id);
     if (!sameIdentifier(b24.unitId, bitrix24Id)) add('unit', bitrix24Id, String(bitrix24Id), ms.unitId);
@@ -506,7 +523,7 @@ function authoritativeRestorePrices(b24: ProductCardPrice[], ms: ProductCardPric
 function findUnit(mappings: unknown[], b24: unknown, ms: unknown, value: unknown, target: Side) {
   const rows = mappings.filter((item) => record(item) && item.status === 'configured' &&
     String(item.bitrix24Id) === String(target === 'MOYSKLAD' ? b24 : value) &&
-    String(item.moyskladId) === String(target === 'BITRIX24' ? ms : value));
+    (target === 'BITRIX24' ? matchesReverseUnit(item, typeof ms === 'string' ? ms : null) : String(item.moyskladId) === String(value)));
   if (rows.length !== 1 || !record(rows[0])) return null;
   return { bitrix24Id: Number(rows[0].bitrix24Id), moyskladId: String(rows[0].moyskladId) };
 }
@@ -554,11 +571,15 @@ function setState(state: ProductCardSyncState, direction: Direction, side: Side,
   }
 }
 
-function readField(snapshot: ProductCardSnapshot, field: string, direction?: Direction): unknown {
+function readField(snapshot: ProductCardSnapshot, field: string, direction?: Direction, side?: Side): unknown {
   if (field === 'name') return snapshot.name;
   if (field === 'description') return snapshot.detailText;
   if (field === 'code') return snapshot.code;
   if (field === 'unit') return snapshot.unitId;
+  if (field.startsWith('price:')) {
+    const typeId = side === 'BITRIX24' ? direction?.bitrix24Key : direction?.moyskladKey;
+    return snapshot.prices.find((price) => price.typeId === typeId)?.value;
+  }
   if (field.startsWith('field:')) return direction?.moyskladField ? snapshot.fields?.[direction.moyskladField] : undefined;
   return undefined;
 }

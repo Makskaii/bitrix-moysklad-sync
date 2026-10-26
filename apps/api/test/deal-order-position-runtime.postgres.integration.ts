@@ -13,6 +13,7 @@ process.env.SYNC_MODE ??= 'apply';
 const db = new PrismaClient();
 const database = new DatabaseService();
 const productId = '33333333-3333-4333-8333-333333333333';
+const serviceProductId = '77777777-7777-4777-8777-777777777777';
 const unitId = '66666666-6666-4666-8666-666666666666';
 const stageId = '88888888-8888-4888-8888-888888888888';
 const currencyId = '99999999-9999-4999-8999-999999999999';
@@ -20,6 +21,7 @@ const serviceCounterpartyId = 'aaaaaaaa-1111-4111-8111-111111111111';
 let server: Server;
 let base = '';
 let productPairId = '';
+let servicePairId = '';
 let runtime: DealOrderPositionRuntimeService;
 let activeOrderId = '';
 let vatIncluded = false;
@@ -30,6 +32,9 @@ let positionAdds = 0;
 let failPositionReadId: string | null = null;
 let productReadBehavior: 'NORMAL' | 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MALFORMED_JSON' | 'INVALID_SHAPE' | 'INVALID_UOM' | 'UNAUTHORIZED' = 'NORMAL';
 let productReadCalls = 0;
+let productReadKind: 'product' | 'service' = 'product';
+let addAck: (row: Record<string, unknown>) => unknown = row => row;
+let failFirstAddedRead = true;
 const testOrderIds: string[] = [];
 
 before(async () => {
@@ -41,6 +46,7 @@ before(async () => {
   await db.syncSetting.upsert({ where: { id: 'global' }, create: { id: 'global', serviceMode: 'on' }, update: { serviceMode: 'on' } });
   await db.syncDirectionSetting.upsert({ where: { entityKey: 'deals-orders' }, create: { entityKey: 'deals-orders', bitrix24ToMoysklad: true, moyskladToBitrix24: true }, update: { bitrix24ToMoysklad: true, moyskladToBitrix24: true } });
   productPairId = (await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: '904', moyskladId: productId, source: 'MANUAL' } })).id;
+  servicePairId = (await db.entityPair.create({ data: { entityType: 'PRODUCT', bitrix24Id: '905', moyskladId: serviceProductId, moyskladType: 'service', source: 'MANUAL' } })).id;
   server = createServer((request, response) => { void reply(request, response); });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
@@ -70,11 +76,12 @@ after(async () => {
   await db.dealOrderCreateOperation.deleteMany({ where: { bitrix24DealId: { startsWith: '98' } } });
   await db.dealOrderReverseCreateOperation.deleteMany({ where: { moyskladOrderId: { in: testOrderIds } } });
   await db.entityPair.deleteMany({ where: { id: productPairId } });
+  await db.entityPair.deleteMany({ where: { id: servicePairId } });
   await db.$disconnect(); await database.$disconnect();
   if (server) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
-test('confirmed empty forward order receives later product rows with VAT through existing pair only', async () => {
+test('confirmed empty forward order receives later product and service rows with VAT through existing pair only', async () => {
   const dealId = uniqueDealId();
   const orderId = randomUUID();
   testOrderIds.push(orderId);
@@ -84,13 +91,15 @@ test('confirmed empty forward order receives later product rows with VAT through
   b24Rows = [];
   msRows = [
     { ...msPosition(randomUUID(), 4, 1_587_000), vat: 22, vatEnabled: true },
-    { ...msPosition(randomUUID(), 1, 150_000), vat: 22, vatEnabled: true },
+    { ...msPosition(randomUUID(), 1, 150_000), assortment: { id: serviceProductId, meta: { type: 'service', href: `${base}api/remap/1.2/entity/service/${serviceProductId}` } }, vat: 22, vatEnabled: true },
   ];
   await db.dealOrderCreateOperation.create({ data: {
     bitrix24DealId: dealId, syncId: randomUUID(), payload: { positions: [] }, skippedRows: [], settingsVersion: 2,
     status: 'SUCCEEDED', moyskladOrderId: orderId,
   } });
   calls = [];
+  addAck = row => row;
+  failFirstAddedRead = false;
   try {
     const result = await runtime.process({ pair: confirmed(pair), eventId: 'event-empty-forward-order-later-ms-rows', eventConfig: config(true) });
     assert.deepEqual(result, { status: 'SYNCED', rowValuesChanged: true });
@@ -98,7 +107,7 @@ test('confirmed empty forward order receives later product rows with VAT through
     assert.equal(b24Rows.reduce((sum, row) => sum + Number(row.quantity) * Number(row.price), 0), 64_980);
     assert.equal(b24Rows.reduce((sum, row) => sum + Number(row.quantity) * Number(row.price), 0) * 100, 6_498_000, 'Bitrix row total must match the native order total in minor units');
     assert.deepEqual(b24Rows.map(row => [row.productId, row.quantity, row.price, row.taxRate, row.taxIncluded]), [
-      [904, 4, 15_870, 22, 'Y'], [904, 1, 1_500, 22, 'Y'],
+      [904, 4, 15_870, 22, 'Y'], [905, 1, 1_500, 22, 'Y'],
     ]);
     assert.equal(await db.dealOrderPositionPair.count({ where: { pairId: pair.id } }), 2);
     assert.equal(await db.dealOrderReversePositionOperation.count({ where: { moyskladOrderId: orderId, status: 'SUCCEEDED' } }), 2);
@@ -271,6 +280,63 @@ test('new MySklad position ID is journaled before readback and retry resumes wit
   assert.equal((await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { id: operation.id } })).status, 'SUCCEEDED');
 });
 
+test('object and single-array ACK persist exact row binding for paid/free ADD, repeat and subsequent update', async () => {
+  for (const shape of ['object', 'array'] as const) for (const price of [7, 0]) {
+    const one = await seed(uniqueDealId());
+    addAck = row => shape === 'array' ? [row] : row;
+    failFirstAddedRead = false;
+    positionAdds = 0;
+    b24Rows.push({ id: '307', productId: 904, measureCode: 796, quantity: 2, price, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null });
+    const input = { pair: confirmed(one.pair), eventId: `event-add-${shape}-${price}`, eventConfig: config() };
+    assert.deepEqual(await runtime.process(input), { status: 'SYNCED', rowValuesChanged: true });
+    const op = await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '307' } } });
+    const link = await db.dealOrderPositionPair.findUniqueOrThrow({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '307' } } });
+    assert.equal(op.status, 'SUCCEEDED');
+    assert.equal(op.moyskladPositionId, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    assert.equal(link.moyskladPositionId, op.moyskladPositionId);
+    assert.equal(msRows.length, 2); assert.equal(msRows[1].quantity, 2); assert.equal(msRows[1].price, price * 100);
+    assert.equal((await runtime.process(input)).status, 'SYNCED');
+    assert.equal(positionAdds, 1);
+    b24Rows[1] = { ...b24Rows[1], quantity: 3 };
+    assert.deepEqual(await runtime.process({ ...input, eventId: input.eventId + '-update' }), { status: 'SYNCED', rowValuesChanged: true });
+    assert.equal(msRows[1].id, op.moyskladPositionId); assert.equal(msRows[1].quantity, 3);
+    assert.equal(msRows.length, 2); assert.equal(positionAdds, 1);
+  }
+});
+
+test('single-array ACK ID survives failed readback and recovery never repeats the POST', async () => {
+  const one = await seed(uniqueDealId());
+  addAck = row => [row];
+  positionAdds = 0;
+  b24Rows.push({ id: '308', productId: 904, measureCode: 796, quantity: 1, price: 0, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null });
+  const input = { pair: confirmed(one.pair), eventId: 'event-array-ack-readback-loss', eventConfig: config() };
+  assert.deepEqual(await runtime.process(input), { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_ADD_OUTCOME_UNKNOWN' });
+  const before = await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '308' } } });
+  assert.equal(before.moyskladPositionId, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+  assert.deepEqual(await runtime.process(input), { status: 'SYNCED', rowValuesChanged: true });
+  assert.equal(positionAdds, 1);
+  assert.equal((await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { id: before.id } })).status, 'SUCCEEDED');
+});
+
+test('malformed or errored ACK remains uncertain with no binding and cannot repeat CREATE', async () => {
+  const replies: Array<(row: Record<string, unknown>) => unknown> = [
+    () => [], row => [row, row], row => ({ ...row, errors: [] }), row => [{ ...row, errors: [{ code: 123 }] }],
+    row => ({ ...row, id: 'wrong-id' }), () => [{}], () => null,
+  ];
+  for (const reply of replies) {
+    const one = await seed(uniqueDealId());
+    addAck = reply; failFirstAddedRead = false; positionAdds = 0;
+    b24Rows.push({ id: '309', productId: 904, measureCode: 796, quantity: 1, price: 7, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null });
+    const input = { pair: confirmed(one.pair), eventId: 'event-malformed-add-' + one.pair.id, eventConfig: config() };
+    assert.deepEqual(await runtime.process(input), { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_ADD_RESPONSE_INVALID' });
+    const op = await db.dealOrderPositionAddOperation.findUniqueOrThrow({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '309' } } });
+    assert.equal(op.status, 'UNCERTAIN'); assert.equal(op.moyskladPositionId, null);
+    assert.equal(await db.dealOrderPositionPair.count({ where: { pairId: one.pair.id, bitrix24ProductRowId: '309' } }), 0);
+    assert.deepEqual(await runtime.process(input), { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_ADD_IDENTITY_UNPROVEN' });
+    assert.equal(positionAdds, 1); assert.equal(msRows.length, 2);
+  }
+});
+
 test('confirmed missing MySklad product skips only its row and records the reason', async () => {
   const one = await seed(uniqueDealId());
   b24Rows = [b24Rows[0], { id: '303', productId: 904, measureCode: 796, quantity: 1, price: 7, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
@@ -354,9 +420,56 @@ test('invalid product responses and non-transient 4xx are held without skipping,
   }
 });
 
+test('paired service rows use the service endpoint and explicitly approved reverse UOM on update and bootstrap', async () => {
+  productReadKind = 'service';
+  await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: 'service' } });
+  try {
+    const one = await seed(uniqueDealId());
+    msRows[0].assortment = { meta: { type: 'service', href: `${base}api/remap/1.2/entity/service/${productId}` } };
+    await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { moyskladValues: targetValues(msRows[0]) } });
+    const settings = config();
+    settings.config.references.units[0].moyskladId = 'aaaaaaaa-1111-4111-8111-111111111111';
+    settings.config.references.units[0].reverseMoyskladIds = [unitId];
+    msRows[0].quantity = 3;
+    calls = [];
+    assert.equal((await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-update', eventConfig: settings })).status, 'SYNCED');
+    assert.equal(b24Rows[0].quantity, 3);
+    assert.ok(calls.some(call => call.path.includes('/entity/service/')));
+    assert.ok(!calls.some(call => call.path.includes('/entity/product/')));
+    await db.dealOrderPositionPair.deleteMany({ where: { pairId: one.pair.id } });
+    assert.equal((await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-bootstrap', eventConfig: settings })).status, 'SYNCED');
+    assert.equal(await db.dealOrderPositionPair.count({ where: { pairId: one.pair.id } }), 1);
+  } finally {
+    productReadKind = 'product';
+    await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: null } });
+  }
+});
+
+test('forward row addition retains a saved service identity instead of constructing a product reference', async () => {
+  productReadKind = 'service';
+  await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: 'service' } });
+  try {
+    const one = await seed(uniqueDealId());
+    msRows[0].assortment = { meta: { type: 'service', href: `${base}api/remap/1.2/entity/service/${productId}` } };
+    await db.dealOrderPositionPair.update({ where: { pairId_bitrix24ProductRowId: { pairId: one.pair.id, bitrix24ProductRowId: '301' } }, data: { moyskladValues: targetValues(msRows[0]) } });
+    b24Rows.push({ ...b24Rows[0], id: '302', quantity: 1 });
+    failFirstAddedRead = false;
+    const result = await runtime.process({ pair: confirmed(one.pair), eventId: 'service-row-add', eventConfig: config() });
+    assert.equal(result.status, 'SYNCED');
+    assert.equal((msRows[1].assortment as any).meta.type, 'service');
+    assert.ok((msRows[1].assortment as any).meta.href.includes('/entity/service/'));
+  } finally {
+    productReadKind = 'product';
+    await db.entityPair.update({ where: { id: productPairId }, data: { moyskladType: null } });
+  }
+});
+
 async function seed(dealId: string) {
+  addAck = row => row;
+  failFirstAddedRead = true;
   await db.syncSetting.update({ where: { id: 'global' }, data: { serviceMode: 'on' } });
   const orderId = randomUUID();
+  testOrderIds.push(orderId);
   activeOrderId = orderId;
   const pair = await db.entityPair.create({ data: { entityType: 'DEAL', bitrix24Id: dealId, moyskladId: orderId, source: 'MANUAL' } });
   b24Rows = [{ id: '301', productId: 904, measureCode: 796, quantity: 2, price: 5, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null }];
@@ -416,7 +529,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     });
     return send(response, { id: activeOrderId, vatIncluded });
   }
-  if (url.pathname === '/api/remap/1.2/entity/product/' + productId) {
+  if (url.pathname === '/api/remap/1.2/entity/' + productReadKind + '/' + productId) {
     productReadCalls += 1;
     if (productReadCalls > 1 && productReadBehavior === 'NOT_FOUND') return send(response, {}, 404);
     if (productReadCalls > 1 && productReadBehavior === 'SERVER_ERROR') return send(response, {}, 500);
@@ -426,7 +539,10 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_SHAPE') return send(response, { id: productId, meta: { type: 'service' }, uom: { id: unitId } });
     if (productReadCalls > 1 && productReadBehavior === 'INVALID_UOM') return send(response, { id: productId, meta: { type: 'product' }, uom: { id: 796 } });
     if (productReadCalls > 1 && productReadBehavior === 'UNAUTHORIZED') return send(response, {}, 401);
-    return send(response, { id: productId, meta: { type: 'product' }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${unitId}`} } });
+    return send(response, { id: productId, meta: { type: productReadKind }, uom: { meta: {type:'uom',href:`${base}api/remap/1.2/entity/uom/${unitId}`} } });
+  }
+  if (url.pathname === `/api/remap/1.2/entity/service/${serviceProductId}`) {
+    return send(response, { id: serviceProductId, meta: { type: 'service' }, uom: { meta: { type: 'uom', href: `${base}api/remap/1.2/entity/uom/${unitId}` } } });
   }
   if (/\/positions\/[^/]+$/.test(url.pathname) && url.pathname.includes('/entity/customerorder/')) {
     const id = url.pathname.split('/').at(-1)!; const row = msRows.find((entry) => entry.id === id);
@@ -442,8 +558,8 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     const created = { ...payload, id };
     msRows.push(created);
-    failPositionReadId = id;
-    return send(response, { id, meta: { type: 'customerorderposition' } });
+    failPositionReadId = failFirstAddedRead ? id : null;
+    return send(response, addAck({ id, meta: { type: 'customerorderposition' } }));
   }
   if (url.pathname.endsWith('/positions')) {
     const offset = Number(url.searchParams.get('offset') ?? 0);

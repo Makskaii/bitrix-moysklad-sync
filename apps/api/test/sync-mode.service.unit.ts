@@ -12,6 +12,7 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
     resumeStatus: 'idle',
   };
   const transitions: Array<Record<string, unknown>> = [];
+  const transactionOptions: unknown[] = [];
   const transaction = {
     $queryRaw: async () => [],
     syncModeTransition: {
@@ -30,7 +31,10 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
     syncSetting: {
       upsert: async () => ({ ...state }),
     },
-    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>) => work(transaction),
+    $transaction: async <T>(work: (tx: typeof transaction) => Promise<T>, options: unknown) => {
+      transactionOptions.push(options);
+      return work(transaction);
+    },
   };
   const service = new SyncModeService(database as never);
 
@@ -49,6 +53,7 @@ test('leaving OFF never schedules or retains an OFF-period replay job', async ()
   assert.equal(state.resumeFrom, null);
   assert.equal(state.resumeThrough, null);
   assert.equal(state.lastInactiveAt, lastInactiveAt);
+  assert.deepEqual(transactionOptions, [{ timeout: 20_000 }, { timeout: 20_000 }]);
 });
 
 test('test ON, pause, and resume never establish or move the separately confirmed launch boundary', async () => {
@@ -240,6 +245,46 @@ test('deal preflight uses the selected source catalogs and keeps optional catalo
     else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
     if (oldB24Secret === undefined) delete process.env.BITRIX24_EVENT_APPLICATION_TOKEN;
     else process.env.BITRIX24_EVENT_APPLICATION_TOKEN = oldB24Secret;
+  }
+});
+
+test('reverse product preflight permits unused live UOMs when every configured target is unique and present', async () => {
+  const configuredUnits = Array.from({ length: 9 }, (_, index) => ({
+    bitrix24Id: index + 1,
+    bitrix24Code: String(index + 1),
+    moyskladId: `ms-unit-${index + 1}`,
+    moyskladCode: String(index + 1),
+    status: 'configured',
+  }));
+  const units = [
+    ...configuredUnits,
+    ...Array.from({ length: 3 }, (_, index) => ({
+      bitrix24Id: index + 10,
+      bitrix24Code: String(index + 10),
+      moyskladId: null,
+      moyskladCode: null,
+      status: 'unmapped',
+    })),
+  ];
+  const oldSecret = process.env.MOYSKLAD_WEBHOOK_SECRET;
+  process.env.MOYSKLAD_WEBHOOK_SECRET = 'test-only-secret';
+  try {
+    const service = new SyncModeService({} as never, undefined, undefined,
+      { active: async () => ({ version: 2, config: {
+        rules: [], references: { units, namedPairs: [] }, productCatalogRuntime: { bitrix24CatalogId: '14' },
+      } }) } as never,
+      { productCatalogReadiness: async () => ({
+        units: [...configuredUnits.map((unit) => unit.moyskladId), ...Array.from({ length: 55 }, (_, index) => `unused-ms-unit-${index + 1}`)],
+        productCatalogs: ['14'],
+      }) } as never);
+
+    const report = await service.preflightEntityDirection('products-variations', 'moyskladToBitrix24', 'admin-token');
+    assert.equal(report.canEnable, true);
+    assert.deepEqual(report.blockers, []);
+    assert.deepEqual(report.warnings.map((warning) => warning.code), ['UNUSED_PROVIDER_UNIT_UNMAPPED']);
+  } finally {
+    if (oldSecret === undefined) delete process.env.MOYSKLAD_WEBHOOK_SECRET;
+    else process.env.MOYSKLAD_WEBHOOK_SECRET = oldSecret;
   }
 });
 

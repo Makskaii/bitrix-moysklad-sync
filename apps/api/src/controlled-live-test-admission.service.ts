@@ -15,6 +15,7 @@ export interface VerifiedControlledSource {
 
 interface ControlledLiveManifestIngressRecord {
   entity: string;
+  name: string;
   syntheticOnly: true;
   direction: 'BITRIX24_TO_MOYSKLAD' | 'MOYSKLAD_TO_BITRIX24' | 'BOTH';
   sourceSystem: 'BITRIX24' | 'MOYSKLAD';
@@ -51,8 +52,10 @@ export class ControlledLiveTestAdmissionService {
       if (candidate.sourceSystem === source.sourceSystem &&
           candidate.sourceNativeId === source.sourceNativeId) return { record: candidate, reversed: false };
       if (candidate.direction === 'BOTH' && candidate.targetSystem === source.sourceSystem) {
-        const prior = priorBindings.find((row: any) => bindingMatchesManifestPair(row, candidate));
-        if (prior && candidate.targetNativeId === source.sourceNativeId) return { record: candidate, reversed: true };
+        const prior = priorBindings.find((row: any) => bindingMatchesManifestPair(row, candidate, this.manifest.runId));
+        const targetField = candidate.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+        const expectedTargetId = candidate.targetNativeId ?? prior?.[targetField];
+        if (prior && expectedTargetId === source.sourceNativeId) return { record: candidate, reversed: true };
       }
       return null;
     }).filter((item: any) => item !== null);
@@ -123,37 +126,82 @@ export class ControlledLiveTestAdmissionService {
    * before it is persisted or dispatched. The later provider read, admission,
    * marker, boundary, and transport checks remain authoritative as well.
    */
-  allowsIncomingEvent(input: {
+  async allowsIncomingEvent(input: {
     sourceSystem: 'BITRIX24' | 'MOYSKLAD';
     eventType: string | null;
     externalEntityType: string | null;
     sourceNativeId: string | null;
-  }): boolean {
+  }): Promise<boolean> {
     if (process.env.CONTROLLED_LIVE_TEST_MODE !== 'enabled') return true;
     const action = controlledIngressAction(input.sourceSystem, input.eventType);
     const entities = controlledIngressEntities(input.sourceSystem, input.externalEntityType);
     const records = (this.manifest as { records?: ControlledLiveManifestIngressRecord[] } | undefined)?.records;
     if (!action || !entities || !input.sourceNativeId || !Array.isArray(records)) return false;
+    const sourceNativeId = input.sourceNativeId;
 
-    const matchingRecords = records.filter((record) => {
+    const matchingRecords: ControlledLiveManifestIngressRecord[] = [];
+    for (const record of records) {
       if (!entities.includes(record.entity) || record.syntheticOnly !== true ||
           !Array.isArray(record.allowedActions) || record.allowedActions.length === 0 ||
           record.allowedActions.some((candidate) => candidate !== 'CREATE' && candidate !== 'UPDATE') ||
           new Set(record.allowedActions).size !== record.allowedActions.length || !record.allowedActions.includes(action) ||
           typeof record.sourceNativeId !== 'string' || !record.sourceNativeId ||
-          record.targetSystem === record.sourceSystem) return false;
+          record.targetSystem === record.sourceSystem) continue;
 
-      const sourceSide = record.sourceSystem === input.sourceSystem && record.sourceNativeId === input.sourceNativeId &&
+      const sourceSide = record.sourceSystem === input.sourceSystem && record.sourceNativeId === sourceNativeId &&
         (record.direction === 'BITRIX24_TO_MOYSKLAD' && record.sourceSystem === 'BITRIX24' && record.targetSystem === 'MOYSKLAD' ||
          record.direction === 'MOYSKLAD_TO_BITRIX24' && record.sourceSystem === 'MOYSKLAD' && record.targetSystem === 'BITRIX24' ||
-         record.direction === 'BOTH' && typeof record.targetNativeId === 'string' && record.targetNativeId.length > 0 && record.sourceSystem !== record.targetSystem);
-      if (sourceSide) return true;
+         record.direction === 'BOTH' && record.sourceSystem !== record.targetSystem);
+      if (sourceSide) {
+        matchingRecords.push(record);
+        continue;
+      }
 
-      return record.direction === 'BOTH' && typeof record.targetNativeId === 'string' && record.targetNativeId.length > 0 &&
-        record.targetSystem === input.sourceSystem && record.targetNativeId === input.sourceNativeId &&
-        record.sourceSystem !== record.targetSystem;
-    });
+      if (record.direction !== 'BOTH' || record.targetSystem !== input.sourceSystem || record.sourceSystem === record.targetSystem) continue;
+      if (typeof record.targetNativeId === 'string' && record.targetNativeId.length > 0) {
+        if (record.targetNativeId === sourceNativeId) matchingRecords.push(record);
+        continue;
+      }
+      if (record.targetNativeId === null && await this.hasExactBoundReverseTarget(record, sourceNativeId)) matchingRecords.push(record);
+    }
     return matchingRecords.length === 1;
+  }
+
+  private async hasExactBoundReverseTarget(record: ControlledLiveManifestIngressRecord, targetNativeId: string): Promise<boolean> {
+    const namespace = this.providerNamespace;
+    if (!namespace || !this.manifest?.runId) return false;
+    const sourceField = record.sourceSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+    const targetField = record.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+    const bindings = await this.database.controlledTestSourceBinding.findMany({
+      where: {
+        runId: this.manifest.runId,
+        entity: record.entity,
+        [sourceField]: record.sourceNativeId,
+        [targetField]: targetNativeId,
+        sourceName: record.name,
+        bitrix24PortalOrigin: namespace.bitrix24PortalOrigin,
+        bitrix24UserId: namespace.bitrix24UserId,
+        moyskladAccountId: namespace.moyskladAccountId,
+        createReservedByEventId: { not: null },
+      },
+      take: 2,
+    });
+    if (bindings.length !== 1) return false;
+    const binding = bindings[0];
+    if (!binding || binding.runId !== this.manifest.runId || binding.entity !== record.entity ||
+        binding[sourceField] !== record.sourceNativeId || binding[targetField] !== targetNativeId ||
+        binding.sourceName !== record.name || !binding.createReservedByEventId ||
+        binding.bitrix24PortalOrigin !== namespace.bitrix24PortalOrigin || binding.bitrix24UserId !== namespace.bitrix24UserId ||
+        binding.moyskladAccountId !== namespace.moyskladAccountId) return false;
+
+    const reservation = await this.database.controlledTestAdmission.findUnique({ where: { eventId: binding.createReservedByEventId } });
+    return !!reservation && reservation.bindingId === binding.id && reservation.runId === this.manifest.runId &&
+      reservation.entity === record.entity && reservation.sourceSystem === record.sourceSystem &&
+      reservation.sourceNativeId === record.sourceNativeId && reservation.targetSystem === record.targetSystem &&
+      reservation.targetNativeId === targetNativeId && reservation.sourceName === record.name &&
+      reservation.bitrix24PortalOrigin === namespace.bitrix24PortalOrigin && reservation.bitrix24UserId === namespace.bitrix24UserId &&
+      reservation.moyskladAccountId === namespace.moyskladAccountId &&
+      reservation.sourceCreatedAt instanceof Date && reservation.sourceCreatedAt.getTime() === binding.sourceCreatedAt.getTime();
   }
 
   async bindCreatedTarget(eventId: string, targetNativeId: string, verifiedTargetNativeId: string, verifiedTargetName: string, targetCreatedAt: Date, verifiedTargetRunMarker?: string): Promise<void> {
@@ -417,10 +465,16 @@ function canonicalProviderIds(record: any): { bitrix24NativeId: string | null; m
   };
 }
 
-function bindingMatchesManifestPair(binding: any, record: any): boolean {
+function bindingMatchesManifestPair(binding: any, record: any, runId: string): boolean {
   const pair = canonicalProviderIds(record);
-  return binding.entity === record.entity && binding.bitrix24NativeId === pair.bitrix24NativeId &&
-    binding.moyskladNativeId === pair.moyskladNativeId && binding.sourceName === record.name;
+  const sourceField = record.sourceSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetField = record.targetSystem === 'BITRIX24' ? 'bitrix24NativeId' : 'moyskladNativeId';
+  const targetMatches = pair[targetField] === null
+    ? typeof binding[targetField] === 'string' && binding[targetField].length > 0 &&
+      typeof binding.createReservedByEventId === 'string' && binding.createReservedByEventId.length > 0
+    : binding[targetField] === pair[targetField];
+  return binding.runId === runId && binding.entity === record.entity &&
+    binding[sourceField] === record.sourceNativeId && targetMatches && binding.sourceName === record.name;
 }
 
 function bindingMatchesExpected(binding: any, runId: string, record: any,

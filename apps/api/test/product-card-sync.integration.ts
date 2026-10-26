@@ -28,6 +28,18 @@ class MemoryState implements ProductCardStateStore {
   async write(_pairId: string, _version: number, state: ProductCardSyncState) { this.value = structuredClone(state); }
 }
 
+test('explicit reverse UOM alternative restores the B24 measure without changing the MS product', async () => {
+  const api = new FakeApi();
+  const configured = structuredClone(settings);
+  configured.references.units = [{ bitrix24Id: 4, moyskladId: 'canonical-unit', status: 'configured', reverseMoyskladIds: ['alternative-unit'] }];
+  api.moysklad.unitId = 'alternative-unit';
+  const result = await new ProductCardSyncService(api, new MemoryState()).sync({ pair, source: 'BITRIX24', authoritativeRestore: true, settingsVersion: 2, settings: configured });
+  assert.equal(result.status, 'SYNCED');
+  assert.equal(api.bitrix24.unitId, '4');
+  assert.equal(api.moysklad.unitId, 'alternative-unit');
+  assert.ok(api.writes.every((write) => write.side === 'BITRIX24'));
+});
+
 class FakeApi implements ProductCardApi {
   bitrix24 = card('Initial', 'B24 detail', '3', [{ priceId: 'b24-price-2', typeId: '2', value: 10, currency: 'RUB' }], { weight: 1.5, xmlId: 'initial-external' });
   moysklad = card('Initial', 'MS detail', 'unit-uuid-3', [{ priceId: 'ms-price-2', typeId: 'price-type-2', value: 10, currency: 'RUB', currencyRef: currencyRef() }], { weight: 1.5, externalCode: 'initial-external' });

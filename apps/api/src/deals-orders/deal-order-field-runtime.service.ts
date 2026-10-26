@@ -10,6 +10,7 @@ import { assertApplyExternalWrite } from '../external-write-guard';
 import { DealOrderWriteDirection, DealOrderWriteGateError, SyncModeService } from '../sync-mode.service';
 import { withDealOrderPairLock } from './deal-order-pair-lock';
 import { isPlannedDeliveryDateMapping, normalizePlannedDeliveryDate, toMoySkladPlannedDeliveryDate, touchesPlannedDeliveryDateEndpoint } from './planned-delivery-date';
+import { configuredStagePairs, dealStageMappings, DealStagePair } from './deal-order-stage-mappings';
 
 type ConfirmedPair = Extract<PairResolutionResult, { status: 'confirmed' }>['pair'];
 type RecordValue = Record<string, unknown>;
@@ -87,7 +88,7 @@ export class DealOrderFieldRuntimeService {
       const currentB24 = readDealOrderRuleField(bitrix24, rule, 'BITRIX24');
       const currentMs = readDealOrderRuleField(moysklad, rule, 'MOYSKLAD');
       if (!currentB24.supported || !currentMs.supported) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_FIELD_SHAPE_UNSUPPORTED' };
-      const transformed = applyFieldTransform(rule.moyskladToBitrix24.transform, currentMs.value);
+      const transformed = transformWarehouseOrField(input.newConfig, rule, 'MOYSKLAD_TO_BITRIX24', currentMs.value);
       if (transformed.status === 'skip') return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_SOURCE_VALUE_MISSING' };
       if (transformed.status === 'error' || !isFieldScalar(transformed.value)) return { status: 'manual_review', reason: 'DEAL_ORDER_REVISION_TRANSFORM_INVALID' };
       if (isExactOptionalStringMapping(rule.sourceField, rule.targetField) && (!isOptionalString(currentMs.value) || !isOptionalString(transformed.value))) {
@@ -156,7 +157,7 @@ export class DealOrderFieldRuntimeService {
       return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_FIELD_GROUPS_UNSUPPORTED' };
     }
     const rules = input.eventConfig.config.rules.filter((rule) => rule.entity === 'deals-orders' && (rule.bitrix24ToMoysklad.enabled || rule.moyskladToBitrix24.enabled));
-    if (!rules.length) return { status: 'SYNCED', heldRules: 0 };
+    if (!rules.length && !configuredStagePairs(input.eventConfig.config).length) return { status: 'SYNCED', heldRules: 0 };
 
     const baseline = await this.database.entityPairBaseline.findUnique({ where: { pairId: pair.id } });
     if (!baseline) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_BASELINE_MISSING' };
@@ -239,12 +240,13 @@ export class DealOrderFieldRuntimeService {
       const b24Changed = !sameJson(b24Current.value, previousB24);
       const msChanged = !sameJson(msCurrent.value, previousMs);
       const paidSumAuthority = isReadOnlyPaidSumRule(rule);
+      const warehouseAuthority = isReverseWarehouseRule(rule);
       if (paidSumAuthority && (!isFiniteNumber(msCurrent.value) || !(b24Current.value === null || isFiniteNumber(b24Current.value)))) {
         heldRules++;
         this.logHeld(input.eventId, pair.id, rule.id, 'READ_ONLY_PAID_SUM_VALUE_INVALID');
         continue;
       }
-      let direction: Direction | 'ECHO' = paidSumAuthority
+      let direction: Direction | 'ECHO' = warehouseAuthority ? 'MOYSKLAD_TO_BITRIX24' : paidSumAuthority
         ? (b24Changed || msChanged ? 'MOYSKLAD_TO_BITRIX24' : 'ECHO')
         : b24Changed && msChanged
         ? 'MOYSKLAD_TO_BITRIX24'
@@ -265,7 +267,10 @@ export class DealOrderFieldRuntimeService {
         continue;
       }
       const sourceValue = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current.value : msCurrent.value;
-      const transformResult = applyFieldTransform(mapping.transform, sourceValue);
+      const transformResult = transformWarehouseOrField(input.eventConfig, rule, direction, sourceValue);
+      if (transformResult.status === 'mapped' && transformResult.transform === 'warehouse-confirmed-default') {
+        await writeOperationalLog(this.database, 'EVENT', 'Warehouse source is not mapped; used the explicitly configured default warehouse.', input.eventId);
+      }
       if (transformResult.status === 'skip') {
         logger.warn(JSON.stringify({ eventId: input.eventId, pairId: pair.id, ruleId: rule.id, reason: `FIELD_VALUE_SKIPPED:${transformResult.reason}` }));
         continue;
@@ -368,14 +373,11 @@ export class DealOrderFieldRuntimeService {
     assertOwner: () => Promise<boolean>,
     runMutation: (direction: DealOrderWriteDirection, mutation: () => Promise<unknown>) => Promise<unknown>,
   ): Promise<Result | null> {
-    const stages = input.eventConfig.config.dealOrderRuntime?.stages;
-    if (!Array.isArray(stages) || stages.length === 0) return null;
+    const stages = configuredStagePairs(input.eventConfig.config);
+    const transitions = dealStageMappings(input.eventConfig.config);
+    if (stages.length === 0) return null;
     const b24State = jsonRecord(state.bitrix24Values);
     const msState = jsonRecord(state.moyskladValues);
-    if (!('native:stage' in b24State) || !('native:stage' in msState) ||
-        typeof b24State['native:stage'] !== 'string' || typeof msState['native:stage'] !== 'string') {
-      return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_BASELINE_UNAVAILABLE' };
-    }
     let b24: RecordValue;
     let moysklad: RecordValue;
     try {
@@ -386,7 +388,30 @@ export class DealOrderFieldRuntimeService {
     } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_STAGE_READ_FAILED' }; }
     const b24Current = readConfiguredStage(b24, stages, 'BITRIX24');
     const msCurrent = readConfiguredStage(moysklad, stages, 'MOYSKLAD');
-    if (!b24Current || !msCurrent) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
+    const preserveUnmappedStage = async (): Promise<Result | null> => {
+      if (input.eventConfig.config.dealOrderRuntime?.unmappedStagePolicy !== 'preserve-and-warn' ||
+          !readNativeStage(b24, 'BITRIX24') || !readNativeStage(moysklad, 'MOYSKLAD')) {
+        return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
+      }
+      await writeOperationalLog(this.database, 'EVENT', 'Deal/order native stages preserved; other fields continue; reason=DEAL_ORDER_STAGE_PRESERVED_UNMAPPED', input.eventId);
+      return null;
+    };
+    if (!b24Current || !msCurrent) return preserveUnmappedStage();
+    if (typeof b24State['native:stage'] !== 'string' || typeof msState['native:stage'] !== 'string') {
+      // Old snapshots did not include stages. Only establish an observation
+      // when both providers already agree; never guess the winner of an old
+      // disagreement or silently swallow a user's first transition.
+      const aligned = stages.filter(stage => stage.bitrix24StageId === b24Current && stage.moyskladId === msCurrent);
+      if (aligned.length !== 1) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_BASELINE_UNAVAILABLE' };
+      if (!await assertOwner()) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
+      try {
+        await this.database.entityPairSyncState.update({ where: { pairId: pair.id }, data: {
+          bitrix24Values: { ...b24State, 'native:stage': b24Current } as Prisma.InputJsonValue,
+          moyskladValues: { ...msState, 'native:stage': msCurrent } as Prisma.InputJsonValue,
+        } });
+        return null;
+      } catch { return { status: 'RETRY', reason: 'DEAL_ORDER_STAGE_STATE_STORE_FAILED' }; }
+    }
     const b24Changed = b24Current !== b24State['native:stage'];
     const msChanged = msCurrent !== msState['native:stage'];
     if (!b24Changed && !msChanged) return null;
@@ -400,10 +425,11 @@ export class DealOrderFieldRuntimeService {
     if (!enabled) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_DIRECTION_DISABLED' };
 
     const sourceId = direction === 'BITRIX24_TO_MOYSKLAD' ? b24Current : msCurrent;
-    const mapping = stages.filter((stage) => direction === 'BITRIX24_TO_MOYSKLAD'
-      ? stage.bitrix24StageId === sourceId
-      : stage.moyskladId === sourceId);
-    if (mapping.length !== 1 || !isUuid(mapping[0].moyskladId) || !mapping[0].bitrix24StageId) {
+    const mapping = direction === 'BITRIX24_TO_MOYSKLAD'
+      ? transitions.bitrix24ToMoysklad.filter(stage => stage.bitrix24StageId === sourceId)
+      : transitions.moyskladToBitrix24.filter(stage => stage.moyskladId === sourceId);
+    if (mapping.length === 0) return preserveUnmappedStage();
+    if (mapping.length !== 1 || !isNativeStageId(mapping[0].moyskladId) || !mapping[0].bitrix24StageId) {
       return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_STAGE_UNMAPPED' };
     }
     const expectedB24 = mapping[0].bitrix24StageId;
@@ -494,13 +520,50 @@ function readScalarField(record: RecordValue, field: string, system: 'bitrix24' 
   return { supported: false };
 }
 
-function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'BITRIX24' | 'MOYSKLAD'):
+export function readDealOrderRuleField(record: RecordValue, rule: Rule, side: 'BITRIX24' | 'MOYSKLAD'):
   { supported: true; value: string | number | boolean | null } | { supported: false } {
   const field = side === 'BITRIX24' ? rule.sourceField : rule.targetField;
+  if (isReverseWarehouseRule(rule) && side === 'MOYSKLAD') return readNativeWarehouse(record.store);
+  if (isReverseWarehouseRule(rule) && side === 'BITRIX24') {
+    const value = record[field];
+    if (value === undefined || value === null || value === '') return { supported: true, value: null };
+    if ((typeof value === 'string' || typeof value === 'number') && /^\d{1,20}$/.test(String(value))) return { supported: true, value: String(value) };
+    return { supported: false };
+  }
   const scalar = readScalarField(record, field, side === 'BITRIX24' ? 'bitrix24' : 'moysklad');
   if (!scalar.supported || !isPlannedDeliveryDateMapping(rule.sourceField, rule.targetField)) return scalar;
   const normalized = normalizePlannedDeliveryDate(scalar.value, side);
   return normalized.supported ? normalized : { supported: false };
+}
+
+export function isReverseWarehouseRule(rule: Rule): boolean {
+  return rule.entity === 'deals-orders' && rule.sourceField === 'UF_CRM_1732004209' && rule.targetField === 'store' &&
+    !rule.bitrix24ToMoysklad.enabled && rule.moyskladToBitrix24.enabled && rule.moyskladToBitrix24.transform.kind === 'reference-map' &&
+    rule.moyskladToBitrix24.transform.resource === 'store';
+}
+export function transformWarehouseOrField(config: VersionedFieldSettingsDto, rule: Rule, direction: Direction, value: unknown): ReturnType<typeof applyFieldTransform> {
+  const transform = direction === 'MOYSKLAD_TO_BITRIX24' ? rule.moyskladToBitrix24.transform : rule.bitrix24ToMoysklad.transform;
+  const result = applyFieldTransform(transform, value);
+  if (!isReverseWarehouseRule(rule) || direction !== 'MOYSKLAD_TO_BITRIX24') return result;
+  const runtime = config.config.dealOrderRuntime;
+  if (result.status === 'mapped') {
+    const known = runtime?.stores.filter(row => row.moyskladId === value && row.bitrix24Id === String(result.value));
+    return known?.length === 1 ? result : { status: 'error', reason: 'Warehouse mapping must match a configured native store pair', transform: 'reference-map' };
+  }
+  // Empty or malformed references are not evidence for choosing another store.
+  if (result.status !== 'error' || typeof value !== 'string' || !isNativeStageId(value) || runtime?.unmappedReferencePolicy !== 'confirmed-defaults') return result;
+  const defaults = runtime.stores.filter(row => row.moyskladId === runtime.defaultStoreId);
+  if (defaults.length !== 1 || !/^\d+$/.test(defaults[0].bitrix24Id)) return result;
+  return { status: 'mapped', value: defaults[0].bitrix24Id, transform: 'warehouse-confirmed-default' };
+}
+function readNativeWarehouse(value: unknown): { supported: true; value: string | null } | { supported: false } {
+  if (value === undefined || value === null) return { supported: true, value: null };
+  if (!isRecord(value) || !isRecord(value.meta) || value.meta.type !== 'store' || typeof value.meta.href !== 'string') return { supported: false };
+  try {
+    const base = externalBase(process.env.MOYSKLAD_API_BASE_URL), url = new URL(value.meta.href), id = url.pathname.split('/').at(-1) ?? '';
+    if (!isNativeStageId(id) || url.href !== new URL(`entity/store/${id}`, base).href) return { supported: false };
+    return { supported: true, value: id };
+  } catch { return { supported: false }; }
 }
 
 async function writeMoySkladAttribute(orderId: string, targetField: string, value: string | number | boolean | null, sourceField: string) {
@@ -524,11 +587,11 @@ async function writeMoySkladStage(orderId: string, stateId: string) {
   assertApplyExternalWrite('MOYSKLAD', 'DEAL_ORDER_STAGE_UPDATE');
   const base = externalBase(process.env.MOYSKLAD_API_BASE_URL);
   const token = process.env.MOYSKLAD_API_TOKEN;
-  if (!token || !isUuid(stateId)) throw new Error('unsupported customerorder state');
+  if (!token || !isNativeStageId(stateId)) throw new Error('unsupported customerorder state');
   const url = new URL(`entity/customerorder/${encodeURIComponent(orderId)}`, base);
   const href = new URL(`entity/customerorder/metadata/states/${encodeURIComponent(stateId)}`, base).href;
   const response = await fetch(url, {
-    method: 'PUT', headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' },
+    method: 'PUT', headers: { authorization: `Bearer ${token}`, accept: 'application/json;charset=utf-8', 'accept-encoding': 'gzip', 'content-type': 'application/json' },
     body: JSON.stringify({ state: { meta: { href, type: 'state', mediaType: 'application/json' } } }),
     redirect: 'error', signal: AbortSignal.timeout(10_000),
   });
@@ -651,14 +714,19 @@ function externalBase(value: string | undefined): URL {
   if (!url.href.endsWith('/')) url.pathname += '/';
   return url;
 }
-function readConfiguredStage(
+export function readConfiguredStage(
   record: RecordValue,
-  stages: Array<{ bitrix24StageId: string; moyskladId: string; creationEnabled: boolean }>,
+  stages: DealStagePair[],
   side: 'BITRIX24' | 'MOYSKLAD',
 ): string | null {
+  const id = readNativeStage(record, side);
+  return id && stages.some(stage => (side === 'BITRIX24' ? stage.bitrix24StageId : stage.moyskladId) === id) ? id : null;
+}
+
+function readNativeStage(record: RecordValue, side: 'BITRIX24' | 'MOYSKLAD'): string | null {
   if (side === 'BITRIX24') {
     const id = typeof record.STAGE_ID === 'string' ? record.STAGE_ID : null;
-    return id && stages.filter((stage) => stage.bitrix24StageId === id).length === 1 ? id : null;
+    return id && /^(?:C\d+:)?[A-Z][A-Z0-9_]*$/.test(id) ? id : null;
   }
   const state = isRecord(record.state) ? record.state : null;
   const meta = state && isRecord(state.meta) ? state.meta : null;
@@ -670,8 +738,8 @@ function readConfiguredStage(
     const prefix = base.pathname.endsWith('/') ? base.pathname.slice(0, -1) : base.pathname;
     const suffix = target.pathname.startsWith(`${prefix}/`) ? target.pathname.slice(prefix.length) : '';
     const match = suffix.match(/^\/entity\/customerorder\/metadata\/states\/([0-9a-f-]{36})$/i);
-    const id = target.origin === base.origin ? match?.[1] ?? null : null;
-    return id && stages.filter((stage) => stage.moyskladId === id).length === 1 ? id : null;
+    const id = target.origin === base.origin && !target.search && !target.hash && !target.username && !target.password ? match?.[1] ?? null : null;
+    return id;
   } catch { return null; }
 }
 function jsonRecord(value: Prisma.JsonValue): RecordValue {
@@ -686,4 +754,9 @@ function isRecord(value: unknown): value is RecordValue {
 }
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isNativeStageId(value: unknown): value is string {
+  // MySklad native IDs are UUID-shaped but do not require RFC variant bits.
+  return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
 }
