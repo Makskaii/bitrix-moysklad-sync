@@ -32,6 +32,14 @@ export function selectedCompanyPriceType(value: unknown, options: PriceTypeOptio
   return matches[0].uuid;
 }
 
+/** Resolves a native MoySklad UUID to the exact Bitrix reference-list element ID. */
+export function companyPriceTypeElementId(value: unknown, options: PriceTypeOption[]): string {
+  if (typeof value !== 'string' || !uuid.test(value)) throw new Error('COMPANY_PRICE_TYPE_UUID_INVALID');
+  const matches = options.filter(option => option.uuid === value.toLowerCase());
+  if (matches.length !== 1) throw new Error('COMPANY_PRICE_TYPE_UUID_UNMAPPED');
+  return matches[0]!.id;
+}
+
 export function normalizeMoyskladPriceType(record: Record<string, unknown>, base: string | undefined): Record<string, unknown> {
   if (record.priceType === undefined || record.priceType === null) return { ...record, priceType: null };
   const value = record.priceType;

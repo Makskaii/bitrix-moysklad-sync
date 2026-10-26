@@ -575,7 +575,13 @@ function validateRuleCompatibility(
   const targetShape = target.shape ?? inferFieldShape(target.type);
   const kind = transform.kind;
   if (kind === 'price-type-uuid') {
-    if (entity === 'companies' && direction === 'BITRIX24_TO_MOYSKLAD' && sourceCode === 'UF_CRM_MS_PRICE_TYPE' && targetCode === 'priceType' && source.referenceKind === 'pricetype' && target.referenceKind === 'pricetype' && sourceCardinality === 'single' && targetCardinality === 'single') return;
+    const exactCompanyPriceTypePair = entity === 'companies'
+      && source.referenceKind === 'pricetype' && target.referenceKind === 'pricetype'
+      && sourceCardinality === 'single' && targetCardinality === 'single'
+      && (direction === 'BITRIX24_TO_MOYSKLAD'
+        ? sourceCode === 'UF_CRM_MS_PRICE_TYPE' && targetCode === 'priceType'
+        : sourceCode === 'priceType' && targetCode === 'UF_CRM_MS_PRICE_TYPE');
+    if (exactCompanyPriceTypePair) return;
     throw new BadRequestException('price-type-uuid is reserved for the single company price-type field and native MoySklad priceType');
   }
   if (kind === 'copy') {
