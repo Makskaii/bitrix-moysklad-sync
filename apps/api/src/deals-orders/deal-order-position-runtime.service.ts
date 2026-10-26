@@ -78,12 +78,19 @@ export class DealOrderPositionRuntimeService {
       if (sourceVatModes.size === 1 && (sourceVatModes.has('Y') !== msVatIncluded)) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_VAT_INCLUSION_CONFLICT' };
       msRows = msRows.map((row) => ({ ...row, vatIncluded: msVatIncluded }));
     }
-    if (!links.length) return this.bootstrapHistoricalLinks(pair.id, pair.moyskladId, input.eventId, input.eventConfig, b24Rows, msRows, lease);
+    if (!links.length) {
+      const canAddToConfirmedEmptyForwardOrder = b24Rows.length === 0 && msRows.length > 0 && this.reverseCreate &&
+        await this.hasConfirmedEmptyForwardOrder(pair.bitrix24Id, pair.moyskladId);
+      if (!canAddToConfirmedEmptyForwardOrder) {
+        return this.bootstrapHistoricalLinks(pair.id, pair.moyskladId, input.eventId, input.eventConfig, b24Rows, msRows, lease);
+      }
+    }
     const skippedRows: Array<{ sourceSystem: 'BITRIX24' | 'MOYSKLAD'; sourceRowId: string; reason: string }> = [];
     let linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
     let linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
     const newRows = b24Rows.filter((row) => !linkedSourceIds.has(String(row.id)));
     let unlinkedTargets = msRows.filter((row) => !linkedTargetIds.has(row.id));
+    let reverseRowsAdded = false;
     if (unlinkedTargets.length > newRows.length) {
       if (newRows.length || !this.reverseCreate) return { status: 'MANUAL_REVIEW', reason: 'DEAL_ORDER_POSITION_SET_CHANGED' };
       const directionSetting = await this.database.syncDirectionSetting.findUnique({ where: { entityKey: 'deals-orders' }, select: { moyskladToBitrix24: true } });
@@ -97,7 +104,17 @@ export class DealOrderPositionRuntimeService {
         if (error instanceof DealOrderWriteGateError) return { status: 'RETRY', reason: error.message };
         return { status: 'RETRY', reason: 'DEAL_ORDER_REVERSE_POSITION_ADD_FAILED' };
       }
+      // The reverse add has created and read back the Bitrix rows. Re-read the
+      // source snapshot before reconciling its durable links; otherwise the
+      // rows added above look like deleted Bitrix rows in this same pass.
+      const linksBeforeReverseAdd = links.length;
+      try { b24Rows = await readAllBitrixRows(pair.bitrix24Id, this.providerGate); }
+      catch (error) {
+        if (error instanceof ServiceModeNotOnError) throw error;
+        return { status: 'RETRY', reason: 'DEAL_ORDER_POSITION_READ_FAILED' };
+      }
       links = await this.database.dealOrderPositionPair.findMany({ where: { pairId: pair.id }, orderBy: { bitrix24ProductRowId: 'asc' } });
+      reverseRowsAdded = links.length > linksBeforeReverseAdd;
       linkedSourceIds = new Set(links.map((link) => link.bitrix24ProductRowId));
       linkedTargetIds = new Set(links.map((link) => link.moyskladPositionId));
       unlinkedTargets = msRows.filter((row) => !linkedTargetIds.has(row.id));
@@ -286,7 +303,7 @@ export class DealOrderPositionRuntimeService {
       const unlinked = await lease.commit((transaction) => transaction.dealOrderPositionPair.deleteMany({ where: { id: { in: alreadyDeleted } } }));
       if (!unlinked.committed) return { status: 'RETRY', reason: 'DEAL_ORDER_PAIR_LOCK_LOST' };
     }
-    const rowValuesChanged = plans.some((plan) => plan.direction !== 'ECHO') || deletions.length > 0 || newRows.length > 0 || alreadyDeleted.length > 0;
+    const rowValuesChanged = reverseRowsAdded || plans.some((plan) => plan.direction !== 'ECHO') || deletions.length > 0 || newRows.length > 0 || alreadyDeleted.length > 0;
     if (skippedRows.length) return { status: 'PARTIAL', reason: 'DEAL_ORDER_POSITION_ROWS_SKIPPED', skippedRows };
     return rowValuesChanged ? { status: 'SYNCED', rowValuesChanged: true } : { status: 'SYNCED' };
   }
@@ -303,6 +320,20 @@ export class DealOrderPositionRuntimeService {
       if (error instanceof DocumentProductIdentityError) return { status: 'MANUAL_REVIEW', reason: error.reason };
       throw error;
     }
+  }
+
+  /** Only a durable, successful forward create with no source or skipped rows
+   * proves that an empty Bitrix document is intentional rather than historical
+   * data whose row correspondence is ambiguous. */
+  private async hasConfirmedEmptyForwardOrder(bitrix24DealId: string, moyskladOrderId: string): Promise<boolean> {
+    const operation = await this.database.dealOrderCreateOperation.findUnique({
+      where: { bitrix24DealId },
+      select: { status: true, moyskladOrderId: true, payload: true, skippedRows: true },
+    });
+    const payload = operation && isRecord(operation.payload) ? operation.payload as Record<string, unknown> : null;
+    if (operation?.status !== 'SUCCEEDED' || operation.moyskladOrderId !== moyskladOrderId || !payload) return false;
+    return Array.isArray(payload.positions) && payload.positions.length === 0 &&
+      Array.isArray(operation.skippedRows) && operation.skippedRows.length === 0;
   }
 
   private async bootstrapHistoricalLinks(
