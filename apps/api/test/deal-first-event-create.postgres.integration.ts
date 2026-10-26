@@ -185,7 +185,7 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   const operation = await app.get(DatabaseService).dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } });
   assert.equal(operation.status, 'SUCCEEDED');
   assert.equal(operation.moyskladOrderId, refs.order);
-  assert.equal(b24DealTitle, 'SO-TEST-1'); assert.equal(b24OrderNumber, 'SO-TEST-1');
+  assert.equal(b24DealTitle, 'Original source title'); assert.equal(b24OrderNumber, 'SO-TEST-1');
   const pair = await app.get(DatabaseService).entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: dealId, active: true } });
   assert.equal(pair.moyskladId, refs.order);
   assert.equal(await app.get(DatabaseService).dealOrderPositionPair.count({ where: { pairId: pair.id } }), 1);
@@ -367,7 +367,7 @@ test('actual public forward create, delayed source read failure and cold restart
     assert.equal(pair.bitrix24Id, sourceId); assert.equal(createPosts, beforePosts + 1); assert.equal(reverseAdds, before);
     assert.equal(await restarted.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: id } }), 0);
     assert.equal(await restarted.pairReviewCase.count({ where: { sourceEntityId: id } }), 0);
-    assert.equal(b24DealTitle, 'SO-TEST-1');
+    assert.equal(b24DealTitle, 'Original forward title');
   } finally { release(); forwardReadBarrier = null; failForwardReadOnce = false; forwardNativeId = refs.order; }
 });
 
@@ -541,7 +541,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
     b24OrderNumber = form.get('fields[UF_CRM_1729757435964]');
-    b24DealTitle = form.get('fields[TITLE]');
+    if (form.has('fields[TITLE]')) b24DealTitle = form.get('fields[TITLE]');
     return send(response, { result: true });
   }
   response.writeHead(404, { 'content-type': 'application/json' });

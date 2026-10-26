@@ -80,17 +80,18 @@ export class DealOrderCreateOperationService {
     };
     const current = await read();
     // The saved native target ID already exists before this source write.
-    // Confirm the complete native order name in BOTH source fields before
-    // committing the pair; response-loss recovery uses that same target ID.
-    if (current.UF_CRM_1729757435964 !== orderName || current.TITLE !== orderName) {
+    // Store the native order name only in the dedicated order-number field;
+    // the deal title belongs to the Bitrix user and must not be overwritten.
+    // Response-loss recovery uses the same saved native target ID.
+    if (current.UF_CRM_1729757435964 !== orderName) {
       const body = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('crm.deal.update.json', withSlash(base)), {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName, 'fields[TITLE]': orderName }),
+        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName }),
       }));
       if (!isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
     }
     const verified = await read();
-    if (verified.UF_CRM_1729757435964 !== orderName || verified.TITLE !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
+    if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
   }
 
   /** Record that a new B24 deal is waiting for complete dependencies. This is
