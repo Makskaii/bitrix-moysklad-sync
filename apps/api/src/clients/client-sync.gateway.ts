@@ -1,7 +1,7 @@
 export type ClientRecord = Record<string, unknown>;
 import { assertApplyExternalWrite } from '../external-write-guard';
 import { ClientProviderOperation, ProviderFailure, providerResponseFailure } from '../provider-failure';
-import { COMPANY_PRICE_TYPE_FIELD, companyPriceTypeOptions, selectedCompanyPriceType, PriceTypeOption, normalizeMoyskladPriceType, encodeMoyskladPriceType } from './company-price-type';
+import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_IBLOCK, COMPANY_PRICE_TYPE_IBLOCK_TYPE, assertCompanyPriceTypeSchema, companyPriceTypeOptions, selectedCompanyPriceType, PriceTypeOption, normalizeMoyskladPriceType, encodeMoyskladPriceType } from './company-price-type';
 
 export interface ClientSyncGateway {
   readBitrix(entity: 'COMPANY' | 'CONTACT', id: string): Promise<ClientRecord>;
@@ -30,8 +30,16 @@ export class HttpClientSyncGateway implements ClientSyncGateway {
     const refresh = async () => {
       const rows = await this.bitrixRequest('crm.company.userfield.list.json', new URLSearchParams({ 'filter[FIELD_NAME]': COMPANY_PRICE_TYPE_FIELD }), 'CLIENT_COMPANY_READ');
       if (!Array.isArray(rows) || rows.length !== 1 || !isRecord(rows[0]) || !/^\d+$/.test(String(rows[0].ID))) throw new Error('COMPANY_PRICE_TYPE_FIELD_UNAVAILABLE');
-      const meta = await this.bitrixRequest('userfieldconfig.get.json', new URLSearchParams({ moduleId: 'crm', id: String(rows[0].ID) }), 'CLIENT_COMPANY_READ');
-      this.companyPriceOptions = { at: Date.now(), options: companyPriceTypeOptions(meta) };
+      const meta = await this.bitrixRequest('crm.company.userfield.get.json', new URLSearchParams({ id: String(rows[0].ID) }), 'CLIENT_COMPANY_READ');
+      assertCompanyPriceTypeSchema(meta);
+      const all: unknown[] = [];
+      for (let start = 0; start < 1000; start += 50) {
+        const page = await this.bitrixRequest('lists.element.get.json', new URLSearchParams({ IBLOCK_ID: COMPANY_PRICE_TYPE_IBLOCK, IBLOCK_TYPE_ID: COMPANY_PRICE_TYPE_IBLOCK_TYPE, start: String(start) }), 'CLIENT_COMPANY_READ');
+        if (!Array.isArray(page)) throw new Error('COMPANY_PRICE_TYPE_DIRECTORY_INVALID');
+        all.push(...page);
+        if (page.length < 50) { this.companyPriceOptions = { at: Date.now(), options: companyPriceTypeOptions(all) }; return; }
+      }
+      throw new Error('COMPANY_PRICE_TYPE_DIRECTORY_TOO_LARGE');
     };
     if (!this.companyPriceOptions || Date.now() - this.companyPriceOptions.at > 60_000) await refresh();
     if (!this.companyPriceOptions!.options.some(option => option.id === String(record[COMPANY_PRICE_TYPE_FIELD]))) await refresh();

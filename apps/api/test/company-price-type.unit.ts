@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_MARKER, companyPriceTypeOptions, selectedCompanyPriceType, normalizeMoyskladPriceType, encodeMoyskladPriceType } from '../src/clients/company-price-type';
+import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_MARKER, assertCompanyPriceTypeSchema, companyPriceTypeOptions, selectedCompanyPriceType, normalizeMoyskladPriceType, encodeMoyskladPriceType } from '../src/clients/company-price-type';
 import { CompanyPriceTypeDirectoryService, planCompanyPriceOptions } from '../src/clients/company-price-type-directory.service';
 import { HttpClientSyncGateway } from '../src/clients/client-sync.gateway';
 import { applyFieldTransform } from '../src/field-settings/field-transform';
@@ -11,17 +11,21 @@ const one = '02b04e92-d515-11e2-e753-7054d21a8d1e';
 const two = 'f2ead8ce-de34-11e5-7a69-8f550015ae90';
 const base = 'https://ms.invalid/api/remap/1.2/';
 const option = { id: '626', uuid: one, name: 'Retail' };
-const field = () => ({ field: { id: '1422', entityId: 'CRM_COMPANY', fieldName: COMPANY_PRICE_TYPE_FIELD, xmlId: COMPANY_PRICE_TYPE_MARKER, userTypeId: 'enumeration', multiple: 'N', enum: [{ id: '626', xmlId: one, value: 'Retail' }] } });
+const field = () => ({ ID: '1424', FIELD_NAME: COMPANY_PRICE_TYPE_FIELD, XML_ID: COMPANY_PRICE_TYPE_MARKER, USER_TYPE_ID: 'iblock_element', MULTIPLE: 'N', SETTINGS: { IBLOCK_ID: 108 } });
+const elements = () => [{ ID: '626', IBLOCK_ID: '108', CODE: one, NAME: 'Retail' }];
 
 test('typed option contract checks marker, multiplicity, unique IDs and UUIDs; names do not establish identity', () => {
   const metadata = field();
-  const options = companyPriceTypeOptions(metadata);
+  assertCompanyPriceTypeSchema(metadata);
+  const options = companyPriceTypeOptions(elements());
   assert.equal(selectedCompanyPriceType('626', options), one);
+  assert.equal(selectedCompanyPriceType(['626'], options), one);
+  assert.throws(() => selectedCompanyPriceType(['626', '628'], options), /SELECTION_INVALID/);
   assert.equal(selectedCompanyPriceType('', options), null);
   assert.throws(() => selectedCompanyPriceType('Retail', options), /UNMAPPED/);
-  metadata.field.multiple = 'Y';
-  assert.throws(() => companyPriceTypeOptions(metadata), /SCHEMA_INVALID/);
-  const duplicate = field(); duplicate.field.enum.push({ id: '628', xmlId: one, value: 'Other' });
+  metadata.MULTIPLE = 'Y';
+  assert.throws(() => assertCompanyPriceTypeSchema(metadata), /SCHEMA_INVALID/);
+  const duplicate = elements(); duplicate.push({ ID: '628', IBLOCK_ID: '108', CODE: one, NAME: 'Other' });
   assert.throws(() => companyPriceTypeOptions(duplicate), /OPTIONS_INVALID/);
 });
 
@@ -30,8 +34,8 @@ test('catalog updates retain option IDs/UUIDs and removed variants; new UUIDs re
   const three = '78a9ffa3-0712-11e6-7a69-8f5500119e54';
   const plan = planCompanyPriceOptions([{ id: one, name: 'Renamed' }, { id: three, name: 'New' }], old);
   assert.equal(plan.renamed, 1); assert.equal(plan.added, 1); assert.deepEqual(plan.missing, [two]);
-  assert.equal(plan.list[0].ID, '626'); assert.equal(plan.list[0].XML_ID, one);
-  assert.equal(plan.list[1].ID, '628'); assert.equal(plan.list[2].XML_ID, three);
+  assert.equal(plan.list[0].ID, '626'); assert.equal(plan.list[0].CODE, one);
+  assert.equal(plan.list[1].ID, '628'); assert.equal(plan.list[2].CODE, three);
   assert.equal(plan.list[2].ID, undefined);
   assert.throws(() => planCompanyPriceOptions([{ id: one, name: 'A' }, { id: one, name: 'B' }], []), /CATALOG_INVALID/);
 });
@@ -53,7 +57,7 @@ test('reserved transform accepts verified UUIDs only and leaves an empty selecti
   for (const wrong of ['626', 'Retail', { id: one }]) assert.equal(applyFieldTransform({ kind: 'price-type-uuid' }, wrong).status, 'error');
 });
 
-test('actual client adapter resolves company option XML UUID, writes native reference, and normalizes readback', async () => {
+test('actual client adapter resolves company reference CODE UUID, writes native reference, and normalizes readback', async () => {
   const original = { b: process.env.BITRIX24_REST_BASE_URL, m: process.env.MOYSKLAD_API_BASE_URL, t: process.env.MOYSKLAD_API_TOKEN };
   Object.assign(process.env, { BITRIX24_REST_BASE_URL: 'https://b24.invalid/rest/', MOYSKLAD_API_BASE_URL: base, MOYSKLAD_API_TOKEN: 'fake' });
   let selected: string = '626', native: Record<string, unknown> = {}, reads = 0, writes = 0;
@@ -63,8 +67,9 @@ test('actual client adapter resolves company option XML UUID, writes native refe
     if (url.hostname === 'b24.invalid') {
       const method = url.pathname.split('/').at(-1);
       if (method === 'crm.company.get.json') result = { ID: '1', [COMPANY_PRICE_TYPE_FIELD]: selected };
-      else if (method === 'crm.company.userfield.list.json') { reads++; result = [{ ID: '1422' }]; }
-      else { assert.equal(method, 'userfieldconfig.get.json'); result = field(); }
+      else if (method === 'crm.company.userfield.list.json') { reads++; result = [{ ID: '1424' }]; }
+      else if (method === 'crm.company.userfield.get.json') result = field();
+      else { assert.equal(method, 'lists.element.get.json'); result = elements(); }
       return new Response(JSON.stringify({ result }));
     }
     assert.equal(url.pathname, '/api/remap/1.2/entity/counterparty/owned');
@@ -101,7 +106,7 @@ test('option worker respects OFF/dry/controlled gates before reading providers',
 });
 
 test('settings reject the UUID transform on unrelated or incompatible fields', async () => {
-  const source = { code: COMPANY_PRICE_TYPE_FIELD, type: 'enumeration', writable: true, cardinality: 'single', shape: 'scalar', referenceKind: 'pricetype' };
+  const source = { code: COMPANY_PRICE_TYPE_FIELD, type: 'iblock_element', writable: true, cardinality: 'single', shape: 'scalar', referenceKind: 'pricetype' };
   const target = { code: 'priceType', type: 'pricetype', writable: true, cardinality: 'single', shape: 'scalar', referenceKind: 'pricetype' };
   const provider = { fieldCatalogs: async () => ({ bitrix24: [source], moysklad: [target] }) };
   const settings = new FieldSettingsService({} as never, provider as never, {} as never);
@@ -119,20 +124,26 @@ test('actual option worker adds/renames by UUID and preserves original option ID
   const old = Object.fromEntries(keys.map(k => [k, process.env[k]]));
   Object.assign(process.env, { SYNC_MODE: 'apply', COMPANY_PRICE_TYPE_SYNC_ENABLED: 'enabled', CONTROLLED_LIVE_TEST_MODE: '', BITRIX24_REST_BASE_URL: 'https://b24.invalid/rest/', MOYSKLAD_API_BASE_URL: base, MOYSKLAD_API_TOKEN: 'fake' });
   const oldFetch = globalThis.fetch;
-  const current = field(); let writes = 0;
+  const current = elements(); let writes = 0;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.hostname === 'ms.invalid') return new Response(JSON.stringify([{ id: one, name: 'Renamed', meta: { type: 'pricetype' } }, { id: two, name: 'Wholesale', meta: { type: 'pricetype' } }]));
     const method = url.pathname.split('/').at(-1);
     let result: unknown;
-    if (method === 'crm.company.userfield.list.json') result = [{ ID: '1422' }];
-    else if (method === 'userfieldconfig.get.json') result = current;
+    if (method === 'crm.company.userfield.list.json') result = [{ ID: '1424' }];
+    else if (method === 'crm.company.userfield.get.json') result = field();
+    else if (method === 'lists.field.get.json') result = { NAME: { FIELD_ID: 'NAME' } };
+    else if (method === 'lists.element.get.json') result = current;
     else {
-      assert.equal(method, 'crm.company.userfield.update.json');
-      const data = JSON.parse(String(init?.body)); assert.equal(data.id, '1422');
-      assert.equal(data.fields.LIST[0].ID, '626'); assert.equal(data.fields.LIST[0].XML_ID, one);
-      current.field.enum = data.fields.LIST.map((v: any, i: number) => ({ id: v.ID ?? String(626 + i * 2), xmlId: v.XML_ID, value: v.VALUE }));
-      writes++; result = true;
+      const data = JSON.parse(String(init?.body)); assert.equal(data.IBLOCK_ID, '108'); assert.equal(data.IBLOCK_TYPE_ID, 'lists');
+      if (method === 'lists.element.update.json') {
+        assert.equal(data.ELEMENT_ID, '626'); assert.equal(data.ELEMENT_CODE, one);
+        current[0].NAME = data.FIELDS.NAME; result = true;
+      } else {
+        assert.equal(method, 'lists.element.add.json'); assert.equal(data.ELEMENT_CODE, two);
+        current.push({ ID: '628', IBLOCK_ID: '108', CODE: data.ELEMENT_CODE, NAME: data.FIELDS.NAME }); result = '628';
+      }
+      writes++;
     }
     return new Response(JSON.stringify({ result }));
   }) as typeof fetch;
@@ -140,9 +151,9 @@ test('actual option worker adds/renames by UUID and preserves original option ID
   const database = { syncSetting: { findUnique: async () => ({ serviceMode: 'on' }) }, $transaction: async (work: (v: unknown) => unknown) => work(tx) } as unknown as DatabaseService;
   try {
     const service = new CompanyPriceTypeDirectoryService(database);
-    assert.deepEqual(await service.runOnce(), { added: 1, renamed: 1, missing: 0, options: 2 });
-    assert.deepEqual(await service.runOnce(), { added: 0, renamed: 0, missing: 0, options: 2 });
-    assert.equal(writes, 1); assert.equal(current.field.enum[0].id, '626');
+    assert.deepEqual(await service.runOnce(), { added: 1, renamed: 1, deferred: 0, missing: 0, options: 2 });
+    assert.deepEqual(await service.runOnce(), { added: 0, renamed: 0, deferred: 0, missing: 0, options: 2 });
+    assert.equal(writes, 2); assert.equal(current[0].ID, '626');
   } finally {
     globalThis.fetch = oldFetch;
     for (const key of keys) if (old[key] === undefined) delete process.env[key]; else process.env[key] = old[key];

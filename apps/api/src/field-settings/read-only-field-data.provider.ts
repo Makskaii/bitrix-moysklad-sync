@@ -1,6 +1,6 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DEFAULT_FIELD_SETTINGS } from './approved-mappings';
-import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_MARKER, companyPriceTypeOptions, selectedCompanyPriceType, normalizeMoyskladPriceType } from '../clients/company-price-type';
+import { COMPANY_PRICE_TYPE_FIELD, COMPANY_PRICE_TYPE_MARKER, COMPANY_PRICE_TYPE_IBLOCK, COMPANY_PRICE_TYPE_IBLOCK_TYPE, assertCompanyPriceTypeSchema, companyPriceTypeOptions, selectedCompanyPriceType, normalizeMoyskladPriceType } from '../clients/company-price-type';
 
 export type CatalogCandidate = { id: string; code: string; label: string };
 export type LiveFieldCatalogs = {
@@ -181,8 +181,10 @@ export class ReadOnlyFieldDataProvider {
     if (entity === 'companies' && sourceRecord[COMPANY_PRICE_TYPE_FIELD]) {
       const fields = await this.bitrixCall(bitrixAccessToken, 'crm.company.userfield.list', { 'filter[FIELD_NAME]': COMPANY_PRICE_TYPE_FIELD });
       if (!Array.isArray(fields) || fields.length !== 1 || !isRecord(fields[0])) throw new ServiceUnavailableException('Company price-type field is unavailable');
-      const metadata = await this.bitrixCall(bitrixAccessToken, 'userfieldconfig.get', { moduleId: 'crm', id: String(fields[0].ID) });
-      sourceRecord = { ...sourceRecord, [COMPANY_PRICE_TYPE_FIELD]: selectedCompanyPriceType(sourceRecord[COMPANY_PRICE_TYPE_FIELD], companyPriceTypeOptions(metadata)) };
+      const metadata = await this.bitrixCall(bitrixAccessToken, 'crm.company.userfield.get', { id: String(fields[0].ID) });
+      assertCompanyPriceTypeSchema(metadata);
+      const items = await this.bitrixListElements(bitrixAccessToken, COMPANY_PRICE_TYPE_IBLOCK, COMPANY_PRICE_TYPE_IBLOCK_TYPE);
+      sourceRecord = { ...sourceRecord, [COMPANY_PRICE_TYPE_FIELD]: selectedCompanyPriceType(sourceRecord[COMPANY_PRICE_TYPE_FIELD], companyPriceTypeOptions(items)) };
     }
     return {
       sourceLabel: sourceLabel(sourceRecord),
@@ -404,11 +406,11 @@ export class ReadOnlyFieldDataProvider {
     throw new ServiceUnavailableException(`Bitrix24 ${method} userfield list exceeds the supported ${MAX_PAGES} page limit`);
   }
 
-  private async bitrixListElements(accessToken: string, listId: string): Promise<Array<Record<string, unknown>>> {
+  private async bitrixListElements(accessToken: string, listId: string, type = 'rest_entity'): Promise<Array<Record<string, unknown>>> {
     const rows: Array<Record<string, unknown>> = [];
     for (let page = 0, start = 0; page < MAX_PAGES; page += 1, start += PAGE_SIZE) {
       const result = await this.bitrixCall(accessToken, 'lists.element.get', {
-        IBLOCK_TYPE_ID: 'rest_entity', IBLOCK_ID: listId, start,
+        IBLOCK_TYPE_ID: type, IBLOCK_ID: listId, start,
         'SELECT[0]': 'ID', 'SELECT[1]': 'CODE', 'SELECT[2]': 'NAME',
       });
       if (!Array.isArray(result)) throw new ServiceUnavailableException(`Bitrix24 returned an invalid list ${listId}`);
@@ -588,7 +590,7 @@ function describeBitrixFields(value: unknown, entity: string, userFields?: unkno
     const enumOptions = enumerationOptions(userField?.LIST ?? definition.enumOptions);
     const custom = /^UF_CRM/i.test(code) || (entity === 'catalog' && /^property\d+$/i.test(code));
     const writable = typeof definition.isReadOnly === 'boolean' ? !definition.isReadOnly : null;
-    const priceTypeReference = entity === 'companies' && code === COMPANY_PRICE_TYPE_FIELD && userField?.XML_ID === COMPANY_PRICE_TYPE_MARKER && type === 'enumeration' && isMultiple === false;
+    const priceTypeReference = entity === 'companies' && code === COMPANY_PRICE_TYPE_FIELD && userField?.XML_ID === COMPANY_PRICE_TYPE_MARKER && type === 'iblock_element' && isRecord(userField.SETTINGS) && String(userField.SETTINGS.IBLOCK_ID) === COMPANY_PRICE_TYPE_IBLOCK && isMultiple === false;
     return [{ code, title, type, writable, writableEvidence: writable === null ? 'unconfirmed' : 'provider-schema', category: custom ? 'custom' : 'standard', cardinality: cardinality(isMultiple), shape: fieldShape(type, isMultiple), ...(enumOptions.length ? { enumOptions } : {}), ...(priceTypeReference ? { referenceKind: 'pricetype' } : referenceKind(type) ? { referenceKind: referenceKind(type) } : {}), ...(entity === 'catalog' && resourceByCode?.has(code) ? { resource: resourceByCode.get(code)! } : {}), ...(entity === 'catalog' && code === 'xmlId' ? { reserved: 'PRODUCT_CREATE_RECOVERY_IDENTITY' } : {}) }];
   });
 }

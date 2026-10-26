@@ -1,20 +1,30 @@
 export const COMPANY_PRICE_TYPE_FIELD = 'UF_CRM_MS_PRICE_TYPE';
 export const COMPANY_PRICE_TYPE_MARKER = 'MOYSKLAD_COMPANY_PRICE_TYPE';
+export const COMPANY_PRICE_TYPE_IBLOCK = '108';
+export const COMPANY_PRICE_TYPE_IBLOCK_TYPE = 'lists';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type PriceTypeOption = { id: string; uuid: string; name: string };
 
 export function companyPriceTypeOptions(value: unknown): PriceTypeOption[] {
-  const f = isRecord(value) && isRecord(value.field) ? value.field : null;
-  if (!f || f.entityId !== 'CRM_COMPANY' || f.fieldName !== COMPANY_PRICE_TYPE_FIELD || f.xmlId !== COMPANY_PRICE_TYPE_MARKER || f.userTypeId !== 'enumeration' || f.multiple !== 'N' || !Array.isArray(f.enum)) throw new Error('COMPANY_PRICE_TYPE_SCHEMA_INVALID');
+  if (!Array.isArray(value)) throw new Error('COMPANY_PRICE_TYPE_OPTIONS_INVALID');
   const ids = new Set<string>(), uuids = new Set<string>();
-  return f.enum.map((row: unknown) => {
-    if (!isRecord(row) || !/^\d+$/.test(String(row.id)) || typeof row.xmlId !== 'string' || !uuid.test(row.xmlId) || typeof row.value !== 'string' || ids.has(String(row.id)) || uuids.has(row.xmlId.toLowerCase())) throw new Error('COMPANY_PRICE_TYPE_OPTIONS_INVALID');
-    const item = { id: String(row.id), uuid: row.xmlId.toLowerCase(), name: row.value };
+  return value.map((row: unknown) => {
+    if (!isRecord(row) || !/^\d+$/.test(String(row.ID)) || String(row.IBLOCK_ID) !== COMPANY_PRICE_TYPE_IBLOCK || typeof row.CODE !== 'string' || !uuid.test(row.CODE) || typeof row.NAME !== 'string' || ids.has(String(row.ID)) || uuids.has(row.CODE.toLowerCase())) throw new Error('COMPANY_PRICE_TYPE_OPTIONS_INVALID');
+    const item = { id: String(row.ID), uuid: row.CODE.toLowerCase(), name: row.NAME };
     ids.add(item.id); uuids.add(item.uuid); return item;
   });
 }
 
+export function assertCompanyPriceTypeSchema(value: unknown): void {
+  if (!isRecord(value) || value.FIELD_NAME !== COMPANY_PRICE_TYPE_FIELD || value.XML_ID !== COMPANY_PRICE_TYPE_MARKER || value.USER_TYPE_ID !== 'iblock_element' || value.MULTIPLE !== 'N' || String(value.SETTINGS?.IBLOCK_ID) !== COMPANY_PRICE_TYPE_IBLOCK) throw new Error('COMPANY_PRICE_TYPE_SCHEMA_INVALID');
+}
+
 export function selectedCompanyPriceType(value: unknown, options: PriceTypeOption[]): string | null {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    if (value.length !== 1) throw new Error('COMPANY_PRICE_TYPE_SELECTION_INVALID');
+    return selectedCompanyPriceType(value[0], options);
+  }
   if (value === undefined || value === null || value === '' || value === false) return null;
   if (typeof value !== 'string' && typeof value !== 'number') throw new Error('COMPANY_PRICE_TYPE_SELECTION_INVALID');
   const matches = options.filter(option => option.id === String(value));
