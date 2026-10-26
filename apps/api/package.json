@@ -2,6 +2,7 @@
   "name": "@sync/api",
   "private": true,
   "scripts": {
+    "test:company-price-type": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/company-price-type.unit.js",
     "test:warehouse-directory": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/warehouse-directory-sync.unit.js",
     "test:api-bind-host": "npx tsc -p tsconfig.test.json && node --test ../../dist/apps/api-test/test/api-bind-host.unit.js",
     "build": "tsc -p tsconfig.build.json",

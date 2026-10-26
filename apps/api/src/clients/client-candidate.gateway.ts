@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { assertApplyExternalWrite } from '../external-write-guard';
+import { encodeMoyskladPriceType } from './company-price-type';
 import { ClientProviderOperation, ProviderFailure, providerResponseFailure } from '../provider-failure';
 import { DatabaseService } from '../database.service';
 import { DryRunWriteJournal } from '../dry-run-write-journal';
@@ -204,7 +205,8 @@ export class HttpClientCandidateGateway implements WritableClientCandidateGatewa
         return targetId;
       }
       assertApplyExternalWrite('MOYSKLAD', 'CLIENT_CREATE', null, `client:${input.entity}`);
-      const created = await this.moyskladRequest(path, 'POST', body);
+      if (input.targetType === 'contactperson' && 'priceType' in body) throw new Error('CLIENT_PRICE_TYPE_REQUIRES_COUNTERPARTY');
+      const created = await this.moyskladRequest(path, 'POST', encodeMoyskladPriceType(body, process.env.MOYSKLAD_API_BASE_URL));
       // This one endpoint documents a one-element array even for one object.
       // Do not generalize bulk acknowledgements to counterparties/other APIs.
       const single = input.targetType === 'contactperson' && Array.isArray(created) && created.length === 1

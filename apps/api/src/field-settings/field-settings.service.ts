@@ -574,6 +574,10 @@ function validateRuleCompatibility(
   const sourceShape = source.shape ?? inferFieldShape(source.type);
   const targetShape = target.shape ?? inferFieldShape(target.type);
   const kind = transform.kind;
+  if (kind === 'price-type-uuid') {
+    if (entity === 'companies' && direction === 'BITRIX24_TO_MOYSKLAD' && sourceCode === 'UF_CRM_MS_PRICE_TYPE' && targetCode === 'priceType' && source.referenceKind === 'pricetype' && target.referenceKind === 'pricetype' && sourceCardinality === 'single' && targetCardinality === 'single') return;
+    throw new BadRequestException('price-type-uuid is reserved for the single company price-type field and native MoySklad priceType');
+  }
   if (kind === 'copy') {
     if (source.type !== target.type || sourceShape !== targetShape || sourceCardinality === 'unknown' || sourceCardinality !== targetCardinality) {
       throw new BadRequestException(`Copy requires exact type and cardinality compatibility for ${String(sourceCode)} → ${String(targetCode)}`);
@@ -1005,7 +1009,7 @@ function validateDirection(value: unknown): { enabled: boolean; transform: Field
 
 function validateFieldTransform(value: JsonRecord): FieldTransform {
   const kind = value.kind;
-  if (kind === 'copy' || kind === 'tbd') return { kind };
+  if (kind === 'copy' || kind === 'tbd' || kind === 'price-type-uuid') return { kind };
   if (kind === 'string-to-number') {
     if (!['integer', 'decimal'].includes(String(value.numberType)) || value.precision !== undefined && (!Number.isInteger(value.precision) || Number(value.precision) < 0 || Number(value.precision) > 15) ||
       value.min !== undefined && (typeof value.min !== 'number' || !Number.isFinite(value.min)) || value.max !== undefined && (typeof value.max !== 'number' || !Number.isFinite(value.max)) ||
