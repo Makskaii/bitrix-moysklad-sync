@@ -80,18 +80,17 @@ export class DealOrderCreateOperationService {
     };
     const current = await read();
     // The saved native target ID already exists before this source write.
-    // Store the native order name only in the dedicated order-number field;
-    // the deal title belongs to the Bitrix user and must not be overwritten.
-    // Response-loss recovery uses the same saved native target ID.
-    if (current.UF_CRM_1729757435964 !== orderName) {
+    // Confirm the complete native order name in BOTH source fields before
+    // committing the pair; response-loss recovery uses that same target ID.
+    if (current.UF_CRM_1729757435964 !== orderName || current.TITLE !== orderName) {
       const body = await this.runCreateMutationAllowed(input, leaseToken, assertWorkerLease, () => requestJson(new URL('crm.deal.update.json', withSlash(base)), {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName }),
+        body: new URLSearchParams({ id: input.bitrix24DealId, 'fields[UF_CRM_1729757435964]': orderName, 'fields[TITLE]': orderName }),
       }));
       if (!isRecord(body) || body.error || body.result !== true) throw new Error('Bitrix24 customer-order number update failed');
     }
     const verified = await read();
-    if (verified.UF_CRM_1729757435964 !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
+    if (verified.UF_CRM_1729757435964 !== orderName || verified.TITLE !== orderName) throw new Error('Bitrix24 customer-order number readback failed');
   }
 
   /** Record that a new B24 deal is waiting for complete dependencies. This is
@@ -222,7 +221,6 @@ export class DealOrderCreateOperationService {
       if (!isRecord(order) || typeof order.name !== 'string' || !order.name.trim()) {
         throw new Error('Customer-order native number is unavailable');
       }
-      if (order.name !== payload.name) throw new Error('Customer-order native number does not match the Bitrix source field');
       if (this.controlledAdmission && process.env.CONTROLLED_LIVE_TEST_MODE === 'enabled') {
         const scope = await this.controlledAdmission.scopeForEvent(input.eventId);
         const createdAt = parseMoySkladCreatedAt(order.created);
@@ -413,13 +411,6 @@ export class DealOrderCreateOperationService {
         where: { bitrix24DealId: input.bitrix24DealId },
         data: { status: partial ? 'PARTIAL' : 'SUCCEEDED', moyskladOrderId, lastErrorCategory: partial ? 'ROWS_SKIPPED' : null, leaseToken: null, leaseUntil: null },
       });
-      await transaction.inboundEvent.updateMany({
-        where: {
-          source: 'BITRIX24', externalEntityType: 'deal', externalEntityId: input.bitrix24DealId,
-          status: 'WAITING_FOR_DATA', lastErrorCategory: 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE',
-        },
-        data: { status: 'SUCCEEDED', lastErrorCategory: 'DEAL_ORDER_CREATED_BY_LATER_EVENT', retryAfter: null },
-      });
       await transaction.pairReviewCase.updateMany({
         where: { entityType: 'DEAL', sourceSystem: 'BITRIX24', sourceEntityId: input.bitrix24DealId, status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
@@ -436,7 +427,6 @@ function validatePreparedOrder(input: DealOrderPreparedInput) {
       !Array.isArray(input.confirmedCustomerPairIds) ||
       input.confirmedCustomerPairIds.length > 10 || new Set(input.confirmedCustomerPairIds).size !== input.confirmedCustomerPairIds.length ||
       input.confirmedCustomerPairIds.some((id) => typeof id !== 'string' || !id.trim()) ||
-      typeof input.payload.name !== 'string' || !input.payload.name.trim() ||
       !input.eventId || !Number.isInteger(input.settingsVersion) || input.settingsVersion < 1) {
     throw new Error('Prepared customer-order identity is invalid');
   }

@@ -63,6 +63,7 @@ export class DealOrderCreationPreparer {
     let rows: Record<string, unknown>[];
     try {
       deal = await readBitrixDeal(input.bitrix24DealId, (work) => this.providerModeGate(work));
+      rows = await readAllBitrixRows(input.bitrix24DealId, (work) => this.providerModeGate(work));
     } catch (error) {
       if (error instanceof ServiceModeNotOnError) throw error;
       return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
@@ -82,14 +83,6 @@ export class DealOrderCreationPreparer {
       // Provider callbacks can arrive before the CREATE acknowledgement and
       // pair commit. Never send an imported deal back as another MS order.
       return { status: 'WAITING', reason: 'REVERSE_DEAL_CREATE_PENDING' };
-    }
-    const sourceOrderNumber = readRequiredSourceOrderNumber(deal.UF_CRM_KVENTRU57);
-    if (!sourceOrderNumber) return { status: 'WAITING', reason: 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE' };
-    try {
-      rows = await readAllBitrixRows(input.bitrix24DealId, (work) => this.providerModeGate(work));
-    } catch (error) {
-      if (error instanceof ServiceModeNotOnError) throw error;
-      return { status: 'WAITING', reason: 'SOURCE_READ_FAILED' };
     }
     const stageId = readString(deal.STAGE_ID);
     const stage = references.stages.find((candidate) => candidate.bitrix24StageId === stageId);
@@ -326,9 +319,6 @@ export class DealOrderCreationPreparer {
       skippedRows,
       unitMappings: units.map((unit) => ({ bitrix24Id: unit.bitrix24Id, bitrix24Code: unit.bitrix24Code, moyskladId: unit.moyskladId, status: unit.status })),
       payload: {
-        // The customer-order number is owned by the Bitrix business process.
-        // Never let MySklad auto-numbering become the source for this value.
-        name: sourceOrderNumber,
         agent: { meta: { type: 'counterparty', href: msHref(msBase, `entity/counterparty/${agentCounterpartyId}`) } },
         organization: { meta: { type: 'organization', href: msHref(msBase, `entity/organization/${targetOrganizationId}`) } },
         store: { meta: { type: 'store', href: msHref(msBase, `entity/store/${targetStoreId}`) } },
@@ -613,7 +603,6 @@ function toMinorUnits(value: unknown): number | null {
 
 function readNumber(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
 function readString(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value.trim() : null; }
-function readRequiredSourceOrderNumber(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value : null; }
 function readNumericId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readRowId(value: unknown): string | null { const id = typeof value === 'string' || typeof value === 'number' ? String(value) : ''; return /^\d{1,20}$/.test(id) && id !== '0' ? id : null; }
 function readOptionalId(value: unknown): string | null { if (value === null || value === undefined || value === '') return null; return readNumericId(value); }

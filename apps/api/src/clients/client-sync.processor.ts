@@ -28,6 +28,7 @@ type PersistedEvent = {
   externalEntityId: string | null; status: string; lastErrorCategory: string | null; attempts: number; processingStartedAt?: Date | null; payload?: unknown;
 };
 const CLIENT_EVENT_LEASE_MS = 60_000;
+const COMPANY_CREATE_WAITING_FOR_INN = 'CLIENT_CREATE_WAITING_FOR_INN';
 
 /**
  * Pair-first client event processor. It intentionally does not perform fuzzy
@@ -1102,6 +1103,15 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       return null;
     }
 
+    // Bitrix requires an INN to create a company. Keep the source event dormant
+    // until a later MySklad update delivers that required value; do not create
+    // a manual-review case or schedule automatic retries for this condition.
+    if (entity === 'COMPANY' && sourceSystem === 'MOYSKLAD' && resolution.action === 'CREATE'
+      && resolution.targetSystem === 'BITRIX24' && (typeof inn !== 'string' || !inn.trim())) {
+      await this.waitForCompanyInn(event, fence);
+      return null;
+    }
+
     let targetId: string | null = resolution.action === 'CREATE' ? null : resolution.targetId;
     let targetType = resolution.targetType;
     const contactPairParentId = entity === 'CONTACT'
@@ -1165,6 +1175,18 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
             : resolution.action === 'CREATE' ? `CREATED: ${resolution.reason}` : 'PERSISTED_PAIR',
         } });
         await tx.pairReviewCase.updateMany({ where: { entityType: entity, sourceSystem, sourceEntityId: sourceId, status: 'OPEN', reason: 'CLIENT_CREATE_IN_PROGRESS' }, data: { status: 'RESOLVED', resolvedAt: new Date() } });
+        if (entity === 'COMPANY' && sourceSystem === 'MOYSKLAD') {
+          const fulfilled = await tx.inboundEvent.updateMany({
+            where: {
+              id: { not: event.id }, source: 'MOYSKLAD', externalEntityType: 'counterparty', externalEntityId: sourceId,
+              status: 'WAITING_FOR_DATA', lastErrorCategory: COMPANY_CREATE_WAITING_FOR_INN,
+            },
+            data: { status: 'SUCCEEDED', processingStartedAt: null, retryAfter: null, lastSuccessfulAt: new Date(), lastErrorCategory: null },
+          });
+          if (fulfilled.count) await tx.operationalLog.create({ data: {
+            category: 'CLIENT_SYNC', message: `Deferred company-create request fulfilled by a later MySklad event after the required INN became available (${fulfilled.count} queued event(s)).`, referenceId: event.id,
+          } });
+        }
         await tx.operationalLog.create({ data: {
           category: 'CLIENT_RUNTIME',
           message: `Client pair resolved (${entity}; ${sourceSystem} ${sourceId} → ${moyskladType} ${moyskladId}; ${resolution.action === 'USE_CANDIDATE' ? `${resolution.reason} Evidence: usage=${resolution.evidence.usageCount ?? 'unavailable'}, filled=${resolution.evidence.filledFields}, created=${resolution.evidence.createdAt}, criteria=${resolution.evidence.criteria.join(',')}` : resolution.action === 'CREATE' ? `created: ${resolution.reason}` : resolution.reason}).`,
@@ -1260,6 +1282,20 @@ export class ClientSyncProcessor implements ClientDependencyResolver {
       await tx.operationalLog.create({ data: { category: 'CLIENT_SYNC', message: `Client event requires review: ${reason}.`, referenceId: event.id } });
     });
     return 'REVIEW';
+  }
+
+  private async waitForCompanyInn(event: PersistedEvent, fence?: EventWorkerLeaseContext): Promise<void> {
+    await this.database.$transaction(async (tx) => {
+      await assertFenceInTransaction(fence, tx);
+      await tx.inboundEvent.updateMany({ where: { id: event.id, status: event.status }, data: {
+        status: 'WAITING_FOR_DATA', processingStartedAt: null, retryAfter: null, lastErrorCategory: COMPANY_CREATE_WAITING_FOR_INN,
+      } });
+      await tx.operationalLog.create({ data: {
+        category: 'CLIENT_SYNC',
+        message: 'Company creation deferred: MySklad INN is required. Waiting for a later source update; no automatic retry scheduled.',
+        referenceId: event.id,
+      } });
+    });
   }
 
   private async retry(event: PersistedEvent, reason: string, retryAfter?: Date, fence?: EventWorkerLeaseContext): Promise<'RETRY'> {

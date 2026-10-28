@@ -175,6 +175,7 @@ h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: -.02em; }
 .monitor-list article small { color: #8995a7; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .event-status { flex: 0 0 auto; padding: 5px 9px; border-radius: 20px; background: #f1f4f8; color: #57677e; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .status-retryable_failure, .status-manual_review { background: #fff0e7; color: #965222; }
+.status-waiting_for_data { background: #eef3fb; color: #405c86; }
 .status-succeeded { background: #eaf5e9; color: #397449; }
 .log-tabs, .incident-actions { display: flex; gap: 7px; flex-wrap: wrap; }
 .log-tabs { margin: 16px 0; }

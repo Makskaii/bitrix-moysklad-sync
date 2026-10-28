@@ -27,8 +27,8 @@ let failNextB24DealRead = true;
 let b24OrderNumber: string | null = null;
 let b24DealTitle: string | null = 'Original title';
 let nativeOrderName = 'SO-54';
-let ignoreNextOrderNumberUpdate = false;
-let loseNextOrderNumberUpdateResponse = false;
+let ignoreNextTitleUpdate = false;
+let loseNextTitleUpdateResponse = false;
 let loseNextCreateResponse = false;
 const providerOrdersBySyncId = new Map<string, string>();
 let activeOrderId = ids.order;
@@ -302,7 +302,7 @@ test('actual preparer never sends a journal-owned imported deal back as another 
 });
 
 test('MySklad order ID persists after remote create and retry reuses it rather than creating a duplicate', async () => {
-  posts = 0; failNextB24DealRead = true; b24OrderNumber = null; b24DealTitle = 'Original source title';
+  posts = 0; failNextB24DealRead = true; b24OrderNumber = null;
   activeOrderId = ids.order;
   const input = preparedInput();
   input.skippedRows = [{ sourceRowId: '302', reason: 'UNIT_UNMAPPED' }];
@@ -323,43 +323,46 @@ test('MySklad order ID persists after remote create and retry reuses it rather t
   assert.equal(operation.status, 'PARTIAL');
   assert.deepEqual(operation.skippedRows, input.skippedRows);
   assert.equal(b24OrderNumber, 'SO-54');
-  assert.equal(b24DealTitle, 'Original source title', 'forward order-number sync preserves the source deal title');
+  assert.equal(b24DealTitle, 'SO-54', 'the entire title equals the actual native MS name');
   const updates = numberUpdates;
   await service.createAndPair(input);
   assert.equal(posts, 1); assert.equal(numberUpdates, updates);
 });
 
-test('an already-correct number preserves a customer title and commits the pair without a title write', async () => {
+test('an already-correct number does not hide a wrong title; ignored title update cannot commit the pair', async () => {
   const input = preparedInput('906'); activeOrderId = randomUUID();
   posts = 0; numberUpdates = 0; failNextB24DealRead = false;
-  b24OrderNumber = 'SO-54'; b24DealTitle = 'Customer supplied title';
-  const result = await service.createAndPair(input);
-  assert.equal(result.status, 'CREATED');
-  assert.equal(posts, 1); assert.equal(numberUpdates, 0);
-  assert.equal(b24DealTitle, 'Customer supplied title'); assert.equal(b24OrderNumber, 'SO-54');
-  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '906', active: true } }), 1);
+  b24OrderNumber = 'SO-54'; b24DealTitle = 'Customer supplied title'; ignoreNextTitleUpdate = true;
+  await assert.rejects(service.createAndPair(input), /number readback failed/);
+  const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '906' } });
+  assert.equal(pending.status, 'PENDING'); assert.equal(pending.moyskladOrderId, activeOrderId);
+  assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '906' } }), 0);
+  const restarted = new DatabaseService();
+  try { await new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input); }
+  finally { await restarted.$disconnect(); }
+  assert.equal(posts, 1); assert.equal(numberUpdates, 2);
+  assert.equal(b24DealTitle, 'SO-54'); assert.equal(b24OrderNumber, 'SO-54');
 });
 
 test('lost B24 update response recovers after a cold service restart by readback, with one native MS order', async () => {
-  activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
+  const input = preparedInput('907'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
   failNextB24DealRead = false; b24OrderNumber = null; b24DealTitle = 'Original source title';
-  nativeOrderName = 'МС / 2026 & №000054 — Обработан'; loseNextOrderNumberUpdateResponse = true;
-  const input = preparedInput('907');
+  nativeOrderName = 'МС / 2026 & №000054 — Обработан'; loseNextTitleUpdateResponse = true;
   try {
     await assert.rejects(service.createAndPair(input));
     const pending = await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '907' } });
     assert.equal(pending.status, 'PENDING'); assert.equal(pending.moyskladOrderId, activeOrderId);
-    assert.equal(b24DealTitle, 'Original source title'); assert.equal(b24OrderNumber, nativeOrderName);
+    assert.equal(b24DealTitle, nativeOrderName); assert.equal(b24OrderNumber, nativeOrderName);
     const restarted = new DatabaseService();
     try { await new DealOrderCreateOperationService(restarted, new SyncModeService(restarted)).createAndPair(input); }
     finally { await restarted.$disconnect(); }
     assert.equal(posts, 1); assert.equal(numberUpdates, 1, 'readback sees the successful lost-response source write');
     assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '907' } })).status, 'SUCCEEDED');
     await service.createAndPair(input); assert.equal(posts, 1); assert.equal(numberUpdates, 1);
-  } finally { nativeOrderName = 'SO-54'; loseNextOrderNumberUpdateResponse = false; }
+  } finally { nativeOrderName = 'SO-54'; loseNextTitleUpdateResponse = false; }
 });
 
-test('lost MS CREATE response retains syncId through restart and records native number without renaming the deal', async () => {
+test('lost MS CREATE response retains syncId through restart and copies native name from the same idempotent order', async () => {
   const input = preparedInput('908'); activeOrderId = randomUUID(); posts = 0; numberUpdates = 0;
   failNextB24DealRead = false; b24OrderNumber = null; b24DealTitle = 'Before lost MS response'; loseNextCreateResponse = true;
   const before = providerOrdersBySyncId.size;
@@ -371,7 +374,7 @@ test('lost MS CREATE response retains syncId through restart and records native 
   finally { await restarted.$disconnect(); }
   assert.equal(providerOrdersBySyncId.size, before + 1); assert.equal(posts, 2, 'second POST has the SAME durable syncId');
   assert.equal((await db.dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: '908' } })).syncId, pending.syncId);
-  assert.equal(b24DealTitle, 'Before lost MS response'); assert.equal(b24OrderNumber, 'SO-54');
+  assert.equal(b24DealTitle, 'SO-54'); assert.equal(b24OrderNumber, 'SO-54');
   assert.equal(await db.entityPair.count({ where: { entityType: 'DEAL', bitrix24Id: '908' } }), 1);
 });
 
@@ -432,7 +435,6 @@ function preparedInput(bitrix24DealId = '901'): any {
     sourceRowValues: [{ id: '301', productId: 904, quantity: 2, price: 0, measureCode: 796 }], sourceMeasureCodes: [796],
     unitMappings: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: ids.unit, status: 'configured' }],
     payload: {
-      name: nativeOrderName,
       agent: ref('counterparty', ids.company), organization: ref('organization', ids.organization), store: ref('store', ids.store),
       state: { meta: { type: 'state', href: `${base}api/remap/1.2/entity/customerorder/metadata/states/${ids.state}` } },
       owner: ref('employee', ids.employee), rate: { currency: ref('currency', ids.currency) },
@@ -486,7 +488,7 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
   if (url.pathname === '/rest/crm.deal.get.json') {
     if (body.get('id') === headerContractDealId) return send(response, { result: {
       ID: headerContractDealId, COMPANY_ID: '902', CONTACT_ID: null, STAGE_ID: 'NEW', CURRENCY_ID: 'RUB', ASSIGNED_BY_ID: null,
-      OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture', UF_CRM_KVENTRU57: 'SO-54',
+      OPPORTUNITY: '10', TITLE: 'Synthetic PostgreSQL preparer header fixture',
       ...headerContractOverrides,
     } });
     if (nextNumberReadBarrier) {
@@ -496,17 +498,17 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
       await barrier.wait;
     }
     if (failNextB24DealRead) { failNextB24DealRead = false; response.writeHead(500); response.end('{}'); return; }
-    return send(response, { result: { ID: body.get('id'), TITLE: b24DealTitle, UF_CRM_KVENTRU57: nativeOrderName, UF_CRM_1729757435964: b24OrderNumber } });
+    return send(response, { result: { ID: body.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.item.productrow.list' && body.get('filter[=ownerId]') === headerContractDealId) {
     return send(response, { result: { productRows: [{ id: '301', productId: '904', measureCode: headerContractMeasureCode, quantity: 1, price: 10, discountTypeId: 2, discountRate: 0, discountSum: 0, taxRate: null, taxIncluded: 'N' }] }, total: 1 });
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
     numberUpdates++;
-    if (!ignoreNextOrderNumberUpdate) b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
-    if (body.has('fields[TITLE]')) b24DealTitle = body.get('fields[TITLE]');
-    ignoreNextOrderNumberUpdate = false;
-    if (loseNextOrderNumberUpdateResponse) { loseNextOrderNumberUpdateResponse = false; response.destroy(); return; }
+    b24OrderNumber = body.get('fields[UF_CRM_1729757435964]');
+    if (!ignoreNextTitleUpdate) b24DealTitle = body.get('fields[TITLE]');
+    ignoreNextTitleUpdate = false;
+    if (loseNextTitleUpdateResponse) { loseNextTitleUpdateResponse = false; response.destroy(); return; }
     return send(response, { result: true });
   }
   response.writeHead(404); response.end('{}');
