@@ -79,9 +79,14 @@ export class DealOrderPositionRuntimeService {
       msRows = msRows.map((row) => ({ ...row, vatIncluded: msVatIncluded }));
     }
     if (!links.length) {
+      // Two empty documents have no ambiguous rows to bind. They may be filled
+      // later, at which point the ordinary creation journals still guard adds.
+      if (b24Rows.length === 0 && msRows.length === 0) return { status: 'SYNCED' };
       const canAddToConfirmedEmptyForwardOrder = b24Rows.length === 0 && msRows.length > 0 && this.reverseCreate &&
         await this.hasConfirmedEmptyForwardOrder(pair.bitrix24Id, pair.moyskladId);
-      if (!canAddToConfirmedEmptyForwardOrder) {
+      const canAddToConfirmedEmptyReverseDeal = b24Rows.length === 0 && msRows.length > 0 && this.reverseCreate &&
+        await this.hasConfirmedEmptyReverseDeal(pair.bitrix24Id, pair.moyskladId);
+      if (!canAddToConfirmedEmptyForwardOrder && !canAddToConfirmedEmptyReverseDeal) {
         return this.bootstrapHistoricalLinks(pair.id, pair.moyskladId, input.eventId, input.eventConfig, b24Rows, msRows, lease);
       }
     }
@@ -333,6 +338,25 @@ export class DealOrderPositionRuntimeService {
     const payload = operation && isRecord(operation.payload) ? operation.payload as Record<string, unknown> : null;
     if (operation?.status !== 'SUCCEEDED' || operation.moyskladOrderId !== moyskladOrderId || !payload) return false;
     return Array.isArray(payload.positions) && payload.positions.length === 0 &&
+      Array.isArray(operation.skippedRows) && operation.skippedRows.length === 0;
+  }
+
+  /** A completed reverse creation with no planned or skipped rows and no
+   * position operations is proof that the linked deal started empty. */
+  private async hasConfirmedEmptyReverseDeal(bitrix24DealId: string, moyskladOrderId: string): Promise<boolean> {
+    const operation = await this.database.dealOrderReverseCreateOperation.findUnique({
+      where: { moyskladOrderId },
+      select: { status: true, bitrix24DealId: true, payload: true, skippedRows: true, _count: { select: { positions: true } } },
+    });
+    const payload = operation && isRecord(operation.payload) ? operation.payload as Record<string, unknown> : null;
+    if (!operation || operation.bitrix24DealId !== bitrix24DealId || !payload) return false;
+    // A row-add attempt may have failed after journaling positions. Let the
+    // existing recovery path verify the exact position IDs before resuming.
+    if (operation.status === 'PENDING' && operation._count.positions > 0 &&
+        Array.isArray(payload.rows) && Array.isArray(payload.skippedRows)) return true;
+    if (operation.status !== 'SUCCEEDED' || operation._count.positions !== 0) return false;
+    return Array.isArray(payload.rows) && payload.rows.length === 0 &&
+      Array.isArray(payload.skippedRows) && payload.skippedRows.length === 0 &&
       Array.isArray(operation.skippedRows) && operation.skippedRows.length === 0;
   }
 

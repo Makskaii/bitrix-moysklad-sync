@@ -341,18 +341,6 @@ export class PairFirstEventProcessor implements OnApplicationBootstrap, OnModule
         }
         if (prepared.status === 'WAITING') {
           const operation = await this.createOperation.recordWaiting(input.externalId, config.version, prepared.reason);
-          if (prepared.reason === 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE' &&
-              !(operation?.status === 'PENDING' && operation.attemptedAt)) {
-            const pair = await this.database.entityPair.findFirst({
-              where: { entityType: 'DEAL', bitrix24Id: input.externalId, active: true },
-              select: { id: true },
-            });
-            // A concurrent callback may already have completed this deal.
-            // Otherwise park this event until Bitrix sends the later field update.
-            await this.finish(event.id, pair ? 'SUCCEEDED' : 'WAITING_FOR_DATA',
-              pair ? 'DEAL_ORDER_CREATED_BY_LATER_EVENT' : prepared.reason, workerLease);
-            return null;
-          }
           // Only bounded preflight identity reads: never terminalize an
           // uncertain, already-sent order CREATE or change its recovery path.
           if (prepared.productIdentityReadFailure && event.attempts + 1 >= 8 && !(operation?.status === 'PENDING' && operation.attemptedAt)) {

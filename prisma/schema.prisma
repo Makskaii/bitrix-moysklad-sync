@@ -138,6 +138,7 @@ model InboundEvent {
   @@unique([source, deliveryKey])
   @@index([status, receivedAt])
   @@index([status, retryAfter])
+  @@index([source, eventType, externalEntityType, externalEntityId, receivedAt], map: "InboundEvent_entity_coalesce_idx")
 }
 
 model ControlledTestAdmission {

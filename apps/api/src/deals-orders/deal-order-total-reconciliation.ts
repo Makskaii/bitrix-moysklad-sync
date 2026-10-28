@@ -18,7 +18,7 @@ export type DealOrderTotalState = {
 
 export type DealOrderTotalResult =
   | { status: 'SYNCED'; state: DealOrderTotalState; conflict: false; reason: null }
-  | { status: 'SYNCED'; state: DealOrderTotalState; conflict: true; reason: 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' | 'B24_ONE_KOPECK_RETAINED' }
+  | { status: 'SYNCED'; state: DealOrderTotalState; conflict: true; reason: 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' | 'B24_KOPECK_DIFFERENCE_RETAINED' | 'B24_TOTAL_DIFFERENCE_RETAINED' }
   | { status: 'MANUAL_REVIEW'; reason: string }
   | { status: 'RETRY'; reason: string };
 
@@ -74,11 +74,17 @@ export class DealOrderTotalReconciliationHandler {
     let outcome = 'TOTALS_MATCH_OR_UNCHANGED';
     let retainedB24 = false;
     if (b24Minor !== msMinor) {
-      // The exception is specific to a B24-origin change, RUB totals, and at
-      // most one minor unit. A simultaneous change remains an MS-wins conflict.
-      if (input.eventSource === 'BITRIX24' && !input.rowValuesChanged && b24Changed && !msChanged && b24Currency === 'RUB' && abs(b24Minor! - msMinor!) <= 1n) {
+      // Position reconciliation has completed before this handler is called.
+      // Each provider may round discounted unit prices differently; keep both
+      // raw totals when their RUB difference is strictly less than one ruble.
+      if (b24Currency === 'RUB' && abs(b24Minor! - msMinor!) < 100n) {
         retainedB24 = true;
-        outcome = 'B24_ONE_KOPECK_RETAINED';
+        outcome = 'B24_KOPECK_DIFFERENCE_RETAINED';
+      } else if (!b24Changed && !msChanged) {
+        // A previous readback already recorded these exact differing totals.
+        // Retrying the same write would generate events without changing them.
+        retainedB24 = true;
+        outcome = 'B24_TOTAL_DIFFERENCE_RETAINED';
       } else {
         outcome = 'B24_TOTAL_RESTORED_FROM_MOYSKLAD';
       }
@@ -94,8 +100,12 @@ export class DealOrderTotalReconciliationHandler {
         final = await input.adapter.readCurrent();
         const finalB24 = parseMinorUnits(final.bitrix24.amount);
         const finalMs = parseMinorUnits(final.moysklad.amount);
-        if (finalB24 === null || finalMs === null || finalB24 !== finalMs || currency(final.bitrix24.currencyCode) !== b24Currency || currency(final.moysklad.currencyCode) !== msCurrency) {
-          return { status: 'RETRY', reason: 'DEAL_ORDER_TOTAL_READBACK_MISMATCH' };
+        if (finalB24 === null || finalMs === null || currency(final.bitrix24.currencyCode) !== b24Currency || currency(final.moysklad.currencyCode) !== msCurrency || finalMs !== msMinor) return { status: 'RETRY', reason: 'DEAL_ORDER_TOTAL_READBACK_MISMATCH' };
+        if (finalB24 !== finalMs) {
+          // Bitrix can recalculate the total from rounded rows. Preserve the
+          // observed values so a stable mismatch cannot stall other updates.
+          retainedB24 = true;
+          outcome = 'B24_TOTAL_DIFFERENCE_RETAINED';
         }
       } catch (error) {
         if (error instanceof Error && /^DEAL_ORDER_WRITE_BLOCKED_/.test(error.message)) return { status: 'RETRY', reason: error.message };
@@ -116,7 +126,7 @@ export class DealOrderTotalReconciliationHandler {
     }
     return {
       status: 'SYNCED', state, conflict: outcome === 'B24_TOTAL_RESTORED_FROM_MOYSKLAD',
-      reason: retainedB24 ? 'B24_ONE_KOPECK_RETAINED' : outcome === 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' ? 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' : null,
+      reason: retainedB24 ? outcome as 'B24_KOPECK_DIFFERENCE_RETAINED' | 'B24_TOTAL_DIFFERENCE_RETAINED' : outcome === 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' ? 'B24_TOTAL_RESTORED_FROM_MOYSKLAD' : null,
     } as DealOrderTotalResult;
   }
 }

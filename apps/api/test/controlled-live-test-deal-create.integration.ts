@@ -124,7 +124,6 @@ test('controlled deal creation reads dependencies, creates one synthetic order, 
       sourceProductIds: [], sourceRowIds: [], sourceRowValues: [], sourceMeasureCodes: [], unitMappings: [], confirmedCustomerPairIds: ['company-pair'],
       serviceCounterpartyId: refs.counterparty,
       payload: {
-        name: sourceName,
         agent: { meta: { type: 'counterparty', href: `https://controlled-ms.invalid/api/remap/1.2/entity/counterparty/${refs.counterparty}` } },
         organization: { meta: { type: 'organization', href: `https://controlled-ms.invalid/api/remap/1.2/entity/organization/${refs.organization}` } },
         store: { meta: { type: 'store', href: `https://controlled-ms.invalid/api/remap/1.2/entity/store/${refs.store}` } },

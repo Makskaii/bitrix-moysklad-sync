@@ -39,14 +39,12 @@ let companyPairId = '';
 let productPairId = '';
 let createPosts = 0;
 let nextPrepareWaiting = false;
-let nextPrepareWaitingForOrderNumber = false;
 let nextPrepareReview = false;
 let b24OrderNumber: string | null = null;
 let b24DealTitle: string | null = 'Original source title';
 let orderPayload: Record<string, any> | null = null;
 const createdEventIds: string[] = [];
 const sourceCreatedAt = new Map<string, Date>();
-const sourceOrderNumbers = new Map<string, string>();
 const reverseOrderId = randomUUID();
 let reverseItem: Record<string, unknown> | null = null;
 let reverseAdds = 0;
@@ -106,16 +104,12 @@ const fieldSettingsFake = {
         await workerLease.assertOwned();
         assert.equal((await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({where:{id:input.eventId}})).status,'PROCESSING');
         if (input.bitrix24DealId === echoDealId) return new DealOrderCreationPreparer(app.get(DatabaseService)).prepare({ ...input, eventConfig: await fieldSettingsFake.eventConfig(input.eventId) } as never, workerLease);
-        if (nextPrepareWaitingForOrderNumber) {
-          nextPrepareWaitingForOrderNumber = false;
-          return { status: 'WAITING', reason: 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE' };
-        }
         if (nextPrepareWaiting) {
           nextPrepareWaiting = false;
           return { status: 'WAITING', reason: 'STAGE_NOT_READY' };
         }
         if (nextPrepareReview) { nextPrepareReview = false; return { status: 'MANUAL_REVIEW', reason: 'PRODUCT_UUID_INVALID', userAction: 'Исправьте UUID' }; }
-        return { status: 'READY', input: preparedOrder(input.bitrix24DealId, input.eventId, sourceOrderNumbers.get(input.bitrix24DealId) ?? 'SO-TEST-1') };
+        return { status: 'READY', input: preparedOrder(input.bitrix24DealId, input.eventId) };
       } },
     },
     DealOrderCreateOperationService,
@@ -191,7 +185,7 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   const operation = await app.get(DatabaseService).dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } });
   assert.equal(operation.status, 'SUCCEEDED');
   assert.equal(operation.moyskladOrderId, refs.order);
-  assert.equal(b24DealTitle, 'Original source title'); assert.equal(b24OrderNumber, 'SO-TEST-1');
+  assert.equal(b24DealTitle, 'SO-TEST-1'); assert.equal(b24OrderNumber, 'SO-TEST-1');
   const pair = await app.get(DatabaseService).entityPair.findFirstOrThrow({ where: { entityType: 'DEAL', bitrix24Id: dealId, active: true } });
   assert.equal(pair.moyskladId, refs.order);
   assert.equal(await app.get(DatabaseService).dealOrderPositionPair.count({ where: { pairId: pair.id } }), 1);
@@ -201,36 +195,6 @@ test('public Bitrix ADD creates one real durable customer-order operation and pa
   await waitForEvent(retry.eventId, 'SUCCEEDED');
   assert.equal(createPosts, 1, 'a later event for the already-paired source must not create a duplicate order');
   assert.equal(await app.get(DatabaseService).dealTimelineNotice.count({ where: { bitrix24DealId: dealId, kind: 'CREATED' } }), 1);
-});
-
-test('a deal waits without creating an order until a later Bitrix callback supplies its business-process number', async () => {
-  const dealId = `83${Date.now()}11`;
-  const previousForwardNativeId = forwardNativeId;
-  forwardNativeId = randomUUID();
-  try {
-    sourceCreatedAt.set(dealId, new Date());
-    sourceOrderNumbers.delete(dealId);
-    nextPrepareWaitingForOrderNumber = true;
-    const before = createPosts;
-    const first = await postDealEvent('ONCRMDEALADD', dealId);
-    const parked = await waitForEvent(first.eventId, 'WAITING_FOR_DATA');
-    assert.equal(parked.lastErrorCategory, 'DEAL_ORDER_NUMBER_WAITING_FOR_SOURCE');
-    assert.equal(createPosts, before, 'no MySklad order is created before the Bitrix number arrives');
-    assert.equal((await app.get(DatabaseService).dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } })).status, 'WAITING');
-
-    sourceOrderNumbers.set(dealId, '000057-AB');
-    const later = await postDealEvent('ONCRMDEALUPDATE', dealId);
-    await waitForEvent(later.eventId, 'SUCCEEDED');
-    assert.equal(createPosts, before + 1);
-    assert.equal(orderPayload?.name, '000057-AB');
-    assert.equal((await app.get(DatabaseService).inboundEvent.findUniqueOrThrow({ where: { id: first.eventId } })).status, 'SUCCEEDED',
-      'the parked source event is fulfilled after the later callback creates and pairs the order');
-    assert.equal((await app.get(DatabaseService).dealOrderCreateOperation.findUniqueOrThrow({ where: { bitrix24DealId: dealId } })).status, 'SUCCEEDED');
-  } finally {
-    forwardNativeId = previousForwardNativeId;
-    sourceCreatedAt.delete(dealId);
-    sourceOrderNumbers.delete(dealId);
-  }
 });
 
 test('public callbacks for a proven create ownership conflict are held without retrying or creating a duplicate', async () => {
@@ -403,7 +367,7 @@ test('actual public forward create, delayed source read failure and cold restart
     assert.equal(pair.bitrix24Id, sourceId); assert.equal(createPosts, beforePosts + 1); assert.equal(reverseAdds, before);
     assert.equal(await restarted.dealOrderReverseCreateOperation.count({ where: { moyskladOrderId: id } }), 0);
     assert.equal(await restarted.pairReviewCase.count({ where: { sourceEntityId: id } }), 0);
-    assert.equal(b24DealTitle, 'Original forward title');
+    assert.equal(b24DealTitle, 'SO-TEST-1');
   } finally { release(); forwardReadBarrier = null; failForwardReadOnce = false; forwardNativeId = refs.order; }
 });
 
@@ -499,11 +463,11 @@ async function waitForEvent(eventId: string, status: string) {
     await new Promise((resolve) => setTimeout(resolve, 20));
     event = await database.inboundEvent.findUniqueOrThrow({ where: { id: eventId } });
   }
-  assert.equal(event.status, status, `event should finish in ${status}; observed ${event.status}/${event.lastErrorCategory ?? 'no-category'}`);
+  assert.equal(event.status, status, `event should finish in ${status}`);
   return event;
 }
 
-function preparedOrder(dealId: string, eventId: string, orderNumber = 'SO-TEST-1') {
+function preparedOrder(dealId: string, eventId: string) {
   const base = new URL('api/remap/1.2/', providerBase).toString();
   const ref = (type: string, id: string) => ({ meta: { type, href: `${base}entity/${type}/${id}` } });
   return {
@@ -513,7 +477,6 @@ function preparedOrder(dealId: string, eventId: string, orderNumber = 'SO-TEST-1
     sourceRowValues: [{ id: '301', productId: Number(product.bitrix24Id), quantity: 2, price: 12500, measureCode: 796 }],
     sourceMeasureCodes: [796], unitMappings: [{ bitrix24Id: 9, bitrix24Code: '796', moyskladId: refs.unit, status: 'configured' as const }],
     payload: {
-      name: orderNumber,
       agent: ref('counterparty', company.moyskladId), organization: ref('organization', refs.organization),
       store: ref('store', refs.store), state: { meta: { type: 'state', href: `${base}entity/customerorder/metadata/states/${refs.state}` } },
       owner: ref('employee', refs.employee), rate: { currency: ref('currency', refs.currency) },
@@ -564,22 +527,21 @@ async function reply(request: IncomingMessage, response: ServerResponse) {
     const recovered = [...extraOrders.values()].find(order => order.syncId === orderPayload?.syncId);
     const id = recovered?.id ?? forwardNativeId;
     if (id !== refs.order) extraOrders.set(id, nativeOrder(id, orderPayload));
-    return send(response, { id, name: orderPayload?.name, meta: { type: 'customerorder' } });
+    return send(response, { id, name: 'SO-TEST-1', meta: { type: 'customerorder' } });
   }
   if (url.pathname === `/api/remap/1.2/entity/customerorder/${refs.order}`) {
     const positions = orderPayload?.positions as Array<Record<string, any>> | undefined;
-    return send(response, { id: refs.order, name: orderPayload?.name, meta: { type: 'customerorder' },
+    return send(response, { id: refs.order, name: 'SO-TEST-1', meta: { type: 'customerorder' },
       positions: { rows: (positions ?? []).map((position) => ({ ...position, id: refs.position })) } });
   }
   if (url.pathname === '/rest/crm.deal.get.json') {
     if (forwardReadBarrier) { const barrier = forwardReadBarrier; forwardReadBarrier = null; barrier.started(); await barrier.wait; }
     if (failForwardReadOnce) { failForwardReadOnce = false; response.writeHead(503); response.end('{}'); return; }
-    const dealId = String(form.get('id') ?? '');
-    return send(response, { result: { ID: dealId, TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber, UF_CRM_KVENTRU57: sourceOrderNumbers.get(dealId) ?? 'SO-TEST-1' } });
+    return send(response, { result: { ID: form.get('id'), TITLE: b24DealTitle, UF_CRM_1729757435964: b24OrderNumber } });
   }
   if (url.pathname === '/rest/crm.deal.update.json') {
     b24OrderNumber = form.get('fields[UF_CRM_1729757435964]');
-    if (form.has('fields[TITLE]')) b24DealTitle = form.get('fields[TITLE]');
+    b24DealTitle = form.get('fields[TITLE]');
     return send(response, { result: true });
   }
   response.writeHead(404, { 'content-type': 'application/json' });
